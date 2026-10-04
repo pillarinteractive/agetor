@@ -118,3 +118,13 @@ Settings → General (`keepAwakeWhileRunning` preference). Closing the lid still
 - **Issue queue** (top-bar Issues button, `src/bun/issue-queue.ts`): a project's open issues with label chips and search;
   pick a pipeline and **Fix** to create and start a pipeline task from the issue (built like `agetor add --issue`), with
   the prompt asking the PR to say `Fixes #n`. Issues that already have a live task show it instead.
+
+## Knowing what each card is doing (`feat/board-clarity`)
+
+- **Status line** under every card title (`src/mainview/lib/card-status.ts`): the step and how long it's been running,
+  what it waits on (lab, base-branch CI), the PR's state, or the result headline; ⓘ when it needs you.
+- **Needs you** bar at the top of the board: only cards waiting on the user, each with its one action
+  (Answer / Retry / Fix CI / Open PR / Review).
+- **Activity** timeline in the run view (`src/bun/activity.ts`): steps derived from the run's history, plus PR, CI,
+  review, merge, lease and auto-fix events appended to `<dataDir>/activity/<taskId>.jsonl` as they happen.
+- The run view header leads with the card's title; a step's panel strip names the card it belongs to.
