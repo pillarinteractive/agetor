@@ -79,3 +79,20 @@ agetor config lease_watchers '[{"project":"/Users/markedmiston/Dev/pillar","labe
 The command runs in `project` and must print `{"held": false}` or `{"held": true, "checkout": "<holder's repo root>"}`
 (`plab lease --json` does, from Pillar's `feature/plab-worktrees-lease-json`). The holder's card gets a lock badge,
 Blocked cards in that project show who holds it or that it's free, and dropping a blocked pipeline on Running retries it.
+
+## Follow-ups on finished pipelines (`feat/pipeline-followups`)
+
+A finished run's view has a **Next** box: run a preset or a custom request (any agent) as one more step of the same run,
+in the same worktree, with every earlier handoff as context. The card goes Running → Review and the follow-up's handoff
+becomes the Result. Presets live in the `pipeline_followups` preference:
+
+```json
+[{"id": "vm", "label": "Run VM tests", "agent": "Codex Builder",
+  "suggestWhen": ["apps/agent/**", "apps/observer/**", "lab/vm/**", "deploy/**"],
+  "prompt": "Run the VM suite with lab/vm/plab cycle …"},
+ {"id": "explain", "label": "Explain", "agent": "Architect", "requiresRequest": true, "prompt": "Answer … Do not modify files."}]
+```
+
+`agent` is a profile name; `suggestWhen` globs (`**` crosses directories; a slash-less pattern matches a file name
+anywhere) mark the preset **Suggested** when the branch changed a matching file. Nothing runs until the user clicks.
+Edit with `agetor config pipeline_followups '<json>'`; the board's current presets are Open PR, Run VM tests, Run E2E, Explain.
