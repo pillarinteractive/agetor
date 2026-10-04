@@ -12,3 +12,4 @@ export { PipelineBadge } from "./PipelineBadge";
 export { StepNode, type StepNodeData, type StepFlowNodeType } from "./StepNode";
 export { StepEdge, type StepEdgeData, type StepFlowEdgeType } from "./StepEdge";
 export { StepPanel } from "./StepPanel";
+export { HandoffCard } from "./HandoffCard";

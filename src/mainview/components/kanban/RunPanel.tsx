@@ -102,7 +102,8 @@ import { createEventBuffer } from "@/lib/event-buffer";
 import { invalidatesRebuiltSnapshot } from "@/lib/rebuilt-mask";
 import { cleanPromptPane } from "@/lib/prompt-noise";
 import { parseUserMessage, splitReferences, parseMessageSegments, normalizeDeliveredUserText, type MessageSegment } from "../../../shared/user-message.ts";
-import { isHandoffReminderMarker } from "../../../shared/pipeline.ts";
+import { isHandoffReminderMarker, splitHandoffMessage } from "../../../shared/pipeline.ts";
+import { HandoffCard } from "../pipelines/HandoffCard";
 import { isImageSourceMetaBreadcrumb, stripImagePlaceholders } from "../../../shared/attachments.ts";
 import { AgentIcon } from "./AgentIcon";
 import { AgentProfileCard } from "./AgentProfileCard";
@@ -6048,16 +6049,29 @@ const UserMessageBlock = memo(function UserMessageBlock({ text, taskId, pathRoot
   );
 });
 
+const AssistantMarkdown = ({ text }: { text: string }) => (
+  <div className="agetor-md text-foreground">
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      components={ASSISTANT_MD_COMPONENTS}
+      urlTransform={MD_URL_TRANSFORM}
+    >
+      {text}
+    </ReactMarkdown>
+  </div>
+);
+
 const AssistantBlock = memo(function AssistantBlock({ text }: { text: string }) {
+  // A pipeline step's final message ends in a `<handoff>` JSON block — show
+  // it as a formatted card instead of the raw JSON. An unparseable handoff
+  // keeps rendering as plain text, so a format problem stays visible.
+  const split = useMemo(() => splitHandoffMessage(text), [text]);
+  if (!split) return <AssistantMarkdown text={text} />;
   return (
-    <div className="agetor-md text-foreground">
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        components={ASSISTANT_MD_COMPONENTS}
-        urlTransform={MD_URL_TRANSFORM}
-      >
-        {text}
-      </ReactMarkdown>
+    <div className="space-y-2">
+      {split.before && <AssistantMarkdown text={split.before} />}
+      <HandoffCard handoff={split.handoff} />
+      {split.after && <AssistantMarkdown text={split.after} />}
     </div>
   );
 });

@@ -24,6 +24,7 @@ import {
   renderHandoffFile,
   resolveNextSteps,
   resolveStartStep,
+  splitHandoffMessage,
   stepNameById,
   validatePipelineGraph,
 } from "./pipeline.ts";
@@ -2502,5 +2503,33 @@ describe("composeHandoffReminder", () => {
     const nextRule = 'This is the last step: set "next" to null.';
     expect(prompt).toContain(nextRule);
     expect(reminder).toContain(nextRule);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// splitHandoffMessage
+
+describe("splitHandoffMessage", () => {
+  const json = '{"schemaVersion":1,"purpose":"p","summary":"- one\\n- two","reason":"r","next":null,"artifacts":[],"openQuestions":["q?"],"status":"blocked"}';
+
+  test("splits prose, the parsed handoff, and trailing text", () => {
+    const split = splitHandoffMessage(`Here is what I found.\n\n<handoff>\n${json}\n</handoff>\n`);
+    expect(split).not.toBeNull();
+    expect(split!.before).toBe("Here is what I found.");
+    expect(split!.after).toBe("");
+    expect(split!.handoff.status).toBe("blocked");
+    expect(split!.handoff.summary).toBe("- one\n- two");
+    expect(split!.handoff.openQuestions).toEqual(["q?"]);
+  });
+
+  test("uses the last block and keeps text after the closing tag", () => {
+    const split = splitHandoffMessage(`intro <HANDOFF>{"bad": </HANDOFF> mid <handoff>${json}</handoff> tail`);
+    expect(split!.before).toBe('intro <HANDOFF>{"bad": </HANDOFF> mid');
+    expect(split!.after).toBe("tail");
+  });
+
+  test("no block, or one that doesn't parse, falls back to the raw text (null)", () => {
+    expect(splitHandoffMessage("just prose")).toBeNull();
+    expect(splitHandoffMessage("<handoff>not json</handoff>")).toBeNull();
   });
 });

@@ -812,3 +812,31 @@ export function stepReminded(run: PipelineRunState | null | undefined, stepId: s
   }
   return !!latest?.reminder;
 }
+
+/**
+ * The step records that are a finished run's outcome — the executions that
+ * handed off with nothing after them (the terminal step, or every branch end
+ * of a fan-out), newest first. What the run view shows as the "Result", so
+ * the user doesn't have to know which step to open. Empty unless the run is
+ * `done`.
+ */
+export function runResultRecords(run: PipelineRunState | null | undefined): PipelineStepRecord[] {
+  if (!run || run.status !== "done") return [];
+  return run.history
+    .filter((r) => r.handoff != null && r.endedAt != null && r.nextStepIds.length === 0)
+    .sort((a, b) => b.seq - a.seq);
+}
+
+/** The latest record for one step execution's task, e.g. to show the handoff
+ *  behind a block. */
+export function latestRecordForTask(
+  run: PipelineRunState | null | undefined,
+  taskId: string | null,
+): PipelineStepRecord | null {
+  if (!run || !taskId) return null;
+  let latest: PipelineStepRecord | null = null;
+  for (const r of run.history) {
+    if (r.taskId === taskId && (!latest || r.seq > latest.seq)) latest = r;
+  }
+  return latest;
+}
