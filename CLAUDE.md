@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+Fork workflow (branches, sandbox vs. the live board, building and installing, going upstream): @FORK.md
+
 ## What this is
 
 Agetor is a local desktop app that orchestrates CLI coding agents (Claude Code, OpenAI Codex, others) from a kanban board. Each task is a prompt + working directory + agent choice; running it spawns the agent as a child process, streams its stdout/stderr to the UI, and moves the card through columns based on exit status.
