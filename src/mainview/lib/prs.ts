@@ -18,7 +18,15 @@ export function prBadge(pr: TaskPrStatus): { text: string; tone: "success" | "da
   const threadsTitle = pr.unresolvedThreads > 0 ? `; ${pr.unresolvedThreads} unresolved review thread(s)` : "";
   if (pr.checks === "failure") {
     // Same rule as pr-watch.ts ownFailures: inherited and rollup checks aren't the PR's.
-    const own = pr.failingChecks.filter((c) => !c.alsoOnBase && c.name !== "required");
+    const behind = (pr.behindBy ?? 0) > 0;
+    const own = pr.failingChecks.filter((c) => !c.alsoOnBase && c.name !== "required" && !(behind && c.passesOnBase));
+    if (own.length === 0 && behind && pr.failingChecks.some((c) => c.passesOnBase)) {
+      return {
+        text: `${base} ✗ CI (behind ${pr.baseRef ?? "base"})${threads}`,
+        tone: "warning",
+        title: `Failing checks pass on ${pr.baseRef ?? "the base branch"} now; the PR is ${pr.behindBy} commit(s) behind — update the branch${threadsTitle}`,
+      };
+    }
     const baseName = pr.baseRef ?? "the base branch";
     if (own.length === 0) {
       return {

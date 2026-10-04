@@ -7,7 +7,7 @@ import type { Task, TaskPrStatus } from "../shared/types.ts";
 process.env.AGETOR_DATA_DIR ??= mkdtempSync(path.join(tmpdir(), "agetor-pr-watch-"));
 const {
   PR_FIX_CI_ACTION, PR_REVIEW_ACTION, followUpReady, markInherited, prFollowUpActions, prFollowUpInstructions, rollUpChecks,
-  shouldAutoFix, tasksToWatch,
+  shouldAutoFix, staleAgainstBase, tasksToWatch,
 } = await import("./pr-watch.ts");
 
 const run = (name: string, status: string, conclusion: string | null) => ({ name, status, conclusion, htmlUrl: `https://ci/${name}` });
@@ -120,5 +120,22 @@ describe("auto Fix CI", () => {
     expect(followUpReady(card(blocked), () => true)).toBe(false);
     expect(followUpReady(card({ ...doneRun, status: "running" }))).toBe(false);
     expect(followUpReady(task({}))).toBe(false);
+  });
+});
+
+describe("behind the base branch", () => {
+  const stale = (behindBy: number) =>
+    pr({ checks: "failure", behindBy, failingChecks: [{ name: "web / vitest", url: null, alsoOnBase: false, passesOnBase: true }] });
+
+  test("a failure that passes on an updated base isn't the PR's: no Fix CI, no auto-fix, Update branch instead", () => {
+    expect(staleAgainstBase(stale(3))).toBe(true);
+    expect(prFollowUpActions(stale(3))).toEqual([]);
+    const doneRun = { status: "done", active: [], snapshot: { graph: { steps: [], edges: [] } } };
+    expect(shouldAutoFix(task({ pipelineRun: doneRun as Task["pipelineRun"] }), stale(3), { enabled: true, ledger: {}, isLive: () => false })).toBe(false);
+  });
+
+  test("up to date with the base, the same failure is the PR's own", () => {
+    expect(staleAgainstBase(stale(0))).toBe(false);
+    expect(prFollowUpActions(stale(0)).map((a) => a.id)).toEqual([PR_FIX_CI_ACTION]);
   });
 });

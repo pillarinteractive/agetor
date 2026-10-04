@@ -2369,6 +2369,26 @@ export async function findGitHubPullForBranch(input: { dir: string; branch: stri
   };
 }
 
+/** How far `head` is ahead of / behind `base` (`GET compare/base...head`). A PR
+ *  that's behind its base may be failing on something the base already fixed. */
+export async function getGitHubCompare(input: { dir: string; base: string; head: string }): Promise<
+  { ok: true; aheadBy: number; behindBy: number } | GitHubListError
+> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  const token = await githubToken(repo.remoteHost ?? null);
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/compare/${encodeURIComponent(input.base)}...${encodeURIComponent(input.head)}`;
+  const res = await fetchGitHub(url, token, "application/vnd.github+json");
+  if (!("status" in res)) return res;
+  const json = (await res.json().catch(() => null)) as { ahead_by?: unknown; behind_by?: unknown } | null;
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  return {
+    ok: true,
+    aheadBy: typeof json?.ahead_by === "number" ? json.ahead_by : 0,
+    behindBy: typeof json?.behind_by === "number" ? json.behind_by : 0,
+  };
+}
+
 /** Check runs on the tip of `ref` (a branch name or sha) — e.g. the PR's base
  *  branch, to tell a failure the PR introduced from one it inherited. */
 export async function getGitHubRefCheckRuns(input: { dir: string; ref: string }): Promise<

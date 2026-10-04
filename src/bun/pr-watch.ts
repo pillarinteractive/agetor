@@ -12,7 +12,7 @@
  */
 import type { FollowUpAction, Task, TaskPrStatus } from "../shared/types.ts";
 import { agentProfiles, preferences, tasks } from "./db.ts";
-import { findGitHubPullForBranch, getGitHubPullChecks, getGitHubPullReviewThreads, getGitHubRefCheckRuns } from "./github.ts";
+import { findGitHubPullForBranch, getGitHubCompare, getGitHubPullChecks, getGitHubPullReviewThreads, getGitHubRefCheckRuns } from "./github.ts";
 import { runPipelineFollowUp } from "./pipeline-runner.ts";
 import { recordActivity } from "./activity.ts";
 import { isTaskRunLive, moveMergedTaskToDone, publishGlobalEvent } from "./orchestrator.ts";
@@ -72,16 +72,28 @@ export function rollUpChecks(runs: { name: string; status: string; conclusion: s
 export function markInherited(
   pr: TaskPrStatus["failingChecks"],
   base: TaskPrStatus["failingChecks"],
+  passingOnBase: string[] = [],
 ): TaskPrStatus["failingChecks"] {
   const onBase = new Set(base.map((b) => b.name));
-  return pr.map((f) => ({ ...f, alsoOnBase: onBase.has(f.name) }));
+  const passes = new Set(passingOnBase);
+  return pr.map((f) => ({ ...f, alsoOnBase: onBase.has(f.name), passesOnBase: passes.has(f.name) }));
+}
+
+/** The PR is behind its base and some of its failures pass on the base now
+ *  — the base probably fixed them; updating the branch is the move, not a
+ *  fix on the PR. */
+export function staleAgainstBase(pr: TaskPrStatus | null): boolean {
+  return !!pr && (pr.behindBy ?? 0) > 0 && pr.failingChecks.some((f) => f.passesOnBase && !ROLLUP_CHECKS.has(f.name));
 }
 
 /** The failures the PR itself caused — the ones worth fixing on its branch.
  *  A rollup check (e.g. "required", which fails whenever any suite does) is
  *  only "own" when some real suite failure is. */
 export function ownFailures(pr: TaskPrStatus | null): TaskPrStatus["failingChecks"] {
-  return (pr?.failingChecks ?? []).filter((f) => !f.alsoOnBase && !ROLLUP_CHECKS.has(f.name));
+  const behind = (pr?.behindBy ?? 0) > 0;
+  return (pr?.failingChecks ?? []).filter(
+    (f) => !f.alsoOnBase && !ROLLUP_CHECKS.has(f.name) && !(behind && f.passesOnBase),
+  );
 }
 
 /** Aggregate checks that fail whenever any suite does — never a cause. */
@@ -95,8 +107,9 @@ function same(a: TaskPrStatus | undefined, b: TaskPrStatus): boolean {
     a.draft === b.draft &&
     a.checks === b.checks &&
     a.unresolvedThreads === b.unresolvedThreads &&
-    a.failingChecks.map((f) => `${f.name}:${f.alsoOnBase}`).join("\n") ===
-      b.failingChecks.map((f) => `${f.name}:${f.alsoOnBase}`).join("\n")
+    (a.behindBy ?? null) === (b.behindBy ?? null) &&
+    a.failingChecks.map((f) => `${f.name}:${f.alsoOnBase}:${f.passesOnBase}`).join("\n") ===
+      b.failingChecks.map((f) => `${f.name}:${f.alsoOnBase}:${f.passesOnBase}`).join("\n")
   );
 }
 
@@ -109,12 +122,20 @@ async function probe(task: Task): Promise<TaskPrStatus | null> {
   let checks: TaskPrStatus["checks"] = "none";
   let failingChecks: TaskPrStatus["failingChecks"] = [];
   let unresolvedThreads = 0;
+  let behindBy: number | null = null;
   if (state === "open") {
     const runs = await getGitHubPullChecks({ dir, number: pull.number });
     if (runs.ok) ({ checks, failing: failingChecks } = rollUpChecks(runs.checkRuns));
     if (failingChecks.length > 0 && pull.baseRef) {
       const base = await getGitHubRefCheckRuns({ dir, ref: pull.baseRef });
-      if (base.ok) failingChecks = markInherited(failingChecks, rollUpChecks(base.checkRuns).failing);
+      if (base.ok) {
+        const passing = base.checkRuns.filter((r) => r.status === "completed" && r.conclusion === "success").map((r) => r.name);
+        failingChecks = markInherited(failingChecks, rollUpChecks(base.checkRuns).failing, passing);
+      }
+    }
+    if (pull.baseRef && pull.headSha) {
+      const cmp = await getGitHubCompare({ dir, base: pull.baseRef, head: pull.headSha });
+      if (cmp.ok) behindBy = cmp.behindBy;
     }
     const threads = await getGitHubPullReviewThreads({ dir, number: pull.number });
     if (threads.ok) unresolvedThreads = threads.threads.filter((t) => !t.isResolved && !t.isOutdated).length;
@@ -127,6 +148,7 @@ async function probe(task: Task): Promise<TaskPrStatus | null> {
     draft: pull.draft,
     baseRef: pull.baseRef,
     headSha: pull.headSha,
+    behindBy,
     checks,
     failingChecks,
     unresolvedThreads,

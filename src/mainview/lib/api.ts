@@ -475,6 +475,11 @@ export const api = {
   getLeases: () => j<LeaseStatus[]>("/leases"),
   /** Every watched task's pull request (src/bun/pr-watch.ts). */
   getPrs: () => j<TaskPrStatus[]>("/prs"),
+  /** Orchestrator suggestions with a ready fix (src/bun/suggestions.ts). */
+  getSuggestions: () =>
+    j<{ id: string; taskId: string; taskTitle: string; title: string; detail: string; apply: { kind: string } }[]>("/suggestions"),
+  applySuggestion: (taskId: string, id: string) =>
+    j<{ ok: true; message: string }>("/suggestions/apply", { method: "POST", body: JSON.stringify({ taskId, id }) }, { retry: false }),
   /** A card's activity timeline, newest first (src/bun/activity.ts). */
   getActivity: (taskId: string) =>
     j<{ ts: number; kind: string; text: string; tone: "muted" | "info" | "success" | "warning" | "danger"; url?: string }[]>(
