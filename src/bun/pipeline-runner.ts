@@ -28,6 +28,7 @@
  * `headless.ts` call it explicitly, once, right before `reconcileOrphans()`.
  */
 import { randomUUID } from "node:crypto";
+import { recordActivity } from "./activity.ts";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { agentProfiles, backlog, dataDir, harnesses, pipelines, runs, tasks } from "./db.ts";
@@ -191,6 +192,38 @@ function upsertBlocked(run: PipelineRunState, entry: PipelineBlock): void {
 
 function removeBlockedFor(run: PipelineRunState, taskId: string): void {
   run.blocked = run.blocked.filter((b) => b.taskId !== taskId);
+}
+
+/**
+ * A follow-up started on a blocked run is the user moving past the block
+ * (Finish stopped on a failing test → "Open PR" with instructions to fix it):
+ * every block from an earlier execution is set aside — dropped from
+ * `blocked`, and its stopped execution from `active` — so the run reads as
+ * running (then done/blocked on the follow-up's own outcome) instead of
+ * staying "blocked" on a step nobody is waiting for. The blocked step's
+ * history record keeps its outcome. Returns the set-aside step names.
+ * Exported for tests.
+ */
+export function supersedeBlocksBefore(run: PipelineRunState, seq: number): string[] {
+  const seqOf = new Map(run.active.map((a) => [a.taskId, a.seq]));
+  const stale = run.blocked.filter((b) => b.taskId === null || (seqOf.get(b.taskId) ?? -1) < seq);
+  if (stale.length === 0) return [];
+  const staleTasks = new Set(stale.map((b) => b.taskId).filter((id): id is string => id !== null));
+  run.blocked = run.blocked.filter((b) => !stale.includes(b));
+  run.active = run.active.filter((a) => !staleTasks.has(a.taskId) || isTaskRunLive(a.taskId));
+  // A join-incomplete block's pending arrivals are what it was waiting on.
+  for (const b of stale) if (b.taskId === null && b.stepId) delete run.joins[b.stepId];
+  const graph = run.snapshot?.graph;
+  return stale.map((b) => (graph && b.stepId ? stepNameById(graph, b.stepId) : (b.stepId ?? "a step")));
+}
+
+function noteSuperseded(parentId: string, steps: string[], by: string): void {
+  if (steps.length === 0) return;
+  recordActivity(parentId, {
+    kind: "step",
+    text: `${steps.join(", ")} block set aside — ${by} took over`,
+    tone: "muted",
+  });
 }
 
 /** Add-or-replace a join arrival by `fromStepId` (m10) — a source step that
@@ -1465,8 +1498,8 @@ export async function runPipelineFollowUp(
     const run = parent.pipelineRun;
     if (!run || !run.snapshot) return { error: "pipeline has never run", status: 409 as const };
     // A blocked run whose executions have all stopped can take one too (e.g.
-    // "Fix CI" while an "Open PR" step sits blocked); its block stays until
-    // the user retries or advances it.
+    // "Fix CI" while an "Open PR" step sits blocked); once it launches, the
+    // earlier blocks are set aside (`supersedeBlocksBefore`).
     const idleBlocked = run.status === "blocked" && run.active.every((a) => !isTaskRunLive(a.taskId));
     if (run.status !== "done" && !idleBlocked) {
       return { error: "follow-ups run once the pipeline has finished or stopped on a block", status: 409 as const };
@@ -1512,6 +1545,8 @@ export async function runPipelineFollowUp(
       .sort((a, b) => a.seq - b.seq)
       .map((r) => ({ stepId: r.stepId, seq: r.seq, handoff: r.handoff }));
     const launched = await launchTarget(parent, run, step, previous);
+    const mine = run.active.find((a) => a.stepId === step.id);
+    if (launched.ok && mine) noteSuperseded(parentId, supersedeBlocksBefore(run, mine.seq), name);
     persist(parentId, run);
     if (!launched.ok && run.active.every((a) => a.stepId !== step.id)) {
       const block = run.blocked.find((b) => b.stepId === step.id);
@@ -2386,6 +2421,15 @@ async function handleColumnChange(
         const beforeLen = run.blocked.length;
         run.blocked = run.blocked.filter((b) => b.taskId !== taskId);
         let changed = run.blocked.length !== beforeLen;
+        // A follow-up running again (resumed by a message) has taken over
+        // from any earlier block, same as when it launched.
+        if (isFollowUpStepId(activeEntry.stepId)) {
+          const set = supersedeBlocksBefore(run, activeEntry.seq);
+          if (set.length) {
+            noteSuperseded(parentId, set, run.snapshot ? stepNameById(run.snapshot.graph, activeEntry.stepId) : "a follow-up");
+            changed = true;
+          }
+        }
         const historyEntry = run.history.find((h) => h.taskId === taskId && h.seq === activeEntry.seq);
         if (historyEntry && (historyEntry.outcome !== null || historyEntry.endedAt !== null || (historyEntry.responseKind ?? null) !== null)) {
           historyEntry.outcome = null;
@@ -2480,7 +2524,7 @@ export async function reconcilePipelineRuns(): Promise<number> {
   const parents = tasks.list().filter((t) => {
     if (t.pipelineId == null || t.pipelineParentId != null || t.archivedAt != null || !t.pipelineRun) return false;
     const status = t.pipelineRun.status;
-    return status === "running" || (status === "blocked" && t.pipelineRun.active.length > 0);
+    return status === "running" || status === "blocked";
   });
 
   for (const parent of parents) {
@@ -2501,6 +2545,22 @@ export async function reconcilePipelineRuns(): Promise<number> {
         await runExclusive(parent.id, async () => persistReconcileFailure(parent.id, a.taskId, err)).catch(() => {});
       }
     }
+    // A run left "blocked" on an earlier step after a follow-up took over —
+    // live now, or already finished (state from before follow-ups superseded
+    // blocks).
+    await runExclusive(parent.id, async () => {
+      const run = tasks.get(parent.id)?.pipelineRun;
+      if (!run || run.blocked.length === 0) return;
+      const live = run.active.filter((a) => isFollowUpStepId(a.stepId) && isTaskRunLive(a.taskId)).map((a) => ({ stepId: a.stepId, seq: a.seq }));
+      const finished = run.history.filter((h) => isFollowUpStepId(h.stepId) && h.outcome === "succeeded").map((h) => ({ stepId: h.stepId, seq: h.seq }));
+      const latest = [...live, ...finished].sort((x, y) => y.seq - x.seq)[0];
+      if (!latest) return;
+      const set = supersedeBlocksBefore(run, latest.seq);
+      if (set.length === 0) return;
+      noteSuperseded(parent.id, set, run.snapshot ? stepNameById(run.snapshot.graph, latest.stepId) : "a follow-up");
+      persist(parent.id, run);
+      count++;
+    }).catch(() => {});
   }
   return count;
 }

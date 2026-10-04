@@ -182,4 +182,7 @@ ordinary task (isolation none, workdir `~/.agetor/conductor` holding its CLAUDE.
 - **Done cards' PRs**: each Done card's PR is looked up once after startup, so a PR merged before a restart shows
   "merged" instead of the final handoff's old CI headline. PR timeline entries re-derived after a restart aren't
   logged twice (`recordActivityOnce`).
+- **Follow-ups take over from a block** (`supersedeBlocksBefore` in `src/bun/pipeline-runner.ts`): starting (or
+  resuming) a follow-up on a blocked run sets aside the earlier blocks, so the card runs, then lands in Review or on
+  the follow-up's own block. Boot repairs runs left blocked behind a live or finished follow-up.
 - E2E live progress: Pillar PR #197 — watcher `{"label":"e2e","command":"node apps/web/scripts/e2e-progress.mjs --json"}`.

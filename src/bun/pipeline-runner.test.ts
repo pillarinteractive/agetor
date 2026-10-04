@@ -2976,3 +2976,35 @@ test("follow-up: a finished run takes one more step in the same run, with earlie
   expect(stepTask.prompt).toContain("Open the PR.");
   await waitUntilIdle(parentId);
 });
+
+test("supersedeBlocksBefore: a follow-up sets aside earlier blocks, keeps later ones, and the run reads as running", async () => {
+  const { supersedeBlocksBefore } = await import("./pipeline-runner.ts");
+  const { deriveRunStatus } = await import("../shared/pipeline.ts");
+  const run = {
+    status: "blocked",
+    active: [
+      { stepId: "finish", taskId: "t-finish", seq: 4 },
+      { stepId: "followup-1", taskId: "t-follow", seq: 5 },
+      { stepId: "other", taskId: "t-later", seq: 6 },
+    ],
+    blocked: [
+      { taskId: "t-finish", stepId: "finish", kind: "step-blocked", message: "failing test" },
+      { taskId: "t-later", stepId: "other", kind: "step-blocked", message: "later block" },
+      { taskId: null, stepId: "join", kind: "join-incomplete", message: "waiting", pending: { stepId: "join", arrivals: [] } },
+    ],
+    joins: { join: { arrivals: [{ fromStepId: "x" }] } },
+    history: [],
+    snapshot: { graph: { steps: [{ id: "finish", name: "Finish" }, { id: "join", name: "Join" }, { id: "other", name: "Other" }], edges: [] } },
+  } as unknown as import("../shared/types.ts").PipelineRunState;
+
+  expect(supersedeBlocksBefore(run, 5)).toEqual(["Finish", "Join"]);
+  expect(run.blocked.map((b) => b.stepId)).toEqual(["other"]);
+  expect(run.active.map((a) => a.stepId)).toEqual(["followup-1", "other"]);
+  expect(run.joins).toEqual({});
+
+  // With the later block gone too, the run is just running its follow-up.
+  expect(supersedeBlocksBefore(run, 7)).toEqual(["Other"]);
+  expect(deriveRunStatus(run)).toBe("running");
+  // Nothing left to set aside.
+  expect(supersedeBlocksBefore(run, 7)).toEqual([]);
+});
