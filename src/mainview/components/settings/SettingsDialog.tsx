@@ -273,6 +273,8 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
   // helper — see src/bun/disclaim.ts. Only the literal stored value "false"
   // turns it off; unset/anything-else reads as on, matching disclaimEnabled().
   const [disclaimSpawnedAgents, setDisclaimSpawnedAgents] = useState(true);
+  // Default-on: hold a caffeinate assertion while agents run (src/bun/keep-awake.ts).
+  const [keepAwakeWhileRunning, setKeepAwakeWhileRunning] = useState(true);
   const [view, setView] = useState<SettingsView>(() => entryView(initialSection, initialAgentProfileId));
   // The view (and a per-open counter) must be correct on the very FIRST commit
   // after the modal opens: the dialog stays mounted while closed, and an
@@ -354,6 +356,8 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
     setBundledTmuxAvailable(tmux.bundledAvailable);
     // keep in sync with DISCLAIM_PREF_KEY in src/bun/disclaim.ts
     setDisclaimSpawnedAgents(prefs["disclaimSpawnedAgents"] !== "false");
+    // keep in sync with KEEP_AWAKE_PREF_KEY in src/bun/keep-awake.ts
+    setKeepAwakeWhileRunning(prefs["keepAwakeWhileRunning"] !== "false");
   };
 
   const onPickTmuxSource = async (source: "system" | "bundled") => {
@@ -374,6 +378,14 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
     subpageDirtyRef.current = false;
     setFormError(null);
   }, [open, initialSection, initialAgentProfileId]);
+
+  const onKeepAwakeWhileRunningChange = (enabled: boolean) => {
+    setKeepAwakeWhileRunning(enabled);
+    // keep in sync with KEEP_AWAKE_PREF_KEY in src/bun/keep-awake.ts
+    void api.setPreference("keepAwakeWhileRunning", String(enabled)).catch(() => {
+      setKeepAwakeWhileRunning((current) => current === enabled ? !enabled : current);
+    });
+  };
 
   const statusByHarness = useMemo(() => {
     const map = new Map(payload.statuses.map((s) => [s.harnessId, s]));
@@ -639,6 +651,8 @@ export function SettingsDialog({ open, onClose, stickyUserMessages, onStickyUser
                       onPickTmuxSource={onPickTmuxSource}
                       disclaimSpawnedAgents={disclaimSpawnedAgents}
                       onDisclaimSpawnedAgentsChange={onDisclaimSpawnedAgentsChange}
+                      keepAwakeWhileRunning={keepAwakeWhileRunning}
+                      onKeepAwakeWhileRunningChange={onKeepAwakeWhileRunningChange}
                       onClose={closeModal}
                     />
                   );
@@ -841,6 +855,8 @@ function GeneralSection({
   onPickTmuxSource,
   disclaimSpawnedAgents,
   onDisclaimSpawnedAgentsChange,
+  keepAwakeWhileRunning,
+  onKeepAwakeWhileRunningChange,
   onClose,
 }: {
   payload: HarnessesPayload;
@@ -855,6 +871,8 @@ function GeneralSection({
   onPickTmuxSource: (source: "system" | "bundled") => void;
   disclaimSpawnedAgents: boolean;
   onDisclaimSpawnedAgentsChange: (enabled: boolean) => void;
+  keepAwakeWhileRunning: boolean;
+  onKeepAwakeWhileRunningChange: (enabled: boolean) => void;
   /** Closes the Settings dialog — used by "Show getting started guide" so the
    *  onboarding checklist underneath is visible after replaying it. */
   onClose: () => void;
@@ -1025,6 +1043,25 @@ function GeneralSection({
           Spawned agents ask for macOS permissions under their own name instead of Agetor's, so the "access data
           from other apps" prompt stops naming Agetor and sticks after you Allow it once. Turn off to revert to the
           previous behavior.
+        </p>
+      </section>
+
+      <section className="space-y-1">
+        <div className="flex items-center justify-between gap-4">
+          <label htmlFor="keep-awake-while-running" className="text-xs text-muted-foreground">
+            Keep Mac awake while agents run
+          </label>
+          <Switch
+            id="keep-awake-while-running"
+            data-testid="settings-keep-awake"
+            checked={keepAwakeWhileRunning}
+            onCheckedChange={onKeepAwakeWhileRunningChange}
+            aria-label="Keep Mac awake while agents run"
+          />
+        </div>
+        <p className="text-[11px] text-muted-foreground">
+          While any task is running, Agetor stops your Mac from sleeping (closing the lid still sleeps it unless an
+          external display is attached). Long turns otherwise fail with "Your computer went to sleep mid-response".
         </p>
       </section>
 

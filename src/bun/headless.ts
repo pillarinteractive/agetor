@@ -3,6 +3,7 @@ import { API_TOKEN } from "./api-config.ts";
 import { db, dataDir, subagents } from "./db.ts";
 import { reconcileOrphans, rearmFxAutoResumes, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
 import { initPipelineRunner, reconcilePipelineRuns } from "./pipeline-runner.ts";
+import { startKeepAwakeLoop } from "./keep-awake.ts";
 import { ensureDisclaimedServer } from "./tmux-resolution.ts";
 import { startApiServer, attachedClientCount } from "./server.ts";
 import { rehydratePath } from "./login-path.ts";
@@ -169,6 +170,8 @@ export async function runDaemon(): Promise<void> {
   // idle-shutdown path.
   void refreshAllModels();
   startPeriodicDiscovery();
+  // Keep the Mac awake while agents run — same as index.ts; timer is unref'd.
+  startKeepAwakeLoop();
 
   // Idle-session reaper (docs/plans/reduce-cpu-and-memory.md §3.1, T4):
   // mirrors index.ts's wiring so the headless daemon doesn't accumulate the
