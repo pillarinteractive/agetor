@@ -32,6 +32,7 @@ import { recordActivity } from "./activity.ts";
 import { syncBaseNote } from "./sync-base.ts";
 import { logBlocks, newBlocks } from "./block-log.ts";
 import { isMergeQueued } from "./merge-intent.ts";
+import { currentSlots, slotDecision, slotUse } from "./step-slots.ts";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { agentProfiles, backlog, dataDir, harnesses, pipelines, runs, tasks } from "./db.ts";
@@ -253,6 +254,59 @@ function scheduleTransientRetry(parentId: string, run: PipelineRunState, stepId:
   timer.unref?.();
 }
 
+/** When each queued step started waiting (`<parentId>:<stepId>`) — slots go
+ *  to the longest-waiting first. In memory: after a restart the order is
+ *  rebuilt from the first pass. */
+const slotWaitSince = new Map<string, number>();
+
+/** Launch queued steps while slots are free, longest-waiting first. Each
+ *  launch re-checks the slots itself (a heavy step may still have to wait
+ *  while a light one behind it goes). Exported for tests. */
+export async function releaseSlotWaits(): Promise<number> {
+  const waiting: { parentId: string; stepId: string; since: number }[] = [];
+  for (const t of tasks.list()) {
+    if (t.archivedAt != null || !t.pipelineRun) continue;
+    for (const b of t.pipelineRun.blocked) {
+      if (b.kind !== "slot-wait" || !b.stepId) continue;
+      const key = `${t.id}:${b.stepId}`;
+      if (!slotWaitSince.has(key)) slotWaitSince.set(key, Date.now());
+      waiting.push({ parentId: t.id, stepId: b.stepId, since: slotWaitSince.get(key)! });
+    }
+  }
+  waiting.sort((a, b) => a.since - b.since);
+  let launched = 0;
+  for (const w of waiting) {
+    const slots = currentSlots();
+    if (slotUse(isTaskRunLive, slots).total >= slots.max) break;
+    const ok = await runExclusive(w.parentId, async () => {
+      const parent = tasks.get(w.parentId);
+      const run = parent?.pipelineRun;
+      if (!parent || !run || parent.archivedAt != null) return false;
+      const block = run.blocked.find((b) => b.kind === "slot-wait" && b.stepId === w.stepId);
+      const step = run.snapshot?.graph.steps.find((s) => s.id === w.stepId);
+      if (!block?.pending || !step) return false;
+      // Still over a limit for this step (e.g. the verification slot)? Leave it queued.
+      if (!slotDecision(step.name, slotUse(isTaskRunLive, slots), slots).ok) return false;
+      run.blocked = run.blocked.filter((b) => b !== block);
+      const previous = block.pending.arrivals.map((a) => ({ stepId: a.fromStepId, seq: a.seq, handoff: a.handoff }));
+      const r = await launchTarget(parent, run, step, previous);
+      persist(w.parentId, run);
+      return r.ok;
+    }).catch(() => false);
+    if (ok) launched++;
+  }
+  return launched;
+}
+
+let slotLoop: ReturnType<typeof setInterval> | null = null;
+
+/** Start the slot scheduler. Idempotent; the timer is unref'd. */
+export function startSlotScheduler(): void {
+  if (slotLoop) return;
+  slotLoop = setInterval(() => void releaseSlotWaits().catch(() => undefined), 10_000);
+  slotLoop.unref?.();
+}
+
 function noteSuperseded(parentId: string, steps: string[], by: string): void {
   if (steps.length === 0) return;
   recordActivity(parentId, {
@@ -333,7 +387,7 @@ function persist(parentId: string, run: PipelineRunState, opts?: { preserveStatu
   tasks.setPipelineRun(parentId, run);
   const parent = tasks.get(parentId);
   // Every new block goes in the block log (src/bun/block-log.ts).
-  const fresh = newBlocks(previousRun?.blocked ?? [], run.blocked);
+  const fresh = newBlocks(previousRun?.blocked ?? [], run.blocked).filter((b) => b.kind !== "slot-wait");
   if (fresh.length && parent) {
     logBlocks(
       fresh.map((b) => ({
@@ -663,7 +717,7 @@ async function launchStep(
   run: PipelineRunState,
   step: PipelineStep,
   previous: { stepId: string; seq: number; handoff: Handoff | null }[],
-  opts?: { batchSiblingStepIds?: string[]; skipWorktreeRefresh?: boolean },
+  opts?: { batchSiblingStepIds?: string[]; skipWorktreeRefresh?: boolean; ignoreSlots?: boolean },
 ): Promise<LaunchResult> {
   const snapshot = run.snapshot;
   if (!snapshot) {
@@ -732,6 +786,27 @@ async function launchStep(
     persist(parent.id, run);
     return { ok: false };
   }
+
+  // Step slots (src/bun/step-slots.ts): too many agents at once starve the
+  // machine. Over the limit, the step queues — a `slot-wait` block that the
+  // slot scheduler (`releaseSlotWaits`) launches when a slot frees.
+  if (!opts?.ignoreSlots) {
+    const slots = currentSlots();
+    const decision = slotDecision(step.name, slotUse(isTaskRunLive, slots), slots);
+    if (!decision.ok) {
+      upsertBlocked(run, {
+        taskId: null,
+        stepId: step.id,
+        kind: "slot-wait",
+        message: `${step.name} is ${decision.why}`,
+        pending: { stepId: step.id, arrivals: pendingArrivals },
+      });
+      slotWaitSince.set(`${parent.id}:${step.id}`, slotWaitSince.get(`${parent.id}:${step.id}`) ?? Date.now());
+      persist(parent.id, run);
+      return { ok: false };
+    }
+  }
+  slotWaitSince.delete(`${parent.id}:${step.id}`);
 
   const seq = ++run.stepCount;
 
@@ -1293,6 +1368,10 @@ export async function startPipelineRun(
     checkJoinIncomplete(run);
     persist(parentRow.id, run);
     if (!result.ok) {
+      // Queued for a free slot (src/bun/step-slots.ts): started, just not yet.
+      if (run.blocked.some((b) => b.kind === "slot-wait" && b.stepId === startStep.id)) {
+        return { runId: "", pending: true as const };
+      }
       return { error: "pipeline failed to start — see the run's blocked step for details" };
     }
     return { runId: result.runId, ...(result.pending ? { pending: true as const } : {}) };
@@ -1607,7 +1686,10 @@ export async function runPipelineFollowUp(
     persist(parentId, run);
     if (!launched.ok && run.active.every((a) => a.stepId !== step.id)) {
       const block = run.blocked.find((b) => b.stepId === step.id);
-      return { error: block?.message ?? "follow-up could not start", status: 409 as const };
+      // Queued for a slot: it starts by itself — not an error.
+      if (block?.kind !== "slot-wait") {
+        return { error: block?.message ?? "follow-up could not start", status: 409 as const };
+      }
     }
     return { task: tasks.get(parentId)! };
   });

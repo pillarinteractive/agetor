@@ -20,6 +20,7 @@ import { startProgressWatchLoop } from "./progress-watch.ts";
 import { startConductorLoop } from "./conductor.ts";
 import { startDependencyLoop } from "./dependencies.ts";
 import { startMergeQueueLoop } from "./merge-queue.ts";
+import { startSlotScheduler } from "./pipeline-runner.ts";
 import { getMainWindow, setMainWindow } from "./window.ts";
 import { makeWindowLifecycle, type Frame } from "./window-lifecycle.ts";
 import { focusWindow } from "./window-focus.ts";
@@ -524,6 +525,10 @@ startDependencyLoop();
 // Ready to Merge (src/bun/merge-queue.ts): work signed-off PRs to green and
 // merge them.
 startMergeQueueLoop();
+
+// Step slots (src/bun/step-slots.ts): start queued pipeline steps as
+// running ones finish.
+startSlotScheduler();
 
 /** Lifecycle wrapper around BrowserWindow construction. Handles:
  *   - idempotency (concurrent reopen events share one in-flight build),

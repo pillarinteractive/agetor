@@ -562,7 +562,10 @@ export type PipelineBlockKind =
   | "handoff-invalid"
   | "step-cap"
   | "profile-missing"
-  | "join-incomplete";
+  | "join-incomplete"
+  /** Not a problem: the step is queued for a free slot (src/bun/step-slots.ts)
+   *  and starts by itself. A run whose only blocks are these reads as running. */
+  | "slot-wait";
 
 /** One currently-active step execution within a {@link PipelineRunState} —
  *  a hidden step task whose turn is running or blocked. Several can coexist

@@ -147,6 +147,11 @@ export function cardStatus(
         })
         .join(" + ");
       const holds = lease.holds.length ? ` · holds ${lease.holds.join(", ")}` : "";
+      // Steps queued for a free slot (src/bun/step-slots.ts).
+      const queued = run.blocked.filter((b) => b.kind === "slot-wait").map((b) => stepName(run, b.stepId));
+      if (queued.length && run.active.length === 0) {
+        return { line: `${queued.join(" + ")} queued — starts when a slot frees up`, tone: "muted", needsYou: null };
+      }
       if (quiet) {
         const step = stepName(run, run.active[0]?.stepId);
         return {

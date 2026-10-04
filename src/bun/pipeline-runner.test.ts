@@ -3008,3 +3008,50 @@ test("supersedeBlocksBefore: a follow-up sets aside earlier blocks, keeps later 
   // Nothing left to set aside.
   expect(supersedeBlocksBefore(run, 7)).toEqual([]);
 });
+
+test("step slots: over the limit a step queues (run stays running), then starts by itself when a slot frees", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, pipelines, preferences } = await import("./db.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+  const { releaseSlotWaits } = await import("./pipeline-runner.ts");
+  const { STEP_SLOTS_PREF } = await import("./step-slots.ts");
+
+  preferences.set(STEP_SLOTS_PREF, JSON.stringify({ max: 1, heavy: { max: 1, steps: [] } }));
+  try {
+    const profile = await makeProfile("slots");
+    const A = newStep({ name: "A", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+    const pipeline = pipelines.insert({ name: uniqueName("slots-pipeline"), graph: { steps: [A], edges: [], startStepId: A.id }, maxSteps: 3 });
+    const mk = async (title: string) => {
+      const c = await createTask({ title, prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
+      if ("error" in c) throw new Error(c.error);
+      liveParentIds.push(c.task.id);
+      return c.task.id;
+    };
+    const first = await mk("slots first");
+    const second = await mk("slots second");
+    const s1 = await startTask(first);
+    if ("error" in s1) throw new Error(s1.error);
+    // Queued, not failed: the start step waits for a slot.
+    await startTask(second);
+
+    const queued = await waitFor(() => {
+      const r = tasks.get(second)?.pipelineRun;
+      return r && (r.blocked.length > 0 || r.active.length > 0) ? r : undefined;
+    });
+    expect(queued.blocked.map((b) => b.kind)).toEqual(["slot-wait"]);
+    expect(queued.status).toBe("running");
+
+    await waitFor(() => (tasks.get(first)?.pipelineRun?.status === "done" ? true : undefined), 8000);
+    // The scheduler isn't running in tests — drive it.
+    for (let i = 0; i < 100 && tasks.get(second)!.pipelineRun!.blocked.length > 0; i++) {
+      await releaseSlotWaits();
+      await new Promise((r) => setTimeout(r, 30));
+    }
+    await waitFor(() => (tasks.get(second)?.pipelineRun?.status === "done" ? true : undefined), 8000);
+    expect(tasks.get(second)!.pipelineRun!.history.length).toBe(1);
+  } finally {
+    // Back to "no limit" for the rest of this file's tests.
+    preferences.set(STEP_SLOTS_PREF, JSON.stringify({ max: 1000, heavy: { max: 1000, steps: [] } }));
+  }
+});

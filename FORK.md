@@ -237,3 +237,13 @@ stopped pipeline) but shows in Backlog (`boardColumnOf`).
   wait for checks → squash-merge (`merge_method` pref). Each automatic step once per PR head, ≤4 fix-ups per card.
   A pipeline's fix-up run returns the card to Ready to Merge (runner honours the intent), not In Review. Dragging
   back to In Review/Backlog withdraws the sign-off. Merged → Done + issue closed.
+
+## Step slots (`feat/step-slots`)
+
+Too many agents at once starve the Mac (five builds + their test suites → timeouts). `step_slots` preference
+(`src/bun/step-slots.ts`, default `{"max":3,"heavy":{"max":1,"steps":["Finish","Open PR","Fix CI","Resolve merge
+conflicts","Run VM tests","Run E2E"]}}`): a pipeline step over the limit queues as a `slot-wait` block — the run reads
+as running, the card says "Finish queued — starts when a slot frees up", the run view shows it in blue with no
+Retry — and `releaseSlotWaits` (every 10s) launches the longest-waiting first. A step counts from launch until it
+settles. Heavy steps match by name prefix. Plain tasks count toward `max` but are never held.
+The packaged app runs Bun 1.4.2 (`build.bunVersion`); Electrobun's bundled 1.3.13 segfaulted under load.

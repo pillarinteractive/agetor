@@ -440,7 +440,7 @@ const isPlainObject = (x: unknown): x is Record<string, unknown> =>
 
 const PIPELINE_RUN_STATUSES = new Set<string>(["idle", "running", "blocked", "done", "cancelled"]);
 const PIPELINE_BLOCK_KINDS = new Set<string>([
-  "step-failed", "step-blocked", "handoff-missing", "handoff-invalid", "step-cap", "profile-missing", "join-incomplete",
+  "step-failed", "step-blocked", "handoff-missing", "handoff-invalid", "step-cap", "profile-missing", "join-incomplete", "slot-wait",
 ]);
 
 /** A stored `Handoff` is trusted structurally, not deeply — it was produced
