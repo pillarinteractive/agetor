@@ -934,6 +934,19 @@ export function deriveRunStatus(run: PipelineRunState): PipelineRunStatus {
   return "done";
 }
 
+/**
+ * Whether a pipeline parent's board column is still owned by its run. While
+ * the run can still move the card (never started, running, blocked) a manual
+ * column change would desync the card from the run, so the server refuses it
+ * and the board refuses the drop. Once the run has finished (`done`, parked in
+ * Review) or been stopped (`cancelled`, parked in Ready) the runner never
+ * moves the card again on its own — `persist()` only re-columns on a status
+ * change — so the user can move it on, e.g. to Done so it can be archived.
+ */
+export function isPipelineColumnRunnerOwned(run: PipelineRunState | null | undefined): boolean {
+  return run?.status !== "done" && run?.status !== "cancelled";
+}
+
 /** Upper bound of {@link effectiveStepCap}: the largest `maxSteps` a
  *  pipeline can store, extended the most times a run-state sanitizer will
  *  ever accept. */

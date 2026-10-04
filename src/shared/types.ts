@@ -4478,7 +4478,53 @@ export type GlobalEvent =
       activeStepIds: string[];
       stepCount: number;
       ts: number;
+    }
+  | {
+      /** A watched lease changed hands, was released, or its probe started
+       *  or stopped failing. Carries every watcher's latest status (the list
+       *  is tiny) so the board replaces its copy wholesale. */
+      kind: "leases";
+      leases: LeaseStatus[];
+      ts: number;
     };
+
+/**
+ * A shared resource that one checkout holds at a time — a lab host, a
+ * hardware rig — watched by running a project-provided command. Configured
+ * as a JSON array of these in the `lease_watchers` preference (e.g. `agetor
+ * config lease_watchers '[{"project":"/path/to/repo","label":"lab",
+ * "command":"lab/vm/plab lease --json"}]'`). See `src/bun/lease-watch.ts`.
+ */
+export interface LeaseWatcherConfig {
+  /** Project (repo) path the command runs in; also scopes the Blocked-card
+   *  hint to that project's tasks. */
+  project: string;
+  /** Short name shown on the badge, e.g. "lab". */
+  label: string;
+  /** Shell command printing one JSON object: `{"held": false}` or
+   *  `{"held": true, "checkout": "<holder's repo root>", "owner"?, "since"?}`. */
+  command: string;
+  /** Seconds between probes (default 30, minimum 5). */
+  intervalSec?: number;
+}
+
+/** A lease watcher's latest observation. */
+export interface LeaseStatus {
+  project: string;
+  label: string;
+  held: boolean;
+  /** Board card whose worktree holds the lease (a pipeline step's parent),
+   *  or null when free, held outside Agetor, or unresolvable. */
+  holderTaskId: string | null;
+  holderTitle: string | null;
+  /** The holder's checkout as the command reported it. */
+  checkout: string | null;
+  owner: string | null;
+  since: string | null;
+  checkedAt: number;
+  /** Why the last probe failed; the previous held/holder stay as they were. */
+  error: string | null;
+}
 
 /**
  * Phase of an in-progress `git clone`, as parsed from git's own `--progress`
