@@ -4,15 +4,40 @@ import remarkGfm from "remark-gfm";
 import { ArrowRight, ChevronDown, CircleAlert, CircleCheck, CircleHelp, Paperclip } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { ASSISTANT_MD_COMPONENTS, ExternalLink, MD_URL_TRANSFORM } from "../kanban/md-components";
+import { HANDOFF_COLLAPSE_CHARS, readableHandoffText } from "@/lib/handoff-format";
 import type { Handoff } from "../../../shared/types.ts";
 
-const Markdown = ({ text }: { text: string }) => (
-  <div className="agetor-md text-xs text-foreground">
-    <ReactMarkdown remarkPlugins={[remarkGfm]} components={ASSISTANT_MD_COMPONENTS} urlTransform={MD_URL_TRANSFORM}>
-      {text}
-    </ReactMarkdown>
-  </div>
-);
+/** Handoff prose as Markdown; long text starts collapsed so the open
+ *  questions and artifacts below it stay in view. */
+function Markdown({ text }: { text: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const long = text.length > HANDOFF_COLLAPSE_CHARS;
+  const collapsed = long && !expanded;
+  return (
+    <div>
+      <div
+        className={cn(
+          "agetor-md text-xs text-foreground",
+          collapsed && "max-h-40 overflow-hidden [mask-image:linear-gradient(to_bottom,black_70%,transparent)]",
+        )}
+      >
+        <ReactMarkdown remarkPlugins={[remarkGfm]} components={ASSISTANT_MD_COMPONENTS} urlTransform={MD_URL_TRANSFORM}>
+          {readableHandoffText(text)}
+        </ReactMarkdown>
+      </div>
+      {long && (
+        <button
+          type="button"
+          data-testid="handoff-show-more"
+          onClick={() => setExpanded((v) => !v)}
+          className="mt-1 text-[11px] font-medium text-info hover:underline"
+        >
+          {expanded ? "Show less" : "Show more"}
+        </button>
+      )}
+    </div>
+  );
+}
 
 function Artifact({ value }: { value: string }) {
   if (/^https?:\/\//i.test(value)) {
