@@ -81,8 +81,14 @@ export function activeTrain(): Train | null {
   }
 }
 
-function saveTrain(t: Train | null): void {
+function saveTrain(t: Train): void {
   preferences.set(STATE_PREF, JSON.stringify(t));
+}
+
+/** Forget train `id` — only if it's still the active one, so a late step
+ *  finishing off an old train can never wipe a newer train's record. */
+function clearTrain(id: string): void {
+  if (activeTrain()?.id === id) preferences.set(STATE_PREF, JSON.stringify(null));
 }
 
 /** Cards that landed through a train: taskId → { pr, url }. */
@@ -247,7 +253,7 @@ export async function trainCiStarted(t: Train): Promise<boolean> {
 export async function replaceTrain(t: Train): Promise<void> {
   await closeGitHubPull({ dir: t.project, number: t.pr, comment: "Replaced by a larger merge train sent by hand — these PRs ride that one." });
   await git(["push", "--quiet", "origin", "--delete", t.branch], t.project);
-  saveTrain(null);
+  clearTrain(t.id);
 }
 
 async function disband(t: Train, why: string, prs: Map<string, TaskPrStatus | null>): Promise<void> {
@@ -258,7 +264,7 @@ async function disband(t: Train, why: string, prs: Map<string, TaskPrStatus | nu
     trainSkip.add(`${m.pr}:${pr?.headSha ?? m.headSha ?? ""}`);
     recordActivity(m.taskId, { kind: "auto", text: `Merge train #${t.pr} disbanded (${why}) — merging on its own`, tone: "warning", url: t.url });
   }
-  saveTrain(null);
+  clearTrain(t.id);
 }
 
 async function land(t: Train): Promise<void> {
@@ -279,7 +285,7 @@ async function land(t: Train): Promise<void> {
     }
   }
   await git(["push", "--quiet", "origin", "--delete", t.branch], t.project);
-  saveTrain(null);
+  clearTrain(t.id);
 }
 
 /** Move the active train along: land it when green, disband it when it
