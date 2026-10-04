@@ -288,3 +288,15 @@ medium + 2 Scouts — the other model family; changes requested → Build) → F
 failed → Build). Codex does the long work on the plan with quota headroom; Claude does short thinking steps.
 `default_pipeline` preference = Change's id: New task and the Issues page start on it. Fix CI / Address review /
 E2E follow-ups run on Codex Builder.
+
+## Merge trains (`feat/merge-train`)
+
+`src/bun/merge-train.ts`, driven by the merge queue: when ≥2 Ready to Merge PRs in one project/base are green,
+mergeable and thread-free (behind is fine) and the oldest has waited `windowMin` (or `max` are ready), Agetor builds
+`agetor/merge-train-<id>` from `origin/<base>` with ONE squashed commit per PR (`<title> (#n)`; conflicting or empty
+PRs drop out and merge alone), pushes it, opens "Merge train: #a, #b" — CI runs once — and when green merges it with
+**rebase** (develop keeps one commit per PR, one push → one develop CI run). Originals are closed "Merged in merge train
+#T", cards → Done, issues closed (`closeIssueForTask`). CI failure / conflict / a member changed or withdrawn →
+disband, members merge individually. A lone ready PR waits the window for company, then merges alone. One train at a
+time. Config `merge_train` = {"enabled":true,"windowMin":10,"max":6}. Cards show "In merge train #T" / "Merged in
+merge train #T" (`Task.mergeTrain`).

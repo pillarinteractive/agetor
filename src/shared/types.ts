@@ -1741,6 +1741,9 @@ export interface Task {
   /** Cards waiting on this one (the reverse of `blockedBy`), server-decorated;
    *  absent when none. */
   blocking?: { taskId: string; title: string }[];
+  /** Riding (or landed in) a merge train (src/bun/merge-train.ts),
+   *  server-decorated. */
+  mergeTrain?: { pr: number; url: string; state: "riding" | "merged" };
   /** When this card's agents last produced anything (the newest run event of
    *  the running task, or for a running pipeline the quietest active step).
    *  Server-decorated for running cards only; drives the "quiet" warning. */

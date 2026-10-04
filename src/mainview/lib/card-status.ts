@@ -122,6 +122,12 @@ export function cardStatus(
     };
   }
   if (pr?.state === "merged") return { line: `PR #${pr.number} merged`, tone: "success", needsYou: null };
+  // Merge trains (src/bun/merge-train.ts): the original PR is closed, not
+  // merged — say where it went.
+  if (task.mergeTrain?.state === "merged") return { line: `Merged in merge train #${task.mergeTrain.pr}`, tone: "success", needsYou: null };
+  if (task.mergeTrain?.state === "riding" && task.column === "merge") {
+    return { line: `In merge train #${task.mergeTrain.pr} — merges with the others when its CI passes`, tone: "info", needsYou: null };
+  }
 
   // Waiting on other cards (src/bun/dependencies.ts): that's the whole story
   // until they land — the card moves on by itself then. A running card keeps

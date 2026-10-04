@@ -40,6 +40,7 @@ import { CLONE_PROVIDERS, isGitProvider } from "../shared/clone-input.ts";
 import { stalledSince } from "./stall-registry.ts";
 import { lastActivityAt } from "./activity-clock.ts";
 import { blockedByFor, blockingFor, readDependencies, setDependencies } from "./dependencies.ts";
+import { activeTrain, mergedViaTrain, trainFor } from "./merge-train.ts";
 import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
 import {
@@ -284,7 +285,7 @@ function withRunningSubagents(t: Task): Task & { runningSubagents: number } {
   // `stalledSince` rides the same decoration: transient in-memory server
   // state (the turn-stall watchdog's mark) that the DB-derived Task can't
   // carry — see stall-registry.ts.
-  return { ...t, runningSubagents, stalledSince: stalledSince(t.id), lastActivityAt: lastActivityAt(t), blockedBy: blockedByFor(t.id), blocking: blockingFor(t.id) };
+  return { ...t, runningSubagents, stalledSince: stalledSince(t.id), lastActivityAt: lastActivityAt(t), blockedBy: blockedByFor(t.id), blocking: blockingFor(t.id), mergeTrain: trainFor(t.id) };
 }
 
 // Turn raw path strings into references: keep only existing absolute paths,
@@ -4427,6 +4428,8 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const allTasks = tasks.list();
           const byId = new Map(allTasks.map((t) => [t.id, t]));
           const deps = readDependencies();
+          const train = activeTrain();
+          const via = mergedViaTrain();
           return json(
             allTasks.map((t) => ({
               ...t,
@@ -4438,6 +4441,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               lastActivityAt: lastActivityAt(t, (id) => byId.get(id)),
               blockedBy: blockedByFor(t.id, deps),
               blocking: blockingFor(t.id, deps),
+              mergeTrain: trainFor(t.id, train, via),
             })),
             { headers: corsHeaders(req) },
           );

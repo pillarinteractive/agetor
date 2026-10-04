@@ -378,6 +378,16 @@ export function issueNumberForTask(task: Pick<Task, "issueUrl" | "prompt">): num
  * branch), close the issue it fixes, saying which PR and where.
  */
 async function closeIssueForMergedPr(task: Task, pr: TaskPrStatus): Promise<void> {
+  const where = pr.baseRef ? ` into \`${pr.baseRef}\`` : "";
+  await closeIssueForTask(task, {
+    comment: `Fixed by #${pr.number}, merged${where}. Closed by Agetor when the PR merged — GitHub only auto-closes on merges into the default branch.`,
+    activity: `fixed by PR #${pr.number}`,
+  });
+}
+
+/** Close the issue a card fixes (once), with `comment` on it. Shared by a PR
+ *  merging and a merge train landing (src/bun/merge-train.ts). */
+export async function closeIssueForTask(task: Task, how: { comment: string; activity: string }): Promise<void> {
   const number = issueNumberForTask(task);
   if (!number) return;
   const key = task.issueUrl ?? `${task.workdir}#${number}`;
@@ -395,17 +405,12 @@ async function closeIssueForMergedPr(task: Task, pr: TaskPrStatus): Promise<void
     remember();
     return;
   }
-  const where = pr.baseRef ? ` into \`${pr.baseRef}\`` : "";
-  await createGitHubComment({
-    dir: task.workdir,
-    number,
-    body: `Fixed by #${pr.number}, merged${where}. Closed by Agetor when the PR merged — GitHub only auto-closes on merges into the default branch.`,
-  });
+  await createGitHubComment({ dir: task.workdir, number, body: how.comment });
   const closed = await updateGitHubIssue({ dir: task.workdir, number, state: "closed" });
   remember();
   recordActivity(task.id, {
     kind: "pr",
-    text: closed.ok ? `Closed issue #${number} (fixed by PR #${pr.number})` : `Couldn't close issue #${number}: ${closed.error}`,
+    text: closed.ok ? `Closed issue #${number} (${how.activity})` : `Couldn't close issue #${number}: ${closed.error}`,
     tone: closed.ok ? "success" : "warning",
     url: task.issueUrl ?? undefined,
   });

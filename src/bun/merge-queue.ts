@@ -18,6 +18,7 @@
  * Dragging the card back to In Review (or Backlog) withdraws the sign-off.
  */
 import type { Task, TaskPrStatus } from "../shared/types.ts";
+import { MERGE_TRAIN_PREF, activeTrain, advanceTrain, buildTrain, parseTrainConfig, shouldDepart, skipsTrain, trainEligible } from "./merge-train.ts";
 import { preferences, tasks } from "./db.ts";
 import { recordActivity } from "./activity.ts";
 import { mergeQueue, setMergeQueued } from "./merge-intent.ts";
@@ -149,7 +150,11 @@ async function take(task: Task, pr: TaskPrStatus | null, step: MergeStep): Promi
 }
 
 /** One pass. Exported for tests. */
-export async function mergeQueueTick(): Promise<void> {
+/** When each train-eligible card became ready (in memory: rebuilt within a
+ *  window after a restart). */
+const readySince = new Map<string, number>();
+
+export async function mergeQueueTick(now = Date.now()): Promise<void> {
   const list = tasks.list();
   // The column is the user's say: in Ready to Merge → signed off; dragged
   // back to In Review / Backlog → withdrawn. Running/Blocked/Done keep it
@@ -158,21 +163,69 @@ export async function mergeQueueTick(): Promise<void> {
     if (t.pipelineParentId) continue;
     if (t.column === "merge" && t.archivedAt == null) setMergeQueued(t.id, true);
   }
+  type Eval = { t: Task; pr: TaskPrStatus | null; mergeability: { mergeable: boolean | null; mergeableState: string } | null; step: MergeStep };
+  const evals: Eval[] = [];
+  const prs = new Map<string, TaskPrStatus | null>();
   for (const id of mergeQueue()) {
     const t = list.find((x) => x.id === id);
     if (!t || t.archivedAt != null || t.column === "done" || t.column === "review" || t.column === "backlog" || t.column === "ready") {
       setMergeQueued(id, false);
+      readySince.delete(id);
       if (t && (t.column === "review" || t.column === "backlog")) note(t, "Sign-off withdrawn — moved out of Ready to Merge", "muted");
       continue;
     }
     const pr = prStatusForTask(id);
-    let mergeability: { mergeable: boolean | null; mergeableState: string } | null = null;
+    prs.set(id, pr);
+    let mergeability: Eval["mergeability"] = null;
     if (pr?.state === "open" && t.column === "merge") {
       const m = await getGitHubPullMergeability({ dir: t.workdir, number: pr.number }).catch(() => null);
       if (m && m.ok) mergeability = { mergeable: m.mergeable, mergeableState: m.mergeableState };
     }
-    const step = nextMergeStep(t, pr, mergeability, hasConfirmedNoPr(id));
-    await take(t, pr, step).catch((e: Error) => note(t, `Merge queue error: ${e.message}`, "warning"));
+    evals.push({ t, pr, mergeability, step: nextMergeStep(t, pr, mergeability, hasConfirmedNoPr(id)) });
+  }
+
+  // 1. The train already out: land it when green, disband it when not.
+  const out = activeTrain();
+  if (out) await advanceTrain(out, prs).catch(() => "waiting");
+  const riding = new Set(activeTrain()?.members.map((m) => m.taskId) ?? []);
+
+  // 2. Cards that could ride a train (src/bun/merge-train.ts).
+  const cfg = parseTrainConfig(preferences.get(MERGE_TRAIN_PREF));
+  const eligible = evals.filter(
+    (e) => !riding.has(e.t.id) && e.t.column === "merge" && !!e.t.branch && trainEligible(e.pr, e.mergeability) && !skipsTrain(e.pr!),
+  );
+  const eligibleIds = new Set(eligible.map((e) => e.t.id));
+  for (const id of [...readySince.keys()]) if (!eligibleIds.has(id)) readySince.delete(id);
+  for (const e of eligible) if (!readySince.has(e.t.id)) readySince.set(e.t.id, now);
+  if (cfg.enabled && !activeTrain()) {
+    const groups = new Map<string, Eval[]>();
+    for (const e of eligible) {
+      const key = `${e.t.workdir}\0${e.pr!.baseRef ?? ""}`;
+      groups.set(key, [...(groups.get(key) ?? []), e]);
+    }
+    const group = [...groups.values()].sort((x, y) => y.length - x.length)[0] ?? [];
+    if (shouldDepart(group.map((e) => readySince.get(e.t.id)!), cfg, now)) {
+      const train = await buildTrain(group.slice(0, cfg.max).map((e) => ({ task: e.t, pr: e.pr! }))).catch(() => null);
+      for (const m of train?.members ?? []) riding.add(m.taskId);
+    }
+  }
+
+  // 3. Everyone else takes their own next step. A ready card waits up to the
+  //    train window for company before merging alone.
+  for (const e of evals) {
+    if (riding.has(e.t.id)) continue;
+    if (cfg.enabled && eligibleIds.has(e.t.id) && (e.step.kind === "merge" || e.step.kind === "update-branch")) {
+      // Company = other ready PRs that could share its train (same project and base).
+      const others = eligible.filter(
+        (x) => x.t.id !== e.t.id && !riding.has(x.t.id) && x.t.workdir === e.t.workdir && x.pr!.baseRef === e.pr!.baseRef,
+      ).length;
+      const waited = now - (readySince.get(e.t.id) ?? now);
+      if (others > 0 || waited < cfg.windowMin * 60_000) {
+        note(e.t, `Green — waiting up to ${cfg.windowMin} min to merge together with other PRs`, "muted");
+        continue;
+      }
+    }
+    await take(e.t, e.pr, e.step).catch((err: Error) => note(e.t, `Merge queue error: ${err.message}`, "warning"));
   }
 }
 
