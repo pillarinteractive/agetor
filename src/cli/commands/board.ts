@@ -94,3 +94,26 @@ export async function cmdFollowUp(args: string[], flags: Flags): Promise<void> {
   });
   return flags.json ? printJson(res) : out(`${c.green("✓")} started ${presetId} on ${task.title}`);
 }
+
+interface BlockRow {
+  pipeline: string;
+  step: string;
+  kind: string;
+  count: number;
+  lastAt: number;
+  examples: { title: string; message: string }[];
+}
+
+/** `agetor blocks [--days N]` — what pipelines block on, most frequent first. */
+export async function cmdBlocks(args: string[], flags: Flags): Promise<void> {
+  const client = await getClient(flags);
+  const i = args.indexOf("--days");
+  const days = i >= 0 ? Number(args[i + 1]) : 14;
+  const rows = await client.call<BlockRow[]>("GET", `/blocks?days=${Number.isFinite(days) && days > 0 ? days : 14}`);
+  if (flags.json) return printJson(rows);
+  if (rows.length === 0) return out(c.dim("no blocks recorded"));
+  for (const r of rows) {
+    out(`${c.bold(String(r.count).padStart(3))}  ${r.pipeline} › ${r.step}  ${c.dim(r.kind)}  ${c.dim(`last ${new Date(r.lastAt).toLocaleString()}`)}`);
+    for (const e of r.examples) out(`       ${c.dim(e.title.slice(0, 60))}: ${e.message.replace(/\s+/g, " ").slice(0, 140)}`);
+  }
+}

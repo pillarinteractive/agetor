@@ -29,6 +29,8 @@
  */
 import { randomUUID } from "node:crypto";
 import { recordActivity } from "./activity.ts";
+import { syncBaseNote } from "./sync-base.ts";
+import { logBlocks, newBlocks } from "./block-log.ts";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { agentProfiles, backlog, dataDir, harnesses, pipelines, runs, tasks } from "./db.ts";
@@ -217,6 +219,39 @@ export function supersedeBlocksBefore(run: PipelineRunState, seq: number): strin
   return stale.map((b) => (graph && b.stepId ? stepNameById(graph, b.stepId) : (b.stepId ?? "a step")));
 }
 
+/**
+ * A step whose agent session crashed (run `failed`: the process died, an API
+ * error ended the turn) or was orphaned (lost across a restart) didn't fail
+ * its task — it never got to finish. Retry it automatically, up to
+ * {@link TRANSIENT_RETRY_MAX} times per step per run, with a growing delay;
+ * after that the block stays for a person. A step that hands off "blocked",
+ * or a Stop the user pressed, never comes through here.
+ */
+export const TRANSIENT_RETRY_MAX = 2;
+const TRANSIENT_RETRY_DELAY_MS = 60_000;
+const transientRetries = new Map<string, number>();
+
+function scheduleTransientRetry(parentId: string, run: PipelineRunState, stepId: string, why: string): void {
+  const key = `${parentId}:${run.startedAt ?? 0}:${stepId}`;
+  const attempt = (transientRetries.get(key) ?? 0) + 1;
+  const stepName = run.snapshot ? stepNameById(run.snapshot.graph, stepId) : stepId;
+  if (attempt > TRANSIENT_RETRY_MAX) {
+    recordActivity(parentId, { kind: "step", text: `${stepName} ${why} again — left for you after ${TRANSIENT_RETRY_MAX} automatic retries`, tone: "danger" });
+    return;
+  }
+  transientRetries.set(key, attempt);
+  recordActivity(parentId, { kind: "step", text: `${stepName} ${why} — retrying automatically (${attempt} of ${TRANSIENT_RETRY_MAX})`, tone: "warning" });
+  const timer = setTimeout(() => {
+    const current = tasks.get(parentId)?.pipelineRun;
+    // Only if the run is still parked on this step (nobody retried, advanced
+    // or stopped it in the meantime).
+    if (!current || (current.status !== "blocked" && current.status !== "cancelled")) return;
+    if (!current.active.some((a) => a.stepId === stepId)) return;
+    void retryPipelineStep(parentId).catch(() => undefined);
+  }, TRANSIENT_RETRY_DELAY_MS * attempt);
+  timer.unref?.();
+}
+
 function noteSuperseded(parentId: string, steps: string[], by: string): void {
   if (steps.length === 0) return;
   recordActivity(parentId, {
@@ -292,9 +327,24 @@ function persist(parentId: string, run: PipelineRunState, opts?: { preserveStatu
   // join bookkeeping write, a reminder stamp, a reconcile pass) snap the
   // card back to `review`/`ready`. `server.ts` separately 409s a column
   // PATCH on a parent whose run is live; both guards stay.
-  const previousStatus = tasks.get(parentId)?.pipelineRun?.status ?? null;
+  const previousRun = tasks.get(parentId)?.pipelineRun ?? null;
+  const previousStatus = previousRun?.status ?? null;
   tasks.setPipelineRun(parentId, run);
   const parent = tasks.get(parentId);
+  // Every new block goes in the block log (src/bun/block-log.ts).
+  const fresh = newBlocks(previousRun?.blocked ?? [], run.blocked);
+  if (fresh.length && parent) {
+    logBlocks(
+      fresh.map((b) => ({
+        taskId: parentId,
+        title: parent.title,
+        pipeline: run.pipelineName,
+        step: run.snapshot && b.stepId ? stepNameById(run.snapshot.graph, b.stepId) : (b.stepId ?? "?"),
+        kind: b.kind,
+        message: b.message.slice(0, 500),
+      })),
+    );
+  }
   if (parent?.archivedAt != null) return; // m8
   const columnFor: Partial<Record<PipelineRunStatus, ColumnId>> = {
     running: "running",
@@ -753,7 +803,11 @@ async function launchStep(
   // file this launch just wrote.
   const references: TaskReference[] = [...(parent.references ?? []), ...handoffRefs];
 
-  let composed = composeStepPrompt({ ...composeArgs, inlineHandoff: true });
+  // A base branch that moved ahead gets merged in before this step verifies
+  // (`pipeline_sync_base`, src/bun/sync-base.ts).
+  const syncNote = await syncBaseNote(parent, step.name).catch(() => null);
+  const withSync = (prompt: string) => (syncNote ? `${syncNote}\n\n${prompt}` : prompt);
+  let composed = withSync(composeStepPrompt({ ...composeArgs, inlineHandoff: true }));
   // m12/D10: measure the SAME wrapping `startTaskInner` will actually launch
   // with — `composeLaunchPrompt` (the profile's instructions/skills
   // preamble) then `appendReferences` (the references block) — not the raw
@@ -762,7 +816,7 @@ async function launchStep(
   if (profile.harnessKind === "gemini") {
     const fullPrompt = appendReferences(composeLaunchPrompt(profile, composed), references);
     if (promptByteOverage("gemini", fullPrompt)) {
-      composed = composeStepPrompt({ ...composeArgs, inlineHandoff: false });
+      composed = withSync(composeStepPrompt({ ...composeArgs, inlineHandoff: false }));
     }
   }
 
@@ -2276,6 +2330,7 @@ async function settleStepRun(
         historyEntry.outcome = "failed";
       }
       persist(parentId, run);
+      scheduleTransientRetry(parentId, run, activeEntry.stepId, tail ? `crashed (${tail.slice(0, 80)})` : "crashed");
       return null;
     }
 
@@ -2338,6 +2393,11 @@ async function settleStepRun(
       // either way this settle must never add a "was stopped" block of
       // its own; `finalizeCancelled` (idempotent) is the whole story.
       finalizeCancelled(parentId, run);
+      // Orphaned (the session was lost, e.g. across a restart) isn't a Stop
+      // anyone pressed.
+      if (status === "orphaned" && !deliberateWholeRunStop) {
+        scheduleTransientRetry(parentId, run, activeEntry.stepId, "lost its session");
+      }
     }
   } catch (err) {
     persistReconcileFailure(parentId, taskId, err);

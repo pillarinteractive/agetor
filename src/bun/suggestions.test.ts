@@ -17,25 +17,17 @@ const blockedRun = (summary: string, o: { reason?: string; openQuestions?: strin
   history: [{ seq: 4, stepId: "finish", taskId: "step-1", startedAt: 0, endedAt: 1, outcome: "succeeded", handoff: handoff(summary, o), nextStepIds: [] }],
 }) as unknown as PipelineRunState;
 const task = (o: Partial<Task>) => ({ id: "t", title: "Issue #191", column: "blocked", workdir: "/repo", prUrl: null, archivedAt: null, pipelineParentId: null, ...o }) as Task;
-const ctx = (o: Partial<{ pr: TaskPrStatus | null; leases: LeaseStatus[]; hasOpenPrPreset: boolean }> = {}) => ({ pr: null, leases: [], hasOpenPrPreset: true, ...o });
+const ctx = (o: Partial<{ pr: TaskPrStatus | null; leases: LeaseStatus[]; hasOpenPrPreset: boolean; autoUpdatesBranches: boolean }> = {}) => ({ pr: null, leases: [], hasOpenPrPreset: true, ...o });
 const pr = (o: Partial<TaskPrStatus> = {}): TaskPrStatus => ({
   taskId: "t", number: 177, url: "u", state: "open", draft: false, baseRef: "develop", headSha: "abc", checks: "failure", failingChecks: [], unresolvedThreads: 0, checkedAt: 0, behindBy: 0, ...o,
 });
 
 describe("suggestFor", () => {
-  test("a step blocked on the test environment gets the unblock message", () => {
-    const s = suggestFor(task({ pipelineRun: blockedRun("- Final pnpm test failed: 17 suites could not load because DATABASE_URL is not set in .env.local") }), ctx());
-    expect(s).toMatchObject({ apply: { kind: "message", stepTaskId: "step-1" } });
-    expect(s!.title).toBe("Unblock Finish: use CI's placeholder DATABASE_URL, then rerun verification");
-    expect((s!.apply as { text: string }).text).toContain("pillar_ci");
-  });
-
-  test("a step blocked on missing dependencies gets told to install them (and both fixes when both apply)", () => {
-    const deps = suggestFor(task({ pipelineRun: blockedRun("- `pnpm lint` failed because `node_modules` is missing", { openQuestions: ["Can verification run in an environment with dependencies installed?"] }) }), ctx());
-    expect(deps!.title).toBe("Unblock Finish: install dependencies, then rerun verification");
-    expect((deps!.apply as { text: string }).text).toContain("pnpm install --frozen-lockfile");
-    const both = suggestFor(task({ pipelineRun: blockedRun("node_modules missing; DATABASE_URL is not set in .env.local") }), ctx());
-    expect(both!.title).toBe("Unblock Finish: install dependencies and use CI's placeholder DATABASE_URL, then rerun verification");
+  test("known setup gaps aren't patched over with a canned message — they're fixed at the source", () => {
+    const env = suggestFor(task({ pipelineRun: blockedRun("- Final pnpm test failed: DATABASE_URL is not set in .env.local") }), ctx());
+    expect(env?.apply.kind).not.toBe("message");
+    const deps = suggestFor(task({ pipelineRun: blockedRun("`node_modules` is missing") }), ctx());
+    expect(deps?.apply.kind).not.toBe("message");
   });
 
   test("a step blocked on the lab gets Retry once the lease is free — not while it's held", () => {
@@ -67,4 +59,11 @@ describe("suggestFor", () => {
   test("nothing to suggest for a healthy running card", () => {
     expect(suggestFor(task({ column: "running" }), ctx())).toBeNull();
   });
+});
+
+test("no Update branch suggestion while the PR watcher updates stale branches itself", () => {
+  const stale = pr({ behindBy: 3, failingChecks: [{ name: "web / vitest", url: null, alsoOnBase: false, passesOnBase: true }] });
+  const t = task({ pipelineRun: undefined, column: "review" });
+  expect(suggestFor(t, ctx({ pr: stale }))?.apply.kind).toBe("update-branch");
+  expect(suggestFor(t, ctx({ pr: stale, autoUpdatesBranches: true }))?.apply.kind).not.toBe("update-branch");
 });

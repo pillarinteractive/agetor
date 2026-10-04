@@ -5,13 +5,11 @@
  * recomputed from the current state at apply time, so a stale button can't
  * act on something that already moved on.
  *
- * Rules:
- * - A step blocked on a fresh-worktree setup gap — no `node_modules`, or
- *   tests that couldn't load `DATABASE_URL`/`.env.local` → message the step
- *   to install dependencies / use CI's placeholder, then rerun.
+ * Rules (known causes of blocks are fixed at the source — worktree setup,
+ * the web tests' placeholder DATABASE_URL — not patched over here):
  * - A step blocked on a lease that is free again → Retry.
  * - A PR behind its base, failing only on checks the base has since fixed →
- *   Update branch.
+ *   Update branch (only when the PR watcher isn't doing that itself).
  * - A finished pipeline with no PR, when an "Open PR" preset exists → run it.
  * - A step blocked on open questions → surface the first question.
  */
@@ -20,7 +18,7 @@ import { handoffHeadline } from "../shared/pipeline.ts";
 import { runs, tasks } from "./db.ts";
 import { listLeases } from "./lease-watch.ts";
 import { blockInfo, blockMentionsLease } from "../shared/block-reason.ts";
-import { prStatusForTask, staleAgainstBase } from "./pr-watch.ts";
+import { PR_AUTOUPDATE_PREF, prStatusForTask, staleAgainstBase } from "./pr-watch.ts";
 import { parseFollowUpPresets, FOLLOW_UPS_PREF, startFollowUp } from "./pipeline-followups.ts";
 import { preferences } from "./db.ts";
 import { sendInput } from "./orchestrator.ts";
@@ -47,46 +45,13 @@ export interface Suggestion {
   apply: SuggestionApply;
 }
 
-export const ENV_UNBLOCK_MESSAGE =
-  "You're unblocked — this isn't a real verification failure. apps/web/src/db only needs DATABASE_URL set at import " +
-  "time; no unit suite connects (they all mock @/db), and CI runs them with a placeholder. Re-run the checks like CI, " +
-  "e.g. from apps/web: `DATABASE_URL=postgres://pillar:pillar@127.0.0.1:5432/pillar_ci pnpm test`, then lint and " +
-  "typecheck. Running the repo's own test commands is fine even though they load .env.local internally — you're not " +
-  "reading the file yourself. Then carry on with your step and hand off.";
-
-const ENV_PATTERN = /DATABASE_URL|\.env\.local|\benv(ironment)? file\b|test environment|permitted test env/i;
-const DEPS_PATTERN = /node_modules|dependencies (are )?(missing|not installed)|provision dependencies|environment with dependencies|Cannot find module|pnpm install/i;
-
-export const DEPS_UNBLOCK_MESSAGE =
-  "You're unblocked — a missing node_modules is part of setting up verification, not a failure. This worktree is " +
-  "fresh, so install dependencies first from the repo root: `pnpm install --frozen-lockfile` (fast: it hard-links " +
-  "from the pnpm store). Then rerun the full verification and carry on with your step.";
 /** The suggestion for one card, if any. Pure; exported for tests. */
 export function suggestFor(
   task: Task,
-  ctx: { pr: TaskPrStatus | null; leases: LeaseStatus[]; hasOpenPrPreset: boolean },
+  ctx: { pr: TaskPrStatus | null; leases: LeaseStatus[]; hasOpenPrPreset: boolean; autoUpdatesBranches?: boolean },
 ): Suggestion | null {
   const base = { taskId: task.id, taskTitle: task.title };
   const block = blockInfo(task);
-
-  const needsDeps = !!block && DEPS_PATTERN.test(block.text);
-  const needsEnv = !!block && ENV_PATTERN.test(block.text);
-  if (block?.stepTaskId && (needsDeps || needsEnv)) {
-    const what = [needsDeps ? "install dependencies" : null, needsEnv ? "use CI's placeholder DATABASE_URL" : null]
-      .filter(Boolean)
-      .join(" and ");
-    return {
-      ...base,
-      id: `env-unblock:${block.stepTaskId}`,
-      title: `Unblock ${block.stepName}: ${what}, then rerun verification`,
-      detail: `${block.stepName} stopped on a fresh-worktree setup gap (${needsDeps ? "no node_modules" : ""}${needsDeps && needsEnv ? ", " : ""}${needsEnv ? "no DATABASE_URL" : ""}) — not a real failure.`,
-      apply: {
-        kind: "message",
-        stepTaskId: block.stepTaskId,
-        text: [needsDeps ? DEPS_UNBLOCK_MESSAGE : null, needsEnv ? ENV_UNBLOCK_MESSAGE : null].filter(Boolean).join("\n\n"),
-      },
-    };
-  }
 
   if (block) {
     const lease = ctx.leases.find(
@@ -103,7 +68,8 @@ export function suggestFor(
     }
   }
 
-  if (ctx.pr && ctx.pr.state === "open" && staleAgainstBase(ctx.pr)) {
+  // The PR watcher updates stale branches itself unless that's turned off.
+  if (!ctx.autoUpdatesBranches && ctx.pr && ctx.pr.state === "open" && staleAgainstBase(ctx.pr)) {
     return {
       ...base,
       id: `update-branch:${ctx.pr.number}:${ctx.pr.headSha ?? ""}`,
@@ -146,11 +112,12 @@ function hasOpenPrPreset(): boolean {
 export function listSuggestions(): Suggestion[] {
   const leases = listLeases();
   const openPr = hasOpenPrPreset();
+  const autoUpdatesBranches = preferences.get(PR_AUTOUPDATE_PREF) !== "false";
   return tasks
     .list()
     .filter((t) => t.archivedAt == null && !t.pipelineParentId)
     .flatMap((t) => {
-      const s = suggestFor(t, { pr: prStatusForTask(t.id), leases, hasOpenPrPreset: openPr });
+      const s = suggestFor(t, { pr: prStatusForTask(t.id), leases, hasOpenPrPreset: openPr, autoUpdatesBranches });
       return s ? [s] : [];
     });
 }

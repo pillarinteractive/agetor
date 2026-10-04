@@ -12,7 +12,7 @@
  */
 import type { FollowUpAction, Task, TaskPrStatus } from "../shared/types.ts";
 import { agentProfiles, preferences, tasks } from "./db.ts";
-import { findGitHubPullForBranch, getGitHubCompare, getGitHubPullChecks, getGitHubPullReviewThreads, getGitHubRefCheckRuns } from "./github.ts";
+import { findGitHubPullForBranch, getGitHubCompare, getGitHubPullChecks, getGitHubPullReviewThreads, getGitHubRefCheckRuns, updateGitHubPullBranch } from "./github.ts";
 import { runPipelineFollowUp } from "./pipeline-runner.ts";
 import { recordActivity, recordActivityOnce } from "./activity.ts";
 import { isTaskRunLive, moveMergedTaskToDone, publishGlobalEvent } from "./orchestrator.ts";
@@ -23,7 +23,17 @@ export const PR_FOLLOWUP_AGENT_PREF = "pr_followup_agent";
 const DEFAULT_PR_FOLLOWUP_AGENT = "Builder";
 const WATCHED_COLUMNS = new Set(["running", "blocked", "review", "done"]);
 /** "true" starts Fix CI on its own when a PR's own checks fail. */
+/** "true" / "false"; unset = on for pipeline cards (a pipeline owns its PR
+ *  until it merges), off for plain tasks. */
 export const PR_AUTOFIX_PREF = "pr_autofix";
+/** "false" turns off updating a PR's branch from its base automatically. */
+export const PR_AUTOUPDATE_PREF = "pr_autoupdate";
+
+export function autoFixEnabled(task: Task, pref: string | null | undefined): boolean {
+  if (pref === "true") return true;
+  if (pref === "false") return false;
+  return !!task.pipelineId;
+}
 /** JSON map "<taskId>#<pr>" → { count, lastSha }: auto Fix CI bookkeeping. */
 const PR_AUTOFIX_ATTEMPTS_PREF = "pr_autofix_attempts";
 export const PR_AUTOFIX_MAX_ATTEMPTS = 2;
@@ -196,6 +206,7 @@ export async function prWatchTick(): Promise<void> {
       if (!task.prUrl && next.url) tasks.update(task.id, { prUrl: next.url });
       if (next.state === "merged" && prev?.state !== "merged" && canMoveToDone(task)) moveMergedTaskToDone(task.id);
       if (!same(prev, next)) changed = true;
+      await maybeAutoUpdateBranch(task, next);
       await maybeAutoFix(task, next);
     }
   } finally {
@@ -294,11 +305,36 @@ export function shouldAutoFix(
   return true;
 }
 
+/** PR heads already updated from their base (`<pr>:<headSha>`) — an update
+ *  makes a new head, so each stale head is updated once. */
+const updatedHeads = new Set<string>();
+
+/** A PR behind its base whose failing checks pass on the base now: merge the
+ *  base into its branch (GitHub's "Update branch") so CI re-runs against
+ *  what it will merge into. Only when the base has actually moved ahead. */
+export function shouldAutoUpdate(pr: TaskPrStatus, opts: { enabled: boolean; done: ReadonlySet<string> }): boolean {
+  if (!opts.enabled || pr.state !== "open" || !staleAgainstBase(pr)) return false;
+  return !opts.done.has(`${pr.number}:${pr.headSha ?? ""}`);
+}
+
+async function maybeAutoUpdateBranch(task: Task, pr: TaskPrStatus): Promise<void> {
+  if (!shouldAutoUpdate(pr, { enabled: preferences.get(PR_AUTOUPDATE_PREF) !== "false", done: updatedHeads })) return;
+  updatedHeads.add(`${pr.number}:${pr.headSha ?? ""}`);
+  const r = await updateGitHubPullBranch({ dir: task.workdir, number: pr.number });
+  recordActivity(task.id, {
+    kind: "auto",
+    text: r.ok
+      ? `Updated PR #${pr.number}'s branch from ${pr.baseRef ?? "base"} (${pr.behindBy} behind; its failing checks pass there)`
+      : `Couldn't update PR #${pr.number}'s branch from ${pr.baseRef ?? "base"}: ${r.error}`,
+    tone: r.ok ? "info" : "warning",
+  });
+}
+
 async function maybeAutoFix(task: Task, pr: TaskPrStatus): Promise<void> {
   const fresh = tasks.get(task.id);
   if (!fresh) return;
   const ledger = readLedger();
-  if (!shouldAutoFix(fresh, pr, { enabled: preferences.get(PR_AUTOFIX_PREF) === "true", ledger })) return;
+  if (!shouldAutoFix(fresh, pr, { enabled: autoFixEnabled(fresh, preferences.get(PR_AUTOFIX_PREF)), ledger })) return;
   const fix = prFollowUpInstructions(PR_FIX_CI_ACTION, pr);
   const agent = prAgent();
   if (!fix || !agent.id) return;

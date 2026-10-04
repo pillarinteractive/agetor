@@ -25,7 +25,7 @@ import { cmdCommit } from "./commands/commit.ts";
 import { cmdConfig } from "./commands/config.ts";
 import { cmdShell } from "./commands/shell.ts";
 import { cmdCommands } from "./commands/discovery.ts";
-import { cmdBoard, cmdSuggestions, cmdActivity, cmdFollowUps, cmdFollowUp } from "./commands/board.ts";
+import { cmdBoard, cmdSuggestions, cmdActivity, cmdFollowUps, cmdFollowUp, cmdBlocks } from "./commands/board.ts";
 import { helpFor } from "./usage.ts";
 
 const HELP = `agetor — drive Agetor from the terminal
@@ -68,6 +68,7 @@ Commands:
   activity <id>       a card's timeline
   followups <id>      follow-ups a finished pipeline offers
   followup <id> <action> [--request <text>]  start a follow-up
+  blocks [--days N]   what pipelines block on, most frequent first
   help                show this help
 
 Global options:
@@ -218,6 +219,8 @@ async function main(): Promise<void> {
       return cmdFollowUps(args, flags);
     case "followup":
       return cmdFollowUp(args, flags);
+    case "blocks":
+      return cmdBlocks(args, flags);
     case "info": {
       const client = await getClient(flags);
       const meta = await client.info();

@@ -186,3 +186,20 @@ ordinary task (isolation none, workdir `~/.agetor/conductor` holding its CLAUDE.
   resuming) a follow-up on a blocked run sets aside the earlier blocks, so the card runs, then lands in Review or on
   the follow-up's own block. Boot repairs runs left blocked behind a live or finished follow-up.
 - E2E live progress: Pillar PR #197 — watcher `{"label":"e2e","command":"node apps/web/scripts/e2e-progress.mjs --json"}`.
+
+## Pipeline robustness (`feat/pipeline-robustness`)
+
+Goal: pipelines finish on their own; a block means something new. Known causes are fixed at the source (worktree
+setup command, CI's placeholder DATABASE_URL in Pillar), not patched with canned unblock messages — those
+suggestion rules are gone.
+- **Base sync before shipping** (`src/bun/sync-base.ts`, pref `pipeline_sync_base` =
+  `[{"project","branch":"develop","steps":["Finish","Open PR"]}]`): when one of those steps launches, the runner
+  fetches `origin/<branch>`; if it's ahead of the task branch the step's prompt starts with "merge it first" (merge
+  commit, never rebase; conflicts it can't resolve → hand back to Fix/Build). Not behind → prompt unchanged.
+- **Crashed / lost steps retry themselves**: a step run that `failed` (session died, API error) or was `orphaned`
+  is retried automatically up to 2× (1 min, 2 min), with timeline entries. A "blocked" handoff or a user Stop never is.
+- **Pipelines own their PRs**: auto Fix CI is on by default for pipeline cards (`pr_autofix` true/false overrides;
+  max 2 per PR, never twice on one head). A PR behind its base whose failing checks pass on the base gets its branch
+  updated automatically (`pr_autoupdate=false` to stop) — so the Update-branch suggestion only shows when that's off.
+- **Block log** (`src/bun/block-log.ts`): every new pipeline block is appended to `blocks.jsonl`; `agetor blocks
+  [--days N]` / `GET /blocks` group them by pipeline › step › kind, most frequent first.

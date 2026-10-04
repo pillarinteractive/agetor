@@ -52,6 +52,7 @@ import type { UpdaterSnapshot } from "./updater.ts";
 import { listLeases } from "./lease-watch.ts";
 import { listProgress } from "./progress-watch.ts";
 import { buildBoardDigest, renderBoardDigest } from "./board-digest.ts";
+import { readBlockLog, summarizeBlocks } from "./block-log.ts";
 import { conductorStatus, conductorTaskId, ensureConductor } from "./conductor.ts";
 import { listPrStatuses } from "./pr-watch.ts";
 import { createTaskFromIssue, listIssueQueue } from "./issue-queue.ts";
@@ -3299,6 +3300,16 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
 
       // The whole board in one read (src/bun/board-digest.ts); `?format=text`
       // is what `agetor board` and the Conductor read.
+      // Every pipeline block so far, grouped (src/bun/block-log.ts);
+      // `?days=N` limits the window (default 14).
+      "/blocks": {
+        GET: authed((req) => {
+          const days = Number(new URL(req.url).searchParams.get("days") ?? "14");
+          const since = Date.now() - (Number.isFinite(days) && days > 0 ? days : 14) * 86_400_000;
+          return json(summarizeBlocks(readBlockLog(since)), { headers: corsHeaders(req) });
+        }),
+      },
+
       "/board/digest": {
         GET: authed((req) => {
           const id = conductorTaskId();

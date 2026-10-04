@@ -142,3 +142,28 @@ describe("behind the base branch", () => {
     expect(prFollowUpActions(stale(0)).map((a) => a.id)).toEqual([PR_FIX_CI_ACTION]);
   });
 });
+
+test("auto Fix CI: on by default for pipeline cards, off for plain tasks, the pref overrides", async () => {
+  const { autoFixEnabled } = await import("./pr-watch.ts");
+  const pipe = { pipelineId: "p" } as unknown as import("../shared/types.ts").Task;
+  const plain = { pipelineId: null } as unknown as import("../shared/types.ts").Task;
+  expect(autoFixEnabled(pipe, null)).toBe(true);
+  expect(autoFixEnabled(plain, null)).toBe(false);
+  expect(autoFixEnabled(pipe, "false")).toBe(false);
+  expect(autoFixEnabled(plain, "true")).toBe(true);
+});
+
+test("auto update branch: only an open PR behind its base whose failures pass there, once per head", async () => {
+  const { shouldAutoUpdate } = await import("./pr-watch.ts");
+  const base = {
+    taskId: "t", number: 9, url: "u", state: "open", draft: false, baseRef: "develop", headSha: "h1", checks: "failure",
+    failingChecks: [{ name: "web / vitest", url: null, alsoOnBase: false, passesOnBase: true }], unresolvedThreads: 0, checkedAt: 0, behindBy: 2,
+  } as import("../shared/types.ts").TaskPrStatus;
+  expect(shouldAutoUpdate(base, { enabled: true, done: new Set() })).toBe(true);
+  expect(shouldAutoUpdate(base, { enabled: true, done: new Set(["9:h1"]) })).toBe(false);
+  expect(shouldAutoUpdate(base, { enabled: false, done: new Set() })).toBe(false);
+  // Develop hasn't moved ahead: nothing to merge.
+  expect(shouldAutoUpdate({ ...base, behindBy: 0 }, { enabled: true, done: new Set() })).toBe(false);
+  // Its own failure (doesn't pass on base): that's Fix CI's job.
+  expect(shouldAutoUpdate({ ...base, failingChecks: [{ name: "web / vitest", url: null, alsoOnBase: false, passesOnBase: false }] }, { enabled: true, done: new Set() })).toBe(false);
+});
