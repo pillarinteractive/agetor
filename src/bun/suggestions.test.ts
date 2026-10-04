@@ -26,8 +26,16 @@ describe("suggestFor", () => {
   test("a step blocked on the test environment gets the unblock message", () => {
     const s = suggestFor(task({ pipelineRun: blockedRun("- Final pnpm test failed: 17 suites could not load because DATABASE_URL is not set in .env.local") }), ctx());
     expect(s).toMatchObject({ apply: { kind: "message", stepTaskId: "step-1" } });
-    expect(s!.title).toContain("Unblock Finish");
+    expect(s!.title).toBe("Unblock Finish: use CI's placeholder DATABASE_URL, then rerun verification");
     expect((s!.apply as { text: string }).text).toContain("pillar_ci");
+  });
+
+  test("a step blocked on missing dependencies gets told to install them (and both fixes when both apply)", () => {
+    const deps = suggestFor(task({ pipelineRun: blockedRun("- `pnpm lint` failed because `node_modules` is missing", { openQuestions: ["Can verification run in an environment with dependencies installed?"] }) }), ctx());
+    expect(deps!.title).toBe("Unblock Finish: install dependencies, then rerun verification");
+    expect((deps!.apply as { text: string }).text).toContain("pnpm install --frozen-lockfile");
+    const both = suggestFor(task({ pipelineRun: blockedRun("node_modules missing; DATABASE_URL is not set in .env.local") }), ctx());
+    expect(both!.title).toBe("Unblock Finish: install dependencies and use CI's placeholder DATABASE_URL, then rerun verification");
   });
 
   test("a step blocked on the lab gets Retry once the lease is free — not while it's held", () => {

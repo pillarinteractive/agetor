@@ -2,7 +2,8 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, statSync } from "nod
 import { rm } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import path from "node:path";
-import { dataDir } from "./db.ts";
+import { dataDir, preferences } from "./db.ts";
+import { recordActivity } from "./activity.ts";
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
 import { LEGACY_BRANCH_PREFIX } from "../shared/types.ts";
 import type { BranchInfo, Task, TaskDiff, WorktreeTeardownResult } from "../shared/types.ts";
@@ -910,12 +911,75 @@ export async function prepareWorkdir(
   }
 
   const baseLabel = task.baseRef ? `base: ${task.baseRef.slice(0, 7)}` : `base: ${root} HEAD`;
+  const setup = await runWorktreeSetup(task, wt);
   return {
     cwd: wt,
     branch,
     worktreePath: wt,
-    note: `created worktree at ${wt} on ${branch} (${baseLabel})`,
+    note: `created worktree at ${wt} on ${branch} (${baseLabel})${setup ? `; ${setup}` : ""}`,
   };
+}
+
+/** Per-project command run once in a newly created worktree, e.g. `pnpm
+ *  install --frozen-lockfile`, so agents start with dependencies in place
+ *  instead of discovering a bare checkout mid-verification. Configured as the
+ *  `worktree_setup` preference: a JSON array of {project, command,
+ *  timeoutSec?}. Exported for tests. */
+export const WORKTREE_SETUP_PREF = "worktree_setup";
+
+export function worktreeSetupFor(
+  raw: string | null | undefined,
+  workdir: string,
+): { command: string; timeoutSec: number } | null {
+  if (!raw) return null;
+  try {
+    const list = JSON.parse(raw) as unknown;
+    if (!Array.isArray(list)) return null;
+    const norm = (p: string) => p.replace(/\/+$/, "");
+    for (const item of list) {
+      const o = item as { project?: unknown; command?: unknown; timeoutSec?: unknown };
+      if (typeof o.project === "string" && typeof o.command === "string" && o.command.trim() && norm(o.project) === norm(workdir)) {
+        const t = typeof o.timeoutSec === "number" && o.timeoutSec > 0 ? o.timeoutSec : 600;
+        return { command: o.command, timeoutSec: t };
+      }
+    }
+  } catch {
+    // malformed preference: no setup
+  }
+  return null;
+}
+
+/** Run the project's setup command in `wt`. Never fails the worktree: a
+ *  failed or timed-out setup is reported in the note and the card's timeline,
+ *  and the agent can still install by hand. Returns a short note, or null
+ *  when the project has no setup command. */
+async function runWorktreeSetup(task: Task, wt: string): Promise<string | null> {
+  const setup = worktreeSetupFor(preferences.get(WORKTREE_SETUP_PREF), task.workdir);
+  if (!setup) return null;
+  const started = Date.now();
+  try {
+    const proc = Bun.spawn(["/bin/sh", "-c", setup.command], {
+      cwd: wt,
+      env: process.env,
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "pipe",
+    });
+    const timer = setTimeout(() => proc.kill(), setup.timeoutSec * 1000);
+    const [stderr, code] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+    clearTimeout(timer);
+    const secs = Math.round((Date.now() - started) / 1000);
+    if (code === 0) {
+      recordActivity(task.id, { kind: "task", text: `Worktree set up: \`${setup.command}\` (${secs}s)`, tone: "muted" });
+      return `ran setup \`${setup.command}\` (${secs}s)`;
+    }
+    const tail = stderr.trim().split("\n").slice(-1)[0] ?? "";
+    recordActivity(task.id, { kind: "task", text: `Worktree setup failed (exit ${code}): ${tail.slice(0, 160)}`, tone: "warning" });
+    return `setup \`${setup.command}\` failed (exit ${code})`;
+  } catch (e) {
+    recordActivity(task.id, { kind: "task", text: `Worktree setup couldn't start: ${(e as Error).message}`, tone: "warning" });
+    return `setup couldn't start`;
+  }
 }
 
 // Process at most this many newly-created (untracked) files. Each costs a
