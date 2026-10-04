@@ -1081,6 +1081,17 @@ function nextRuleText(outgoing: { name: string; label: string }[], transition: "
 
 const SUBAGENT_INSTRUCTIONS_PREVIEW_MAX = 2000;
 
+/** Claude Code's Agent-tool model alias for a persona's model ("sonnet-5.5" →
+ *  "sonnet"), or null when the persona isn't a Claude model. */
+export function claudeModelAlias(harnessKind: string, model: string | null | undefined): "opus" | "sonnet" | "haiku" | null {
+  if (harnessKind !== "claude-code" || !model) return null;
+  const m = model.toLowerCase();
+  if (m.includes("haiku")) return "haiku";
+  if (m.includes("sonnet")) return "sonnet";
+  if (m.includes("opus")) return "opus";
+  return null;
+}
+
 /**
  * Compose the (pre-`composeLaunchPrompt`) prompt text for one step's launch,
  * deterministically: pipeline/step header, the overall goal, the previous
@@ -1102,6 +1113,9 @@ export function composeStepPrompt(input: {
   transition: "choose" | "all";
   subagentProfiles: AgentProfileSnapshot[];
   subagentCap: number | null;
+  /** The step agent's own harness — decides how (and whether) it can run a
+   *  subagent on the persona's model. */
+  parentHarnessKind?: string;
   inlineHandoff: boolean;
   parallelSiblings: string[];
   /** Per-call token fencing the untrusted-handoff markers (review finding
@@ -1173,7 +1187,10 @@ export function composeStepPrompt(input: {
   }
 
   parts.push("## Delegation");
-  if (input.subagentProfiles.length > 0) {
+  // Codex has no subagent tool; a persona list there would only invite the
+  // agent to emulate one on its own (expensive) model.
+  const canDelegate = !input.parentHarnessKind || input.parentHarnessKind === "claude-code";
+  if (input.subagentProfiles.length > 0 && canDelegate) {
     parts.push(
       input.subagentCap === null
         ? "You may delegate to subagents. No limit on how many."
@@ -1194,6 +1211,18 @@ export function composeStepPrompt(input: {
         + "and start the subagent's description with the persona's name (for example "
         + `"${input.subagentProfiles[0]!.name}: <what it should do>") so its work can be attributed to that persona.`,
     );
+    // Subagents otherwise inherit THIS step's model — a Scout spawned from an
+    // Opus step would run on Opus. Say which model to pass.
+    const withModel = input.subagentProfiles
+      .map((p) => ({ p, alias: claudeModelAlias(p.harnessKind, p.model) }))
+      .filter((x) => x.alias);
+    if (withModel.length > 0) {
+      parts.push(
+        "Run each subagent on its persona's model, not yours: spawn it with the Agent tool and set its `model` parameter — "
+          + withModel.map((x) => `${x.p.name}: \`model: "${x.alias}"\``).join("; ")
+          + ". Delegate searching, reading and summarising across many files; keep decisions and edits yourself.",
+      );
+    }
   } else {
     parts.push("Do not spawn subagents for this step.");
   }

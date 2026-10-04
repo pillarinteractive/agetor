@@ -875,6 +875,7 @@ async function launchStep(
     transition: step.transition,
     subagentProfiles,
     subagentCap: step.subagents.cap,
+    parentHarnessKind: profile.harnessKind,
     parallelSiblings,
   };
   // M10: step tasks carry the parent's own references plus every handoff

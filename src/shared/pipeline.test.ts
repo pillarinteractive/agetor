@@ -2595,3 +2595,30 @@ test("a next step written as shown in the option list — 'Name (label)' — res
   const h = (next: string) => ({ schemaVersion: 1, purpose: "", summary: "", reason: "", next, artifacts: [], openQuestions: [], status: "blocked" }) as never;
   expect(resolveNextSteps(g, "finish", h("Fix (verification failed)"))).toEqual({ kind: "steps", stepIds: ["fix"] });
 });
+
+describe("delegation runs subagents on their persona's model", () => {
+  const { claudeModelAlias, composeStepPrompt, newStep } = require("./pipeline.ts") as typeof import("./pipeline.ts");
+  const scout = { id: "s", name: "Scout", harness: "claude-code", harnessKind: "claude-code", harnessLabel: "Claude Code", model: "sonnet-5.5", effort: "low", mode: null, fast: false, maxMode: false, instructions: "Explore.", skills: [], capturedAt: 0 } as never;
+  const compose = (parentHarnessKind: string) =>
+    composeStepPrompt({
+      pipelineName: "P", step: newStep({ name: "Plan" }), stepIndex: 1, stepCap: 5, goal: "g", previous: [], outgoing: [],
+      transition: "choose", subagentProfiles: [scout], subagentCap: 3, parentHarnessKind, inlineHandoff: true, parallelSiblings: [],
+    });
+
+  test("aliases", () => {
+    expect(claudeModelAlias("claude-code", "sonnet-5.5")).toBe("sonnet");
+    expect(claudeModelAlias("claude-code", "opus-5.5")).toBe("opus");
+    expect(claudeModelAlias("claude-code", "haiku-4.5")).toBe("haiku");
+    expect(claudeModelAlias("codex", "gpt-6-sol")).toBeNull();
+  });
+
+  test("a Claude step is told to pass the persona's model", () => {
+    const text = compose("claude-code");
+    expect(text).toContain('Scout: `model: "sonnet"`');
+    expect(text).toContain("Limit: 3 subagent(s).");
+  });
+
+  test("a Codex step gets no subagent personas", () => {
+    expect(compose("codex")).toContain("Do not spawn subagents for this step.");
+  });
+});
