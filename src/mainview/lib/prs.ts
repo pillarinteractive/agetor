@@ -41,7 +41,7 @@ export function prBadge(pr: TaskPrStatus): { text: string; tone: "success" | "da
       title: `CI failing: ${own.map((c) => c.name).join(", ")}${threadsTitle}`,
     };
   }
-  if (pr.checks === "pending") return { text: `${base} …${threads}`, tone: "warning", title: `Checks running${threadsTitle}` };
+  if (pr.checks === "pending") return { text: `${base} · checks running${threads}`, tone: "warning", title: `Checks running${threadsTitle}` };
   if (pr.checks === "success") return { text: `${base} ✓${threads}`, tone: threads ? "warning" : "success", title: `Checks passed${threadsTitle}` };
   return { text: `${base}${pr.draft ? " draft" : ""}${threads}`, tone: threads ? "warning" : "muted", title: `No checks reported${threadsTitle}` };
 }

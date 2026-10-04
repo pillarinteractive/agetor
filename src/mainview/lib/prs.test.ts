@@ -9,7 +9,7 @@ const pr = (o: Partial<TaskPrStatus> = {}): TaskPrStatus => ({
 describe("prBadge", () => {
   test("states map to text and tone", () => {
     expect(prBadge(pr())).toMatchObject({ text: "PR #7 ✓", tone: "success" });
-    expect(prBadge(pr({ checks: "pending" }))).toMatchObject({ text: "PR #7 …", tone: "warning" });
+    expect(prBadge(pr({ checks: "pending" }))).toMatchObject({ text: "PR #7 · checks running", tone: "warning" });
     expect(prBadge(pr({ checks: "failure", failingChecks: [{ name: "lint", url: null, alsoOnBase: false }] }))).toMatchObject({ text: "PR #7 ✗ CI", tone: "danger", title: "CI failing: lint" });
     expect(prBadge(pr({ unresolvedThreads: 2 }))).toMatchObject({ text: "PR #7 ✓ · 2 💬", tone: "warning" });
     expect(

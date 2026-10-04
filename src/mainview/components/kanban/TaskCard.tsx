@@ -18,6 +18,10 @@ import { cardStatus } from "@/lib/card-status";
 import { ordinal } from "../../../shared/block-reason.ts";
 import { progressFraction, progressLine, useTaskProgress } from "@/lib/progress";
 
+// The theme's --destructive is a dark fill meant for buttons (30% lightness
+// in dark mode) — unreadable as text on a dark card. Text uses a lighter red.
+const DANGER_TEXT = "text-red-600 dark:text-red-400";
+
 type ChipTone = "info" | "success" | "warning" | "danger" | "muted" | "merged";
 
 /** The card's chip style: one size, readable contrast, tinted by tone. */
@@ -27,7 +31,7 @@ function chip(tone: ChipTone): string {
     tone === "info" && "bg-info/15 text-info",
     tone === "success" && "bg-success/15 text-success",
     tone === "warning" && "bg-warning/15 text-warning",
-    tone === "danger" && "bg-destructive/15 text-destructive",
+    tone === "danger" && cn("bg-red-500/15", DANGER_TEXT),
     tone === "merged" && "bg-violet-500/15 text-violet-400",
     tone === "muted" && "bg-muted text-muted-foreground",
   );
@@ -207,7 +211,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
             title={status.needsYou ? `Needs you: ${status.needsYou.reason}` : status.line}
             className={cn(
               "flex items-start gap-1 text-xs leading-snug",
-              status.tone === "danger" && "text-destructive",
+              status.tone === "danger" && DANGER_TEXT,
               status.tone === "warning" && "text-warning",
               status.tone === "success" && "text-success",
               status.tone === "info" && "text-info",
@@ -228,7 +232,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
                   title={p.current ?? line.text}
                   className={cn(
                     "truncate text-xs leading-snug",
-                    line.tone === "danger" && "text-destructive",
+                    line.tone === "danger" && DANGER_TEXT,
                     line.tone === "success" && "text-success",
                     line.tone === "info" && "text-info",
                     line.tone === "muted" && "text-muted-foreground",
