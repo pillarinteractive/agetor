@@ -919,6 +919,8 @@ export function resolveNextSteps(
     (o) => stepNameKey(o.step.name) === nextKey,
     (o) => o.step.id === next,
     (o) => stepNameKey(o.edge.label) === nextKey,
+    // The option list shows "Name (label)" — agents copy it verbatim.
+    (o) => o.edge.label.trim().length > 0 && stepNameKey(`${o.step.name} (${o.edge.label})`) === nextKey,
   ];
   for (const matches of tiers) {
     const hits = dedupeStrings(outgoing.filter(matches).map((o) => o.step.id));

@@ -2586,3 +2586,12 @@ describe("canFinish steps", () => {
     expect(text).toContain("Fix (verification failed)");
   });
 });
+
+test("a next step written as shown in the option list — 'Name (label)' — resolves", () => {
+  const { newStep, resolveNextSteps } = require("./pipeline.ts") as typeof import("./pipeline.ts");
+  const fix = { ...newStep({ name: "Fix" }), id: "fix" };
+  const finish = { ...newStep({ name: "Finish" }), id: "finish", canFinish: true };
+  const g = { steps: [fix, finish], edges: [{ id: "e", from: "finish", to: "fix", label: "verification failed" }], startStepId: "fix" };
+  const h = (next: string) => ({ schemaVersion: 1, purpose: "", summary: "", reason: "", next, artifacts: [], openQuestions: [], status: "blocked" }) as never;
+  expect(resolveNextSteps(g, "finish", h("Fix (verification failed)"))).toEqual({ kind: "steps", stepIds: ["fix"] });
+});

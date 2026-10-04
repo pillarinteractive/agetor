@@ -2190,7 +2190,21 @@ async function settleStepRun(
       // are visible), but do NOT resolve/advance: the execution stays in
       // `run.active` exactly like an unresolved handoff, waiting on a
       // Retry (re-run the step) or a manual Advance.
-      if (classified.kind === "handoff-blocked") {
+      // …unless it also chose where the work goes next ("verification
+      // failed" → Fix): the step routed it, so follow that choice instead of
+      // stopping the run on a person.
+      const blockedButRouted =
+        classified.kind === "handoff-blocked" &&
+        !!classified.handoff?.next?.trim() &&
+        resolveNextSteps(graph, activeEntry.stepId, classified.handoff).kind === "steps";
+      if (blockedButRouted) {
+        recordActivity(parentId, {
+          kind: "step",
+          text: `${stepName} reported a problem and handed it to "${classified.handoff!.next}" — following its choice`,
+          tone: "warning",
+        });
+      }
+      if (classified.kind === "handoff-blocked" && !blockedButRouted) {
         const handoff = classified.handoff!;
         const oq = handoff.openQuestions.length > 0
           ? ` (open questions: ${handoff.openQuestions.join("; ")})`
@@ -2208,7 +2222,7 @@ async function settleStepRun(
         return null;
       }
 
-      if (classified.kind !== "handoff") {
+      if (classified.kind !== "handoff" && !blockedButRouted) {
         // Defensive: `classifyStepResponse` only returns "error"/
         // "cancelled" for the failed/cancelled/orphaned run statuses,
         // never for "succeeded" — this can't actually be reached, but
