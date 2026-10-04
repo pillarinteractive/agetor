@@ -14,6 +14,7 @@ import { realpathSync } from "node:fs";
 import type { LeaseStatus, LeaseWatcherConfig, Task } from "../shared/types.ts";
 import { preferences, tasks } from "./db.ts";
 import { publishGlobalEvent } from "./orchestrator.ts";
+import { recordActivity } from "./activity.ts";
 
 export const LEASE_WATCHERS_PREF = "lease_watchers";
 const DEFAULT_INTERVAL_SEC = 30;
@@ -192,6 +193,10 @@ async function probe(w: LeaseWatcherConfig): Promise<void> {
     // A watcher removed from the preference while this probe ran is gone.
     if (!parseLeaseWatchers(preferences.get(LEASE_WATCHERS_PREF)).some((c) => keyOf(c) === key)) return;
     statuses.set(key, next);
+    if (prev && prev.holderTaskId !== next.holderTaskId && !next.error) {
+      if (prev.holderTaskId) recordActivity(prev.holderTaskId, { kind: "lease", text: `Released the ${w.label}`, tone: "muted" });
+      if (next.holderTaskId) recordActivity(next.holderTaskId, { kind: "lease", text: `Took the ${w.label}`, tone: "info" });
+    }
     if (!sameObservation(prev, next)) publish();
   } finally {
     inFlight.delete(key);

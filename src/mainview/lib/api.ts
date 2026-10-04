@@ -475,6 +475,11 @@ export const api = {
   getLeases: () => j<LeaseStatus[]>("/leases"),
   /** Every watched task's pull request (src/bun/pr-watch.ts). */
   getPrs: () => j<TaskPrStatus[]>("/prs"),
+  /** A card's activity timeline, newest first (src/bun/activity.ts). */
+  getActivity: (taskId: string) =>
+    j<{ ts: number; kind: string; text: string; tone: "muted" | "info" | "success" | "warning" | "danger"; url?: string }[]>(
+      `/tasks/${encodeURIComponent(taskId)}/activity`,
+    ),
   /** A project's open issues, each with the task already on it (src/bun/issue-queue.ts). */
   getIssueQueue: (path: string, opts: { labels?: string[]; q?: string; page?: number } = {}) => {
     const qs = new URLSearchParams({ path, page: String(opts.page ?? 1) });

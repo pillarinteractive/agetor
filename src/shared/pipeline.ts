@@ -967,6 +967,16 @@ export const EFFECTIVE_STEP_CAP_MAX = PIPELINE_LIMITS.maxStepsMax * (1 + PIPELIN
  * as the default / 0) — so the result is always a finite integer no larger
  * than {@link EFFECTIVE_STEP_CAP_MAX}.
  */
+/** A handoff's one-line headline for cards and lists: the summary's first
+ *  non-empty line with Markdown list/heading markers stripped, capped. */
+export function handoffHeadline(handoff: Pick<Handoff, "summary"> | null | undefined, max = 140): string {
+  const line = (handoff?.summary ?? "")
+    .split("\n")
+    .map((l) => l.replace(/^\s*(?:[-*+]|\d+[.)]|#+)\s+/, "").trim())
+    .find((l) => l.length > 0) ?? "";
+  return line.length > max ? `${line.slice(0, max - 1).trimEnd()}…` : line;
+}
+
 /** Id prefix of a follow-up step — one the user added to a finished run
  *  (`runPipelineFollowUp`) rather than one from the pipeline's graph. */
 export const FOLLOW_UP_STEP_PREFIX = "followup-";

@@ -14,6 +14,7 @@ import type { FollowUpAction, Task, TaskPrStatus } from "../shared/types.ts";
 import { agentProfiles, preferences, tasks } from "./db.ts";
 import { findGitHubPullForBranch, getGitHubPullChecks, getGitHubPullReviewThreads, getGitHubRefCheckRuns } from "./github.ts";
 import { runPipelineFollowUp } from "./pipeline-runner.ts";
+import { recordActivity } from "./activity.ts";
 import { isTaskRunLive, moveMergedTaskToDone, publishGlobalEvent } from "./orchestrator.ts";
 
 const PR_WATCH_INTERVAL_MS = 60_000;
@@ -157,6 +158,7 @@ export async function prWatchTick(): Promise<void> {
       if (!next) continue;
       const prev = statuses.get(task.id);
       statuses.set(task.id, next);
+      for (const e of prActivity(prev, next)) recordActivity(task.id, e);
       if (!task.prUrl && next.url) tasks.update(task.id, { prUrl: next.url });
       if (next.state === "merged" && prev?.state !== "merged" && canMoveToDone(task)) moveMergedTaskToDone(task.id);
       if (!same(prev, next)) changed = true;
@@ -166,6 +168,38 @@ export async function prWatchTick(): Promise<void> {
     inFlight = false;
   }
   if (changed) publishGlobalEvent({ kind: "prs", prs: listPrStatuses(), ts: Date.now() });
+}
+
+/** Timeline entries for what changed between two observations of a PR.
+ *  Exported for tests. */
+export function prActivity(
+  prev: TaskPrStatus | undefined,
+  next: TaskPrStatus,
+): { kind: "pr" | "ci" | "review"; text: string; tone: "muted" | "info" | "success" | "warning" | "danger"; url?: string }[] {
+  const out: ReturnType<typeof prActivity> = [];
+  const n = `PR #${next.number}`;
+  if (!prev || prev.number !== next.number) out.push({ kind: "pr", text: `${n} opened`, tone: "info", url: next.url });
+  if (next.state === "merged" && prev?.state !== "merged") out.push({ kind: "pr", text: `${n} merged`, tone: "success", url: next.url });
+  else if (next.state === "closed" && prev?.state !== "closed") out.push({ kind: "pr", text: `${n} closed without merging`, tone: "muted", url: next.url });
+  if (next.state !== "open") return out;
+  const failingKey = (p: TaskPrStatus | undefined) => (p?.failingChecks ?? []).map((f) => f.name).sort().join("\n");
+  if (next.checks === "failure" && (prev?.checks !== "failure" || failingKey(prev) !== failingKey(next))) {
+    const own = ownFailures(next).map((f) => f.name);
+    const inherited = next.failingChecks.filter((f) => f.alsoOnBase).map((f) => f.name);
+    const text = own.length
+      ? `CI failing: ${own.join(", ")}${inherited.length ? ` (also inherited from ${next.baseRef ?? "base"}: ${inherited.join(", ")})` : ""}`
+      : `CI failing, but only on checks that also fail on ${next.baseRef ?? "base"}: ${inherited.join(", ")}`;
+    out.push({ kind: "ci", text, tone: own.length ? "danger" : "warning", url: next.url });
+  } else if (next.checks === "success" && prev?.checks !== "success") {
+    out.push({ kind: "ci", text: "CI passed", tone: "success", url: next.url });
+  }
+  const before = prev?.unresolvedThreads ?? 0;
+  if (next.unresolvedThreads > before) {
+    out.push({ kind: "review", text: `${next.unresolvedThreads} review comment${next.unresolvedThreads === 1 ? "" : "s"} to address`, tone: "warning", url: next.url });
+  } else if (before > 0 && next.unresolvedThreads === 0) {
+    out.push({ kind: "review", text: "Review comments resolved", tone: "success", url: next.url });
+  }
+  return out;
 }
 
 /** A merged PR finishes the card — unless a pipeline run is still live
@@ -237,6 +271,7 @@ async function maybeAutoFix(task: Task, pr: TaskPrStatus): Promise<void> {
   const count = (ledger[key]?.count ?? 0) + 1;
   ledger[key] = { count, lastSha: pr.headSha };
   preferences.set(PR_AUTOFIX_ATTEMPTS_PREF, JSON.stringify(ledger));
+  recordActivity(task.id, { kind: "auto", text: `Started Fix CI automatically (attempt ${count} of ${PR_AUTOFIX_MAX_ATTEMPTS})`, tone: "info" });
   await runPipelineFollowUp(task.id, {
     profileId: agent.id,
     name: `${fix.name} · auto ${count}/${PR_AUTOFIX_MAX_ATTEMPTS}`,

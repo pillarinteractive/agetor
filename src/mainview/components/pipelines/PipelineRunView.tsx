@@ -41,6 +41,7 @@ import {
 } from "@/lib/pipelines";
 import { HandoffCard } from "./HandoffCard";
 import { FollowUpPanel } from "./FollowUpPanel";
+import { ActivityTimeline } from "./ActivityTimeline";
 import { pipelineStepProgress, stepNameById } from "../../../shared/pipeline.ts";
 import type {
   Handoff,
@@ -795,9 +796,16 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
           <ArrowLeft className="size-4" aria-hidden />
           Back to board
         </Button>
-        <span className="flex min-w-0 items-center gap-1.5 text-sm font-semibold">
-          <Workflow className="size-4 shrink-0 text-muted-foreground" aria-hidden />
-          <span className="truncate">{run.pipelineName}</span>
+        {/* The card's own title leads — it's what the user knows the work by;
+         *  the pipeline it runs is secondary. */}
+        <span className="flex min-w-0 flex-col">
+          <span data-testid="pipeline-run-title" className="truncate text-sm font-semibold" title={task.title}>
+            {task.title}
+          </span>
+          <span className="flex min-w-0 items-center gap-1 text-[11px] text-muted-foreground">
+            <Workflow className="size-3 shrink-0" aria-hidden />
+            <span className="truncate">{run.pipelineName}</span>
+          </span>
         </span>
         <Badge
           variant="secondary"
@@ -1083,6 +1091,8 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
               </AnimatePresence>
             </div>
           )}
+
+          <ActivityTimeline taskId={taskId} refreshKey={`${run.stepCount}:${run.status}:${run.endedAt ?? ""}:${run.blocked.length}`} />
 
           <div>
             <p className="mb-1.5 text-xs font-medium text-muted-foreground">History</p>

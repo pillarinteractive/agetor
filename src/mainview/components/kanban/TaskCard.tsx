@@ -1,7 +1,7 @@
 import { memo } from "react";
 import { useDraggable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, FolderOpen, GitBranch, GitCompare, GitPullRequest, ListTodo, Lock, LockOpen, MessageCircleQuestion, Paperclip, PauseCircle, Play, Square, Terminal, Trash2 } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, CircleAlert, FolderOpen, GitBranch, GitCompare, GitPullRequest, ListTodo, Lock, LockOpen, MessageCircleQuestion, Paperclip, PauseCircle, Play, Square, Terminal, Trash2 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -15,6 +15,7 @@ import { AgentIcon } from "./AgentIcon";
 import { PipelineBadge } from "@/components/pipelines";
 import { useTaskLeaseInfo } from "@/lib/leases";
 import { prBadge, useTaskPr } from "@/lib/prs";
+import { cardStatus } from "@/lib/card-status";
 
 interface Props {
   task: Task;
@@ -51,6 +52,8 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
   const lease = useTaskLeaseInfo(task);
   const pr = useTaskPr(task.id);
   const prInfo = pr ? prBadge(pr) : null;
+  // One plain sentence: what the card is doing, or what it's waiting on.
+  const status = cardStatus(task, { pr, lease, now: Date.now() });
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: task.id,
     // Archived cards are immutable until unarchived — block drag-to-column so
@@ -286,6 +289,24 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
           </span>
         )}
         <CardTitle className="text-sm break-words">{task.title}</CardTitle>
+        {!archived && (
+          <p
+            data-testid="card-status"
+            data-tone={status.tone}
+            title={status.needsYou ? `Needs you: ${status.needsYou.reason}` : status.line}
+            className={cn(
+              "flex items-start gap-1 text-[11px] leading-snug",
+              status.tone === "danger" && "text-destructive",
+              status.tone === "warning" && "text-warning",
+              status.tone === "success" && "text-success",
+              status.tone === "info" && "text-info",
+              status.tone === "muted" && "text-muted-foreground",
+            )}
+          >
+            {status.needsYou && <CircleAlert className="mt-px size-3 shrink-0" aria-label="Needs you" />}
+            <span className="line-clamp-2">{status.line}</span>
+          </p>
+        )}
       </CardHeader>
       <CardContent className="space-y-2">
         {/* Blocked, and its project has a watched lease: say whether it's
