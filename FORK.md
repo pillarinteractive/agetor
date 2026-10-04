@@ -102,3 +102,14 @@ Edit with `agetor config pipeline_followups '<json>'`; the board's current prese
 While any task is running, Agetor holds `caffeinate -i -s -w <pid>` so long agent turns aren't cut off by the Mac
 sleeping ("Your computer went to sleep mid-response"); it's released when nothing is running. On by default; toggle in
 Settings → General (`keepAwakeWhileRunning` preference). Closing the lid still sleeps the Mac unless a display is attached.
+
+## PR babysitter and issue queue (`feat/pr-watch-issues`)
+
+- **PR watcher** (`src/bun/pr-watch.ts`): every 60s, finds each live card's PR by branch (agents open PRs with `gh`, which
+  Agetor never sees), rolls up check runs and counts unresolved review threads. The card shows a PR badge; a merged PR
+  moves the card to Done. A finished pipeline's Next box offers suggested **Fix CI** / **Address review** follow-ups
+  (agent: `pr_followup_agent` preference, default `Builder`). The Builder profiles may push their own task branch so
+  these can update the PR; never `main`/`develop`, never force-push.
+- **Issue queue** (top-bar Issues button, `src/bun/issue-queue.ts`): a project's open issues with label chips and search;
+  pick a pipeline and **Fix** to create and start a pipeline task from the issue (built like `agetor add --issue`), with
+  the prompt asking the PR to say `Fixes #n`. Issues that already have a live task show it instead.
