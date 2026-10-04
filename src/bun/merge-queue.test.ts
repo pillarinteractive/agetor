@@ -45,3 +45,8 @@ test("closed or draft PRs need the user", () => {
   expect(nextMergeStep(card(), pr({ state: "closed" }), null).kind).toBe("needs-you");
   expect(nextMergeStep(card(), pr({ draft: true }), null).kind).toBe("needs-you");
 });
+
+test("no PR status because the lookup failed isn't 'no PR' — it waits instead of opening another", () => {
+  expect(nextMergeStep(card(), null, null, false)).toEqual({ kind: "wait", why: "checking for a PR" });
+  expect(nextMergeStep(card(), null, null, true).kind).toBe("open-pr");
+});

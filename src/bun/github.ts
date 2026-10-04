@@ -540,11 +540,12 @@ const GITHUB_DIFF_BODY_CAP_BYTES = 8_000_000;
  *  unrecognized/absent value locks without a reason instead of erroring. */
 const ISSUE_LOCK_REASONS = new Set(["off-topic", "too heated", "resolved", "spam"]);
 
-export async function run(cmd: string[], cwd?: string, timeoutMs = 10_000): Promise<CommandResult> {
+export async function run(cmd: string[], cwd?: string, timeoutMs = 10_000, env?: Record<string, string | undefined>): Promise<CommandResult> {
   let proc: PipedProcess;
   try {
     proc = Bun.spawn(cmd, {
       cwd,
+      ...(env ? { env } : {}),
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",
@@ -862,7 +863,11 @@ export async function githubToken(host: string | null): Promise<string | null> {
   if (stored) return stored;
   const envToken = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
   if (envToken) return envToken;
-  const gh = await run(["gh", "auth", "token"], undefined, 5_000);
+  // The live env, not Bun's launch-time default: an app opened from the Dock
+  // starts with a bare PATH, and only the rehydrated one finds Homebrew's
+  // `gh` — without it this fails, every API call goes out unauthenticated,
+  // and a private repo's PRs read as missing.
+  const gh = await run(["gh", "auth", "token"], undefined, 5_000, process.env);
   return gh.ok && gh.stdout ? gh.stdout : null;
 }
 

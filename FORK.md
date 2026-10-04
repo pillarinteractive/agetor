@@ -256,3 +256,12 @@ the background (title = card title, body = its prompt), then is linked — `issu
 in its prompt — so tags/dependencies show a number and the issue closes when its PR merges. At startup, live cards
 without one are caught up (Done cards are left). Skips pipeline steps, the Conductor, cards from an issue, non-GitHub
 projects. `agetor config auto_issues false` turns it off; never runs under tests unless set to `true`.
+
+## PR lookups that can't silently fail (`fix/pr-lookup-robustness`)
+
+- `githubToken` runs `gh auth token` with the live env: an app opened from the Dock has a bare launch PATH, `gh`
+  wasn't found, every call went out unauthenticated, and a private repo's PRs read as "none".
+- The PR watcher separates "GitHub says no PR" (`hasConfirmedNoPr`) from "couldn't look" (probe throws, last status
+  kept). The merge queue only opens a PR on a confirmed none, once per card.
+- A pipeline that finishes in In Review with commits beyond its base and no PR gets "Open PR" started automatically
+  (once per run) — In Review always has a PR.

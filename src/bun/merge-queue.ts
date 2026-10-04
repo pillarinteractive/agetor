@@ -21,7 +21,7 @@ import type { Task, TaskPrStatus } from "../shared/types.ts";
 import { preferences, tasks } from "./db.ts";
 import { recordActivity } from "./activity.ts";
 import { mergeQueue, setMergeQueued } from "./merge-intent.ts";
-import { ownFailures, prAgent, prStatusForTask, PR_FIX_CI_ACTION, PR_REVIEW_ACTION } from "./pr-watch.ts";
+import { hasConfirmedNoPr, ownFailures, prAgent, prStatusForTask, PR_FIX_CI_ACTION, PR_REVIEW_ACTION } from "./pr-watch.ts";
 import { getGitHubPullMergeability, mergeGitHubPull, updateGitHubPullBranch } from "./github.ts";
 import { startFollowUp } from "./pipeline-followups.ts";
 
@@ -44,10 +44,15 @@ export function nextMergeStep(
   task: Pick<Task, "column" | "pipelineId" | "pipelineRun">,
   pr: TaskPrStatus | null,
   mergeability: { mergeable: boolean | null; mergeableState: string } | null,
+  noPrConfirmed = true,
 ): MergeStep {
   if (task.column === "running") return { kind: "wait", why: "a fix-up step is running" };
   if (task.column === "blocked") return { kind: "wait", why: "blocked — see the card" };
-  if (!pr) return task.pipelineId ? { kind: "open-pr" } : { kind: "needs-you", why: "no pull request to merge" };
+  if (!pr) {
+    // Only when GitHub said there's none — a failed lookup isn't "no PR".
+    if (!noPrConfirmed) return { kind: "wait", why: "checking for a PR" };
+    return task.pipelineId ? { kind: "open-pr" } : { kind: "needs-you", why: "no pull request to merge" };
+  }
   if (pr.state === "merged") return { kind: "wait", why: "merged" };
   if (pr.state === "closed") return { kind: "needs-you", why: `PR #${pr.number} was closed without merging` };
   if (pr.draft) return { kind: "needs-you", why: `PR #${pr.number} is a draft` };
@@ -94,7 +99,8 @@ async function take(task: Task, pr: TaskPrStatus | null, step: MergeStep): Promi
     note(task, `Can't merge yet: ${step.why}`, "warning");
     return;
   }
-  const key = `${task.id}:${step.kind}:${pr?.headSha ?? task.pipelineRun?.stepCount ?? ""}`;
+  // Opening a PR is a once-per-card step; the rest once per PR head.
+  const key = step.kind === "open-pr" ? `${task.id}:open-pr` : `${task.id}:${step.kind}:${pr?.headSha ?? ""}`;
   if (taken.has(key)) return;
   const count = stepCounts.get(task.id) ?? 0;
   if (step.kind !== "merge" && step.kind !== "update-branch" && count >= MAX_AUTO_STEPS) {
@@ -165,7 +171,7 @@ export async function mergeQueueTick(): Promise<void> {
       const m = await getGitHubPullMergeability({ dir: t.workdir, number: pr.number }).catch(() => null);
       if (m && m.ok) mergeability = { mergeable: m.mergeable, mergeableState: m.mergeableState };
     }
-    const step = nextMergeStep(t, pr, mergeability);
+    const step = nextMergeStep(t, pr, mergeability, hasConfirmedNoPr(id));
     await take(t, pr, step).catch((e: Error) => note(t, `Merge queue error: ${e.message}`, "warning"));
   }
 }

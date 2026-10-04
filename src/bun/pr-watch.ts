@@ -12,7 +12,7 @@
  */
 import type { FollowUpAction, Task, TaskPrStatus } from "../shared/types.ts";
 import { agentProfiles, preferences, tasks } from "./db.ts";
-import { findGitHubPullForBranch, getGitHubCompare, getGitHubPullChecks, getGitHubPullReviewThreads, createGitHubComment, getGitHubIssueThread, getGitHubRefCheckRuns, updateGitHubIssue, updateGitHubPullBranch } from "./github.ts";
+import { run as run_, findGitHubPullForBranch, getGitHubCompare, getGitHubPullChecks, getGitHubPullReviewThreads, createGitHubComment, getGitHubIssueThread, getGitHubRefCheckRuns, updateGitHubIssue, updateGitHubPullBranch } from "./github.ts";
 import { runPipelineFollowUp } from "./pipeline-runner.ts";
 import { parseIssueUrl } from "../shared/issue-task.ts";
 import { recordActivity, recordActivityOnce } from "./activity.ts";
@@ -134,10 +134,56 @@ function same(a: TaskPrStatus | undefined, b: TaskPrStatus): boolean {
   );
 }
 
+/** Runs already given an automatic Open PR (`<taskId>:<run.endedAt>`). */
+const openPrStarted = new Set<string>();
+
+/**
+ * In Review always has a PR. A pipeline that finished with commits on its
+ * branch but no PR (its last step verified and stopped, or a PR step was
+ * skipped) gets the "Open PR" follow-up started automatically — once per run.
+ * Only after GitHub confirmed there's no PR, and only when the branch has
+ * commits beyond its base (a "not a bug" report has nothing to ship).
+ */
+async function maybeOpenMissingPr(task: Task): Promise<void> {
+  const run = task.pipelineRun;
+  if (!run || run.status !== "done" || task.column !== "review" || !hasConfirmedNoPr(task.id)) return;
+  const key = `${task.id}:${run.endedAt ?? run.stepCount}`;
+  if (openPrStarted.has(key)) return;
+  const checkout = task.worktreePath;
+  if (!checkout || !task.baseRef) return;
+  const ahead = await run_(["git", "rev-list", "--count", `${task.baseRef}..HEAD`], checkout);
+  if (!ahead.ok || Number(ahead.stdout) <= 0) return;
+  openPrStarted.add(key);
+  const { startFollowUp } = await import("./pipeline-followups.ts");
+  const r = await startFollowUp(task.id, { presetId: "pr" });
+  recordActivity(task.id, {
+    kind: "auto",
+    text: "error" in r ? `Finished without a PR, and couldn't open one: ${r.error}` : "Finished without a PR — opening one",
+    tone: "error" in r ? "warning" : "info",
+  });
+}
+
+/** Cards whose branch GitHub confirmed has no PR (a successful lookup that
+ *  came back empty). "No status" alone can also mean the lookup failed — no
+ *  token, offline — and must never be taken as "open a PR". */
+const confirmedNoPr = new Set<string>();
+
+export function hasConfirmedNoPr(taskId: string): boolean {
+  return confirmedNoPr.has(taskId) && !statuses.has(taskId);
+}
+
 async function probe(task: Task): Promise<TaskPrStatus | null> {
   const dir = task.workdir;
   const found = await findGitHubPullForBranch({ dir, branch: task.branch! });
-  if (!found.ok || !found.pull) return null;
+  if (!found.ok) {
+    confirmedNoPr.delete(task.id);
+    throw new Error(found.error); // keep the last status; try again next tick
+  }
+  if (!found.pull) {
+    confirmedNoPr.add(task.id);
+    return null;
+  }
+  confirmedNoPr.delete(task.id);
   const pull = found.pull;
   const state: TaskPrStatus["state"] = pull.mergedAt ? "merged" : pull.state;
   let checks: TaskPrStatus["checks"] = "none";
@@ -199,7 +245,10 @@ export async function prWatchTick(): Promise<void> {
         continue; // network hiccup: keep the last status, try next tick
       }
       if (task.column === "done") checkedDone.add(task.id);
-      if (!next) continue;
+      if (!next) {
+        await maybeOpenMissingPr(task);
+        continue;
+      }
       const prev = statuses.get(task.id);
       statuses.set(task.id, next);
       // First sight after a restart re-derives "opened"/"merged"; don't log them twice.
@@ -268,6 +317,8 @@ export function resetPrWatchForTests(): void {
   loop = null;
   statuses.clear();
   checkedDone.clear();
+  confirmedNoPr.clear();
+  openPrStarted.clear();
   inFlight = false;
 }
 
