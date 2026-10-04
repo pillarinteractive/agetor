@@ -110,6 +110,11 @@ Settings → General (`keepAwakeWhileRunning` preference). Closing the lid still
   moves the card to Done. A finished pipeline's Next box offers suggested **Fix CI** / **Address review** follow-ups
   (agent: `pr_followup_agent` preference, default `Builder`). The Builder profiles may push their own task branch so
   these can update the PR; never `main`/`develop`, never force-push.
+  - A failing check that also fails on the PR's base branch is marked inherited: the badge reads
+    `✗ CI (also on develop)` and Fix CI isn't offered for it (the aggregate `required` check never counts).
+  - Follow-ups also run on a **blocked** run once nothing in it is live.
+  - Opt-in auto Fix CI: `agetor config pr_autofix true`. Starts Fix CI by itself for the PR's own failures, at most
+    twice per PR and never twice for the same commit (ledger in the `pr_autofix_attempts` preference).
 - **Issue queue** (top-bar Issues button, `src/bun/issue-queue.ts`): a project's open issues with label chips and search;
   pick a pipeline and **Fix** to create and start a pipeline task from the issue (built like `agetor add --issue`), with
   the prompt asking the PR to say `Fixes #n`. Issues that already have a live task show it instead.
