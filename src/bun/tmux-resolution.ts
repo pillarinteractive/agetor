@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { dataDir, preferences } from "./db.ts";
 import { disclaimArgv } from "./disclaim.ts";
@@ -142,6 +143,27 @@ export function tmuxSocketArgs(): string[] {
 }
 
 /**
+ * Spawn options every tmux client invocation must carry.
+ *
+ * `env`: Bun.spawn's default env is the environ the process was launched
+ * with, not the live `process.env`, so without this the PATH that
+ * `rehydratePath()` writes at boot never reaches tmux. tmux gives a new
+ * session's process the PATH of the client that created it (an explicit
+ * `-e PATH=` doesn't override it), so a Finder-launched app ran every agent
+ * with `/usr/bin:/bin:/usr/sbin:/sbin` — no node, gh, pnpm or go.
+ *
+ * `cwd`: whichever client first touches the socket starts the server, and the
+ * server keeps that working directory for its lifetime. The packaged app runs
+ * from `Agetor.app/Contents/MacOS`, which an update deletes when it replaces
+ * the bundle; after that the long-lived server can no longer resolve its cwd
+ * and every new session fails to start (`getcwd: cannot access parent
+ * directories`). The home directory outlives any app update.
+ */
+export function tmuxSpawnOptions(): { env: Record<string, string | undefined>; cwd: string } {
+  return { env: process.env, cwd: os.homedir() };
+}
+
+/**
  * Build the argv for a disclaimed `tmux start-server` on agetor's own
  * socket — pure so it's unit-testable without spawning anything. `tmuxBin`
  * is the caller-resolved tmux binary (`resolveTmuxBin()`); wrapping happens
@@ -172,7 +194,12 @@ export async function ensureDisclaimedServer(): Promise<void> {
     // Ignore stdio rather than pipe: `start-server` emits nothing and this is
     // best-effort, so there's no output to capture and a drain-free pipe is
     // pointless. `disclaim`'s exec-replace preserves these fd choices.
-    const proc = Bun.spawn(argv, { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+    const proc = Bun.spawn(argv, {
+      ...tmuxSpawnOptions(),
+      stdin: "ignore",
+      stdout: "ignore",
+      stderr: "ignore",
+    });
     await proc.exited;
   } catch {
     // Best-effort — swallow. See doc comment above.
@@ -204,6 +231,7 @@ export async function spawnTmuxNewSession(
   await ensureDisclaimedServer();
   try {
     const proc = Bun.spawn([tmux, ...args], {
+      ...tmuxSpawnOptions(),
       stdin: "ignore",
       stdout: "pipe",
       stderr: "pipe",

@@ -1,6 +1,6 @@
 import { test, expect, beforeAll, afterAll, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync } from "node:fs";
-import { tmpdir } from "node:os";
+import os, { tmpdir } from "node:os";
 import path from "node:path";
 import { rmTestDataDir } from "./test-data-dir.ts";
 
@@ -18,6 +18,7 @@ let tmuxSocketName: () => string | null;
 let tmuxSocketArgs: () => string[];
 let buildEnsureServerArgv: (tmuxBin: string) => string[];
 let ensureDisclaimedServer: () => Promise<void>;
+let tmuxSpawnOptions: typeof import("./tmux-resolution.ts").tmuxSpawnOptions;
 let DISCLAIM_PREF_KEY: string;
 let preferences: typeof import("./db.ts").preferences;
 let dataDir: string;
@@ -29,6 +30,7 @@ beforeAll(async () => {
     tmuxSocketArgs,
     buildEnsureServerArgv,
     ensureDisclaimedServer,
+    tmuxSpawnOptions,
   } = await import("./tmux-resolution.ts"));
   ({ DISCLAIM_PREF_KEY } = await import("./disclaim.ts"));
   ({ preferences, dataDir } = await import("./db.ts"));
@@ -114,6 +116,27 @@ test.skipIf(process.platform !== "darwin")(
 );
 
 // --- ensureDisclaimedServer --------------------------------------------------
+
+// --- tmuxSpawnOptions ----------------------------------------------------------
+test("tmuxSpawnOptions: passes the live process.env so a rehydrated PATH reaches tmux", async () => {
+  const original = process.env.PATH;
+  process.env.PATH = `/agetor-rehydrated-test:${original ?? ""}`;
+  try {
+    const opts = tmuxSpawnOptions();
+    expect(opts.env.PATH).toBe(process.env.PATH);
+    // Bun.spawn's default env is the launch-time environ; the explicit env is
+    // what makes the child see the rehydrated PATH.
+    const proc = Bun.spawn(["/bin/sh", "-c", 'printf %s "$PATH"'], { ...opts, stdout: "pipe" });
+    expect(await new Response(proc.stdout).text()).toStartWith("/agetor-rehydrated-test:");
+  } finally {
+    if (original === undefined) delete process.env.PATH;
+    else process.env.PATH = original;
+  }
+});
+
+test("tmuxSpawnOptions: runs from the home directory, never the app bundle", () => {
+  expect(tmuxSpawnOptions().cwd).toBe(os.homedir());
+});
 
 test("ensureDisclaimedServer: resolves without throwing", async () => {
   process.env.AGETOR_TMUX_BIN = "/bin/echo";
