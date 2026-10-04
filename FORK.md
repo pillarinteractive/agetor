@@ -138,3 +138,5 @@ blocked on a lease that's free → Retry; PR behind its base whose failing check
 finished run with commits and no PR → Open PR preset; blocked step with open questions → show the first one.
 The PR watcher also records `behindBy` and `passesOnBase`, so a failure the base has since fixed isn't treated as the
 PR's own (no Fix CI / auto-fix). Layer 2 (a Conductor agent you chat with) is planned.
+- **Worktree setup** (`worktree_setup` preference, `src/bun/worktree.ts`): a per-project command run once in each newly
+  created worktree. Pillar: `pnpm install --frozen-lockfile --prefer-offline`. Failures never block the worktree.
