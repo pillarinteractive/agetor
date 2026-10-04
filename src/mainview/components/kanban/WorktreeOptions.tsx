@@ -1,4 +1,4 @@
-import { type Dispatch, type SetStateAction, useEffect, useMemo, useState } from "react";
+import { type Dispatch, type SetStateAction, useEffect, useMemo, useRef, useState } from "react";
 import { GitBranch, SlidersHorizontal } from "lucide-react";
 import { api, type BranchNamingConfig } from "@/lib/api";
 import { Input } from "@/components/ui/input";
@@ -92,9 +92,46 @@ export interface WorktreeOptionsState {
  * fetch, and the clean/dirty branch-name field. Mirrors `TaskLaunchPickers`'s
  * `useTaskLaunch` house style — state hook + component + helper in one file.
  */
+export const BASE_REF_PREF_PREFIX = "lastBaseRef:";
+
 export function useWorktreeOptions({ workdir, title, taskType, enabled = true }: { workdir: string; title: string; taskType: TaskType; enabled?: boolean }): WorktreeOptionsState {
   const [isolate, setIsolate] = useState(true);
-  const [baseRef, setBaseRef] = useState("");
+  const [baseRef, setBaseRefState] = useState("");
+  // The base branch the user last picked for each project (`lastBaseRef:<dir>`
+  // preference), so a project whose work branches off `develop` stays on
+  // `develop` across tasks, project switches and restarts. "" = the
+  // checkout's current HEAD.
+  const rememberedBaseRef = useRef<Map<string, string>>(new Map());
+  const [baseRefPrefsLoaded, setBaseRefPrefsLoaded] = useState(false);
+  useEffect(() => {
+    void api
+      .listPreferences()
+      .then((prefs) => {
+        for (const [k, v] of Object.entries(prefs)) {
+          if (k.startsWith(BASE_REF_PREF_PREFIX) && typeof v === "string") rememberedBaseRef.current.set(k.slice(BASE_REF_PREF_PREFIX.length), v);
+        }
+      })
+      .catch(() => {})
+      .finally(() => setBaseRefPrefsLoaded(true));
+  }, []);
+  const rememberedFor = (dir: string) => rememberedBaseRef.current.get(dir.trim()) ?? "";
+  // Land on the remembered base whenever the project changes (and once the
+  // preferences arrive).
+  useEffect(() => {
+    if (!baseRefPrefsLoaded) return;
+    setBaseRefState(rememberedFor(workdir));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workdir, baseRefPrefsLoaded]);
+  /** A pick in the branch picker: use it and remember it for this project. */
+  const setBaseRef: Dispatch<SetStateAction<string>> = (next) => {
+    const value = typeof next === "function" ? next(baseRef) : next;
+    setBaseRefState(value);
+    const dir = workdir.trim();
+    if (dir) {
+      rememberedBaseRef.current.set(dir, value);
+      void api.setPreference(`${BASE_REF_PREF_PREFIX}${dir}`, value).catch(() => {});
+    }
+  };
   // Branch nomenclature for the selected project (loaded from the server;
   // falls back to the built-in defaults). While clean (`!branchDirty`), the
   // field DERIVES its display from the tag-visible PATTERN (e.g.
@@ -170,10 +207,11 @@ export function useWorktreeOptions({ workdir, title, taskType, enabled = true }:
 
   const payload = () => worktreePayload({ isolate, baseRef, branchSubmitValue: branchField.submitValue });
 
-  const resetBaseRef = () => setBaseRef("");
+  // Back to this project's remembered base (HEAD when none was picked).
+  const resetBaseRef = () => setBaseRefState(rememberedFor(workdir));
 
   const resetAfterSubmit = () => {
-    setBaseRef("");
+    setBaseRefState(rememberedFor(workdir));
     // Reset the branch field so the next task re-derives from its (now empty)
     // title and gets a fresh unique token; drop any manual override.
     setBranchDirty(false);

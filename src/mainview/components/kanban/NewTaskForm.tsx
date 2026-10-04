@@ -148,6 +148,8 @@ interface Props {
   focusNonce?: number;
 }
 
+const LAST_WORKDIR_PREF = "lastWorkdir";
+
 export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSettingsAgents, pipelines, pipelinesLoaded, onOpenPipelines, agentModels, harnessModels, onRefreshModels, focusNonce }: Props) {
   // Collapsed = thin icon rail; the board's `flex-1` <main> takes the freed
   // width on its own. Seeded synchronously from localStorage (lazy initial
@@ -230,6 +232,20 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
   // ProjectPicker will auto-select the most-recently-used project from the
   // persisted list.
   const [workdir, setWorkdir] = useState("");
+  // The project the user last picked (`lastWorkdir` preference) wins over the
+  // picker's "most recently added" fallback, so the form stays on it across
+  // restarts. The fallback only runs once the preference has been read.
+  const [workdirPrefLoaded, setWorkdirPrefLoaded] = useState(false);
+  useEffect(() => {
+    void api
+      .listPreferences()
+      .then((prefs) => {
+        const last = prefs[LAST_WORKDIR_PREF];
+        if (typeof last === "string" && last) setWorkdir((cur) => cur || last);
+      })
+      .catch(() => {})
+      .finally(() => setWorkdirPrefLoaded(true));
+  }, []);
   // Owns the isolate toggle, base-ref, and branch-name field state/derivations
   // — see `WorktreeOptions.tsx`. Declared here (before the mode/model state)
   // since `wt.isolate`/`wt.baseRef` are read further down by the `fileScope`
@@ -789,11 +805,12 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
                   value={workdir}
                   onChange={(p) => {
                     setWorkdir(p);
+                    void api.setPreference(LAST_WORKDIR_PREF, p).catch(() => {});
                     // The previously-picked branch likely doesn't exist on the new
                     // project — drop back to HEAD so the picker shows a valid default.
                     wt.resetBaseRef();
                   }}
-                  autoSelectFirst
+                  autoSelectFirst={workdirPrefLoaded}
                   placement="bottom"
                   title="Pick the working directory the agent runs in. Add new ones with the folder picker at the bottom of the list."
                 />
