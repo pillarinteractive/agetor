@@ -1128,9 +1128,11 @@ test("GET /tasks ships a trimmed pipelineRun (no handoffs, no profile snapshots)
   const listed = list.find((t) => t.id === parent.id)!;
   expect(listed.pipelineRun).not.toBeNull();
   const trimmed = listed.pipelineRun!;
-  // Trimmed: every persisted handoff nulled, profiles emptied…
+  // Trimmed: each history handoff cut to its headline, join arrivals nulled, profiles emptied…
   expect(trimmed.history).toHaveLength(1);
-  expect(trimmed.history[0]!.handoff).toBeNull();
+  expect(trimmed.history[0]!.handoff).toEqual({
+    schemaVersion: 1, purpose: "", summary: "big summary", reason: "", next: null, artifacts: [], openQuestions: [],
+  });
   expect(trimmed.joins[stepId]!.arrivals[0]!.handoff).toBeNull();
   expect(trimmed.snapshot!.profiles).toEqual({});
   // …but everything the board/TUI/`agetor ls` read is intact.

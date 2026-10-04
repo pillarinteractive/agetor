@@ -190,6 +190,8 @@ type StreamEvent = RunEvent & { id: number; dbId?: number };
  * step id can't be found in the graph (or there's no graph yet).
  */
 interface PipelineStripInfo {
+  /** The pipeline card's own title — what the user knows this work by. */
+  parentTitle: string;
   pipelineName: string;
   stepName: string;
   stepIndex: number | null;
@@ -2747,7 +2749,7 @@ function RunPanelBody({
   // from under this step) — the strip then reads as an orphan and its "Open
   // pipeline" button is disabled, since there's no run view left to open
   // (L-A10); `"error"` is any other fetch failure.
-  const pipelineStripCacheRef = useRef<Map<string, { pipelineName: string; graph: PipelineGraph | null }>>(new Map());
+  const pipelineStripCacheRef = useRef<Map<string, { parentTitle: string; pipelineName: string; graph: PipelineGraph | null }>>(new Map());
   const [pipelineStrip, setPipelineStrip] = useState<PipelineStripInfo | "loading" | "error" | "missing" | null>(null);
   useEffect(() => subscribePipelineGlobalEvents((ev) => {
     if (ev.kind === "pipeline") pipelineStripCacheRef.current.delete(ev.taskId);
@@ -2756,7 +2758,7 @@ function RunPanelBody({
     const parentId = task.pipelineParentId;
     if (!parentId) return;
     const stepId = task.pipelineStepId;
-    const buildInfo = (pipelineName: string, graph: PipelineGraph | null): PipelineStripInfo => {
+    const buildInfo = (parentTitle: string, pipelineName: string, graph: PipelineGraph | null): PipelineStripInfo => {
       const stepName = graph && stepId ? stepNameById(graph, stepId) : (stepId ?? "this step");
       const stepTotal = graph?.steps.length ?? 0;
       let stepIndex: number | null = null;
@@ -2764,7 +2766,7 @@ function RunPanelBody({
         const pos = graph.steps.findIndex((s) => s.id === stepId);
         if (pos >= 0) stepIndex = pos + 1;
       }
-      return { pipelineName, stepName, stepIndex, stepTotal };
+      return { parentTitle, pipelineName, stepName, stepIndex, stepTotal };
     };
 
     const cached = pipelineStripCacheRef.current.get(parentId);
@@ -2772,7 +2774,7 @@ function RunPanelBody({
       // Immediate first paint from the cache — identical shape to the
       // background refetch below since `stepIndex` is derived purely from
       // the (frozen, cacheable) graph, not the ever-changing history.
-      setPipelineStrip(buildInfo(cached.pipelineName, cached.graph));
+      setPipelineStrip(buildInfo(cached.parentTitle, cached.pipelineName, cached.graph));
     } else {
       setPipelineStrip("loading");
     }
@@ -2783,9 +2785,10 @@ function RunPanelBody({
         const run = parentTask.pipelineRun ?? null;
         const graph = run?.snapshot?.graph ?? null;
         const pipelineName = run?.pipelineName || parentTask.title || "pipeline";
-        pipelineStripCacheRef.current.set(parentId, { pipelineName, graph });
+        const parentTitle = parentTask.title || pipelineName;
+        pipelineStripCacheRef.current.set(parentId, { parentTitle, pipelineName, graph });
         if (cancelled) return;
-        setPipelineStrip(buildInfo(pipelineName, graph));
+        setPipelineStrip(buildInfo(parentTitle, pipelineName, graph));
       } catch (e) {
         if (cancelled) return;
         if (e instanceof ApiError && e.status === 404) {
@@ -3674,11 +3677,12 @@ function RunPanelBody({
             <span className="truncate">
               {pipelineStrip && pipelineStrip !== "loading" && pipelineStrip !== "error" && pipelineStrip !== "missing" ? (
                 <>
-                  Part of pipeline <strong className="font-semibold">{pipelineStrip.pipelineName}</strong> · step{" "}
+                  <strong className="font-semibold" data-testid="run-panel-parent-title">{pipelineStrip.parentTitle}</strong> · step{" "}
                   <strong className="font-semibold">{pipelineStrip.stepName}</strong>
                   {pipelineStrip.stepIndex !== null && pipelineStrip.stepTotal > 0
                     ? ` (${pipelineStrip.stepIndex}/${pipelineStrip.stepTotal})`
                     : null}
+                  <span className="opacity-80"> · {pipelineStrip.pipelineName}</span>
                 </>
               ) : pipelineStrip === "missing" ? (
                 "Part of a pipeline whose task no longer exists"

@@ -51,6 +51,7 @@ import type { UpdaterSnapshot } from "./updater.ts";
 import { listLeases } from "./lease-watch.ts";
 import { listPrStatuses } from "./pr-watch.ts";
 import { createTaskFromIssue, listIssueQueue } from "./issue-queue.ts";
+import { listActivity } from "./activity.ts";
 import { listFollowUps, startFollowUp } from "./pipeline-followups.ts";
 import {
   bundledTmuxAvailable,
@@ -222,7 +223,7 @@ import { armForceQuit, broadcastAppEvent, subscribeAppEvents } from "./quit-guar
 import { consumePendingOpenTask } from "./pending-open.ts";
 import { binaryPreviewKind, contentTypeForPreviewPath, isImagePath } from "../shared/attachments.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
-import { PIPELINE_CONTROL_CHAR_RE, isPipelineColumnRunnerOwned, validatePipelineGraph } from "../shared/pipeline.ts";
+import { PIPELINE_CONTROL_CHAR_RE, handoffHeadline, isPipelineColumnRunnerOwned, validatePipelineGraph } from "../shared/pipeline.ts";
 import type { AgentProfilePatch } from "./db.ts";
 
 // Re-export so existing call sites (index.ts → webview URL) keep working.
@@ -670,8 +671,9 @@ function parsePipelineDescription(body: Record<string, unknown>): { value: strin
 
 /**
  * The trimmed `Task.pipelineRun` variant `GET /tasks` ships (M-S3, see the
- * field's doc in `shared/types.ts`): every persisted handoff (history and
- * partial-join arrivals) is nulled and the frozen profile snapshots dropped,
+ * field's doc in `shared/types.ts`): every history handoff is cut to its
+ * headline (`handoffHeadline`), partial-join arrival handoffs are nulled and
+ * the frozen profile snapshots dropped,
  * since the board/TUI/`agetor ls` only read `snapshot.graph`, `status`,
  * `active`, `blocked`, history outcomes and `stepCount` — and the 2s poll
  * was otherwise shipping every handoff of every pipeline task on every
@@ -686,7 +688,23 @@ function trimPipelineRunForList(run: PipelineRunState): PipelineRunState {
   return {
     ...run,
     snapshot: run.snapshot ? { ...run.snapshot, profiles: {} } : null,
-    history: run.history.map((h) => ({ ...h, handoff: null })),
+    // Keep each step's headline (status, next, first summary line) so a card
+    // can say what its run did without the full handoff on every poll.
+    history: run.history.map((h) => ({
+      ...h,
+      handoff: h.handoff
+        ? {
+            schemaVersion: 1 as const,
+            purpose: "",
+            summary: handoffHeadline(h.handoff),
+            reason: "",
+            next: h.handoff.next,
+            artifacts: [],
+            openQuestions: [],
+            ...(h.handoff.status ? { status: h.handoff.status } : {}),
+          }
+        : null,
+    })),
     joins,
   };
 }
@@ -4862,6 +4880,15 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // Follow-ups on a finished pipeline (src/bun/pipeline-followups.ts):
       // GET lists the configured presets, flagging the ones the branch's
       // changed files make worth running; POST runs one (or a custom request).
+      // A card's activity timeline, newest first (src/bun/activity.ts).
+      "/tasks/:id/activity": {
+        GET: authed((req) => {
+          const t = tasks.get(req.params.id);
+          if (!t) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          return json(listActivity(t), { headers: corsHeaders(req) });
+        }),
+      },
+
       "/tasks/:id/pipeline/followups": {
         GET: authed(async (req) => {
           const t = tasks.get(req.params.id);
