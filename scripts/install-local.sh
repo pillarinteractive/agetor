@@ -5,9 +5,10 @@
 #
 #   bun run build:local && bun run install:local
 #
-# Before swapping it backs up ~/.agetor/agetor.sqlite and the current app to
-# ~/.agetor/backups/, so rolling back is: quit Agetor, unzip the previous app
-# into /Applications, and (only if a migration ran) restore the database.
+# Before swapping it backs up ~/.agetor/agetor.sqlite and moves the current
+# app into ~/.agetor/backups/, so rolling back is: quit Agetor, move the
+# previous app back into /Applications, and (only if a migration ran) restore
+# the database.
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -32,23 +33,24 @@ if [ -f "$DATA_DIR/agetor.sqlite" ]; then
   sqlite3 "$DATA_DIR/agetor.sqlite" ".backup '$BACKUPS/agetor.sqlite.$STAMP'"
   echo "backed up database → $BACKUPS/agetor.sqlite.$STAMP"
 fi
-if [ -d "$TARGET" ]; then
-  ditto -c -k --keepParent "$TARGET" "$BACKUPS/Agetor.app.$STAMP.zip"
-  echo "backed up app → $BACKUPS/Agetor.app.$STAMP.zip"
-fi
-
 if pgrep -f "$TARGET/Contents/MacOS" >/dev/null; then
-  echo "quitting Agetor (agents keep running in tmux)…"
+  echo "quitting Agetor — confirm Quit if it asks (agents keep running in tmux)…"
   osascript -e 'quit app "Agetor"' >/dev/null 2>&1 || true
   i=0
   while pgrep -f "$TARGET/Contents/MacOS" >/dev/null; do
     i=$((i + 1))
-    [ "$i" -le 30 ] || { echo "Agetor didn't quit — quit it and re-run" >&2; exit 1; }
+    [ "$i" -le 300 ] || { echo "Agetor didn't quit — quit it and re-run" >&2; exit 1; }
     sleep 1
   done
 fi
 
-rm -rf "$TARGET"
+# Move the old bundle aside rather than deleting it: a tmux server started by
+# an older Agetor can still have Contents/MacOS as its working directory, and
+# deleting it breaks every new agent session until that server restarts.
+if [ -d "$TARGET" ]; then
+  mv "$TARGET" "$BACKUPS/Agetor.app.$STAMP"
+  echo "moved previous app → $BACKUPS/Agetor.app.$STAMP"
+fi
 ditto "$STAGE/Agetor.app" "$TARGET"
 echo "installed $(git -C "$ROOT" rev-parse --short HEAD) → $TARGET"
 open "$TARGET"
