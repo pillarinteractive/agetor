@@ -42,6 +42,7 @@ import {
 import { HandoffCard } from "./HandoffCard";
 import { FollowUpPanel } from "./FollowUpPanel";
 import { ActivityTimeline } from "./ActivityTimeline";
+import { LiveProgressPanel } from "./LiveProgressPanel";
 import { pipelineStepProgress, stepNameById } from "../../../shared/pipeline.ts";
 import type {
   Handoff,
@@ -926,6 +927,7 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
         </div>
 
         <div className="w-96 shrink-0 overflow-y-auto border-l border-border bg-card p-3">
+          <LiveProgressPanel taskId={taskId} />
           {resultRecords.length > 0 && (
             <div data-testid="pipeline-run-result" className="mb-3 flex flex-col gap-2">
               <p className="text-xs font-medium text-muted-foreground">Result</p>

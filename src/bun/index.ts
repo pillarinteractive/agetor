@@ -16,6 +16,7 @@ import { startUpdaterLoop, applyUpdate, checkForUpdate, getUpdateSnapshot } from
 import { startLeaseWatchLoop } from "./lease-watch.ts";
 import { startKeepAwakeLoop } from "./keep-awake.ts";
 import { startPrWatchLoop } from "./pr-watch.ts";
+import { startProgressWatchLoop } from "./progress-watch.ts";
 import { getMainWindow, setMainWindow } from "./window.ts";
 import { makeWindowLifecycle, type Frame } from "./window-lifecycle.ts";
 import { focusWindow } from "./window-focus.ts";
@@ -504,6 +505,10 @@ startKeepAwakeLoop();
 // Follow each task's pull request (src/bun/pr-watch.ts): badge, Fix CI /
 // Address review follow-ups, and Done on merge.
 startPrWatchLoop();
+
+// Live progress of lab/E2E runs on running cards (src/bun/progress-watch.ts).
+// A no-op until `progress_watchers` is configured.
+startProgressWatchLoop();
 
 /** Lifecycle wrapper around BrowserWindow construction. Handles:
  *   - idempotency (concurrent reopen events share one in-flight build),

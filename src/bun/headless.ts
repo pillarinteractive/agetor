@@ -6,6 +6,7 @@ import { initPipelineRunner, reconcilePipelineRuns } from "./pipeline-runner.ts"
 import { startLeaseWatchLoop } from "./lease-watch.ts";
 import { startKeepAwakeLoop } from "./keep-awake.ts";
 import { startPrWatchLoop } from "./pr-watch.ts";
+import { startProgressWatchLoop } from "./progress-watch.ts";
 import { ensureDisclaimedServer } from "./tmux-resolution.ts";
 import { startApiServer, attachedClientCount } from "./server.ts";
 import { rehydratePath } from "./login-path.ts";
@@ -179,6 +180,8 @@ export async function runDaemon(): Promise<void> {
 
   // PR watcher — same as index.ts; timer is unref'd.
   startPrWatchLoop();
+  // Live run progress — same as index.ts; timer is unref'd.
+  startProgressWatchLoop();
 
   // Idle-session reaper (docs/plans/reduce-cpu-and-memory.md §3.1, T4):
   // mirrors index.ts's wiring so the headless daemon doesn't accumulate the

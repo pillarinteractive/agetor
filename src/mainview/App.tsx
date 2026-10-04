@@ -28,11 +28,12 @@ import {
 } from "lucide-react";
 import { api, type AgentModelMap, type HarnessModelMap } from "@/lib/api";
 import { Button } from "@/components/ui/button";
-import { clampFontSizePercent, COLUMNS, USAGE_SUPPORTED_KINDS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type HarnessQuota, type LeaseStatus, type Project, type TaskPrStatus, type Task, type TaskType } from "../shared/types.ts";
+import { clampFontSizePercent, COLUMNS, USAGE_SUPPORTED_KINDS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type HarnessQuota, type LeaseStatus, type Project, type TaskPrStatus, type TaskProgress, type Task, type TaskType } from "../shared/types.ts";
 import { parseIssueUrl } from "../shared/issue-task.ts";
 import { isPipelineColumnRunnerOwned } from "../shared/pipeline.ts";
 import { LeaseContext } from "@/lib/leases";
 import { PrContext } from "@/lib/prs";
+import { ProgressContext } from "@/lib/progress";
 import { IssuesPage } from "@/components/issues/IssuesPage";
 import { NeedsYouBar } from "@/components/kanban/NeedsYouBar";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
@@ -331,6 +332,7 @@ function AppInner() {
   const [tmuxDialogOpen, setTmuxDialogOpen] = useState(false);
   const [updateSnapshot, setUpdateSnapshot] = useState<UpdateSnapshot | null>(null);
   const [leases, setLeases] = useState<LeaseStatus[]>([]);
+  const [progress, setProgress] = useState<TaskProgress[]>([]);
   const [prs, setPrs] = useState<ReadonlyMap<string, TaskPrStatus>>(new Map());
   const applyPrs = useCallback((list: TaskPrStatus[]) => setPrs(new Map(list.map((p) => [p.taskId, p]))), []);
   const [homeDir, setHomeDir] = useState<string>("");
@@ -633,6 +635,7 @@ function AppInner() {
     // Same for lease badges: later changes arrive as `leases` events.
     api.getLeases().then(setLeases).catch(() => { /* fine */ });
     api.getPrs().then(applyPrs).catch(() => { /* fine */ });
+    api.getProgress().then(setProgress).catch(() => { /* fine */ });
     // Skip poll ticks while the window is hidden — a backgrounded kanban
     // board has no reason to keep re-fetching + re-rendering every 2s/15s.
     // The intervals themselves keep running (cheap — it's just the fetch +
@@ -1128,6 +1131,11 @@ function AppInner() {
       // Pull request badges (src/bun/pr-watch.ts).
       if (ev.kind === "prs") {
         applyPrs(ev.prs);
+        return;
+      }
+      // Live lab/E2E run progress (src/bun/progress-watch.ts).
+      if (ev.kind === "progress") {
+        setProgress(ev.progress);
         return;
       }
       // "Already looking at it" — the run panel is open on the task, OR the
@@ -2150,6 +2158,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
             }
           }}
         />
+        <ProgressContext.Provider value={progress}>
         <main className="flex min-w-0 flex-1 flex-col">
           {/* Chrome that stays mounted regardless of `view` (D5,
               docs/plans/pipelines.md): update/tmux banners and the global
@@ -2371,6 +2380,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
             )}
           </AnimatePresence>
         </main>
+        </ProgressContext.Provider>
       </div>
       <RunPanel
         task={selected}

@@ -49,6 +49,7 @@ import {
 } from "./agents.ts";
 import type { UpdaterSnapshot } from "./updater.ts";
 import { listLeases } from "./lease-watch.ts";
+import { listProgress } from "./progress-watch.ts";
 import { listPrStatuses } from "./pr-watch.ts";
 import { createTaskFromIssue, listIssueQueue } from "./issue-queue.ts";
 import { listActivity } from "./activity.ts";
@@ -3288,6 +3289,9 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // the board loads this once, then follows `leases` global events.
       "/leases": {
         GET: authed((req) => json(listLeases(), { headers: corsHeaders(req) })),
+      },
+      "/progress": {
+        GET: authed((req) => json(listProgress(), { headers: corsHeaders(req) })),
       },
 
       // Every watched task's pull request (src/bun/pr-watch.ts); the board

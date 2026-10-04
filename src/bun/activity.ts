@@ -14,7 +14,7 @@ import { dataDir } from "./db.ts";
 
 export interface ActivityEntry {
   ts: number;
-  kind: "step" | "pr" | "ci" | "review" | "lease" | "auto" | "task";
+  kind: "step" | "pr" | "ci" | "review" | "lease" | "auto" | "task" | "progress";
   text: string;
   tone: "muted" | "info" | "success" | "warning" | "danger";
   url?: string;

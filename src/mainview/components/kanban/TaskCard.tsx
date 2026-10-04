@@ -16,6 +16,7 @@ import { PipelineBadge } from "@/components/pipelines";
 import { useTaskLeaseInfo } from "@/lib/leases";
 import { prBadge, useTaskPr } from "@/lib/prs";
 import { cardStatus } from "@/lib/card-status";
+import { progressFraction, progressLine, useTaskProgress } from "@/lib/progress";
 
 interface Props {
   task: Task;
@@ -52,6 +53,8 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
   const lease = useTaskLeaseInfo(task);
   const pr = useTaskPr(task.id);
   const prInfo = pr ? prBadge(pr) : null;
+  // Live lab/E2E run progress in this card's checkout (src/bun/progress-watch.ts).
+  const progress = useTaskProgress(task.id);
   // One plain sentence: what the card is doing, or what it's waiting on.
   const status = cardStatus(task, { pr, lease, now: Date.now() });
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
@@ -307,6 +310,36 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
             <span className="line-clamp-2">{status.line}</span>
           </p>
         )}
+        {!archived &&
+          progress.map((p) => {
+            const line = progressLine(p);
+            const fraction = p.active ? progressFraction(p.counts) : null;
+            return (
+              <div key={`${p.project}:${p.label}`} data-testid="card-progress" className="flex flex-col gap-0.5">
+                <p
+                  title={p.current ?? line.text}
+                  className={cn(
+                    "truncate text-[11px] leading-snug",
+                    line.tone === "danger" && "text-destructive",
+                    line.tone === "success" && "text-success",
+                    line.tone === "info" && "text-info",
+                    line.tone === "muted" && "text-muted-foreground",
+                  )}
+                >
+                  {p.active ? "▶ " : ""}
+                  {line.text}
+                </p>
+                {fraction != null && (
+                  <div className="h-1 overflow-hidden rounded bg-muted">
+                    <div
+                      className={cn("h-full", line.tone === "danger" ? "bg-destructive" : "bg-info")}
+                      style={{ width: `${Math.round(fraction * 100)}%` }}
+                    />
+                  </div>
+                )}
+              </div>
+            );
+          })}
       </CardHeader>
       <CardContent className="space-y-2">
         {/* Blocked, and its project has a watched lease: say whether it's

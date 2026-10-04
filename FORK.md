@@ -140,3 +140,13 @@ The PR watcher also records `behindBy` and `passesOnBase`, so a failure the base
 PR's own (no Fix CI / auto-fix). Layer 2 (a Conductor agent you chat with) is planned.
 - **Worktree setup** (`worktree_setup` preference, `src/bun/worktree.ts`): a per-project command run once in each newly
   created worktree. Pillar: `pnpm install --frozen-lockfile --prefer-offline`. Failures never block the worktree.
+
+## Live run progress (`feat/live-progress`)
+
+`src/bun/progress-watch.ts` runs each `progress_watchers` command (preference: JSON array of
+`{project, label, command, intervalSec?}`) in the checkout of every **running** card of that project, every few
+seconds. The command prints one `progress/v1` object (`active`, `phase`, `phases`, `targets`, `counts`, `current`,
+`failures`, `artifacts`, `last`). The card shows a live line with a bar ("lab: test 120/180 · 2 failed"). The run view
+gets a **Live** panel with a phase stepper, counts, the test running now, failures and evidence paths. Phase starts
+and the final result go on the activity timeline. A checkout whose command fails (for example a branch older than
+the tool) is backed off for 2 minutes. Pillar: `lab/vm/plab progress --json` (Pillar PR #194), label `lab`.

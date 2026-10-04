@@ -4488,6 +4488,14 @@ export type GlobalEvent =
       ts: number;
     }
   | {
+      /** A running card's live progress (lab or E2E run phase, test counts,
+       *  failures) changed. Carries every card's latest progress so the board
+       *  replaces its copy wholesale. See `src/bun/progress-watch.ts`. */
+      kind: "progress";
+      progress: TaskProgress[];
+      ts: number;
+    }
+  | {
       /** A watched task's pull request changed (opened, checks, review
        *  threads, merged). Carries every watched PR so the board replaces its
        *  copy wholesale. See `src/bun/pr-watch.ts`. */
@@ -5115,4 +5123,55 @@ export function clampFontSizePercent(raw: unknown): number {
   if (!Number.isFinite(n)) return FONT_SIZE_DEFAULT;
   const rounded = Math.round(n);
   return Math.min(FONT_SIZE_MAX, Math.max(FONT_SIZE_MIN, rounded));
+}
+
+/** One `progress_watchers` preference entry: a command that reports what a
+ *  long-running project tool (a VM lab suite, an E2E run) is doing in a
+ *  checkout. Agetor runs it in each running card's checkout. */
+export interface ProgressWatcherConfig {
+  /** Project (repo) path; only that project's cards are probed. */
+  project: string;
+  /** Short name shown on the card, e.g. "lab". */
+  label: string;
+  /** Shell command run in the card's checkout, printing one `progress/v1`
+   *  JSON object (see {@link TaskProgressReport}). */
+  command: string;
+  /** Seconds between probes of a running card (default 10, minimum 3). */
+  intervalSec?: number;
+}
+
+export interface ProgressCounts {
+  passed: number;
+  failed: number;
+  skipped: number;
+  errors: number;
+  total: number | null;
+}
+
+/** The `progress/v1` object a progress command prints. */
+export interface TaskProgressReport {
+  active: boolean;
+  /** Free-form phase name; "idle" when nothing is running. */
+  phase: string;
+  /** The run's phases in order, for a stepper. */
+  phases: string[] | null;
+  /** The tool's own name for the run, e.g. "VM suite". */
+  runLabel: string | null;
+  targets: string[] | null;
+  startedAt: string | null;
+  phaseStartedAt: string | null;
+  counts: ProgressCounts | null;
+  current: string | null;
+  failures: { name: string; message: string | null }[];
+  artifacts: { label: string; path: string }[];
+  last: { finishedAt: string | null; result: "passed" | "failed" | null; counts: ProgressCounts | null } | null;
+}
+
+/** A card's latest progress from one watcher. */
+export interface TaskProgress extends TaskProgressReport {
+  taskId: string;
+  project: string;
+  label: string;
+  checkout: string;
+  checkedAt: number;
 }

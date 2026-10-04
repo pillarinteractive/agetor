@@ -517,6 +517,8 @@ function describeGlobalEvent(event: GlobalEvent): string {
       return `leases:${event.leases.length}`;
     case "prs":
       return `prs:${event.prs.length}`;
+    case "progress":
+      return `progress:${event.progress.length}`;
     default:
       return assertNever(event);
   }
