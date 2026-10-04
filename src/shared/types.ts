@@ -444,6 +444,10 @@ export interface PipelineStep {
    *  `"all"` — starts once every distinct incoming source has arrived in
    *  this generation (fan-in / join), receiving all their handoffs. */
   join: "any" | "all";
+  /** A "choose" step that may also END the run: handing off with `next: null`
+   *  finishes the pipeline, naming a step goes there (e.g. Finish → "verification
+   *  failed" → Fix). Without it, a step with outgoing edges always continues. */
+  canFinish?: boolean;
 }
 
 /** A directed connection between two {@link PipelineStep}s by id.

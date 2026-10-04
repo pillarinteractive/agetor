@@ -203,3 +203,7 @@ suggestion rules are gone.
   updated automatically (`pr_autoupdate=false` to stop) — so the Update-branch suggestion only shows when that's off.
 - **Block log** (`src/bun/block-log.ts`): every new pipeline block is appended to `blocks.jsonl`; `agetor blocks
   [--days N]` / `GET /blocks` group them by pipeline › step › kind, most frequent first.
+- **Steps that can finish** (`PipelineStep.canFinish`, editor: "Can also finish the pipeline"): a choose step with
+  outgoing edges that may also end the run by handing off `next: null`. Pillar's Finish uses it with a
+  "verification failed" edge back to Fix (Bugfix) / Build (Feature), so a failing final check loops back instead of
+  blocking (bounded by maxSteps).

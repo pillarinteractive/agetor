@@ -1862,7 +1862,7 @@ function attemptHandoffReminderOrBlock(input: {
   const stepObj = graph.steps.find((s) => s.id === activeEntry.stepId);
   const outgoing = outgoingSteps(graph, activeEntry.stepId).map((o) => ({ name: o.step.name, label: o.edge.label }));
   const transition = stepObj?.transition ?? "choose";
-  const reminderText = composeHandoffReminder({ stepName, reason, detail, outgoing, transition });
+  const reminderText = composeHandoffReminder({ stepName, reason, detail, outgoing, transition, canFinish: stepObj?.canFinish === true });
 
   // No block recorded — the execution stays `active`; the send itself
   // happens once the caller has released the lock (L-R7).

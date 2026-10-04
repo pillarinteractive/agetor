@@ -2555,3 +2555,34 @@ describe("splitHandoffMessage", () => {
     expect(splitHandoffMessage("<handoff>not json</handoff>")).toBeNull();
   });
 });
+
+describe("canFinish steps", () => {
+  const { newStep, resolveNextSteps, validatePipelineGraph, composeHandoffReminder } = require("./pipeline.ts") as typeof import("./pipeline.ts");
+  const finish = { ...newStep({ name: "Finish" }), id: "finish", canFinish: true };
+  const fix = { ...newStep({ name: "Fix" }), id: "fix" };
+  const graph = { steps: [fix, finish], edges: [{ id: "e1", from: "finish", to: "fix", label: "verification failed" }], startStepId: "fix" };
+  const handoff = (next: string | null) => ({ schemaVersion: 1, purpose: "p", summary: "s", reason: "r", next, artifacts: [], openQuestions: [], status: "done" }) as never;
+
+  test("no next step finishes the run; naming one (or its edge label) goes there", () => {
+    expect(resolveNextSteps(graph, "finish", handoff(null))).toEqual({ kind: "terminal" });
+    expect(resolveNextSteps(graph, "finish", handoff(""))).toEqual({ kind: "terminal" });
+    expect(resolveNextSteps(graph, "finish", handoff("verification failed"))).toEqual({ kind: "steps", stepIds: ["fix"] });
+    expect(resolveNextSteps(graph, "finish", handoff("Fix"))).toEqual({ kind: "steps", stepIds: ["fix"] });
+    // Without canFinish a single edge is always followed.
+    const plain = { ...graph, steps: [fix, { ...finish, canFinish: undefined }] };
+    expect(resolveNextSteps(plain, "finish", handoff(null))).toEqual({ kind: "steps", stepIds: ["fix"] });
+  });
+
+  test("the validator keeps it (only when on) and rejects junk", () => {
+    const ok = validatePipelineGraph(graph);
+    expect(ok.ok && ok.graph.steps.find((s) => s.id === "finish")!.canFinish).toBe(true);
+    expect(ok.ok && "canFinish" in ok.graph.steps.find((s) => s.id === "fix")!).toBe(false);
+    expect(validatePipelineGraph({ ...graph, steps: [fix, { ...finish, canFinish: "yes" }] }).ok).toBe(false);
+  });
+
+  test("the handoff rule tells the agent it may finish", () => {
+    const text = composeHandoffReminder({ stepName: "Finish", reason: "handoff-missing", detail: null, outgoing: [{ name: "Fix", label: "verification failed" }], transition: "choose", canFinish: true });
+    expect(text).toContain('set "next" to null — that finishes the pipeline');
+    expect(text).toContain("Fix (verification failed)");
+  });
+});

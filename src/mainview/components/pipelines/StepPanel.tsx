@@ -195,6 +195,19 @@ export function StepPanel({
             label="Run all next steps in parallel"
           />
         </div>
+        {step.transition === "choose" && (
+          <label className="mt-2 flex items-center gap-2">
+            <Switch
+              data-testid="pipeline-step-can-finish"
+              checked={step.canFinish === true}
+              onCheckedChange={(checked) => {
+                const { canFinish: _drop, ...rest } = step;
+                onChange(checked ? { ...rest, canFinish: true } : rest);
+              }}
+            />
+            <span className="text-xs text-muted-foreground">Can also finish the pipeline (choose no next step)</span>
+          </label>
+        )}
         {step.transition === "all" && (
           <p className="mt-1 text-xs text-warning">
             Parallel steps share this pipeline's worktree — keep their scopes disjoint.
