@@ -948,7 +948,7 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
             </div>
           )}
 
-          {run.status === "done" && (
+          {(run.status === "done" || (run.status === "blocked" && !hasLiveExecution(steps, run))) && (
             <FollowUpPanel
               taskId={taskId}
               refreshKey={`${run.stepCount}:${run.endedAt ?? ""}`}

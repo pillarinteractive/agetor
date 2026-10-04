@@ -4503,9 +4503,14 @@ export interface TaskPrStatus {
   url: string;
   state: "open" | "closed" | "merged";
   draft: boolean;
+  /** The branch the PR merges into, and its head commit. */
+  baseRef: string | null;
+  headSha: string | null;
   /** Rolled up from the head commit's check runs. */
   checks: "none" | "pending" | "success" | "failure";
-  failingChecks: { name: string; url: string | null }[];
+  /** `alsoOnBase`: the same check fails on the tip of the base branch, so the
+   *  PR inherited it rather than caused it. */
+  failingChecks: { name: string; url: string | null; alsoOnBase: boolean }[];
   unresolvedThreads: number;
   checkedAt: number;
 }

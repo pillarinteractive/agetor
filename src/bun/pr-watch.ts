@@ -12,14 +12,20 @@
  */
 import type { FollowUpAction, Task, TaskPrStatus } from "../shared/types.ts";
 import { agentProfiles, preferences, tasks } from "./db.ts";
-import { findGitHubPullForBranch, getGitHubPullChecks, getGitHubPullReviewThreads } from "./github.ts";
-import { moveMergedTaskToDone, publishGlobalEvent } from "./orchestrator.ts";
+import { findGitHubPullForBranch, getGitHubPullChecks, getGitHubPullReviewThreads, getGitHubRefCheckRuns } from "./github.ts";
+import { runPipelineFollowUp } from "./pipeline-runner.ts";
+import { isTaskRunLive, moveMergedTaskToDone, publishGlobalEvent } from "./orchestrator.ts";
 
 const PR_WATCH_INTERVAL_MS = 60_000;
 /** Agent that runs the PR follow-ups; `pr_followup_agent` overrides it. */
 export const PR_FOLLOWUP_AGENT_PREF = "pr_followup_agent";
 const DEFAULT_PR_FOLLOWUP_AGENT = "Builder";
 const WATCHED_COLUMNS = new Set(["running", "blocked", "review", "done"]);
+/** "true" starts Fix CI on its own when a PR's own checks fail. */
+export const PR_AUTOFIX_PREF = "pr_autofix";
+/** JSON map "<taskId>#<pr>" → { count, lastSha }: auto Fix CI bookkeeping. */
+const PR_AUTOFIX_ATTEMPTS_PREF = "pr_autofix_attempts";
+export const PR_AUTOFIX_MAX_ATTEMPTS = 2;
 
 const statuses = new Map<string, TaskPrStatus>();
 let loop: ReturnType<typeof setInterval> | null = null;
@@ -55,11 +61,30 @@ export function rollUpChecks(runs: { name: string; status: string; conclusion: s
   if (runs.length === 0) return { checks: "none", failing: [] };
   const failing = runs
     .filter((r) => ["failure", "timed_out", "cancelled", "action_required", "startup_failure"].includes(r.conclusion ?? ""))
-    .map((r) => ({ name: r.name, url: r.htmlUrl }));
+    .map((r) => ({ name: r.name, url: r.htmlUrl, alsoOnBase: false }));
   if (failing.length > 0) return { checks: "failure", failing };
   if (runs.some((r) => r.status !== "completed")) return { checks: "pending", failing: [] };
   return { checks: "success", failing: [] };
 }
+
+/** Flag each PR failure that also fails on the base branch's tip. */
+export function markInherited(
+  pr: TaskPrStatus["failingChecks"],
+  base: TaskPrStatus["failingChecks"],
+): TaskPrStatus["failingChecks"] {
+  const onBase = new Set(base.map((b) => b.name));
+  return pr.map((f) => ({ ...f, alsoOnBase: onBase.has(f.name) }));
+}
+
+/** The failures the PR itself caused — the ones worth fixing on its branch.
+ *  A rollup check (e.g. "required", which fails whenever any suite does) is
+ *  only "own" when some real suite failure is. */
+export function ownFailures(pr: TaskPrStatus | null): TaskPrStatus["failingChecks"] {
+  return (pr?.failingChecks ?? []).filter((f) => !f.alsoOnBase && !ROLLUP_CHECKS.has(f.name));
+}
+
+/** Aggregate checks that fail whenever any suite does — never a cause. */
+const ROLLUP_CHECKS = new Set(["required"]);
 
 function same(a: TaskPrStatus | undefined, b: TaskPrStatus): boolean {
   return (
@@ -69,7 +94,8 @@ function same(a: TaskPrStatus | undefined, b: TaskPrStatus): boolean {
     a.draft === b.draft &&
     a.checks === b.checks &&
     a.unresolvedThreads === b.unresolvedThreads &&
-    a.failingChecks.map((f) => f.name).join("\n") === b.failingChecks.map((f) => f.name).join("\n")
+    a.failingChecks.map((f) => `${f.name}:${f.alsoOnBase}`).join("\n") ===
+      b.failingChecks.map((f) => `${f.name}:${f.alsoOnBase}`).join("\n")
   );
 }
 
@@ -85,6 +111,10 @@ async function probe(task: Task): Promise<TaskPrStatus | null> {
   if (state === "open") {
     const runs = await getGitHubPullChecks({ dir, number: pull.number });
     if (runs.ok) ({ checks, failing: failingChecks } = rollUpChecks(runs.checkRuns));
+    if (failingChecks.length > 0 && pull.baseRef) {
+      const base = await getGitHubRefCheckRuns({ dir, ref: pull.baseRef });
+      if (base.ok) failingChecks = markInherited(failingChecks, rollUpChecks(base.checkRuns).failing);
+    }
     const threads = await getGitHubPullReviewThreads({ dir, number: pull.number });
     if (threads.ok) unresolvedThreads = threads.threads.filter((t) => !t.isResolved && !t.isOutdated).length;
   }
@@ -94,6 +124,8 @@ async function probe(task: Task): Promise<TaskPrStatus | null> {
     url: pull.htmlUrl,
     state,
     draft: pull.draft,
+    baseRef: pull.baseRef,
+    headSha: pull.headSha,
     checks,
     failingChecks,
     unresolvedThreads,
@@ -128,6 +160,7 @@ export async function prWatchTick(): Promise<void> {
       if (!task.prUrl && next.url) tasks.update(task.id, { prUrl: next.url });
       if (next.state === "merged" && prev?.state !== "merged" && canMoveToDone(task)) moveMergedTaskToDone(task.id);
       if (!same(prev, next)) changed = true;
+      await maybeAutoFix(task, next);
     }
   } finally {
     inFlight = false;
@@ -156,6 +189,61 @@ export function resetPrWatchForTests(): void {
   inFlight = false;
 }
 
+/** Can a follow-up run on this card right now: a finished run, or a blocked
+ *  one with nothing still live. */
+export function followUpReady(task: Task, isLive: (taskId: string) => boolean = isTaskRunLive): boolean {
+  const run = task.pipelineRun;
+  if (!run || !run.snapshot) return false;
+  if (run.status === "done") return true;
+  return run.status === "blocked" && run.active.every((a) => !isLive(a.taskId));
+}
+
+type AutoFixLedger = Record<string, { count: number; lastSha: string | null }>;
+
+function readLedger(): AutoFixLedger {
+  try {
+    const v = JSON.parse(preferences.get(PR_AUTOFIX_ATTEMPTS_PREF) ?? "{}");
+    return v && typeof v === "object" ? (v as AutoFixLedger) : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Whether auto Fix CI should start for this PR now: on, the PR's own
+ *  checks fail, the card can take a follow-up, this commit wasn't already
+ *  tried, and the attempt cap isn't reached. Exported for tests. */
+export function shouldAutoFix(
+  task: Task,
+  pr: TaskPrStatus,
+  opts: { enabled: boolean; ledger: AutoFixLedger; isLive?: (taskId: string) => boolean },
+): boolean {
+  if (!opts.enabled || pr.state !== "open" || pr.checks !== "failure") return false;
+  if (ownFailures(pr).length === 0) return false;
+  if (!followUpReady(task, opts.isLive)) return false;
+  const entry = opts.ledger[`${task.id}#${pr.number}`];
+  if (entry && (entry.count >= PR_AUTOFIX_MAX_ATTEMPTS || (pr.headSha && entry.lastSha === pr.headSha))) return false;
+  return true;
+}
+
+async function maybeAutoFix(task: Task, pr: TaskPrStatus): Promise<void> {
+  const fresh = tasks.get(task.id);
+  if (!fresh) return;
+  const ledger = readLedger();
+  if (!shouldAutoFix(fresh, pr, { enabled: preferences.get(PR_AUTOFIX_PREF) === "true", ledger })) return;
+  const fix = prFollowUpInstructions(PR_FIX_CI_ACTION, pr);
+  const agent = prAgent();
+  if (!fix || !agent.id) return;
+  const key = `${task.id}#${pr.number}`;
+  const count = (ledger[key]?.count ?? 0) + 1;
+  ledger[key] = { count, lastSha: pr.headSha };
+  preferences.set(PR_AUTOFIX_ATTEMPTS_PREF, JSON.stringify(ledger));
+  await runPipelineFollowUp(task.id, {
+    profileId: agent.id,
+    name: `${fix.name} · auto ${count}/${PR_AUTOFIX_MAX_ATTEMPTS}`,
+    instructions: fix.instructions,
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Follow-ups built from a PR's state (offered in a finished pipeline's Next box)
 // ---------------------------------------------------------------------------
@@ -176,7 +264,8 @@ export function prFollowUpActions(pr: TaskPrStatus | null): FollowUpAction[] {
   if (!pr || pr.state !== "open") return [];
   const agent = prAgent();
   const out: FollowUpAction[] = [];
-  if (pr.checks === "failure") {
+  const own = ownFailures(pr);
+  if (pr.checks === "failure" && own.length > 0) {
     out.push({
       id: PR_FIX_CI_ACTION,
       label: `Fix CI (#${pr.number})`,
@@ -184,7 +273,7 @@ export function prFollowUpActions(pr: TaskPrStatus | null): FollowUpAction[] {
       agentId: agent.id,
       requiresRequest: false,
       suggested: true,
-      matched: pr.failingChecks.map((c) => c.name).slice(0, 3),
+      matched: own.map((c) => c.name).slice(0, 3),
     });
   }
   if (pr.unresolvedThreads > 0) {
@@ -208,12 +297,17 @@ export function prFollowUpInstructions(actionId: string, pr: TaskPrStatus | null
   const push =
     "Commit the fixes (conventional commits) and push them to this task's branch so the PR updates — " +
     "never force-push and never push to main or develop. Put the PR URL in the handoff artifacts.";
-  if (actionId === PR_FIX_CI_ACTION && pr.checks === "failure") {
-    const list = pr.failingChecks.map((c) => `- ${c.name}${c.url ? ` (${c.url})` : ""}`).join("\n");
+  const own = ownFailures(pr);
+  if (actionId === PR_FIX_CI_ACTION && pr.checks === "failure" && own.length > 0) {
+    const list = own.map((c) => `- ${c.name}${c.url ? ` (${c.url})` : ""}`).join("\n");
+    const inherited = pr.failingChecks.filter((c) => c.alsoOnBase).map((c) => c.name);
+    const inheritedNote = inherited.length
+      ? `\n\nThese also fail on ${pr.baseRef ?? "the base branch"} and are not this PR's to fix — leave them alone: ${inherited.join(", ")}.`
+      : "";
     return {
       name: `Fix CI (#${pr.number})`,
       instructions:
-        `CI is failing on pull request #${pr.number} (${pr.url}). Failing checks:\n${list}\n\n` +
+        `CI is failing on pull request #${pr.number} (${pr.url}). Failing checks this PR caused:\n${list}${inheritedNote}\n\n` +
         "Read the failing logs (`gh pr checks " + pr.number + "`, `gh run view <run-id> --log-failed`), find the root cause, " +
         "and fix it with the smallest correct change; reproduce locally with the matching verification commands from AGENTS.md. " +
         "If a failure is unrelated to this branch (flaky or infrastructure), say so with evidence instead of changing code. " +

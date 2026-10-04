@@ -17,10 +17,20 @@ export function prBadge(pr: TaskPrStatus): { text: string; tone: "success" | "da
   const threads = pr.unresolvedThreads > 0 ? ` · ${pr.unresolvedThreads} 💬` : "";
   const threadsTitle = pr.unresolvedThreads > 0 ? `; ${pr.unresolvedThreads} unresolved review thread(s)` : "";
   if (pr.checks === "failure") {
+    // Same rule as pr-watch.ts ownFailures: inherited and rollup checks aren't the PR's.
+    const own = pr.failingChecks.filter((c) => !c.alsoOnBase && c.name !== "required");
+    const baseName = pr.baseRef ?? "the base branch";
+    if (own.length === 0) {
+      return {
+        text: `${base} ✗ CI (also on ${pr.baseRef ?? "base"})${threads}`,
+        tone: "warning",
+        title: `CI failing, but the same checks fail on ${baseName}, so not this PR's doing: ${pr.failingChecks.map((c) => c.name).join(", ")}${threadsTitle}`,
+      };
+    }
     return {
       text: `${base} ✗ CI${threads}`,
       tone: "danger",
-      title: `CI failing: ${pr.failingChecks.map((c) => c.name).join(", ")}${threadsTitle}`,
+      title: `CI failing: ${own.map((c) => c.name).join(", ")}${threadsTitle}`,
     };
   }
   if (pr.checks === "pending") return { text: `${base} …${threads}`, tone: "warning", title: `Checks running${threadsTitle}` };
