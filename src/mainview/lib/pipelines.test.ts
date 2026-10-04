@@ -862,6 +862,11 @@ describe("runResultRecords", () => {
     expect(runResultRecords(run).map((r) => r.stepId)).toEqual(["b", "a"]);
   });
 
+  test("once a follow-up has run, it alone is the result", () => {
+    const run = makeRun({ status: "done", history: [rec(1, "a", []), rec(2, "b", []), rec(3, "followup-1", [])] });
+    expect(runResultRecords(run).map((r) => r.stepId)).toEqual(["followup-1"]);
+  });
+
   test("nothing until the run is done, and records without a handoff are skipped", () => {
     expect(runResultRecords(makeRun({ status: "running", history: [rec(1, "a", [])] }))).toEqual([]);
     expect(runResultRecords(makeRun({ status: "done", history: [rec(1, "a", [], { handoff: null })] }))).toEqual([]);

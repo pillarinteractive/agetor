@@ -967,6 +967,14 @@ export const EFFECTIVE_STEP_CAP_MAX = PIPELINE_LIMITS.maxStepsMax * (1 + PIPELIN
  * as the default / 0) — so the result is always a finite integer no larger
  * than {@link EFFECTIVE_STEP_CAP_MAX}.
  */
+/** Id prefix of a follow-up step — one the user added to a finished run
+ *  (`runPipelineFollowUp`) rather than one from the pipeline's graph. */
+export const FOLLOW_UP_STEP_PREFIX = "followup-";
+
+export function isFollowUpStepId(stepId: string): boolean {
+  return stepId.startsWith(FOLLOW_UP_STEP_PREFIX);
+}
+
 export function effectiveStepCap(run: PipelineRunState): number {
   const rawMax = run.snapshot?.maxSteps;
   const maxSteps = isFiniteNumber(rawMax)

@@ -4495,6 +4495,38 @@ export type GlobalEvent =
  * config lease_watchers '[{"project":"/path/to/repo","label":"lab",
  * "command":"lab/vm/plab lease --json"}]'`). See `src/bun/lease-watch.ts`.
  */
+/**
+ * A follow-up preset for finished pipelines ("Open PR", "Run VM tests", …),
+ * configured as a JSON array in the `pipeline_followups` preference. See
+ * `src/bun/pipeline-followups.ts`.
+ */
+export interface FollowUpPreset {
+  id: string;
+  label: string;
+  /** Agent (profile) name that runs it. */
+  agent: string;
+  /** Instructions for the follow-up step. */
+  prompt: string;
+  /** Path globs (`apps/agent/**`, `*.md`); when the branch changed a
+   *  matching file, the preset is highlighted as suggested. */
+  suggestWhen?: string[];
+  /** The user must type a request (e.g. the question for "Explain"). */
+  requiresRequest?: boolean;
+}
+
+/** A preset as offered for one finished pipeline task. */
+export interface FollowUpAction {
+  id: string;
+  label: string;
+  agentName: string;
+  /** Null when no agent by that name exists any more. */
+  agentId: string | null;
+  requiresRequest: boolean;
+  suggested: boolean;
+  /** Up to a few changed files that made it suggested. */
+  matched: string[];
+}
+
 export interface LeaseWatcherConfig {
   /** Project (repo) path the command runs in; also scopes the Blocked-card
    *  hint to that project's tasks. */

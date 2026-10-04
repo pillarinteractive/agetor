@@ -40,6 +40,7 @@ import {
   runResultRecords,
 } from "@/lib/pipelines";
 import { HandoffCard } from "./HandoffCard";
+import { FollowUpPanel } from "./FollowUpPanel";
 import { pipelineStepProgress, stepNameById } from "../../../shared/pipeline.ts";
 import type {
   Handoff,
@@ -943,6 +944,14 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
                 );
               })}
             </div>
+          )}
+
+          {run.status === "done" && (
+            <FollowUpPanel
+              taskId={taskId}
+              refreshKey={`${run.stepCount}:${run.endedAt ?? ""}`}
+              onStarted={() => void load()}
+            />
           )}
 
           <div className="mb-3">

@@ -55,7 +55,9 @@ import {
   composeStepPrompt,
   deriveRunStatus,
   effectiveStepCap,
+  FOLLOW_UP_STEP_PREFIX,
   incomingSteps,
+  isFollowUpStepId,
   normalizeHandoff,
   outgoingSteps,
   renderHandoffFile,
@@ -1435,6 +1437,82 @@ export async function retryPipelineStep(
     }
     const result = await performPipelineRetry(parent, run, opts?.taskId);
     if ("error" in result) return { error: result.error, status: 409 as const };
+    return { task: tasks.get(parentId)! };
+  });
+}
+
+/**
+ * Run a follow-up on a finished pipeline: one more step — "Open PR", "Run VM
+ * tests", "Explain …", or anything the user asks — in the same worktree, with
+ * every earlier handoff as context. The step is appended to the run's frozen
+ * graph (with no edges, so it ends the run again) and its agent to the
+ * snapshot's profiles; it then launches, settles and hands off exactly like a
+ * graph step, so the card goes Running → Review with the follow-up's handoff
+ * as the run's newest result. The run's step cap is raised just enough to fit
+ * it — the user asked for this step explicitly.
+ */
+export async function runPipelineFollowUp(
+  parentId: string,
+  input: { profileId: string; name: string; instructions: string },
+): Promise<{ task: Task } | { error: string; status: 400 | 404 | 409 }> {
+  return runExclusive(parentId, async () => {
+    const parent = tasks.get(parentId);
+    if (!parent || !parent.pipelineId) return { error: "not a pipeline task", status: 404 as const };
+    if (tombstonedPipelineParents.has(parentId)) return { error: "pipeline task no longer exists", status: 404 as const };
+    if (parent.archivedAt != null) {
+      return { error: "pipeline task is archived — unarchive it first", status: 409 as const };
+    }
+    const run = parent.pipelineRun;
+    if (!run || !run.snapshot) return { error: "pipeline has never run", status: 409 as const };
+    if (run.status !== "done") {
+      return { error: "follow-ups run once the pipeline has finished", status: 409 as const };
+    }
+    const name = input.name.trim();
+    const instructions = input.instructions.trim();
+    if (!name) return { error: "name required", status: 400 as const };
+    if (!instructions) return { error: "instructions required", status: 400 as const };
+
+    const profile = agentProfiles.get(input.profileId);
+    if (!profile) return { error: "agent not found", status: 400 as const };
+    const harness = harnesses.getByIdOrKind(profile.harness);
+    if (!harness) return { error: `harness for agent "${profile.name}" no longer exists`, status: 400 as const };
+
+    const graph = run.snapshot.graph;
+    const count = graph.steps.filter((s) => isFollowUpStepId(s.id)).length;
+    const right = graph.steps.reduce((x, s) => Math.max(x, s.position.x), 0);
+    const step: PipelineStep = {
+      id: `${FOLLOW_UP_STEP_PREFIX}${count + 1}`,
+      name,
+      instructions,
+      agentProfileId: profile.id,
+      position: { x: right + 300, y: count * 120 },
+      subagents: { profileIds: [], cap: null },
+      transition: "choose",
+      join: "any",
+    };
+    run.snapshot = {
+      ...run.snapshot,
+      graph: { ...graph, steps: [...graph.steps, step] },
+      profiles: {
+        ...run.snapshot.profiles,
+        [profile.id]: snapshotFromProfile(profile, { kind: harness.kind, label: harness.label }, Date.now()),
+      },
+    };
+    const ext = Math.max(0, Math.trunc(run.capExtensions ?? 0));
+    if (run.stepCount >= effectiveStepCap(run)) {
+      run.snapshot.maxSteps = Math.ceil((run.stepCount + 1) / (1 + ext));
+    }
+
+    const previous = run.history
+      .filter((r) => r.handoff != null)
+      .sort((a, b) => a.seq - b.seq)
+      .map((r) => ({ stepId: r.stepId, seq: r.seq, handoff: r.handoff }));
+    const launched = await launchTarget(parent, run, step, previous);
+    persist(parentId, run);
+    if (!launched.ok && run.active.every((a) => a.stepId !== step.id)) {
+      const block = run.blocked.find((b) => b.stepId === step.id);
+      return { error: block?.message ?? "follow-up could not start", status: 409 as const };
+    }
     return { task: tasks.get(parentId)! };
   });
 }

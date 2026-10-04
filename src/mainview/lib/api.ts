@@ -3,6 +3,7 @@ import type {
   AgentProfile,
   AgentStatus,
   AppEvent,
+  FollowUpAction,
   LeaseStatus,
   BranchInfo,
   BranchNamingConfig,
@@ -579,6 +580,17 @@ export const api = {
     j<Task>(`/tasks/${encodeURIComponent(taskId)}/pipeline/retry`, {
       method: "POST",
       body: JSON.stringify(body ?? {}),
+    }, { retry: false }),
+  /** Follow-up presets for a finished pipeline, with the ones its branch's
+   *  changes make worth running flagged `suggested`. */
+  getFollowUps: (taskId: string) =>
+    j<{ actions: FollowUpAction[]; changedFiles: number }>(`/tasks/${encodeURIComponent(taskId)}/pipeline/followups`),
+  /** Run a follow-up step on a finished pipeline: a preset (plus optional
+   *  extra request) or a custom request with a chosen agent. */
+  runFollowUp: (taskId: string, body: { presetId?: string; profileId?: string; request?: string }) =>
+    j<Task>(`/tasks/${encodeURIComponent(taskId)}/pipeline/followups`, {
+      method: "POST",
+      body: JSON.stringify(body),
     }, { retry: false }),
   /** Stop every active execution of a pipeline run and return the parent
    *  task to `ready` (state `cancelled`) — mirrors Stop on an ordinary
