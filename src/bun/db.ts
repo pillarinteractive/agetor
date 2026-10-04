@@ -607,8 +607,8 @@ const sanitizeStepRecord = (raw: unknown): PipelineStepRecord | null => {
  *  column, still deep-validated via `validatePipelineGraph` on every read —
  *  see that function's doc), a run snapshot's `graph` is validated at run
  *  start by `startPipelineRun` (which refuses to start the run at all on a
- *  bad graph) and captured exactly once at that point, and nothing ever
- *  mutates a `pipeline_run` column's snapshot after it's written —
+ *  bad graph) and captured exactly once at that point, and after that only
+ *  `runPipelineFollowUp` changes it, by appending an edge-less step —
  *  re-validating the whole graph on every read (every task poll, every
  *  pipeline route) only spends cycles re-checking something that can't have
  *  changed. Only shape-check enough to make it safe to hand to the
