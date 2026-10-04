@@ -175,3 +175,11 @@ test("the issue a card fixes: its issue link, else a Fixes/Closes/Resolves line 
   expect(issueNumberForTask({ issueUrl: null, prompt: "closes #7 please" })).toBe(7);
   expect(issueNumberForTask({ issueUrl: null, prompt: "See #12 for context" })).toBeNull();
 });
+
+test("a cancelled run is not a failure — it just isn't verified yet", async () => {
+  const { rollUpChecks } = await import("./pr-watch.ts");
+  const r = (name: string, status: string, conclusion: string | null) => ({ name, status, conclusion, htmlUrl: null });
+  expect(rollUpChecks([r("web", "completed", "cancelled"), r("lab", "completed", "success")]).checks).toBe("pending");
+  expect(rollUpChecks([r("web", "completed", "cancelled"), r("lab", "completed", "failure")]).checks).toBe("failure");
+  expect(rollUpChecks([r("web", "completed", "success")]).checks).toBe("success");
+});

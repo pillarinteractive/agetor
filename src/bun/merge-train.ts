@@ -182,7 +182,14 @@ export async function buildTrain(ready: { task: Task; pr: TaskPrStatus }[]): Pro
   const train: Train = { id, project, base, branch, pr: opened.item.number, url: opened.item.htmlUrl, members, createdAt: Date.now() };
   saveTrain(train);
   for (const m of members) {
-    recordActivity(m.taskId, { kind: "auto", text: `Joined merge train #${train.pr} with ${members.length - 1} other PR(s)`, tone: "info", url: train.url });
+    // Its own CI is now redundant — free the runners for the train's run.
+    const cancelled = await cancelBranchRuns(project, m.branch).catch(() => 0);
+    recordActivity(m.taskId, {
+      kind: "auto",
+      text: `Joined merge train #${train.pr} with ${members.length - 1} other PR(s)${cancelled ? ` — cancelled ${cancelled} pending CI run(s) of its own so the train goes first` : ""}`,
+      tone: "info",
+      url: train.url,
+    });
   }
   return train;
 }
@@ -240,6 +247,30 @@ export function skipsTrain(pr: TaskPrStatus): boolean {
   return trainSkip.has(`${pr.number}:${pr.headSha ?? ""}`);
 }
 
+/**
+ * Cancel queued and running CI on `branch`. A train's run checks its members'
+ * changes combined, so their own pending runs only hold runners the train is
+ * waiting for (runners serve the oldest run first); a replaced or disbanded
+ * train's run is just as dead. Best-effort; returns how many were cancelled.
+ */
+export async function cancelBranchRuns(dir: string, branch: string): Promise<number> {
+  let n = 0;
+  for (const status of ["queued", "in_progress", "waiting", "pending"]) {
+    const list = await run(
+      ["gh", "api", `repos/{owner}/{repo}/actions/runs?branch=${encodeURIComponent(branch)}&status=${status}&per_page=50`, "-q", ".workflow_runs[].id"],
+      dir,
+      20_000,
+      process.env,
+    );
+    if (!list.ok) continue;
+    for (const id of list.stdout.split("\n").filter(Boolean)) {
+      const r = await run(["gh", "api", "-X", "POST", `repos/{owner}/{repo}/actions/runs/${id}/cancel`], dir, 20_000, process.env);
+      if (r.ok) n++;
+    }
+  }
+  return n;
+}
+
 /** Has the train's CI actually started — any check run in progress or done?
  *  (Queued-only checks haven't used a runner yet.) */
 export async function trainCiStarted(t: Train): Promise<boolean> {
@@ -252,12 +283,14 @@ export async function trainCiStarted(t: Train): Promise<boolean> {
  *  members aren't marked to merge alone — they ride the replacement. */
 export async function replaceTrain(t: Train): Promise<void> {
   await closeGitHubPull({ dir: t.project, number: t.pr, comment: "Replaced by a larger merge train sent by hand — these PRs ride that one." });
+  await cancelBranchRuns(t.project, t.branch).catch(() => 0);
   await git(["push", "--quiet", "origin", "--delete", t.branch], t.project);
   clearTrain(t.id);
 }
 
 async function disband(t: Train, why: string, prs: Map<string, TaskPrStatus | null>): Promise<void> {
   await closeGitHubPull({ dir: t.project, number: t.pr, comment: `Disbanding this merge train: ${why}. Agetor merges these PRs one at a time instead.` });
+  await cancelBranchRuns(t.project, t.branch).catch(() => 0);
   await git(["push", "--quiet", "origin", "--delete", t.branch], t.project);
   for (const m of t.members) {
     const pr = prs.get(m.taskId);

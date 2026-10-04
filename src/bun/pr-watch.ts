@@ -81,11 +81,13 @@ export function rollUpChecks(runs: { name: string; status: string; conclusion: s
   failing: TaskPrStatus["failingChecks"];
 } {
   if (runs.length === 0) return { checks: "none", failing: [] };
+  // A cancelled run isn't a code failure — it was superseded (a newer push,
+  // or Agetor freeing runners for a merge train). It just isn't verified.
   const failing = runs
-    .filter((r) => ["failure", "timed_out", "cancelled", "action_required", "startup_failure"].includes(r.conclusion ?? ""))
+    .filter((r) => ["failure", "timed_out", "action_required", "startup_failure"].includes(r.conclusion ?? ""))
     .map((r) => ({ name: r.name, url: r.htmlUrl, alsoOnBase: false }));
   if (failing.length > 0) return { checks: "failure", failing };
-  if (runs.some((r) => r.status !== "completed")) return { checks: "pending", failing: [] };
+  if (runs.some((r) => r.status !== "completed" || r.conclusion === "cancelled")) return { checks: "pending", failing: [] };
   return { checks: "success", failing: [] };
 }
 
@@ -444,6 +446,10 @@ async function maybeAutoUpdateBranch(task: Task, pr: TaskPrStatus): Promise<void
 async function maybeAutoFix(task: Task, pr: TaskPrStatus): Promise<void> {
   const fresh = tasks.get(task.id);
   if (!fresh) return;
+  // Riding a merge train: the train's own CI is what counts, and a fix-up
+  // commit would only break the train.
+  const { activeTrain } = await import("./merge-train.ts");
+  if (activeTrain()?.members.some((m) => m.taskId === task.id)) return;
   const ledger = readLedger();
   if (!shouldAutoFix(fresh, pr, { enabled: autoFixEnabled(fresh, preferences.get(PR_AUTOFIX_PREF)), ledger })) return;
   const fix = prFollowUpInstructions(PR_FIX_CI_ACTION, pr);
