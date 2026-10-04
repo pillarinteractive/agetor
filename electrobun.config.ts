@@ -45,10 +45,6 @@ export default {
     exitOnLastWindowClosed: false,
   },
   build: {
-    // Run the packaged app on the same Bun the code is developed and tested
-    // on. Electrobun 1.18's bundled Bun (1.3.13) segfaulted on a worker
-    // thread under load (2026-10-04: three SIGTRAP crashes, no JS error).
-    bunVersion: "1.4.2",
     copy: {
       "dist/index.html": "views/mainview/index.html",
       "dist/assets": "views/mainview/assets",
