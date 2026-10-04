@@ -267,3 +267,14 @@ projects. `agetor config auto_issues false` turns it off; never runs under tests
   kept). The merge queue only opens a PR on a confirmed none, once per card.
 - A pipeline that finishes in In Review with commits beyond its base and no PR gets "Open PR" started automatically
   (once per run) — In Review always has a PR.
+
+## Models, effort and subagents (`feat/subagent-models`)
+
+Step subagents (`step.subagents`) now run on their persona's model: a Claude step's Delegation section tells it to
+pass the Agent tool's `model` (`claudeModelAlias`: sonnet/opus/haiku) — before, a Scout spawned from an Opus step ran
+on Opus. Codex steps get no personas (no subagent tool). Board config (2026-10-04): Scout sonnet/low (subagent on Plan
+×4, Survey ×4, Reproduce ×3, Fix ×2, Feature Review ×2, Security ×2); Architect opus/high (Plan, Survey, Explain);
+Investigator sonnet/high (Reproduce); Builder opus/high (Fix); Codex Builder gpt-6-sol/high (Build, VM); Claude
+Reviewer opus/medium; Codex Reviewer gpt-6-sol/medium; Security Reviewer opus/high; Editor sonnet/medium (Synthesize,
+File issues); Finisher gpt-6-luna/medium; Conductor sonnet. Verification is path-scoped (Pillar
+`.github/scripts/verify_changed.py --if-needed`, PR #229), CI runs the full suite.
