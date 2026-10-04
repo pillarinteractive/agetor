@@ -521,7 +521,9 @@ export function prFollowUpInstructions(actionId: string, pr: TaskPrStatus | null
       instructions:
         `CI is failing on pull request #${pr.number} (${pr.url}). Failing checks this PR caused:\n${list}${inheritedNote}\n\n` +
         "Read the failing logs (`gh pr checks " + pr.number + "`, `gh run view <run-id> --log-failed`), find the root cause, " +
-        "and fix it with the smallest correct change; reproduce locally with the matching verification commands from AGENTS.md. " +
+        "and fix it with the smallest correct change. Reproduce only the failing check locally (its command from the CI log or " +
+        "AGENTS.md), then run the project's scoped check (`python3 .github/scripts/verify_changed.py --if-needed` in Pillar) — " +
+        "not the whole suite; CI re-runs everything when you push. " +
         "If a failure is unrelated to this branch (flaky or infrastructure), say so with evidence instead of changing code. " +
         push,
     };
@@ -533,7 +535,8 @@ export function prFollowUpInstructions(actionId: string, pr: TaskPrStatus | null
         `Pull request #${pr.number} (${pr.url}) has ${pr.unresolvedThreads} unresolved review thread(s). ` +
         "Read them (`gh pr view " + pr.number + " --comments`, and `gh api repos/{owner}/{repo}/pulls/" + pr.number + "/comments` " +
         "for line comments). Address each: change the code where the reviewer is right, or reply on the thread explaining why " +
-        "not (`gh api` / `gh pr comment`). Don't resolve threads yourself — the reviewer does. Run the relevant verification. " +
+        "not (`gh api` / `gh pr comment`). Don't resolve threads yourself — the reviewer does. Verify only what you changed " +
+        "(`python3 .github/scripts/verify_changed.py --if-needed` in Pillar); CI runs the rest when you push. " +
         push +
         " In the handoff, list each thread and what you did about it.",
     };
