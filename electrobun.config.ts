@@ -1,5 +1,11 @@
 import type { ElectrobunConfig } from "electrobun";
 
+// `bun run build:local` (AGETOR_LOCAL_BUILD=1) packages the app for this Mac
+// only: no Developer ID signing or notarization, and the update feed points at
+// the fork's own releases so the app never offers to replace itself with
+// upstream's build.
+const localBuild = process.env.AGETOR_LOCAL_BUILD === "1";
+
 export default {
   app: {
     name: "Agetor",
@@ -19,7 +25,9 @@ export default {
     // Resources/version.json, and Updater.checkForUpdate() fetches
     // <baseUrl>/<channel>-macos-arm64-update.json from there. Filenames stay
     // identical across releases so the redirect resolves cleanly each time.
-    baseUrl: "https://github.com/alamops/agetor/releases/latest/download",
+    baseUrl: localBuild
+      ? "https://github.com/pillarinteractive/agetor/releases/latest/download"
+      : "https://github.com/alamops/agetor/releases/latest/download",
     // Delta patches carry forward old-hash → new-hash diffs; turning them on
     // means scripts/upload-release.ts must also reupload previous releases'
     // .patch files into the new release (GitHub's "latest" URL only serves
@@ -70,8 +78,8 @@ export default {
     mac: {
       bundleCEF: false,
       icons: "src/assets/agetor.iconset",
-      codesign: true,
-      notarize: true,
+      codesign: !localBuild,
+      notarize: !localBuild,
     },
     linux: { bundleCEF: false, icon: "src/assets/agetor-icon.png" },
     win: { bundleCEF: false, icon: "src/assets/agetor-icon.ico" },
