@@ -59,6 +59,15 @@ describe("leaseInfoForTask", () => {
     );
   });
 
+  test("a failing probe that never saw a holder doesn't claim the lease is free", () => {
+    const failing = makeLease({ error: "exited 1: usage" });
+    expect(leaseInfoForTask(makeTask({ column: "blocked" }), [failing]).waiting).toEqual([]);
+    const stale = makeLease({ error: "timeout", held: true, holderTaskId: "task-2", holderTitle: "E2E" });
+    expect(leaseInfoForTask(makeTask({ column: "blocked" }), [stale]).waiting).toEqual([
+      { label: "lab", heldBy: "E2E", free: false },
+    ]);
+  });
+
   test("no hint outside Blocked, for other projects, or on the holder itself", () => {
     const held = makeLease({ held: true, holderTaskId: "task-2" });
     expect(leaseInfoForTask(makeTask({ column: "review" }), [held]).waiting).toEqual([]);
