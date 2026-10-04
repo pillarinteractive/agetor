@@ -5217,4 +5217,6 @@ export interface TaskDependency {
   satisfied: boolean;
   /** "PR #201 · checks running", "running", "PR #201 merged", "done"… */
   detail: string;
+  /** Its short handle for tags: "#214", "PR #210", or its first words. */
+  ref?: string;
 }

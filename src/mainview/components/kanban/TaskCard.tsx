@@ -228,7 +228,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
                 title={`Blocks: ${task.blocking!.map((b) => b.title).join(", ")}`}
               >
                 <Link2 className="size-3" />
-                {title.issue ? `#${title.issue} · ` : ""}blocks {task.blocking!.length}
+                {shortCardName(task.title, { issueUrl: task.issueUrl, prNumber: pr?.number ?? null })} · blocks {task.blocking!.length}
               </span>
             )}
             {waitingTags.map((d) => (
@@ -239,7 +239,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
                 title={`Waiting on "${d.title}" — ${d.detail}`}
               >
                 <Link2 className="size-3" />
-                waits on {shortCardName(d.title)}
+                waits on {d.ref ?? shortCardName(d.title)}
               </span>
             ))}
           </div>

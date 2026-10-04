@@ -18,6 +18,7 @@ import { prStatusForTask } from "./pr-watch.ts";
 import { recordActivity } from "./activity.ts";
 import { sendInput, startTask } from "./orchestrator.ts";
 import { prBadge } from "../mainview/lib/prs.ts";
+import { shortCardName } from "../mainview/lib/card-names.ts";
 
 export const DEPENDENCIES_PREF = "card_dependencies";
 const TICK_MS = 15_000;
@@ -83,6 +84,10 @@ export function setDependencies(taskId: string, ids: string[]): { ok: true; deps
 /** One dependency's state, as the card shows it. */
 export function dependencyOf(dep: Task | null, depId: string, pr = dep ? prStatusForTask(dep.id) : null): TaskDependency {
   if (!dep) return { taskId: depId, title: "a deleted card", satisfied: true, detail: "deleted" };
+  return { ...dependencyState(dep, pr), ref: shortCardName(dep.title, { issueUrl: dep.issueUrl, prNumber: pr?.number ?? null }) };
+}
+
+function dependencyState(dep: Task, pr: ReturnType<typeof prStatusForTask>): TaskDependency {
   if (pr?.state === "merged") return { taskId: dep.id, title: dep.title, satisfied: true, detail: `PR #${pr.number} merged` };
   if (dep.archivedAt != null || dep.column === "done") return { taskId: dep.id, title: dep.title, satisfied: true, detail: "done" };
   const detail = pr ? prBadge(pr).text : dep.column;

@@ -128,7 +128,7 @@ export function cardStatus(
   // its live line (the chip still shows the dependency).
   const waitingOn = (task.blockedBy ?? []).filter((d) => !d.satisfied);
   if (waitingOn.length && task.column !== "running" && task.column !== "done") {
-    const names = waitingOn.map((d) => shortCardName(d.title)).join(", ");
+    const names = waitingOn.map((d) => d.ref ?? shortCardName(d.title)).join(", ");
     const detail = waitingOn.length === 1 ? ` · ${waitingOn[0]!.detail}` : "";
     return { line: `Waiting on ${names}${detail}`, tone: "warning", needsYou: null };
   }

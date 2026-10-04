@@ -126,7 +126,7 @@ test("a card blocked by another card says what it's waiting on — until it land
   const t = task({ column: "blocked", blockedBy: [dep] });
   expect(status(t)).toMatchObject({ line: "Waiting on #214 · PR #201 · checks running", tone: "warning", needsYou: null });
   const other = { ...dep, taskId: "e", title: "procexec TestRun_BoundsStdout times out on macOS" };
-  expect(status(task({ column: "blocked", blockedBy: [dep, other] })).line).toBe("Waiting on #214, procexec TestRun_Bounds…");
+  expect(status(task({ column: "blocked", blockedBy: [dep, other] })).line).toBe("Waiting on #214, procexec…");
   // Satisfied dependencies don't hold the card.
   expect(status(task({ column: "ready", blockedBy: [{ ...dep, satisfied: true }] })).line).not.toContain("Waiting on");
 });

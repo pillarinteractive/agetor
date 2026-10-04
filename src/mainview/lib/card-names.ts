@@ -10,11 +10,23 @@ export function splitCardTitle(title: string): { issue: string | null; text: str
   return m ? { issue: m[1]!, text: m[2]! || title } : { issue: null, text: title };
 }
 
-/** "#214" for an issue card, else its first few words. */
-export function shortCardName(title: string, max = 24): string {
+/** A card's short handle for tags: its issue number ("#214"), else its PR
+ *  ("PR #210"), else its first word or two ("Provision…"). The tag's color
+ *  does the linking; the text only has to be recognisable. */
+export function shortCardName(title: string, opts: { issueUrl?: string | null; prNumber?: number | null; max?: number } = {}): string {
   const t = splitCardTitle(title);
   if (t.issue) return `#${t.issue}`;
-  return t.text.length > max ? `${t.text.slice(0, max - 1).trimEnd()}…` : t.text;
+  const fromUrl = /\/issues\/(\d+)/.exec(opts.issueUrl ?? "");
+  if (fromUrl) return `#${fromUrl[1]}`;
+  if (opts.prNumber) return `PR #${opts.prNumber}`;
+  const max = opts.max ?? 14;
+  const words = t.text.split(/\s+/);
+  let out = words[0] ?? t.text;
+  for (const w of words.slice(1)) {
+    if (`${out} ${w}`.length > max) break;
+    out = `${out} ${w}`;
+  }
+  return out.length < t.text.length ? `${out.slice(0, max)}…` : out;
 }
 
 /** Tag classes, chosen per blocking card. Distinct hues, readable on the
