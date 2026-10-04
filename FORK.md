@@ -246,4 +246,5 @@ conflicts","Run VM tests","Run E2E"]}}`): a pipeline step over the limit queues 
 as running, the card says "Finish queued — starts when a slot frees up", the run view shows it in blue with no
 Retry — and `releaseSlotWaits` (every 10s) launches the longest-waiting first. A step counts from launch until it
 settles. Heavy steps match by name prefix. Plain tasks count toward `max` but are never held.
-The packaged app runs Bun 1.4.2 (`build.bunVersion`); Electrobun's bundled 1.3.13 segfaulted under load.
+Don't set `build.bunVersion`: Electrobun 1.18's native channel (window drag, etc.) breaks on Bun 1.4.2. The bundled
+Bun 1.3.13 has segfaulted under heavy load (3× on 2026-10-04); the real fix is an Electrobun 2.x upgrade.
