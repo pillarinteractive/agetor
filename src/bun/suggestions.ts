@@ -25,6 +25,7 @@ import { sendInput } from "./orchestrator.ts";
 import { retryPipelineStep } from "./pipeline-runner.ts";
 import { updateGitHubPullBranch } from "./github.ts";
 import { recordActivity } from "./activity.ts";
+import { blockedByFor, readDependencies } from "./dependencies.ts";
 
 export type SuggestionApply =
   | { kind: "message"; stepTaskId: string; text: string }
@@ -113,9 +114,13 @@ export function listSuggestions(): Suggestion[] {
   const leases = listLeases();
   const openPr = hasOpenPrPreset();
   const autoUpdatesBranches = preferences.get(PR_AUTOUPDATE_PREF) !== "false";
+  const deps = readDependencies();
   return tasks
     .list()
     .filter((t) => t.archivedAt == null && !t.pipelineParentId)
+    // A card waiting on another card moves on by itself when that lands —
+    // nothing to suggest meanwhile (src/bun/dependencies.ts).
+    .filter((t) => !(blockedByFor(t.id, deps) ?? []).some((d) => !d.satisfied))
     .flatMap((t) => {
       const s = suggestFor(t, { pr: prStatusForTask(t.id), leases, hasOpenPrPreset: openPr, autoUpdatesBranches });
       return s ? [s] : [];

@@ -103,7 +103,10 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
   // call-to-action "Review" instead of "Answer" to avoid promising a Q&A flow
   // the panel can't deliver.
   const pendingCount = task.pendingInteractionCount;
-  const blocked = task.column === "blocked";
+  // A card waiting on another card (src/bun/dependencies.ts) moves on by
+  // itself when that lands — it isn't waiting on the user.
+  const waitingOnCards = (task.blockedBy ?? []).some((d) => !d.satisfied);
+  const blocked = task.column === "blocked" && !waitingOnCards;
   const awaiting = pendingCount > 0 || blocked;
   const awaitingLabel =
     pendingCount > 1 ? `Answer (${pendingCount})`
