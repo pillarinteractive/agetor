@@ -49,6 +49,7 @@ import {
 } from "./agents.ts";
 import type { UpdaterSnapshot } from "./updater.ts";
 import { listLeases } from "./lease-watch.ts";
+import { listFollowUps, startFollowUp } from "./pipeline-followups.ts";
 import {
   bundledTmuxAvailable,
   bundledTmuxPath,
@@ -4802,6 +4803,27 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           }
 
           const result = await retryPipelineStep(req.params.id, { taskId });
+          return "error" in result
+            ? json({ error: result.error }, { status: result.status, headers: corsHeaders(req) })
+            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Follow-ups on a finished pipeline (src/bun/pipeline-followups.ts):
+      // GET lists the configured presets, flagging the ones the branch's
+      // changed files make worth running; POST runs one (or a custom request).
+      "/tasks/:id/pipeline/followups": {
+        GET: authed(async (req) => {
+          const t = tasks.get(req.params.id);
+          if (!t || !t.pipelineId) {
+            return json({ error: "not a pipeline task" }, { status: 404, headers: corsHeaders(req) });
+          }
+          return json(await listFollowUps(t), { headers: corsHeaders(req) });
+        }),
+        POST: authed(async (req) => {
+          const raw = await req.json().catch(() => ({}));
+          const body = raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+          const result = await startFollowUp(req.params.id, body);
           return "error" in result
             ? json({ error: result.error }, { status: result.status, headers: corsHeaders(req) })
             : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });

@@ -22,6 +22,7 @@ import type {
   Subagent,
   Task,
 } from "../../shared/types.ts";
+import { isFollowUpStepId } from "../../shared/pipeline.ts";
 
 // ---------------------------------------------------------------------------
 // usePipelines — module-cached list, modelled on useAgentProfiles.
@@ -818,13 +819,15 @@ export function stepReminded(run: PipelineRunState | null | undefined, stepId: s
  * handed off with nothing after them (the terminal step, or every branch end
  * of a fan-out), newest first. What the run view shows as the "Result", so
  * the user doesn't have to know which step to open. Empty unless the run is
- * `done`.
+ * `done`. Once a follow-up has run, the newest follow-up IS the result — the
+ * earlier outcomes stay in History.
  */
 export function runResultRecords(run: PipelineRunState | null | undefined): PipelineStepRecord[] {
   if (!run || run.status !== "done") return [];
-  return run.history
+  const ends = run.history
     .filter((r) => r.handoff != null && r.endedAt != null && r.nextStepIds.length === 0)
     .sort((a, b) => b.seq - a.seq);
+  return ends[0] && isFollowUpStepId(ends[0].stepId) ? [ends[0]] : ends;
 }
 
 /** The latest record for one step execution's task, e.g. to show the handoff

@@ -2919,3 +2919,60 @@ test("M-R7: a delete cascade that throws un-tombstones the parent, which stays r
   expect(tombstonedPipelineParents.has(parentId)).toBe(true);
   expect(tasks.list().some((t) => t.pipelineParentId === parentId)).toBe(false);
 });
+
+test("follow-up: a finished run takes one more step in the same run, with earlier handoffs as context, and ends done again", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, pipelines } = await import("./db.ts");
+  const { newStep, isFollowUpStepId } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+  const { runPipelineFollowUp } = await import("./pipeline-runner.ts");
+
+  const profile = await makeProfile("followup");
+  const A = newStep({ name: "A", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const graph = { steps: [A], edges: [], startStepId: A.id };
+  // maxSteps 1: the follow-up must raise the cap rather than block on it.
+  const pipeline = pipelines.insert({ name: uniqueName("followup-pipeline"), graph, maxSteps: 1 });
+
+  const created = await createTask({ title: "follow-up run", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
+  if ("error" in created) throw new Error(created.error);
+  const parentId = created.task.id;
+  liveParentIds.push(parentId);
+
+  // Not finished yet → refused.
+  const early = await runPipelineFollowUp(parentId, { profileId: profile.id, name: "Too soon", instructions: "x" });
+  expect("error" in early && early.status).toBe(409);
+
+  const started = await startTask(parentId);
+  if ("error" in started) throw new Error(started.error);
+  await waitFor(() => (tasks.get(parentId)?.pipelineRun?.status === "done" ? true : undefined));
+
+  const badAgent = await runPipelineFollowUp(parentId, { profileId: "nope", name: "X", instructions: "x" });
+  expect("error" in badAgent && badAgent.status).toBe(400);
+
+  const followUp = await runPipelineFollowUp(parentId, {
+    profileId: profile.id,
+    name: "Open PR",
+    instructions: `Open the PR. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done`,
+  });
+  if ("error" in followUp) throw new Error(followUp.error);
+
+  const finished = await waitFor(() => {
+    const t = tasks.get(parentId);
+    return t?.pipelineRun?.status === "done" && t.pipelineRun.history.length === 2 ? t : undefined;
+  });
+  const run = finished.pipelineRun!;
+  expect(finished.column).toBe("review");
+  const step = run.snapshot!.graph.steps.find((s) => isFollowUpStepId(s.id))!;
+  expect(step.name).toBe("Open PR");
+  expect(run.snapshot!.graph.edges).toEqual([]);
+  const record = run.history[1]!;
+  expect(record.stepId).toBe(step.id);
+  expect(record.outcome).toBe("succeeded");
+  expect(record.nextStepIds).toEqual([]);
+  // The follow-up's step task saw the goal, A's handoff and its own instructions.
+  const stepTask = tasks.get(record.taskId)!;
+  expect(stepTask.prompt).toContain("goal");
+  expect(stepTask.prompt).toContain('From "A"');
+  expect(stepTask.prompt).toContain("Open the PR.");
+  await waitUntilIdle(parentId);
+});
