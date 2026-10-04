@@ -44,3 +44,8 @@ test("the carry-on message names what landed and says merge, not rebase", () => 
   expect(m).toContain("git merge --no-edit origin/<base>");
   expect(m).toContain("no rebase");
 });
+
+test("an unblocked card that hasn't started isn't held here — its launch takes the slot", async () => {
+  const { unblockGate } = await import("./dependencies.ts");
+  expect(unblockGate(task({ column: "ready", runId: null }))).toEqual({ ok: true });
+});

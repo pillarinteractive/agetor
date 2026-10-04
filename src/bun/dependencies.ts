@@ -16,7 +16,8 @@ import type { Task, TaskDependency } from "../shared/types.ts";
 import { preferences, runs, tasks } from "./db.ts";
 import { prStatusForTask } from "./pr-watch.ts";
 import { recordActivity } from "./activity.ts";
-import { sendInput, startTask } from "./orchestrator.ts";
+import { isTaskRunLive, sendInput, startTask } from "./orchestrator.ts";
+import { currentSlots, slotDecision, slotUse } from "./step-slots.ts";
 import { prBadge } from "../mainview/lib/prs.ts";
 import { shortCardName } from "../mainview/lib/card-names.ts";
 
@@ -170,18 +171,48 @@ export async function dependencyTick(): Promise<string[]> {
     }
     const deps = ids.map((id) => dependencyOf(tasks.get(id), id));
     if (!deps.every((d) => d.satisfied)) continue;
+    // Resuming a step is starting work: it waits for a free slot like any
+    // launch (src/bun/step-slots.ts). Cards stay queued here, oldest entry
+    // first, and the next pass tries again.
+    const gate = unblockGate(task);
+    if (!gate.ok) {
+      noteOnce(taskId, `Unblocked — waiting for a free slot to carry on (${gate.why})`);
+      continue;
+    }
     delete map[taskId];
     writeDependencies(map);
+    const landed = deps.map((d) => `"${d.title}" ${d.detail}`).join(", ");
+    recordActivity(taskId, { kind: "task", text: `Unblocked — ${landed}`, tone: "success" });
     const what = await act(task, deps).catch((e: Error) => `failed: ${e.message}`);
-    recordActivity(taskId, {
-      kind: "task",
-      text: `Unblocked — ${deps.map((d) => `"${d.title}" ${d.detail}`).join(", ")}; ${what}`,
-      tone: "success",
-    });
+    recordActivity(taskId, { kind: "task", text: `After unblocking: ${what}`, tone: "muted" });
     acted.push(taskId);
   }
   if (changed) writeDependencies(map);
   return acted;
+}
+
+const noted = new Map<string, string>();
+function noteOnce(taskId: string, text: string): void {
+  if (noted.get(taskId) === text) return;
+  noted.set(taskId, text);
+  recordActivity(taskId, { kind: "task", text, tone: "muted" });
+}
+
+/** Whether an unblocked card may carry on now: resuming a step needs a free
+ *  slot for that step (a heavy one needs the verification slot); a plain
+ *  task needs any free slot; a fresh start is gated by the launch itself. */
+export function unblockGate(task: Task): { ok: true } | { ok: false; why: string } {
+  const action = unblockAction(task);
+  if (action !== "message-step" && action !== "message-task") return { ok: true };
+  const slots = currentSlots();
+  const use = slotUse(isTaskRunLive, slots);
+  let name = "";
+  if (action === "message-step") {
+    const run = task.pipelineRun!;
+    const block = run.blocked.find((b) => b.taskId);
+    name = run.snapshot?.graph.steps.find((s) => s.id === block?.stepId)?.name ?? "";
+  }
+  return slotDecision(name, use, slots);
 }
 
 let loop: ReturnType<typeof setInterval> | null = null;
