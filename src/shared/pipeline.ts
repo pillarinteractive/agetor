@@ -769,6 +769,25 @@ export function parseHandoff(text: string): { ok: true; handoff: Handoff } | { o
 }
 
 /**
+ * Split an agent message around its handoff for display: the prose before
+ * the last `<handoff>` block, the parsed handoff, and anything after the
+ * closing tag. `null` when the message has no handoff that {@link
+ * parseHandoff} accepts, so callers fall back to showing the raw text — an
+ * invalid handoff stays visible as-is rather than disappearing.
+ */
+export function splitHandoffMessage(text: string): { before: string; handoff: Handoff; after: string } | null {
+  const parsed = parseHandoff(text);
+  if (!parsed.ok) return null;
+  const lower = text.toLowerCase();
+  const start = lower.lastIndexOf(HANDOFF_OPEN_PREFIX);
+  if (start === -1) return null;
+  const close = `</${HANDOFF_TAG}>`;
+  const closeAt = lower.indexOf(close, start);
+  const end = closeAt === -1 ? text.length : closeAt + close.length;
+  return { before: text.slice(0, start).trimEnd(), handoff: parsed.handoff, after: text.slice(end).trim() };
+}
+
+/**
  * Classify a step execution's final response into a {@link StepResponseKind}
  * — the single decision point the runner uses to choose between advancing,
  * sending the one automatic {@link composeHandoffReminder} follow-up, or
@@ -977,6 +996,8 @@ function renderHandoffContract(outgoing: { name: string; label: string }[], tran
       '"summary":"…what you did / found…","reason":"…why you are handing off now and what the next step ' +
       'should do…","next":<see below>,"artifacts":["paths or URLs"],"openQuestions":["…"],' +
       '"status":"done"|"blocked"}',
+    'Write "summary" and "reason" as short Markdown — one point per line or bullet (use \\n line breaks inside the ' +
+      "JSON string), not one long paragraph; the run view renders them for the user.",
     nextRuleText(outgoing, transition),
     `Do not put anything after the closing </${HANDOFF_TAG}> tag.`,
   ];

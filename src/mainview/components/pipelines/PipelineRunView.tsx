@@ -36,7 +36,10 @@ import {
   type SubagentFlowEdge,
   type SubagentFlowNode,
   type SubagentSatellite,
+  latestRecordForTask,
+  runResultRecords,
 } from "@/lib/pipelines";
+import { HandoffCard } from "./HandoffCard";
 import { pipelineStepProgress, stepNameById } from "../../../shared/pipeline.ts";
 import type {
   Handoff,
@@ -438,6 +441,9 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
 
   const effectiveGraph = run?.snapshot?.graph ?? pipelineGraph;
   const progress = run ? pipelineStepProgress(run) : null;
+  // A finished run's outcome, shown first so the user doesn't have to know
+  // which step to open.
+  const resultRecords = runResultRecords(run);
 
   // Latest refs for values the effects below read but must NOT depend on
   // directly (their object identity churns every poll/render even when
@@ -909,6 +915,36 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
         </div>
 
         <div className="w-96 shrink-0 overflow-y-auto border-l border-border bg-card p-3">
+          {resultRecords.length > 0 && (
+            <div data-testid="pipeline-run-result" className="mb-3 flex flex-col gap-2">
+              <p className="text-xs font-medium text-muted-foreground">Result</p>
+              {resultRecords.map((record) => {
+                const stepName = effectiveGraph ? stepNameById(effectiveGraph, record.stepId) : record.stepId;
+                const stepTask = steps.find((t) => t.id === record.taskId) ?? null;
+                return (
+                  <div key={record.seq} className="flex flex-col gap-1.5">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="min-w-0 truncate text-xs font-medium">{stepName}</span>
+                      {stepTask && (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          data-testid="pipeline-run-open-step"
+                          onClick={() => onOpenTask(stepTask)}
+                          className="h-6 shrink-0 px-2 text-[11px]"
+                        >
+                          Open step
+                        </Button>
+                      )}
+                    </div>
+                    <HandoffCard handoff={record.handoff!} />
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
           <div className="mb-3">
             <button
               type="button"
@@ -932,6 +968,10 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
                 {run.blocked.map((entry, index) => {
                   const stepName = entry.stepId && effectiveGraph ? stepNameById(effectiveGraph, entry.stepId) : entry.stepId;
                   const stepTask = entry.taskId ? (steps.find((t) => t.id === entry.taskId) ?? null) : null;
+                  // A step that handed off as blocked explains itself in its
+                  // handoff — show that formatted instead of the one-line
+                  // message the runner flattened it into.
+                  const blockHandoff = entry.kind === "step-blocked" ? latestRecordForTask(run, entry.taskId)?.handoff ?? null : null;
                   return (
                     <motion.div
                       // Index-prefixed: two run-level blocks of the same
@@ -947,7 +987,11 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
                         {stepName ? `${stepName} — ` : ""}
                         {entry.kind}
                       </p>
-                      <p className="mt-0.5 text-xs text-muted-foreground">{entry.message}</p>
+                      {blockHandoff ? (
+                        <HandoffCard handoff={blockHandoff} className="mt-1.5" />
+                      ) : (
+                        <p className="mt-0.5 text-xs text-muted-foreground">{entry.message}</p>
+                      )}
                       <div className="mt-2 flex flex-wrap items-center gap-2">
                         {stepTask && (
                           <Button
@@ -1155,12 +1199,9 @@ function HistoryRow({ record, graph }: { record: PipelineStepRecord; graph: Pipe
         </div>
       )}
       {open && record.handoff && (
-        <pre
-          data-testid="pipeline-run-history-handoff"
-          className="mt-2 max-h-48 overflow-auto rounded bg-muted p-2 text-[10px]"
-        >
-          {JSON.stringify(record.handoff, null, 2)}
-        </pre>
+        <div data-testid="pipeline-run-history-handoff" className="mt-2">
+          <HandoffCard handoff={record.handoff} />
+        </div>
       )}
     </li>
   );

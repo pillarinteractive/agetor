@@ -4,10 +4,12 @@ import {
   blockedSummary,
   edgeVisualState,
   graphFromFlow,
+  latestRecordForTask,
   latestTransition,
   matchSubagentToProfile,
   reconcileFlowItems,
   responseKindLabel,
+  runResultRecords,
   satellitesSignature,
   stepLayoutFootprint,
   stepReminded,
@@ -836,5 +838,39 @@ describe("reconcileFlowItems", () => {
       subagentSatellites(step, [makeSubagent({ description: "Helper One", status: "running" })], nameOf),
     );
     expect(subagentEdgeKey(e1!)).not.toBe(subagentEdgeKey(e2!));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// runResultRecords / latestRecordForTask
+
+describe("runResultRecords", () => {
+  const handoff = {
+    schemaVersion: 1 as const, purpose: "p", summary: "s", reason: "r", next: null, artifacts: [], openQuestions: [],
+  };
+  const rec = (seq: number, stepId: string, nextStepIds: string[], extra: Partial<PipelineStepRecord> = {}): PipelineStepRecord => ({
+    seq, stepId, taskId: `task-${stepId}`, startedAt: seq, endedAt: seq + 1, outcome: "succeeded", handoff, nextStepIds, ...extra,
+  });
+
+  test("a finished run's result is the step that handed off with nothing next", () => {
+    const run = makeRun({ status: "done", history: [rec(1, "repro", ["report"]), rec(2, "report", [])] });
+    expect(runResultRecords(run).map((r) => r.stepId)).toEqual(["report"]);
+  });
+
+  test("every branch end of a fan-out counts, newest first", () => {
+    const run = makeRun({ status: "done", history: [rec(1, "scope", ["a", "b"]), rec(2, "a", []), rec(3, "b", [])] });
+    expect(runResultRecords(run).map((r) => r.stepId)).toEqual(["b", "a"]);
+  });
+
+  test("nothing until the run is done, and records without a handoff are skipped", () => {
+    expect(runResultRecords(makeRun({ status: "running", history: [rec(1, "a", [])] }))).toEqual([]);
+    expect(runResultRecords(makeRun({ status: "done", history: [rec(1, "a", [], { handoff: null })] }))).toEqual([]);
+    expect(runResultRecords(null)).toEqual([]);
+  });
+
+  test("latestRecordForTask picks the newest execution of that task", () => {
+    const run = makeRun({ history: [rec(1, "build", []), rec(3, "build", []), rec(2, "review", [])] });
+    expect(latestRecordForTask(run, "task-build")?.seq).toBe(3);
+    expect(latestRecordForTask(run, null)).toBeNull();
   });
 });
