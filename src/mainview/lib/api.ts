@@ -3,6 +3,7 @@ import type {
   AgentProfile,
   AgentStatus,
   AppEvent,
+  LeaseStatus,
   BranchInfo,
   BranchNamingConfig,
   ColumnId,
@@ -468,6 +469,8 @@ export const api = {
       .then(() => undefined)
       .catch((e) => { console.warn("[agetor] focusWindow failed", e); }),
   getUpdateStatus: () => j<UpdateSnapshot>("/updates/status"),
+  /** Every lease watcher's latest status (src/bun/lease-watch.ts). */
+  getLeases: () => j<LeaseStatus[]>("/leases"),
   checkForUpdate: () => j<UpdateSnapshot>("/updates/check", { method: "POST" }),
   applyUpdate: () => j<{ ok: true }>("/updates/apply", { method: "POST" }),
   listAgents: () => j<AgentStatus[]>("/agents"),

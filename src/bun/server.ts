@@ -48,6 +48,7 @@ import {
   toTerminalAppleScript,
 } from "./agents.ts";
 import type { UpdaterSnapshot } from "./updater.ts";
+import { listLeases } from "./lease-watch.ts";
 import {
   bundledTmuxAvailable,
   bundledTmuxPath,
@@ -3259,6 +3260,12 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           if (!removed) return json({ error: "token not found" }, { status: 404, headers: corsHeaders(req) });
           return json({ ok: true }, { headers: corsHeaders(req) });
         }),
+      },
+
+      // Latest status of every `lease_watchers` watcher (src/bun/lease-watch.ts);
+      // the board loads this once, then follows `leases` global events.
+      "/leases": {
+        GET: authed((req) => json(listLeases(), { headers: corsHeaders(req) })),
       },
 
       // Cross-session UI preferences. Currently used by NewTaskForm to

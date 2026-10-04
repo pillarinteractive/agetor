@@ -1,7 +1,7 @@
 import { memo } from "react";
 import { useDraggable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, FolderOpen, GitBranch, GitCompare, ListTodo, MessageCircleQuestion, Paperclip, PauseCircle, Play, Square, Terminal, Trash2 } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, FolderOpen, GitBranch, GitCompare, ListTodo, Lock, LockOpen, MessageCircleQuestion, Paperclip, PauseCircle, Play, Square, Terminal, Trash2 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -13,6 +13,7 @@ import { sentFileBasename } from "../../../shared/sent-files.ts";
 import { isTaskFxPaused } from "../../../shared/fx-recovery.ts";
 import { AgentIcon } from "./AgentIcon";
 import { PipelineBadge } from "@/components/pipelines";
+import { useTaskLeaseInfo } from "@/lib/leases";
 
 interface Props {
   task: Task;
@@ -46,6 +47,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
   // — this card never inspects `task.agent` to decide whether to show it.
   const fxAutoResumeAt = task.fxRecovery?.autoResume?.at ?? null;
   const fxAutoResumeCountdown = useCountdown(fxAutoResumeAt);
+  const lease = useTaskLeaseInfo(task);
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: task.id,
     // Archived cards are immutable until unarchived — block drag-to-column so
@@ -233,6 +235,19 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
                 {fxPausedBadgeText(task.fxRecovery, fxAutoResumeCountdown)}
               </Badge>
             )}
+            {/* This card's worktree holds a watched lease (src/bun/lease-watch.ts). */}
+            {lease.holds.map((label) => (
+              <Badge
+                key={label}
+                variant="outline"
+                className="gap-1 text-[10px] shrink-0 text-info border-info/40"
+                data-testid="lease-badge"
+                title={`Holds the ${label} lease`}
+              >
+                <Lock className="size-3" />
+                {label}
+              </Badge>
+            ))}
           </div>
           {/* A pipeline task's badge is the pipeline name + step progress
            *  (D5/D9, docs/plans/pipelines.md) — the profile is per-step, not
@@ -270,6 +285,19 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
         <CardTitle className="text-sm break-words">{task.title}</CardTitle>
       </CardHeader>
       <CardContent className="space-y-2">
+        {/* Blocked, and its project has a watched lease: say whether it's
+         *  free yet, so the user knows when a retry (drag to Running) can
+         *  get through. */}
+        {lease.waiting.map((w) => (
+          <p
+            key={w.label}
+            className={cn("flex items-center gap-1 text-[10px]", w.free ? "text-success" : "text-warning")}
+            data-testid="lease-wait-hint"
+          >
+            {w.free ? <LockOpen className="size-3 shrink-0" /> : <Lock className="size-3 shrink-0" />}
+            <span className="truncate">{w.free ? `${w.label} free — retry` : `${w.label} held by ${w.heldBy}`}</span>
+          </p>
+        ))}
         <p className="text-xs text-muted-foreground line-clamp-2">{task.prompt}</p>
         <p
           className="text-[10px] text-muted-foreground/70 font-mono truncate"
