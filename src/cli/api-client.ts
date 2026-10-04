@@ -129,6 +129,13 @@ export class AgetorClient {
     return parsed as T;
   }
 
+  /** Any route, for commands too small to deserve a typed method (the board
+   *  digest, suggestions, activity, follow-ups). A non-JSON body comes back as
+   *  its text. */
+  call<T>(method: string, path: string, body?: unknown): Promise<T> {
+    return this.req(method, path, body);
+  }
+
   // ── tasks ────────────────────────────────────────────────────────────────
   listTasks(): Promise<Task[]> {
     return this.req("GET", "/tasks");

@@ -25,6 +25,7 @@ import { cmdCommit } from "./commands/commit.ts";
 import { cmdConfig } from "./commands/config.ts";
 import { cmdShell } from "./commands/shell.ts";
 import { cmdCommands } from "./commands/discovery.ts";
+import { cmdBoard, cmdSuggestions, cmdActivity, cmdFollowUps, cmdFollowUp } from "./commands/board.ts";
 import { helpFor } from "./usage.ts";
 
 const HELP = `agetor — drive Agetor from the terminal
@@ -62,6 +63,11 @@ Commands:
   clone <url>         clone a repository as a new project (--provider, --dest, --no-eli5)
   projects <sub>      list | add | rm | branches (project folders)
   config [k] [v]      view / set core preferences (defaultHarness, last model…)
+  board               the whole board: status, PRs, leases, live runs, suggestions
+  suggestions [apply <id> <sid>]  list / apply rule-based fixes
+  activity <id>       a card's timeline
+  followups <id>      follow-ups a finished pipeline offers
+  followup <id> <action> [--request <text>]  start a follow-up
   help                show this help
 
 Global options:
@@ -202,6 +208,16 @@ async function main(): Promise<void> {
       return cmdClone(args, flags);
     case "config":
       return cmdConfig(args, flags);
+    case "board":
+      return cmdBoard(args, flags);
+    case "suggestions":
+      return cmdSuggestions(args, flags);
+    case "activity":
+      return cmdActivity(args, flags);
+    case "followups":
+      return cmdFollowUps(args, flags);
+    case "followup":
+      return cmdFollowUp(args, flags);
     case "info": {
       const client = await getClient(flags);
       const meta = await client.info();

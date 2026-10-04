@@ -5,6 +5,9 @@
 #
 #   bun run build:local && bun run install:local
 #
+# It also compiles the `agetor` CLI into ~/.agetor/bin/agetor for the
+# Conductor agent.
+#
 # Before swapping it backs up ~/.agetor/agetor.sqlite and moves the current
 # app into ~/.agetor/backups/, so rolling back is: quit Agetor, move the
 # previous app back into /Applications, and (only if a migration ran) restore
@@ -27,6 +30,14 @@ tar -xf "$ARCHIVE" -C "$STAGE"
 # Electrobun skips signing for local builds; give the bundle a consistent
 # ad-hoc signature so macOS treats it as one app.
 codesign --force --deep --sign - "$STAGE/Agetor.app"
+
+# The `agetor` CLI the Conductor agent drives (src/bun/conductor.ts), built
+# from the same commit as the app so their routes match. Built before the
+# swap so a compile error leaves the running app alone.
+mkdir -p "$DATA_DIR/bin"
+bun build "$ROOT/src/cli/index.ts" --compile --outfile "$STAGE/agetor" >/dev/null
+mv -f "$STAGE/agetor" "$DATA_DIR/bin/agetor"
+echo "installed CLI → $DATA_DIR/bin/agetor"
 
 mkdir -p "$BACKUPS"
 if [ -f "$DATA_DIR/agetor.sqlite" ]; then

@@ -17,6 +17,7 @@ import { startLeaseWatchLoop } from "./lease-watch.ts";
 import { startKeepAwakeLoop } from "./keep-awake.ts";
 import { startPrWatchLoop } from "./pr-watch.ts";
 import { startProgressWatchLoop } from "./progress-watch.ts";
+import { startConductorLoop } from "./conductor.ts";
 import { getMainWindow, setMainWindow } from "./window.ts";
 import { makeWindowLifecycle, type Frame } from "./window-lifecycle.ts";
 import { focusWindow } from "./window-focus.ts";
@@ -509,6 +510,10 @@ startPrWatchLoop();
 // Live progress of lab/E2E runs on running cards (src/bun/progress-watch.ts).
 // A no-op until `progress_watchers` is configured.
 startProgressWatchLoop();
+
+// The Conductor (src/bun/conductor.ts): automatic board updates to the chat
+// agent while it's idle. A no-op until the user starts a Conductor.
+startConductorLoop();
 
 /** Lifecycle wrapper around BrowserWindow construction. Handles:
  *   - idempotency (concurrent reopen events share one in-flight build),

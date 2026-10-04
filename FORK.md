@@ -150,3 +150,20 @@ seconds. The command prints one `progress/v1` object (`active`, `phase`, `phases
 gets a **Live** panel with a phase stepper, counts, the test running now, failures and evidence paths. Phase starts
 and the final result go on the activity timeline. A checkout whose command fails (for example a branch older than
 the tool) is backed off for 2 minutes. Pillar: `lab/vm/plab progress --json` (Pillar PR #194), label `lab`.
+
+## The Conductor, layer 2 (`feat/conductor`)
+
+A chat agent for the whole board: the ✨ button in the top bar starts it the first time (then opens its chat). It's an
+ordinary task (isolation none, workdir `~/.agetor/conductor` holding its CLAUDE.md/AGENTS.md, id in the
+`conductor_task_id` preference) hidden from the columns. It reads the board through the CLI — new commands
+`agetor board`, `suggestions [apply]`, `activity`, `followups`, `followup` (`src/cli/commands/board.ts`, backed by
+`GET /board/digest` in `src/bun/board-digest.ts`) — and acts only when asked. `install:local` compiles the CLI to
+`~/.agetor/bin/agetor`; the instructions pin it with `--data-dir … --no-daemon`.
+- **Watching** (`src/bun/conductor.ts`): every 30s it snapshots each card's column, needs-you reason, pipeline status,
+  PR summary, finished lab/E2E result and the suggestions; when that changes and the Conductor is idle it sends an
+  "[Automatic board update — not from the user]" message (at most every `minIntervalMin`, `maxPerHour`).
+- **Config**: `agetor config conductor '{"model":"opus-5.5","watch":true,"minIntervalMin":5,"maxPerHour":6}'`
+  (also `agent`, `mode`); `agetor config conductor_rules '<text>'` appends standing rules to its instructions
+  (rewritten at every start). Delete/archive the Conductor task to start a fresh one.
+- Testing without touching the board: a throwaway daemon with its own data dir, port and tmux socket —
+  `AGETOR_DATA_DIR=<tmp> AGETOR_API_PORT=4319 AGETOR_TMUX_SOCKET=agetor-ct bun src/bun/headless.ts`.

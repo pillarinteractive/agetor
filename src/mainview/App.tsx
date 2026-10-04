@@ -24,6 +24,7 @@ import {
   Trash2,
   Workflow,
   X,
+  Sparkles,
   type LucideIcon,
 } from "lucide-react";
 import { api, type AgentModelMap, type HarnessModelMap } from "@/lib/api";
@@ -333,6 +334,8 @@ function AppInner() {
   const [updateSnapshot, setUpdateSnapshot] = useState<UpdateSnapshot | null>(null);
   const [leases, setLeases] = useState<LeaseStatus[]>([]);
   const [progress, setProgress] = useState<TaskProgress[]>([]);
+  // The Conductor chat agent's task — hidden from the columns, opened from the top bar.
+  const [conductorId, setConductorId] = useState<string | null>(null);
   const [prs, setPrs] = useState<ReadonlyMap<string, TaskPrStatus>>(new Map());
   const applyPrs = useCallback((list: TaskPrStatus[]) => setPrs(new Map(list.map((p) => [p.taskId, p]))), []);
   const [homeDir, setHomeDir] = useState<string>("");
@@ -636,6 +639,7 @@ function AppInner() {
     api.getLeases().then(setLeases).catch(() => { /* fine */ });
     api.getPrs().then(applyPrs).catch(() => { /* fine */ });
     api.getProgress().then(setProgress).catch(() => { /* fine */ });
+    api.getConductor().then((c) => setConductorId(c.taskId)).catch(() => { /* fine */ });
     // Skip poll ticks while the window is hidden — a backgrounded kanban
     // board has no reason to keep re-fetching + re-rendering every 2s/15s.
     // The intervals themselves keep running (cheap — it's just the fetch +
@@ -1389,6 +1393,7 @@ function AppInner() {
       // state itself still holds them (the run panel's `selected`-sync
       // effect and `GET /tasks/:id/pipeline` both need the full list/row).
       if (t.pipelineParentId != null) return false;
+      if (t.id === conductorId) return false;
       if (q) {
         const hay = `${t.title}\n${t.prompt}\n${t.workdir}\n${t.branch ?? ""}`.toLowerCase();
         if (!hay.includes(q)) return false;
@@ -1400,7 +1405,7 @@ function AppInner() {
       if (archivedView === "archived" && t.archivedAt == null) return false;
       return true;
     });
-  }, [tasks, textQuery, repoFilter, harnessFilter, typeFilter, archivedView]);
+  }, [tasks, textQuery, repoFilter, harnessFilter, typeFilter, archivedView, conductorId]);
 
   const visibleColumns = useMemo(
     () => (statusFilter.length === 0 ? COLUMNS : COLUMNS.filter((c) => statusFilter.includes(c.id))),
@@ -1498,6 +1503,24 @@ function AppInner() {
   const openIssuesPage = useCallback(() => {
     navigate({ kind: "issues" });
   }, [navigate]);
+  const conductorTask = conductorId ? (tasks.find((t) => t.id === conductorId) ?? null) : null;
+  const [conductorStarting, setConductorStarting] = useState(false);
+  // Open the Conductor's chat, creating and starting it the first time.
+  const openConductor = useCallback(() => {
+    if (conductorTask) {
+      openTask(conductorTask);
+      return;
+    }
+    setConductorStarting(true);
+    api
+      .startConductor()
+      .then((t) => {
+        setConductorId(t.id);
+        openTask(t);
+      })
+      .catch((e) => toast.error("Couldn't start the Conductor", { description: e instanceof Error ? e.message : String(e) }))
+      .finally(() => setConductorStarting(false));
+  }, [conductorTask, openTask]);
   // From the issue queue: open the card working on an issue (a pipeline
   // task opens its run view, like a board click).
   const openTaskById = useCallback((taskId: string) => {
@@ -2082,6 +2105,24 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
             <FolderGit2 className="size-4" />
           </Button>
           <Button
+            variant={conductorTask && selected?.id === conductorTask.id ? "secondary" : "ghost"}
+            size="icon"
+            data-testid="conductor-button"
+            onClick={openConductor}
+            disabled={conductorStarting}
+            aria-label="Conductor"
+            title={conductorTask ? "Conductor — chat about the board" : "Start the Conductor — an agent that watches the board and suggests what to do"}
+            className="relative"
+          >
+            <Sparkles className="size-4" />
+            {conductorTask && (conductorTask.unread || conductorTask.column === "running") && (
+              <span
+                className={`absolute right-1 top-1 size-1.5 rounded-full ${conductorTask.column === "running" ? "animate-pulse bg-info" : "bg-primary"}`}
+                aria-hidden
+              />
+            )}
+          </Button>
+          <Button
             variant={view.kind === "issues" ? "secondary" : "ghost"}
             size="icon"
             data-testid="issues-button"
@@ -2186,7 +2227,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                 className="flex min-h-0 flex-1 flex-col"
               >
                 <NeedsYouBar
-                  tasks={tasks}
+                  tasks={conductorId ? tasks.filter((t) => t.id !== conductorId) : tasks}
                   prs={prs}
                   leases={leases}
                   onOpen={openTask}

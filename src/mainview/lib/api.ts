@@ -475,6 +475,9 @@ export const api = {
   /** Every lease watcher's latest status (src/bun/lease-watch.ts). */
   getLeases: () => j<LeaseStatus[]>("/leases"),
   getProgress: () => j<TaskProgress[]>("/progress"),
+  /** The Conductor chat agent (src/bun/conductor.ts). */
+  getConductor: () => j<{ taskId: string | null }>("/conductor"),
+  startConductor: () => j<Task>("/conductor", { method: "POST" }, { retry: false }),
   /** Every watched task's pull request (src/bun/pr-watch.ts). */
   getPrs: () => j<TaskPrStatus[]>("/prs"),
   /** Orchestrator suggestions with a ready fix (src/bun/suggestions.ts). */
