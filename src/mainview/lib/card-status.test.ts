@@ -23,7 +23,7 @@ const status = (t: Task, o: { pr?: TaskPrStatus | null; lease?: TaskLeaseInfo; p
 describe("cardStatus — pipelines", () => {
   test("running: the active step and how long it's been going, plus a held lease", () => {
     const t = task({ pipelineRun: run({ active: [{ stepId: "build", taskId: "s1", seq: 3 }], history: [{ seq: 3, stepId: "build", taskId: "s1", startedAt: NOW - 3 * 3_600_000 - 5 * 60_000, endedAt: null, outcome: null, handoff: null, nextStepIds: [] }] }) });
-    expect(status(t, { lease: { holds: ["lab"], waiting: [] } })).toMatchObject({ line: "Build · 3h 5m · holds lab", tone: "info", needsYou: null });
+    expect(status(t, { lease: { holds: ["lab"], waiting: [] } })).toMatchObject({ line: "Build step running · 3h 5m · holds lab", tone: "info", needsYou: null });
   });
 
   test("blocked on a lease held elsewhere: waiting, nothing for the user to do", () => {
@@ -43,7 +43,7 @@ describe("cardStatus — pipelines", () => {
 
   test("running but quiet past the threshold: a warning the user should check", () => {
     const t = task({ lastActivityAt: NOW - 25 * 60_000, pipelineRun: run({ active: [{ stepId: "build", taskId: "s1", seq: 3 }], history: [{ seq: 3, stepId: "build", taskId: "s1", startedAt: NOW - 3_600_000, endedAt: null, outcome: null, handoff: null, nextStepIds: [] }] }) });
-    expect(status(t)).toMatchObject({ line: "Build · 1h · quiet 25m", tone: "warning", needsYou: { reason: "Build has been quiet for 25m", actionLabel: "Check" } });
+    expect(status(t)).toMatchObject({ line: "Build step running · 1h · quiet 25m", tone: "warning", needsYou: { reason: "Build has been quiet for 25m", actionLabel: "Check" } });
     // A lab/E2E run reporting live progress isn't quiet.
     expect(status(t, { progressActive: true })).toMatchObject({ tone: "info", needsYou: null });
     // Recent activity isn't quiet either.

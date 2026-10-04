@@ -144,7 +144,11 @@ export function cardStatus(
       const now_ = run.active
         .map((a) => {
           const rec = latestRecord(run, a.taskId);
-          return `${stepName(run, a.stepId)}${rec ? ` · ${formatAge(now - rec.startedAt)}` : ""}`;
+          // "Review step running · started just now" — a bare step name ("Review")
+          // reads like the board's In Review column.
+          if (!rec) return `${stepName(run, a.stepId)} step starting`;
+          const age = formatAge(now - rec.startedAt);
+          return `${stepName(run, a.stepId)} step running · ${age === "just now" ? "started just now" : age}`;
         })
         .join(" + ");
       const holds = lease.holds.length ? ` · holds ${lease.holds.join(", ")}` : "";
