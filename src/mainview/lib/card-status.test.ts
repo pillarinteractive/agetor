@@ -55,13 +55,21 @@ describe("cardStatus — pipelines", () => {
     expect(status(t, { lease: { holds: [], waiting: [{ label: "lab", heldBy: null, free: true, position: 1, queueLength: 1 }] } }).needsYou).toMatchObject({ action: "retry", actionLabel: "Retry" });
   });
 
-  test("blocked step explains itself with its handoff headline", () => {
+  test("a stopped step says why (its handoff's reason, not what it did) and what it's asking", () => {
+    const h = { ...handoff("- Merged origin/develop; working tree is clean\n- more", "blocked"), reason: "- Verification failed: DATABASE_URL unset\n- more", openQuestions: ["Can it run with less load?"] };
     const t = task({ column: "blocked", pipelineRun: run({
       status: "blocked",
-      blocked: [{ taskId: "s5", stepId: "followup-1", kind: "step-blocked", message: "long flattened message" }],
-      history: [{ seq: 5, stepId: "followup-1", taskId: "s5", startedAt: 0, endedAt: 1, outcome: "succeeded", handoff: handoff("- Verification failed: DATABASE_URL unset\n- more", "blocked"), nextStepIds: [] }],
+      blocked: [{ taskId: "s5", stepId: "followup-1", kind: "step-blocked", message: 'step "Open PR" reported it is blocked: - Verification failed: DATABASE_URL unset' }],
+      history: [{ seq: 5, stepId: "followup-1", taskId: "s5", startedAt: 0, endedAt: 1, outcome: "succeeded", handoff: h, nextStepIds: [] }],
     }) });
-    expect(status(t)).toMatchObject({ line: "Open PR blocked: Verification failed: DATABASE_URL unset", tone: "danger", needsYou: { action: "open" } });
+    expect(status(t)).toMatchObject({
+      line: "Open PR stopped: Verification failed: DATABASE_URL unset",
+      tone: "danger",
+      needsYou: { action: "open", reason: "Open PR asks: Can it run with less load?" },
+    });
+    // No handoff: the runner's message, without its preamble.
+    const bare = task({ column: "blocked", pipelineRun: run({ status: "blocked", blocked: [{ taskId: "s5", stepId: "followup-1", kind: "step-blocked", message: 'step "Open PR" reported it is blocked: tests timed out' }] }) });
+    expect(status(bare).line).toBe("Open PR stopped: tests timed out");
   });
 
   const finished = (o: Partial<Task> = {}) => task({ column: "review", pipelineRun: run({

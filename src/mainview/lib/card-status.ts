@@ -6,7 +6,7 @@
  * and the board's "Needs you" bar.
  */
 import type { PipelineRunState, Task, TaskPrStatus } from "../../shared/types.ts";
-import { handoffHeadline } from "../../shared/pipeline.ts";
+import { blockReasonLine, handoffHeadline } from "../../shared/pipeline.ts";
 import type { TaskLeaseInfo } from "./leases.ts";
 import { ordinal } from "../../shared/block-reason.ts";
 
@@ -188,13 +188,16 @@ export function cardStatus(
           needsYou: { reason: `${freed.label} is free — retry ${step}`, action: "retry", actionLabel: "Retry" },
         };
       }
-      const why = handoffHeadline(latestRecord(run, block?.taskId)?.handoff) || block?.message || "blocked";
+      // Why it stopped (its handoff's reason), and what it's asking, if anything.
+      const handoff = latestRecord(run, block?.taskId)?.handoff;
+      const why = blockReasonLine(handoff, block?.message) || "blocked";
+      const question = handoff?.openQuestions?.find((q) => q.trim());
       const retryable = block && ["step-failed", "step-cap"].includes(block.kind);
       return {
-        line: `${step} blocked: ${why}`,
+        line: `${step} stopped: ${why}`,
         tone: "danger",
         needsYou: {
-          reason: `${step} blocked`,
+          reason: question ? `${step} asks: ${question}` : `${step} stopped`,
           action: retryable ? "retry" : "open",
           actionLabel: retryable ? "Retry" : "Open",
         },

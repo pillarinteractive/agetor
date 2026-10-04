@@ -988,6 +988,25 @@ export function handoffHeadline(handoff: Pick<Handoff, "summary"> | null | undef
   return line.length > max ? `${line.slice(0, max - 1).trimEnd()}…` : line;
 }
 
+/** Why a step stopped, in one line: the first line of its handoff's
+ *  `reason` (what a blocked step says about the block), else of the runner's
+ *  block message without its `step "X" reported it is blocked:` preamble,
+ *  else the summary's first line. */
+export function blockReasonLine(
+  handoff: Pick<Handoff, "summary" | "reason"> | null | undefined,
+  message: string | null | undefined,
+  max = 160,
+): string {
+  const first = (text: string | null | undefined) =>
+    (text ?? "")
+      .split("\n")
+      .map((l) => l.replace(/^\s*(?:[-*+]|\d+[.)]|#+)\s+/, "").trim())
+      .find((l) => l.length > 0) ?? "";
+  const fromMessage = (message ?? "").replace(/^step "[^"]*" (?:reported it is blocked|failed)(?: —|:)?\s*/i, "");
+  const line = first(handoff?.reason) || first(fromMessage) || first(handoff?.summary);
+  return line.length > max ? `${line.slice(0, max - 1).trimEnd()}…` : line;
+}
+
 /** Id prefix of a follow-up step — one the user added to a finished run
  *  (`runPipelineFollowUp`) rather than one from the pipeline's graph. */
 export const FOLLOW_UP_STEP_PREFIX = "followup-";
