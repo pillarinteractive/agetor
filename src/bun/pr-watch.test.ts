@@ -167,3 +167,11 @@ test("auto update branch: only an open PR behind its base whose failures pass th
   // Its own failure (doesn't pass on base): that's Fix CI's job.
   expect(shouldAutoUpdate({ ...base, failingChecks: [{ name: "web / vitest", url: null, alsoOnBase: false, passesOnBase: false }] }, { enabled: true, done: new Set() })).toBe(false);
 });
+
+test("the issue a card fixes: its issue link, else a Fixes/Closes/Resolves line in the prompt", async () => {
+  const { issueNumberForTask } = await import("./pr-watch.ts");
+  expect(issueNumberForTask({ issueUrl: "https://github.com/o/r/issues/191", prompt: "" })).toBe(191);
+  expect(issueNumberForTask({ issueUrl: null, prompt: "Work on it.\n\nFixes #156" })).toBe(156);
+  expect(issueNumberForTask({ issueUrl: null, prompt: "closes #7 please" })).toBe(7);
+  expect(issueNumberForTask({ issueUrl: null, prompt: "See #12 for context" })).toBeNull();
+});

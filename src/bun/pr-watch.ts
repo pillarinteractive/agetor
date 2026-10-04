@@ -12,8 +12,9 @@
  */
 import type { FollowUpAction, Task, TaskPrStatus } from "../shared/types.ts";
 import { agentProfiles, preferences, tasks } from "./db.ts";
-import { findGitHubPullForBranch, getGitHubCompare, getGitHubPullChecks, getGitHubPullReviewThreads, getGitHubRefCheckRuns, updateGitHubPullBranch } from "./github.ts";
+import { findGitHubPullForBranch, getGitHubCompare, getGitHubPullChecks, getGitHubPullReviewThreads, createGitHubComment, getGitHubIssueThread, getGitHubRefCheckRuns, updateGitHubIssue, updateGitHubPullBranch } from "./github.ts";
 import { runPipelineFollowUp } from "./pipeline-runner.ts";
+import { parseIssueUrl } from "../shared/issue-task.ts";
 import { recordActivity, recordActivityOnce } from "./activity.ts";
 import { isTaskRunLive, moveMergedTaskToDone, publishGlobalEvent } from "./orchestrator.ts";
 
@@ -205,6 +206,7 @@ export async function prWatchTick(): Promise<void> {
       for (const e of prActivity(prev, next)) (prev ? recordActivity : recordActivityOnce)(task.id, e);
       if (!task.prUrl && next.url) tasks.update(task.id, { prUrl: next.url });
       if (next.state === "merged" && prev?.state !== "merged" && canMoveToDone(task)) moveMergedTaskToDone(task.id);
+      if (next.state === "merged") await closeIssueForMergedPr(task, next);
       if (!same(prev, next)) changed = true;
       await maybeAutoUpdateBranch(task, next);
       await maybeAutoFix(task, next);
@@ -303,6 +305,59 @@ export function shouldAutoFix(
   const entry = opts.ledger[`${task.id}#${pr.number}`];
   if (entry && (entry.count >= PR_AUTOFIX_MAX_ATTEMPTS || (pr.headSha && entry.lastSha === pr.headSha))) return false;
   return true;
+}
+
+/** Issues this watcher already closed (issue URLs) — so a restart, or the
+ *  same PR seen again, never closes or comments twice. */
+const CLOSED_ISSUES_PREF = "closed_issues";
+
+/** The issue a card fixes: its own issue link, else a "Fixes #N" line in its
+ *  prompt (cards made from an issue carry both). Pure; exported for tests. */
+export function issueNumberForTask(task: Pick<Task, "issueUrl" | "prompt">): number | null {
+  const parsed = parseIssueUrl(task.issueUrl ?? null);
+  if (parsed) return parsed.number;
+  const m = /\b(?:fix(?:es|ed)?|close[sd]?|resolve[sd]?)\s+#(\d+)\b/i.exec(task.prompt ?? "");
+  return m ? Number(m[1]) : null;
+}
+
+/**
+ * GitHub only auto-closes "Fixes #N" when the PR merges into the repo's
+ * default branch. Pillar's PRs merge into `develop`, so a fixed issue stayed
+ * open until a release reached `main`. When a card's PR merges (into any
+ * branch), close the issue it fixes, saying which PR and where.
+ */
+async function closeIssueForMergedPr(task: Task, pr: TaskPrStatus): Promise<void> {
+  const number = issueNumberForTask(task);
+  if (!number) return;
+  const key = task.issueUrl ?? `${task.workdir}#${number}`;
+  let done: string[] = [];
+  try {
+    done = JSON.parse(preferences.get(CLOSED_ISSUES_PREF) ?? "[]");
+  } catch {
+    done = [];
+  }
+  if (done.includes(key)) return;
+  const remember = () => preferences.set(CLOSED_ISSUES_PREF, JSON.stringify([...done, key].slice(-500)));
+  const thread = await getGitHubIssueThread({ dir: task.workdir, number, includeComments: false });
+  if (!thread.ok) return; // try again next tick
+  if (thread.item.state === "closed") {
+    remember();
+    return;
+  }
+  const where = pr.baseRef ? ` into \`${pr.baseRef}\`` : "";
+  await createGitHubComment({
+    dir: task.workdir,
+    number,
+    body: `Fixed by #${pr.number}, merged${where}. Closed by Agetor when the PR merged — GitHub only auto-closes on merges into the default branch.`,
+  });
+  const closed = await updateGitHubIssue({ dir: task.workdir, number, state: "closed" });
+  remember();
+  recordActivity(task.id, {
+    kind: "pr",
+    text: closed.ok ? `Closed issue #${number} (fixed by PR #${pr.number})` : `Couldn't close issue #${number}: ${closed.error}`,
+    tone: closed.ok ? "success" : "warning",
+    url: task.issueUrl ?? undefined,
+  });
 }
 
 /** PR heads already updated from their base (`<pr>:<headSha>`) — an update

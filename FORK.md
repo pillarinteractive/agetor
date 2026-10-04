@@ -216,3 +216,11 @@ Stored in the `card_dependencies` preference; `Task.blockedBy` is decorated onto
 While waiting, the card says `Waiting on "<card>" · PR #201 · checks running` and carries a "waits on #201" chip.
 When the last one lands, a 15s watcher moves the card on and clears the entry: never-started → started; blocked
 pipeline → its blocked step is told to merge the base and carry on; idle single task → told the same.
+
+## Closing issues when their PR merges (`feat/close-issues-on-merge`)
+
+GitHub only auto-closes "Fixes #N" when a PR merges into the default branch; Pillar's PRs merge into `develop`, so
+fixed issues stayed open. When a card's PR merges (seen by the PR watcher, including Done cards' one lookup after a
+restart), the issue it fixes — its `issueUrl`, else a `Fixes/Closes/Resolves #N` line in its prompt — is closed with
+a "Fixed by #PR, merged into develop" comment. `closed_issues` preference remembers what was closed; an issue
+already closed is left alone.
