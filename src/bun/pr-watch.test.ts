@@ -131,7 +131,7 @@ describe("behind the base branch", () => {
     expect(staleAgainstBase(stale(3))).toBe(true);
     expect(prFollowUpActions(stale(3))).toEqual([]);
     const doneRun = { status: "done", active: [], snapshot: { graph: { steps: [], edges: [] } } };
-    expect(shouldAutoFix(task({ pipelineRun: doneRun as Task["pipelineRun"] }), stale(3), { enabled: true, ledger: {}, isLive: () => false })).toBe(false);
+    expect(shouldAutoFix(task({ pipelineRun: doneRun as unknown as Task["pipelineRun"] }), stale(3), { enabled: true, ledger: {}, isLive: () => false })).toBe(false);
   });
 
   test("up to date with the base, the same failure is the PR's own", () => {
