@@ -23,7 +23,8 @@
     "release:build-only": "bun run build:stable && bun scripts/verify-release.ts",
     "release:upload-only": "bun scripts/upload-release.ts",
     "typecheck": "tsc --noEmit",
-    "test": "bun test"
+    "test": "bun test",
+    "install:local": "sh scripts/install-local.sh"
   },
   "devDependencies": {
     "@playwright/test": "^1.62.1",
