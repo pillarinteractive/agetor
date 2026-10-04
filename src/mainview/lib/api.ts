@@ -475,6 +475,18 @@ export const api = {
   getLeases: () => j<LeaseStatus[]>("/leases"),
   /** Every watched task's pull request (src/bun/pr-watch.ts). */
   getPrs: () => j<TaskPrStatus[]>("/prs"),
+  /** A project's open issues, each with the task already on it (src/bun/issue-queue.ts). */
+  getIssueQueue: (path: string, opts: { labels?: string[]; q?: string; page?: number } = {}) => {
+    const qs = new URLSearchParams({ path, page: String(opts.page ?? 1) });
+    for (const l of opts.labels ?? []) qs.append("label", l);
+    if (opts.q) qs.set("q", opts.q);
+    return j<{ repo: string; items: { item: GitHubListItem; task: { id: string; title: string; column: Task["column"] } | null }[]; hasMore: boolean }>(
+      `/issue-queue?${qs.toString()}`,
+    );
+  },
+  /** Create and start a pipeline task for an issue. */
+  fixIssue: (path: string, number: number, pipelineId: string) =>
+    j<Task>("/issue-queue", { method: "POST", body: JSON.stringify({ path, number, pipelineId }) }, { retry: false }),
   checkForUpdate: () => j<UpdateSnapshot>("/updates/check", { method: "POST" }),
   applyUpdate: () => j<{ ok: true }>("/updates/apply", { method: "POST" }),
   listAgents: () => j<AgentStatus[]>("/agents"),

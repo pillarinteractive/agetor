@@ -50,6 +50,7 @@ import {
 import type { UpdaterSnapshot } from "./updater.ts";
 import { listLeases } from "./lease-watch.ts";
 import { listPrStatuses } from "./pr-watch.ts";
+import { createTaskFromIssue, listIssueQueue } from "./issue-queue.ts";
 import { listFollowUps, startFollowUp } from "./pipeline-followups.ts";
 import {
   bundledTmuxAvailable,
@@ -3274,6 +3275,48 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // loads this once, then follows `prs` global events.
       "/prs": {
         GET: authed((req) => json(listPrStatuses(), { headers: corsHeaders(req) })),
+      },
+
+      // Issue queue (src/bun/issue-queue.ts): a project's open issues, each
+      // with the task already on it; POST turns one into a pipeline task.
+      "/issue-queue": {
+        GET: authed(async (req) => {
+          const url = new URL(req.url);
+          const dir = url.searchParams.get("path");
+          if (!dir) return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          const labels = url.searchParams.getAll("label").map((l) => l.trim()).filter(Boolean);
+          const page = Number(url.searchParams.get("page") ?? "1");
+          const result = await listIssueQueue({
+            dir,
+            labels: labels.length ? labels : undefined,
+            query: url.searchParams.get("q")?.trim() || undefined,
+            page: Number.isInteger(page) && page > 0 ? page : 1,
+          });
+          return result.ok
+            ? json(result, { headers: corsHeaders(req) })
+            : json({ error: result.error }, { status: 502, headers: corsHeaders(req) });
+        }),
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+          if (typeof body.path !== "string" || !body.path) {
+            return json({ error: "path required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.number !== "number" || !Number.isInteger(body.number) || body.number <= 0) {
+            return json({ error: "valid issue number required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (typeof body.pipelineId !== "string" || !body.pipelineId) {
+            return json({ error: "pipelineId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await createTaskFromIssue({
+            dir: body.path,
+            number: body.number,
+            pipelineId: body.pipelineId,
+            start: body.start !== false,
+          });
+          return "error" in result
+            ? json({ error: result.error }, { status: result.status, headers: corsHeaders(req) })
+            : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+        }),
       },
 
       // Cross-session UI preferences. Currently used by NewTaskForm to

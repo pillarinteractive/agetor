@@ -33,6 +33,7 @@ import { parseIssueUrl } from "../shared/issue-task.ts";
 import { isPipelineColumnRunnerOwned } from "../shared/pipeline.ts";
 import { LeaseContext } from "@/lib/leases";
 import { PrContext } from "@/lib/prs";
+import { IssuesPage } from "@/components/issues/IssuesPage";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
 import { ContextMenu, type ContextMenuItem } from "@/components/ui/context-menu";
@@ -197,7 +198,8 @@ const ICON_BY_ACTION: Record<TaskMenuAction, LucideIcon> = {
 type AppView =
   | { kind: "board" }
   | { kind: "pipelines"; pipelineId: string | null; editing: boolean }
-  | { kind: "pipeline-run"; taskId: string };
+  | { kind: "pipeline-run"; taskId: string }
+  | { kind: "issues" };
 
 /**
  * The actual app tree. Split out from the default-exported `App` so it can
@@ -1484,6 +1486,15 @@ function AppInner() {
   const openPipelinesPage = useCallback(() => {
     navigate({ kind: "pipelines", pipelineId: null, editing: false });
   }, [navigate]);
+  const openIssuesPage = useCallback(() => {
+    navigate({ kind: "issues" });
+  }, [navigate]);
+  // From the issue queue: open the card working on an issue (a pipeline
+  // task opens its run view, like a board click).
+  const openTaskById = useCallback((taskId: string) => {
+    const t = tasksRef.current.find((x) => x.id === taskId);
+    if (t) openTask(t);
+  }, [openTask]);
   /** Switch Settings' "Open pipelines page"/"Edit"/"New pipeline" affordances
    *  to the matching app-level view — Settings closes itself in the same
    *  gesture (see the `SettingsDialog` `onOpenPipelines` prop below). Routed
@@ -2062,6 +2073,16 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
             <FolderGit2 className="size-4" />
           </Button>
           <Button
+            variant={view.kind === "issues" ? "secondary" : "ghost"}
+            size="icon"
+            data-testid="issues-button"
+            onClick={openIssuesPage}
+            aria-label="Issues"
+            title="Issues"
+          >
+            <CircleDot className="size-4" />
+          </Button>
+          <Button
             variant={view.kind === "pipelines" || view.kind === "pipeline-run" ? "secondary" : "ghost"}
             size="icon"
             data-testid="pipelines-button"
@@ -2250,6 +2271,19 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                     </div>
                   )}
                 </div>
+              </motion.div>
+            )}
+
+            {view.kind === "issues" && (
+              <motion.div
+                key="issues"
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -8 }}
+                transition={{ duration: 0.18 }}
+                className="flex min-h-0 flex-1 flex-col"
+              >
+                <IssuesPage projects={projects} onBack={() => setView({ kind: "board" })} onOpenTask={openTaskById} />
               </motion.div>
             )}
 
