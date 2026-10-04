@@ -63,15 +63,20 @@ export function IssuesPage({
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [busyNumber, setBusyNumber] = useState<number | null>(null);
+  // Every label seen this session, so filtering by one doesn't hide the rest.
+  const [seenLabels, setSeenLabels] = useState<string[]>([]);
 
   // Default to the first project once projects load, and the first pipeline.
   useEffect(() => {
     if (!projects.some((p) => p.path === projectPath) && projects[0]) setProjectPath(projects[0].path);
   }, [projects, projectPath]);
+  // First visit: prefer a bug-fixing pipeline over whatever sorts first.
   useEffect(() => {
-    if (!pipelines.some((p) => p.id === pipelineId) && pipelines[0]) setPipelineId(pipelines[0].id);
+    if (pipelines.some((p) => p.id === pipelineId) || !pipelines[0]) return;
+    setPipelineId((pipelines.find((p) => /bug ?fix/i.test(p.name)) ?? pipelines[0]).id);
   }, [pipelines, pipelineId]);
   useEffect(() => remember(PROJECT_KEY, projectPath), [projectPath]);
+  useEffect(() => setSeenLabels([]), [projectPath]);
   useEffect(() => remember(PIPELINE_KEY, pipelineId), [pipelineId]);
   useEffect(() => remember(LABELS_KEY, JSON.stringify(labels)), [labels]);
 
@@ -83,6 +88,7 @@ export function IssuesPage({
       const res = await api.getIssueQueue(projectPath, { labels, q: appliedQuery || undefined });
       setRows(res.items);
       setRepo(res.repo);
+      setSeenLabels((cur) => [...new Set([...cur, ...res.items.flatMap((r) => r.item.labels.map((l) => l.name))])]);
     } catch (e) {
       setError(e instanceof ApiError ? e.message : "Couldn't load issues.");
       setRows([]);
@@ -96,11 +102,10 @@ export function IssuesPage({
   }, [load]);
 
   // Label chips: the ones in use on the loaded issues, plus any active filter.
-  const labelChoices = useMemo(() => {
-    const names = new Set(labels);
-    for (const r of rows ?? []) for (const l of r.item.labels) names.add(l.name);
-    return [...names].sort((a, b) => a.localeCompare(b));
-  }, [rows, labels]);
+  const labelChoices = useMemo(
+    () => [...new Set([...seenLabels, ...labels])].sort((a, b) => a.localeCompare(b)),
+    [seenLabels, labels],
+  );
 
   const toggleLabel = (name: string) =>
     setLabels((cur) => (cur.includes(name) ? cur.filter((l) => l !== name) : [...cur, name]));
