@@ -14,6 +14,7 @@ import { broadcastAppEvent, consumeForceQuit } from "./quit-guard.ts";
 import { refreshAllModels, startPeriodicDiscovery } from "./model-discovery.ts";
 import { startUpdaterLoop, applyUpdate, checkForUpdate, getUpdateSnapshot } from "./updater.ts";
 import { startLeaseWatchLoop } from "./lease-watch.ts";
+import { startKeepAwakeLoop } from "./keep-awake.ts";
 import { getMainWindow, setMainWindow } from "./window.ts";
 import { makeWindowLifecycle, type Frame } from "./window-lifecycle.ts";
 import { focusWindow } from "./window-focus.ts";
@@ -494,6 +495,10 @@ startUpdaterLoop();
 // Lease badges (src/bun/lease-watch.ts): probe each `lease_watchers` command
 // and publish who holds the resource. A no-op until one is configured.
 startLeaseWatchLoop();
+
+// Hold a caffeinate assertion while any agent is running so a long turn
+// isn't cut off by the Mac idling to sleep (src/bun/keep-awake.ts).
+startKeepAwakeLoop();
 
 /** Lifecycle wrapper around BrowserWindow construction. Handles:
  *   - idempotency (concurrent reopen events share one in-flight build),
