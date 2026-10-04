@@ -1,5 +1,5 @@
 import { test, expect, beforeAll, describe } from "bun:test";
-import { mkdtempSync, mkdirSync, existsSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, existsSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
@@ -1582,5 +1582,37 @@ describe("detachWorktree", () => {
     const live = { ...task, worktreePath: created.worktreePath, branch: created.branch };
     const alreadyAbsent = await detachWorktree(live, { force: true });
     expect(alreadyAbsent).toEqual({ removed: false, reason: "already-absent" });
+  });
+});
+
+describe("worktree setup command", () => {
+  test("worktreeSetupFor matches the project and defaults the timeout", async () => {
+    const { worktreeSetupFor } = await import("./worktree.ts");
+    const raw = JSON.stringify([{ project: "/repo/", command: "pnpm install --frozen-lockfile" }, { project: "/other", command: "x", timeoutSec: 5 }]);
+    expect(worktreeSetupFor(raw, "/repo")).toEqual({ command: "pnpm install --frozen-lockfile", timeoutSec: 600 });
+    expect(worktreeSetupFor(raw, "/other")).toEqual({ command: "x", timeoutSec: 5 });
+    expect(worktreeSetupFor(raw, "/nope")).toBeNull();
+    expect(worktreeSetupFor("not json", "/repo")).toBeNull();
+  });
+
+  test("runs once in a newly created worktree; a failing setup never blocks the worktree", async () => {
+    const { prepareWorkdir, WORKTREE_SETUP_PREF } = await import("./worktree.ts");
+    const { preferences } = await import("./db.ts");
+    const repo = await makeRepo();
+    try {
+      preferences.set(WORKTREE_SETUP_PREF, JSON.stringify([{ project: repo, command: "echo ran > setup-ran.txt" }]));
+      const r = await prepareWorkdir(fakeTask({ workdir: repo, title: "setup ok" }));
+      if ("error" in r) throw new Error(r.error);
+      expect(readFileSync(path.join(r.worktreePath!, "setup-ran.txt"), "utf8").trim()).toBe("ran");
+      expect(r.note).toContain("ran setup");
+
+      preferences.set(WORKTREE_SETUP_PREF, JSON.stringify([{ project: repo, command: "echo boom >&2; exit 7" }]));
+      const failed = await prepareWorkdir(fakeTask({ workdir: repo, title: "setup fails", id: "wt-setup-fail" }));
+      if ("error" in failed) throw new Error(failed.error);
+      expect(failed.worktreePath).not.toBeNull();
+      expect(failed.note).toContain("failed (exit 7)");
+    } finally {
+      preferences.set(WORKTREE_SETUP_PREF, "");
+    }
   });
 });

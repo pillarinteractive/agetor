@@ -96,3 +96,47 @@ becomes the Result. Presets live in the `pipeline_followups` preference:
 `agent` is a profile name; `suggestWhen` globs (`**` crosses directories; a slash-less pattern matches a file name
 anywhere) mark the preset **Suggested** when the branch changed a matching file. Nothing runs until the user clicks.
 Edit with `agetor config pipeline_followups '<json>'`; the board's current presets are Open PR, Run VM tests, Run E2E, Explain.
+
+## Keep awake (`feat/keep-awake`)
+
+While any task is running, Agetor holds `caffeinate -i -s -w <pid>` so long agent turns aren't cut off by the Mac
+sleeping ("Your computer went to sleep mid-response"); it's released when nothing is running. On by default; toggle in
+Settings → General (`keepAwakeWhileRunning` preference). Closing the lid still sleeps the Mac unless a display is attached.
+
+## PR babysitter and issue queue (`feat/pr-watch-issues`)
+
+- **PR watcher** (`src/bun/pr-watch.ts`): every 60s, finds each live card's PR by branch (agents open PRs with `gh`, which
+  Agetor never sees), rolls up check runs and counts unresolved review threads. The card shows a PR badge; a merged PR
+  moves the card to Done. A finished pipeline's Next box offers suggested **Fix CI** / **Address review** follow-ups
+  (agent: `pr_followup_agent` preference, default `Builder`). The Builder profiles may push their own task branch so
+  these can update the PR; never `main`/`develop`, never force-push.
+  - A failing check that also fails on the PR's base branch is marked inherited: the badge reads
+    `✗ CI (also on develop)` and Fix CI isn't offered for it (the aggregate `required` check never counts).
+  - Follow-ups also run on a **blocked** run once nothing in it is live.
+  - Opt-in auto Fix CI: `agetor config pr_autofix true`. Starts Fix CI by itself for the PR's own failures, at most
+    twice per PR and never twice for the same commit (ledger in the `pr_autofix_attempts` preference).
+- **Issue queue** (top-bar Issues button, `src/bun/issue-queue.ts`): a project's open issues with label chips and search;
+  pick a pipeline and **Fix** to create and start a pipeline task from the issue (built like `agetor add --issue`), with
+  the prompt asking the PR to say `Fixes #n`. Issues that already have a live task show it instead.
+
+## Knowing what each card is doing (`feat/board-clarity`)
+
+- **Status line** under every card title (`src/mainview/lib/card-status.ts`): the step and how long it's been running,
+  what it waits on (lab, base-branch CI), the PR's state, or the result headline; ⓘ when it needs you.
+- **Needs you** bar at the top of the board: only cards waiting on the user, each with its one action
+  (Answer / Retry / Fix CI / Open PR / Review).
+- **Activity** timeline in the run view (`src/bun/activity.ts`): steps derived from the run's history, plus PR, CI,
+  review, merge, lease and auto-fix events appended to `<dataDir>/activity/<taskId>.jsonl` as they happen.
+- The run view header leads with the card's title; a step's panel strip names the card it belongs to.
+
+## Orchestrator suggestions, layer 1 (`feat/suggestions`)
+
+`src/bun/suggestions.ts` recognises situations that used to need a person and proposes the fix; they appear at the top
+of the Needs you bar with **Apply**. Nothing runs without the click, and each suggestion is recomputed at apply time.
+Rules: step blocked on the test environment (`DATABASE_URL`/`.env.local`) → message it to use CI's placeholder; step
+blocked on a lease that's free → Retry; PR behind its base whose failing checks pass on the base → Update branch;
+finished run with commits and no PR → Open PR preset; blocked step with open questions → show the first one.
+The PR watcher also records `behindBy` and `passesOnBase`, so a failure the base has since fixed isn't treated as the
+PR's own (no Fix CI / auto-fix). Layer 2 (a Conductor agent you chat with) is planned.
+- **Worktree setup** (`worktree_setup` preference, `src/bun/worktree.ts`): a per-project command run once in each newly
+  created worktree. Pillar: `pnpm install --frozen-lockfile --prefer-offline`. Failures never block the worktree.
