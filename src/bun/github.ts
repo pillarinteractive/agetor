@@ -2328,7 +2328,18 @@ export async function applyGitHubSuggestion(input: ApplyGitHubSuggestionInput): 
  *  how the PR watcher finds a PR an agent opened with `gh pr create`, which
  *  Agetor never saw. `pull: null` when there is none. */
 export async function findGitHubPullForBranch(input: { dir: string; branch: string }): Promise<
-  | { ok: true; pull: { number: number; htmlUrl: string; state: "open" | "closed"; draft: boolean; mergedAt: string | null } | null }
+  | {
+      ok: true;
+      pull: {
+        number: number;
+        htmlUrl: string;
+        state: "open" | "closed";
+        draft: boolean;
+        mergedAt: string | null;
+        baseRef: string | null;
+        headSha: string | null;
+      } | null;
+    }
   | GitHubListError
 > {
   const repo = await repoForDir(input.dir);
@@ -2352,8 +2363,30 @@ export async function findGitHubPullForBranch(input: { dir: string; branch: stri
       state: first.state === "closed" ? "closed" : "open",
       draft: first.draft === true,
       mergedAt: typeof first.merged_at === "string" ? first.merged_at : null,
+      baseRef: typeof (first.base as { ref?: unknown } | undefined)?.ref === "string" ? (first.base as { ref: string }).ref : null,
+      headSha: typeof (first.head as { sha?: unknown } | undefined)?.sha === "string" ? (first.head as { sha: string }).sha : null,
     },
   };
+}
+
+/** Check runs on the tip of `ref` (a branch name or sha) — e.g. the PR's base
+ *  branch, to tell a failure the PR introduced from one it inherited. */
+export async function getGitHubRefCheckRuns(input: { dir: string; ref: string }): Promise<
+  { ok: true; checkRuns: GitHubCheckRun[] } | GitHubListError
+> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  const token = await githubToken(repo.remoteHost ?? null);
+  const url = new URL(`${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/commits/${encodeURIComponent(input.ref)}/check-runs`);
+  url.searchParams.set("per_page", "100");
+  const res = await fetchGitHub(url.toString(), token, "application/vnd.github+json");
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const raw = json && typeof json === "object" && Array.isArray((json as { check_runs?: unknown }).check_runs)
+    ? (json as { check_runs: unknown[] }).check_runs
+    : [];
+  return { ok: true, checkRuns: raw.map(normalizeCheckRun).filter((x): x is GitHubCheckRun => !!x) };
 }
 
 export async function getGitHubPullChecks(input: GitHubItemNumberInput): Promise<GitHubChecksResponse> {

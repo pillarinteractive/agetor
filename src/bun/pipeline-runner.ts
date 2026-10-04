@@ -1464,8 +1464,12 @@ export async function runPipelineFollowUp(
     }
     const run = parent.pipelineRun;
     if (!run || !run.snapshot) return { error: "pipeline has never run", status: 409 as const };
-    if (run.status !== "done") {
-      return { error: "follow-ups run once the pipeline has finished", status: 409 as const };
+    // A blocked run whose executions have all stopped can take one too (e.g.
+    // "Fix CI" while an "Open PR" step sits blocked); its block stays until
+    // the user retries or advances it.
+    const idleBlocked = run.status === "blocked" && run.active.every((a) => !isTaskRunLive(a.taskId));
+    if (run.status !== "done" && !idleBlocked) {
+      return { error: "follow-ups run once the pipeline has finished or stopped on a block", status: 409 as const };
     }
     const name = input.name.trim();
     const instructions = input.instructions.trim();

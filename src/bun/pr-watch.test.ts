@@ -5,12 +5,14 @@ import path from "node:path";
 import type { Task, TaskPrStatus } from "../shared/types.ts";
 
 process.env.AGETOR_DATA_DIR ??= mkdtempSync(path.join(tmpdir(), "agetor-pr-watch-"));
-const { PR_FIX_CI_ACTION, PR_REVIEW_ACTION, prFollowUpActions, prFollowUpInstructions, rollUpChecks, tasksToWatch } =
-  await import("./pr-watch.ts");
+const {
+  PR_FIX_CI_ACTION, PR_REVIEW_ACTION, followUpReady, markInherited, prFollowUpActions, prFollowUpInstructions, rollUpChecks,
+  shouldAutoFix, tasksToWatch,
+} = await import("./pr-watch.ts");
 
 const run = (name: string, status: string, conclusion: string | null) => ({ name, status, conclusion, htmlUrl: `https://ci/${name}` });
 const pr = (o: Partial<TaskPrStatus> = {}): TaskPrStatus => ({
-  taskId: "t1", number: 42, url: "https://github.com/o/r/pull/42", state: "open", draft: false,
+  taskId: "t1", number: 42, url: "https://github.com/o/r/pull/42", state: "open", draft: false, baseRef: "develop", headSha: "abc",
   checks: "success", failingChecks: [], unresolvedThreads: 0, checkedAt: 0, ...o,
 });
 const task = (o: Partial<Task>) => ({ id: "t1", column: "review", branch: "feature/x", archivedAt: null, pipelineParentId: null, ...o }) as Task;
@@ -47,14 +49,14 @@ describe("PR follow-ups", () => {
   test("failing CI and unresolved threads each offer a suggested action; a clean or merged PR offers none", () => {
     expect(prFollowUpActions(pr())).toEqual([]);
     expect(prFollowUpActions(pr({ state: "merged", checks: "failure" }))).toEqual([]);
-    const actions = prFollowUpActions(pr({ checks: "failure", failingChecks: [{ name: "lint", url: null }], unresolvedThreads: 2 }));
+    const actions = prFollowUpActions(pr({ checks: "failure", failingChecks: [{ name: "lint", url: null, alsoOnBase: false }], unresolvedThreads: 2 }));
     expect(actions.map((a) => [a.id, a.suggested])).toEqual([[PR_FIX_CI_ACTION, true], [PR_REVIEW_ACTION, true]]);
     expect(actions[0]!.label).toBe("Fix CI (#42)");
     expect(actions[1]!.matched).toEqual(["2 unresolved threads"]);
   });
 
   test("instructions carry the PR and failing checks, allow pushing only the task branch, and go stale with the PR", () => {
-    const failing = pr({ checks: "failure", failingChecks: [{ name: "lint", url: "https://ci/lint" }] });
+    const failing = pr({ checks: "failure", failingChecks: [{ name: "lint", url: "https://ci/lint", alsoOnBase: false }] });
     const ci = prFollowUpInstructions(PR_FIX_CI_ACTION, failing)!;
     expect(ci.instructions).toContain("#42");
     expect(ci.instructions).toContain("- lint (https://ci/lint)");
@@ -62,5 +64,61 @@ describe("PR follow-ups", () => {
     expect(prFollowUpInstructions(PR_FIX_CI_ACTION, pr())).toBeNull();
     expect(prFollowUpInstructions(PR_REVIEW_ACTION, pr({ unresolvedThreads: 1 }))!.instructions).toContain("Don't resolve threads yourself");
     expect(prFollowUpInstructions(PR_REVIEW_ACTION, null)).toBeNull();
+  });
+});
+
+describe("inherited failures", () => {
+  const fail = (name: string, alsoOnBase = false) => ({ name, url: null, alsoOnBase });
+
+  test("markInherited flags the PR failures that also fail on the base branch", () => {
+    expect(markInherited([fail("vitest"), fail("lint")], [fail("vitest")]).map((f) => [f.name, f.alsoOnBase])).toEqual([
+      ["vitest", true],
+      ["lint", false],
+    ]);
+  });
+
+  test("no Fix CI when every failure is inherited (the 'required' rollup doesn't count)", () => {
+    const inheritedOnly = pr({ checks: "failure", failingChecks: [fail("vitest", true), fail("required")] });
+    expect(prFollowUpActions(inheritedOnly)).toEqual([]);
+    expect(prFollowUpInstructions(PR_FIX_CI_ACTION, inheritedOnly)).toBeNull();
+  });
+
+  test("Fix CI lists only the PR's own failures and tells the agent to leave inherited ones alone", () => {
+    const mixed = pr({ checks: "failure", failingChecks: [fail("vitest", true), fail("lint")] });
+    expect(prFollowUpActions(mixed)[0]!.matched).toEqual(["lint"]);
+    const text = prFollowUpInstructions(PR_FIX_CI_ACTION, mixed)!.instructions;
+    expect(text).toContain("- lint");
+    expect(text).not.toContain("- vitest");
+    expect(text).toContain("also fail on develop");
+  });
+});
+
+describe("auto Fix CI", () => {
+  const doneRun = { status: "done", active: [], snapshot: { graph: { steps: [], edges: [] } } };
+  const card = (run: unknown) => task({ pipelineRun: run as Task["pipelineRun"] });
+  const failing = pr({ checks: "failure", headSha: "sha1", failingChecks: [{ name: "lint", url: null, alsoOnBase: false }] });
+  const opts = (o: Partial<{ enabled: boolean; ledger: Record<string, { count: number; lastSha: string | null }> }> = {}) => ({
+    enabled: true, ledger: {}, isLive: () => false, ...o,
+  });
+
+  test("starts for the PR's own failure on a finished run", () => {
+    expect(shouldAutoFix(card(doneRun), failing, opts())).toBe(true);
+  });
+
+  test("never when off, inherited, already tried on this commit, or out of attempts", () => {
+    expect(shouldAutoFix(card(doneRun), failing, opts({ enabled: false }))).toBe(false);
+    const inherited = pr({ checks: "failure", failingChecks: [{ name: "vitest", url: null, alsoOnBase: true }] });
+    expect(shouldAutoFix(card(doneRun), inherited, opts())).toBe(false);
+    expect(shouldAutoFix(card(doneRun), failing, opts({ ledger: { "t1#42": { count: 1, lastSha: "sha1" } } }))).toBe(false);
+    expect(shouldAutoFix(card(doneRun), failing, opts({ ledger: { "t1#42": { count: 2, lastSha: "old" } } }))).toBe(false);
+    expect(shouldAutoFix(card(doneRun), failing, opts({ ledger: { "t1#42": { count: 1, lastSha: "old" } } }))).toBe(true);
+  });
+
+  test("a blocked run takes a follow-up only when nothing in it is still running", () => {
+    const blocked = { status: "blocked", active: [{ stepId: "s", taskId: "step-1", seq: 1 }], snapshot: {} };
+    expect(followUpReady(card(blocked), () => false)).toBe(true);
+    expect(followUpReady(card(blocked), () => true)).toBe(false);
+    expect(followUpReady(card({ ...doneRun, status: "running" }))).toBe(false);
+    expect(followUpReady(task({}))).toBe(false);
   });
 });
