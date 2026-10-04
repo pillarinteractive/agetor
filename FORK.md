@@ -278,3 +278,13 @@ Investigator sonnet/high (Reproduce); Builder opus/high (Fix); Codex Builder gpt
 Reviewer opus/medium; Codex Reviewer gpt-6-sol/medium; Security Reviewer opus/high; Editor sonnet/medium (Synthesize,
 File issues); Finisher gpt-6-luna/medium; Conductor sonnet. Verification is path-scoped (Pillar
 `.github/scripts/verify_changed.py --if-needed`, PR #229), CI runs the full suite.
+
+## One pipeline: Change (`feat/default-pipeline`)
+
+Board config (2026-10-04): pipelines are **Change** (default for every card) and **Branch Review**; Feature, Bugfix
+and Simplify were retired. Change = Understand (Investigator, Claude sonnet-5.5 high + 3 Sonnet Scouts; can end the
+run, or skip to Finish for a trivial change it made) → Build (Codex gpt-6.1-sol high) → Review (Claude opus-5.5
+medium + 2 Scouts — the other model family; changes requested → Build) → Finish (Codex gpt-6-luna; verification
+failed → Build). Codex does the long work on the plan with quota headroom; Claude does short thinking steps.
+`default_pipeline` preference = Change's id: New task and the Issues page start on it. Fix CI / Address review /
+E2E follow-ups run on Codex Builder.

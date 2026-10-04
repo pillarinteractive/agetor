@@ -150,6 +150,8 @@ interface Props {
 
 const LAST_WORKDIR_PREF = "lastWorkdir";
 
+const DEFAULT_PIPELINE_PREF = "default_pipeline";
+
 export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSettingsAgents, pipelines, pipelinesLoaded, onOpenPipelines, agentModels, harnessModels, onRefreshModels, focusNonce }: Props) {
   // Collapsed = thin icon rail; the board's `flex-1` <main> takes the freed
   // width on its own. Seeded synchronously from localStorage (lazy initial
@@ -206,6 +208,19 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
   // every other field below. Mutually exclusive with `agentProfileId` —
   // each picker's `onChange` below clears the other.
   const [pipelineId, setPipelineId] = useState<string | null>(null);
+  // The board's default pipeline (`default_pipeline` preference — "Change"):
+  // a new task starts on it unless the user picks another, or "No pipeline".
+  const [defaultPipelineId, setDefaultPipelineId] = useState<string | null>(null);
+  const pipelinePickedRef = useRef(false);
+  useEffect(() => {
+    void api
+      .listPreferences()
+      .then((prefs) => {
+        const id = prefs[DEFAULT_PIPELINE_PREF];
+        if (typeof id === "string" && id) setDefaultPipelineId(id);
+      })
+      .catch(() => {});
+  }, []);
   // Soft-deleted harnesses are excluded from the picker and the default-
   // fallback logic. The full `harnesses` list is still used for
   // `selectedHarness` lookup so the resolved kind stays correct even for a
@@ -517,6 +532,10 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
   // won't clear against a non-empty not-yet-fetched list.
   const pipelinesKnownLoaded = pipelinesLoaded ?? pipelines.length === 0;
   useEffect(() => {
+    if (pipelinePickedRef.current || pipelineId || !defaultPipelineId) return;
+    if (pipelines.some((p) => p.id === defaultPipelineId)) setPipelineId(defaultPipelineId);
+  }, [pipelines, pipelineId, defaultPipelineId]);
+  useEffect(() => {
     if (pipelineId && pipelinesKnownLoaded && !pipelines.some((p) => p.id === pipelineId)) {
       setPipelineId(null);
     }
@@ -654,7 +673,9 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
     capture.clearDropHint();
     wt.resetAfterSubmit();
     setAgentProfileId(null);
-    setPipelineId(null);
+    // Back to the default pipeline for the next task.
+    pipelinePickedRef.current = false;
+    setPipelineId(defaultPipelineId && pipelines.some((p) => p.id === defaultPipelineId) ? defaultPipelineId : null);
     // Keep `workdir`, `model`, `effort`, `mode` set on purpose — the next
     // task should default to the same project + picks the user just used.
   };
@@ -828,6 +849,7 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
                 <PipelinePicker
                   value={pipelineId}
                   onChange={(id) => {
+                    pipelinePickedRef.current = true;
                     setPipelineId(id);
                     if (id) setAgentProfileId(null);
                   }}
@@ -849,7 +871,10 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
                     <button
                       type="button"
                       data-testid="new-task-pipeline-clear"
-                      onClick={() => setPipelineId(null)}
+                      onClick={() => {
+                        pipelinePickedRef.current = true;
+                        setPipelineId(null);
+                      }}
                       className="shrink-0 text-[11px] text-muted-foreground hover:text-foreground hover:underline"
                     >
                       Change
@@ -868,7 +893,10 @@ export function NewTaskForm({ onSubmit, agents, harnesses, profiles, onOpenSetti
                   value={agentProfileId}
                   onChange={(id) => {
                     setAgentProfileId(id);
-                    if (id) setPipelineId(null);
+                    if (id) {
+                      pipelinePickedRef.current = true;
+                      setPipelineId(null);
+                    }
                   }}
                   profiles={profiles}
                   // Full list, not `availableHarnesses` — the picker/card

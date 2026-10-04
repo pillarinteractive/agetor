@@ -70,11 +70,21 @@ export function IssuesPage({
   useEffect(() => {
     if (!projects.some((p) => p.path === projectPath) && projects[0]) setProjectPath(projects[0].path);
   }, [projects, projectPath]);
-  // First visit: prefer a bug-fixing pipeline over whatever sorts first.
+  // First visit (or the remembered pipeline was retired): the board's default
+  // pipeline (`default_pipeline` preference), else one named Change/Bugfix,
+  // else whatever sorts first.
+  const [defaultPipelineId, setDefaultPipelineId] = useState<string | null>(null);
+  useEffect(() => {
+    void api.listPreferences().then((prefs) => setDefaultPipelineId(prefs.default_pipeline || null)).catch(() => {});
+  }, []);
   useEffect(() => {
     if (pipelines.some((p) => p.id === pipelineId) || !pipelines[0]) return;
-    setPipelineId((pipelines.find((p) => /bug ?fix/i.test(p.name)) ?? pipelines[0]).id);
-  }, [pipelines, pipelineId]);
+    const pick =
+      pipelines.find((p) => p.id === defaultPipelineId) ??
+      pipelines.find((p) => /^change\b|bug ?fix/i.test(p.name)) ??
+      pipelines[0];
+    setPipelineId(pick.id);
+  }, [pipelines, pipelineId, defaultPipelineId]);
   useEffect(() => remember(PROJECT_KEY, projectPath), [projectPath]);
   useEffect(() => setSeenLabels([]), [projectPath]);
   useEffect(() => remember(PIPELINE_KEY, pipelineId), [pipelineId]);
