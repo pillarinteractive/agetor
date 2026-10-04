@@ -13,6 +13,7 @@ import { resolveThemePreference, resolveFontSizePreference, buildWindowHash } fr
 import { broadcastAppEvent, consumeForceQuit } from "./quit-guard.ts";
 import { refreshAllModels, startPeriodicDiscovery } from "./model-discovery.ts";
 import { startUpdaterLoop, applyUpdate, checkForUpdate, getUpdateSnapshot } from "./updater.ts";
+import { startLeaseWatchLoop } from "./lease-watch.ts";
 import { getMainWindow, setMainWindow } from "./window.ts";
 import { makeWindowLifecycle, type Frame } from "./window-lifecycle.ts";
 import { focusWindow } from "./window-focus.ts";
@@ -489,6 +490,10 @@ process.on("exit", stopFxAutoResumeTimers);
 // that the UI subscribes to via SSE to render the "update ready" banner.
 // Defers its first probe 5s past boot so it doesn't slow window open.
 startUpdaterLoop();
+
+// Lease badges (src/bun/lease-watch.ts): probe each `lease_watchers` command
+// and publish who holds the resource. A no-op until one is configured.
+startLeaseWatchLoop();
 
 /** Lifecycle wrapper around BrowserWindow construction. Handles:
  *   - idempotency (concurrent reopen events share one in-flight build),

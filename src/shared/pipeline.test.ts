@@ -15,6 +15,7 @@ import {
   deriveRunStatus,
   effectiveStepCap,
   incomingSteps,
+  isPipelineColumnRunnerOwned,
   matchPipelineRef,
   newStep,
   normalizeHandoff,
@@ -1263,6 +1264,27 @@ function fullHandoffJsonObj(overrides: Partial<Handoff> = {}): Handoff {
     ...overrides,
   };
 }
+
+// ---------------------------------------------------------------------------
+// isPipelineColumnRunnerOwned
+
+describe("isPipelineColumnRunnerOwned", () => {
+  test("a live run owns the parent's column", () => {
+    for (const status of ["idle", "running", "blocked"] as const) {
+      expect(isPipelineColumnRunnerOwned(makeRun({ status }))).toBe(true);
+    }
+  });
+
+  test("a parent that never started is still runner-owned", () => {
+    expect(isPipelineColumnRunnerOwned(null)).toBe(true);
+    expect(isPipelineColumnRunnerOwned(undefined)).toBe(true);
+  });
+
+  test("a finished or stopped run releases the column to the user", () => {
+    expect(isPipelineColumnRunnerOwned(makeRun({ status: "done" }))).toBe(false);
+    expect(isPipelineColumnRunnerOwned(makeRun({ status: "cancelled" }))).toBe(false);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // deriveRunStatus

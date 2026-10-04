@@ -28,8 +28,10 @@ import {
 } from "lucide-react";
 import { api, type AgentModelMap, type HarnessModelMap } from "@/lib/api";
 import { Button } from "@/components/ui/button";
-import { clampFontSizePercent, COLUMNS, USAGE_SUPPORTED_KINDS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type HarnessQuota, type Project, type Task, type TaskType } from "../shared/types.ts";
+import { clampFontSizePercent, COLUMNS, USAGE_SUPPORTED_KINDS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type HarnessQuota, type LeaseStatus, type Project, type Task, type TaskType } from "../shared/types.ts";
 import { parseIssueUrl } from "../shared/issue-task.ts";
+import { isPipelineColumnRunnerOwned } from "../shared/pipeline.ts";
+import { LeaseContext } from "@/lib/leases";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
 import { ContextMenu, type ContextMenuItem } from "@/components/ui/context-menu";
@@ -324,6 +326,7 @@ function AppInner() {
   const [worktreesOpen, setWorktreesOpen] = useState(false);
   const [tmuxDialogOpen, setTmuxDialogOpen] = useState(false);
   const [updateSnapshot, setUpdateSnapshot] = useState<UpdateSnapshot | null>(null);
+  const [leases, setLeases] = useState<LeaseStatus[]>([]);
   const [homeDir, setHomeDir] = useState<string>("");
   // Active data dir resolved server-side (~/.agetor for the packaged .app,
   // ~/.agetor-dev when launched via `bun run dev` / `dev:hmr`). Threaded to
@@ -621,6 +624,8 @@ function AppInner() {
     // freshly-opened webview wouldn't know about an update that was already
     // downloaded by the previous main-process tick.
     api.getUpdateStatus().then(setUpdateSnapshot).catch(() => { /* fine */ });
+    // Same for lease badges: later changes arrive as `leases` events.
+    api.getLeases().then(setLeases).catch(() => { /* fine */ });
     // Skip poll ticks while the window is hidden — a backgrounded kanban
     // board has no reason to keep re-fetching + re-rendering every 2s/15s.
     // The intervals themselves keep running (cheap — it's just the fetch +
@@ -1108,6 +1113,11 @@ function AppInner() {
         });
         return;
       }
+      // Lease badges are board-scoped too (src/bun/lease-watch.ts).
+      if (ev.kind === "leases") {
+        setLeases(ev.leases);
+        return;
+      }
       // "Already looking at it" — the run panel is open on the task, OR the
       // full-page pipeline run view is showing it (L-A3: a pipeline parent
       // never opens in the panel, so `selectedIdRef` alone would toast a
@@ -1507,10 +1517,23 @@ function AppInner() {
     if (!col) return;
     const t = tasksRef.current.find((x) => x.id === id);
     if (!t || t.column === col) return;
-    // A pipeline PARENT's column is runner-owned (mirrors `pipelineRun.status`;
-    // the server 409s a `column` patch on it) — refuse the drop and say why,
-    // instead of an optimistic flip that snaps back with a raw 409 (L-A4).
-    if (t.pipelineId) {
+    // Dropping a blocked pipeline on Running is a Retry — e.g. once the lease
+    // it was waiting on frees up. The runner moves the card itself.
+    if (t.pipelineId && t.pipelineRun?.status === "blocked" && col === "running") {
+      try {
+        setError(null);
+        await api.retryPipeline(id);
+      } catch (e) {
+        surfaceError(e);
+      }
+      await refresh();
+      return;
+    }
+    // A pipeline PARENT's column is runner-owned while its run is live (mirrors
+    // `pipelineRun.status`; the server 409s a `column` patch on it) — refuse
+    // the drop and say why, instead of an optimistic flip that snaps back with
+    // a raw 409 (L-A4). A finished or stopped run's card moves freely.
+    if (t.pipelineId && isPipelineColumnRunnerOwned(t.pipelineRun)) {
       toast("This pipeline task's column is managed by its run.");
       return;
     }
@@ -2166,6 +2189,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                 <div className="relative flex-1">
                   <div className="kanban-scroll absolute inset-0 overflow-x-scroll">
                     <DndContext sensors={sensors} onDragEnd={onDragEnd}>
+                      <LeaseContext.Provider value={leases}>
                       <div className="flex gap-3 p-4">
                         {visibleColumns.map((c) => (
                           <Column
@@ -2188,6 +2212,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                           />
                         ))}
                       </div>
+                      </LeaseContext.Provider>
                     </DndContext>
                   </div>
                   {/* Zero-task state: the full onboarding card sits above the

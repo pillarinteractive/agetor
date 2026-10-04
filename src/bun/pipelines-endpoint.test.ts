@@ -1176,6 +1176,53 @@ test("PATCH /tasks/:id column on a pipeline PARENT → 409 when it differs; a sa
   expect(((await plainMoved.json()) as Task).column).toBe("ready");
 });
 
+test("PATCH /tasks/:id column on a FINISHED or STOPPED pipeline parent moves it (Review → Done, then archivable); a live one still 409s", async () => {
+  const { tasks } = await import("./db.ts");
+  const profile = await createProfile();
+  const pipeline = await createPipeline(profile.id);
+  const stepId = pipeline.graph.steps[0]!.id;
+  const runState = (status: "running" | "done" | "cancelled") => ({
+    pipelineId: pipeline.id,
+    pipelineName: pipeline.name,
+    snapshot: null,
+    status,
+    active: status === "running" ? [{ stepId, taskId: "step-task-1", seq: 1 }] : [],
+    joins: {},
+    blocked: [],
+    history: [],
+    stepCount: 1,
+    startedAt: 1,
+    endedAt: status === "running" ? null : 2,
+  });
+
+  // Finished: the runner parked it in Review; Done is the user's call, and
+  // only a Done card can be archived.
+  const finished = await createTask({ pipelineId: pipeline.id });
+  tasks.setPipelineRun(finished.id, runState("done"));
+  tasks.update(finished.id, { column: "review" });
+  const toDone = await call(`/tasks/${finished.id}`, { method: "PATCH", body: JSON.stringify({ column: "done" }) });
+  expect(toDone.status).toBe(200);
+  expect(((await toDone.json()) as Task).column).toBe("done");
+  const archived = await call(`/tasks/${finished.id}/archive`, { method: "POST" });
+  expect(archived.status).toBe(200);
+  expect(((await archived.json()) as Task).archivedAt).not.toBeNull();
+
+  // Stopped: parked in Ready; the user can retire it the same way.
+  const stopped = await createTask({ pipelineId: pipeline.id });
+  tasks.setPipelineRun(stopped.id, runState("cancelled"));
+  tasks.update(stopped.id, { column: "ready" });
+  const stoppedToDone = await call(`/tasks/${stopped.id}`, { method: "PATCH", body: JSON.stringify({ column: "done" }) });
+  expect(stoppedToDone.status).toBe(200);
+
+  // Live: still runner-owned.
+  const live = await createTask({ pipelineId: pipeline.id });
+  tasks.setPipelineRun(live.id, runState("running"));
+  tasks.update(live.id, { column: "running" });
+  const liveMoved = await call(`/tasks/${live.id}`, { method: "PATCH", body: JSON.stringify({ column: "done" }) });
+  expect(liveMoved.status).toBe(409);
+  expect((await liveMoved.json()).error).toBe("pipeline task's column is managed by its run");
+});
+
 test("POST /tasks/:id/start on a (non-orphaned) pipeline step task → 409 (M-R5)", async () => {
   const profile = await createProfile();
   const pipeline = await createPipeline(profile.id);

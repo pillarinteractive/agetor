@@ -513,6 +513,8 @@ function describeGlobalEvent(event: GlobalEvent): string {
       return `fx-auto-resume:${event.state}`;
     case "pipeline":
       return `pipeline:${event.status}`;
+    case "leases":
+      return `leases:${event.leases.length}`;
     default:
       return assertNever(event);
   }

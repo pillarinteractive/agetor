@@ -24,7 +24,7 @@ import {
   type AskQuestion,
   type TmuxPromptChoice,
 } from "./interactions.ts";
-import { resolveTmuxBin, tmuxSocketArgs, ensureDisclaimedServer } from "./tmux-resolution.ts";
+import { resolveTmuxBin, tmuxSocketArgs, tmuxSpawnOptions, ensureDisclaimedServer } from "./tmux-resolution.ts";
 import { createDeathProbe } from "./session-liveness.ts";
 import { detectAskModal, isLossyAskPane, parseModalPane, type AskModalKind, type DriveStep, type NavKey, type ParsedQuestionPane } from "./claude-questions.ts";
 
@@ -1466,6 +1466,7 @@ interface RunResult {
 async function tmux(args: string[], opts: { stdinText?: string } = {}): Promise<RunResult> {
   try {
     const proc = Bun.spawn([resolveTmuxBin(), ...tmuxSocketArgs(), ...args], {
+      ...tmuxSpawnOptions(),
       stdin: opts.stdinText !== undefined
         ? new TextEncoder().encode(opts.stdinText)
         : "ignore",
