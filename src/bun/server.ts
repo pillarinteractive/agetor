@@ -39,6 +39,7 @@ import { buildEli5Prompt, eli5TaskTitle } from "../shared/clone-eli5.ts";
 import { CLONE_PROVIDERS, isGitProvider } from "../shared/clone-input.ts";
 import { stalledSince } from "./stall-registry.ts";
 import { lastActivityAt } from "./activity-clock.ts";
+import { blockedByFor, readDependencies, setDependencies } from "./dependencies.ts";
 import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
 import {
@@ -283,7 +284,7 @@ function withRunningSubagents(t: Task): Task & { runningSubagents: number } {
   // `stalledSince` rides the same decoration: transient in-memory server
   // state (the turn-stall watchdog's mark) that the DB-derived Task can't
   // carry — see stall-registry.ts.
-  return { ...t, runningSubagents, stalledSince: stalledSince(t.id), lastActivityAt: lastActivityAt(t) };
+  return { ...t, runningSubagents, stalledSince: stalledSince(t.id), lastActivityAt: lastActivityAt(t), blockedBy: blockedByFor(t.id) };
 }
 
 // Turn raw path strings into references: keep only existing absolute paths,
@@ -4425,6 +4426,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const counts = subagents.runningCountsByTask();
           const allTasks = tasks.list();
           const byId = new Map(allTasks.map((t) => [t.id, t]));
+          const deps = readDependencies();
           return json(
             allTasks.map((t) => ({
               ...t,
@@ -4434,6 +4436,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               runningSubagents: counts.get(t.id) ?? 0,
               stalledSince: stalledSince(t.id),
               lastActivityAt: lastActivityAt(t, (id) => byId.get(id)),
+              blockedBy: blockedByFor(t.id, deps),
             })),
             { headers: corsHeaders(req) },
           );
@@ -4948,6 +4951,19 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       },
 
       // A card's activity timeline, newest first (src/bun/activity.ts).
+      // Cards this card is blocked by (src/bun/dependencies.ts). PUT {ids}
+      // replaces them; an empty list clears.
+      "/tasks/:id/blocked-by": {
+        PUT: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { ids?: unknown };
+          const ids = Array.isArray(body.ids) ? body.ids.filter((x): x is string => typeof x === "string") : null;
+          if (!ids) return json({ error: "ids (array) required" }, { status: 400, headers: corsHeaders(req) });
+          const r = setDependencies(req.params.id, ids);
+          if ("error" in r) return json({ error: r.error }, { status: 400, headers: corsHeaders(req) });
+          return json({ blockedBy: blockedByFor(req.params.id) ?? [] }, { headers: corsHeaders(req) });
+        }),
+      },
+
       "/tasks/:id/activity": {
         GET: authed((req) => {
           const t = tasks.get(req.params.id);

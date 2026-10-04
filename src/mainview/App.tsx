@@ -25,6 +25,7 @@ import {
   Workflow,
   X,
   Sparkles,
+  Link2,
   type LucideIcon,
 } from "lucide-react";
 import { api, type AgentModelMap, type HarnessModelMap } from "@/lib/api";
@@ -37,6 +38,7 @@ import { PrContext } from "@/lib/prs";
 import { ProgressContext } from "@/lib/progress";
 import { IssuesPage } from "@/components/issues/IssuesPage";
 import { NeedsYouBar } from "@/components/kanban/NeedsYouBar";
+import { BlockedByDialog } from "@/components/kanban/BlockedByDialog";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
 import { ContextMenu, type ContextMenuItem } from "@/components/ui/context-menu";
@@ -185,6 +187,7 @@ const ICON_BY_ACTION: Record<TaskMenuAction, LucideIcon> = {
   "mark-unread": Mail,
   "copy-branch": GitBranch,
   "copy-worktree-path": Copy,
+  "blocked-by": Link2,
   delete: Trash2,
 };
 
@@ -1861,6 +1864,8 @@ function AppInner() {
   // below), so actions still act on current state (e.g. `cancel` sees the
   // current `runId`) even though the menu itself is a snapshot.
   const [taskMenu, setTaskMenu] = useState<{ task: Task; isOpen: boolean; x: number; y: number } | null>(null);
+  // "Blocked by…" picker (src/bun/dependencies.ts), opened from the card menu.
+  const [blockedByTask, setBlockedByTask] = useState<Task | null>(null);
   const openTaskMenu = useCallback((t: Task, pos: { x: number; y: number }) => {
     setTaskMenu({ task: t, isOpen: t.id === selectedIdRef.current, x: pos.x, y: pos.y });
   }, []);
@@ -1951,6 +1956,9 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         if (worktreePath) void copyToClipboard(worktreePath, "worktree path");
         break;
       }
+      case "blocked-by":
+        setBlockedByTask(t);
+        break;
       case "delete":
         void del(t);
         break;
@@ -2423,6 +2431,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         </main>
         </ProgressContext.Provider>
       </div>
+      <BlockedByDialog task={blockedByTask} tasks={tasks} onClose={() => setBlockedByTask(null)} />
       <RunPanel
         task={selected}
         stickyUserMessages={stickyUserMessages}

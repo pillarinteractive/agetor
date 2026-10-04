@@ -207,3 +207,12 @@ suggestion rules are gone.
   outgoing edges that may also end the run by handing off `next: null`. Pillar's Finish uses it with a
   "verification failed" edge back to Fix (Bugfix) / Build (Feature), so a failing final check loops back instead of
   blocking (bounded by maxSteps).
+
+## Card dependencies (`feat/card-dependencies`)
+
+"Blocked by…" in a card's right-click menu, `agetor depends <id> <dep…>` (or `--clear`), or ask the Conductor.
+Stored in the `card_dependencies` preference; `Task.blockedBy` is decorated onto API responses
+(`src/bun/dependencies.ts`). A dependency is satisfied when its card is Done/archived/deleted or its PR merged.
+While waiting, the card says `Waiting on "<card>" · PR #201 · checks running` and carries a "waits on #201" chip.
+When the last one lands, a 15s watcher moves the card on and clears the entry: never-started → started; blocked
+pipeline → its blocked step is told to merge the base and carry on; idle single task → told the same.

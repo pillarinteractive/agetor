@@ -25,6 +25,7 @@ export type TaskMenuAction =
   | "mark-unread"
   | "copy-branch"
   | "copy-worktree-path"
+  | "blocked-by"
   | "delete";
 
 /** Visual/semantic grouping — T3 inserts a separator between consecutive
@@ -135,6 +136,11 @@ export function buildTaskContextMenu(task: Task, ctx: { isOpen: boolean }): Task
   }
   if (task.issueUrl) {
     entries.push({ action: "view-issue", label: "View issue", group: "inspect" });
+  }
+
+  // Card dependencies — any live board card can wait on other cards.
+  if (!archived && !isStepTask && task.column !== "done") {
+    entries.push({ action: "blocked-by", label: "Blocked by…", group: "inspect" });
   }
 
   // utility — read/unread + copy entries share one group so they render as a

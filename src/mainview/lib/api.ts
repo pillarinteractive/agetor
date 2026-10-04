@@ -476,6 +476,9 @@ export const api = {
   getLeases: () => j<LeaseStatus[]>("/leases"),
   getProgress: () => j<TaskProgress[]>("/progress"),
   /** The Conductor chat agent (src/bun/conductor.ts). */
+  /** Replace the cards a card is blocked by (src/bun/dependencies.ts). */
+  setBlockedBy: (taskId: string, ids: string[]) =>
+    j<{ blockedBy: unknown[] }>(`/tasks/${encodeURIComponent(taskId)}/blocked-by`, { method: "PUT", body: JSON.stringify({ ids }) }, { retry: false }),
   getConductor: () => j<{ taskId: string | null }>("/conductor"),
   startConductor: () => j<Task>("/conductor", { method: "POST" }, { retry: false }),
   /** Every watched task's pull request (src/bun/pr-watch.ts). */

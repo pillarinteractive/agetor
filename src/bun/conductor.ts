@@ -114,6 +114,10 @@ Ids can be the 8-character prefix shown in \`board\`. You may also read the card
     ${cli} followup <id> <actionId> [--request "<text>"]   # start a follow-up step
     ${cli} add --title "<title>" --prompt "<prompt>" --workdir <repo>   # draft a new task (add --start to run it)
     ${cli} move <id> <column>
+    ${cli} depends <id> <blocked-by-id>…         # <id> waits on those cards; it moves on by itself when they land
+
+When a card can't proceed until another card's work merges, propose \`depends\` rather than asking the user to remember
+to nudge it later.
 
 Say what you're about to do in one line, do it, then report the result. If the user's request is ambiguous, ask.
 

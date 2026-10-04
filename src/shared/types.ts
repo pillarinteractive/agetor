@@ -1719,6 +1719,9 @@ export interface Task {
    * stalled.
    */
   stalledSince?: number | null;
+  /** Cards this one is blocked by (`card_dependencies`, src/bun/dependencies.ts),
+   *  server-decorated; absent when it has none. */
+  blockedBy?: TaskDependency[];
   /** When this card's agents last produced anything (the newest run event of
    *  the running task, or for a running pipeline the quietest active step).
    *  Server-decorated for running cards only; drives the "quiet" warning. */
@@ -5185,4 +5188,14 @@ export interface TaskProgress extends TaskProgressReport {
   label: string;
   checkout: string;
   checkedAt: number;
+}
+
+/** One "blocked by" dependency of a card. Satisfied when that card is Done or
+ *  archived, or its PR merged. */
+export interface TaskDependency {
+  taskId: string;
+  title: string;
+  satisfied: boolean;
+  /** "PR #201 · checks running", "running", "PR #201 merged", "done"… */
+  detail: string;
 }

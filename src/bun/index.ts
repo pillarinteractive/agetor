@@ -18,6 +18,7 @@ import { startKeepAwakeLoop } from "./keep-awake.ts";
 import { startPrWatchLoop } from "./pr-watch.ts";
 import { startProgressWatchLoop } from "./progress-watch.ts";
 import { startConductorLoop } from "./conductor.ts";
+import { startDependencyLoop } from "./dependencies.ts";
 import { getMainWindow, setMainWindow } from "./window.ts";
 import { makeWindowLifecycle, type Frame } from "./window-lifecycle.ts";
 import { focusWindow } from "./window-focus.ts";
@@ -514,6 +515,10 @@ startProgressWatchLoop();
 // The Conductor (src/bun/conductor.ts): automatic board updates to the chat
 // agent while it's idle. A no-op until the user starts a Conductor.
 startConductorLoop();
+
+// Card dependencies (src/bun/dependencies.ts): move a card on once what
+// it was blocked by has landed.
+startDependencyLoop();
 
 /** Lifecycle wrapper around BrowserWindow construction. Handles:
  *   - idempotency (concurrent reopen events share one in-flight build),

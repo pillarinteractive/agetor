@@ -103,6 +103,16 @@ export function cardStatus(
   }
   if (pr?.state === "merged") return { line: `PR #${pr.number} merged`, tone: "success", needsYou: null };
 
+  // Waiting on other cards (src/bun/dependencies.ts): that's the whole story
+  // until they land — the card moves on by itself then. A running card keeps
+  // its live line (the chip still shows the dependency).
+  const waitingOn = (task.blockedBy ?? []).filter((d) => !d.satisfied);
+  if (waitingOn.length && task.column !== "running" && task.column !== "done") {
+    const first = waitingOn[0]!;
+    const more = waitingOn.length > 1 ? ` (+${waitingOn.length - 1} more)` : "";
+    return { line: `Waiting on "${first.title}" · ${first.detail}${more}`, tone: "warning", needsYou: null };
+  }
+
   const run = task.pipelineRun ?? null;
   if (run) {
     if (run.status === "running") {

@@ -1,7 +1,7 @@
 import { memo } from "react";
 import { useDraggable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, CircleAlert, FolderOpen, GitBranch, GitCompare, GitPullRequest, ListTodo, Lock, LockOpen, MessageCircleQuestion, Paperclip, PauseCircle, Play, Square, Terminal, Trash2 } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, CircleAlert, FolderOpen, GitBranch, GitCompare, GitPullRequest, ListTodo, Link2, Lock, LockOpen, MessageCircleQuestion, Paperclip, PauseCircle, Play, Square, Terminal, Trash2 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { abbreviateHome, cn } from "@/lib/utils";
@@ -41,6 +41,14 @@ function chip(tone: ChipTone): string {
 export function splitCardTitle(title: string): { issue: string | null; text: string } {
   const m = /^Issue #(\d+):\s*(?:\[[^\]]*\]\s*)?([\s\S]*)$/.exec(title);
   return m ? { issue: m[1]!, text: m[2]! || title } : { issue: null, text: title };
+}
+
+/** A dependency's title, short enough for a chip: its issue number when it
+ *  has one, else the first few words. */
+function shortTitle(title: string): string {
+  const t = splitCardTitle(title);
+  if (t.issue) return `#${t.issue}`;
+  return t.text.length > 28 ? `${t.text.slice(0, 27)}…` : t.text;
 }
 
 const repoName = (dir: string) => dir.replace(/\/+$/, "").split("/").pop() || dir;
@@ -273,6 +281,15 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
               {task.agent}
             </span>
           )}
+          {/* Cards this one is blocked by (src/bun/dependencies.ts), until they land. */}
+          {(task.blockedBy ?? [])
+            .filter((d) => !d.satisfied)
+            .map((d) => (
+              <span key={d.taskId} className={chip("warning")} data-testid="blocked-by-chip" title={`Blocked by "${d.title}" — ${d.detail}`}>
+                <Link2 className="size-3 shrink-0" />
+                <span className="truncate">waits on {shortTitle(d.title)}</span>
+              </span>
+            ))}
           {/* The task's pull request, as the PR watcher last saw it (src/bun/pr-watch.ts). */}
           {pr && prInfo && (
             <span className={chip(prInfo.tone)} data-testid="pr-badge" data-tone={prInfo.tone} title={prInfo.title}>

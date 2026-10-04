@@ -61,10 +61,13 @@ const ACTION_GROUP: Record<TaskMenuAction, TaskMenuGroup> = {
   "mark-unread": "utility",
   "copy-branch": "utility",
   "copy-worktree-path": "utility",
+  "blocked-by": "inspect",
   delete: "danger",
 };
 
-const actions = (entries: ReturnType<typeof buildTaskContextMenu>) => entries.map((e) => e.action);
+// The sequence tests below predate "Blocked by…"; it has its own tests at the end.
+const actions = (entries: ReturnType<typeof buildTaskContextMenu>) =>
+  entries.map((e) => e.action).filter((a) => a !== "blocked-by");
 
 describe("buildTaskContextMenu", () => {
   test("backlog task, nothing set -> open, start, diff, open-in-finder, delete", () => {
@@ -563,5 +566,20 @@ describe("buildTaskContextMenu", () => {
 
       expect(actions(entries)).toEqual(["open-pipeline", "start", "diff", "open-in-finder", "delete"]);
     });
+  });
+});
+
+describe("blocked-by entry", () => {
+  const all = (t: Parameters<typeof buildTaskContextMenu>[0]) => buildTaskContextMenu(t, { isOpen: false }).map((e) => e.action);
+  test("offered on live cards, at the end of the inspect group (before the utility/danger entries)", () => {
+    const list = all(makeTask({ column: "ready" }));
+    expect(list).toContain("blocked-by");
+    expect(list.indexOf("blocked-by")).toBeLessThan(list.indexOf("delete"));
+    expect(list.indexOf("blocked-by")).toBeGreaterThan(list.indexOf("open-in-finder"));
+  });
+  test("not on Done or archived cards, or pipeline steps", () => {
+    expect(all(makeTask({ column: "done" }))).not.toContain("blocked-by");
+    expect(all(makeTask({ archivedAt: 1 }))).not.toContain("blocked-by");
+    expect(all(makeTask({ pipelineParentId: "p" }))).not.toContain("blocked-by");
   });
 });

@@ -117,3 +117,26 @@ export async function cmdBlocks(args: string[], flags: Flags): Promise<void> {
     for (const e of r.examples) out(`       ${c.dim(e.title.slice(0, 60))}: ${e.message.replace(/\s+/g, " ").slice(0, 140)}`);
   }
 }
+
+/** `agetor depends <id> <dep…>` — <id> is blocked by those cards (replaces
+ *  any earlier list); `agetor depends <id> --clear` removes them;
+ *  `agetor depends <id>` shows them. */
+export async function cmdDepends(args: string[], flags: Flags): Promise<void> {
+  const client = await getClient(flags);
+  const [ref, ...rest] = args;
+  if (!ref) throw new Error("usage: agetor depends <id> [<blocked-by-id>…] | --clear");
+  const task = await resolveTask(client, ref);
+  if (rest.length === 0) {
+    const deps = task.blockedBy ?? [];
+    if (flags.json) return printJson(deps);
+    if (deps.length === 0) return out(c.dim("not blocked by any card"));
+    for (const d of deps) out(`${d.satisfied ? c.green("✓") : c.yellow("…")} ${d.title} [${d.taskId.slice(0, 8)}] ${c.dim(d.detail)}`);
+    return;
+  }
+  const ids = rest[0] === "--clear" ? [] : await Promise.all(rest.map(async (r) => (await resolveTask(client, r)).id));
+  const res = await client.call<{ blockedBy: { title: string; detail: string }[] }>("PUT", `/tasks/${encodeURIComponent(task.id)}/blocked-by`, { ids });
+  if (flags.json) return printJson(res);
+  if (ids.length === 0) return out(`${c.green("✓")} ${task.title} isn't blocked by any card`);
+  out(`${c.green("✓")} ${task.title} is blocked by ${res.blockedBy.map((d) => `"${d.title}" (${d.detail})`).join(", ")}`);
+  out(c.dim("  it moves on by itself once they're done or their PRs merge"));
+}

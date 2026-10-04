@@ -8,6 +8,7 @@ import { startKeepAwakeLoop } from "./keep-awake.ts";
 import { startPrWatchLoop } from "./pr-watch.ts";
 import { startProgressWatchLoop } from "./progress-watch.ts";
 import { startConductorLoop } from "./conductor.ts";
+import { startDependencyLoop } from "./dependencies.ts";
 import { ensureDisclaimedServer } from "./tmux-resolution.ts";
 import { startApiServer, attachedClientCount } from "./server.ts";
 import { rehydratePath } from "./login-path.ts";
@@ -185,6 +186,8 @@ export async function runDaemon(): Promise<void> {
   startProgressWatchLoop();
   // Conductor board updates — same as index.ts; timer is unref'd.
   startConductorLoop();
+  // Card dependencies — same as index.ts; timer is unref'd.
+  startDependencyLoop();
 
   // Idle-session reaper (docs/plans/reduce-cpu-and-memory.md §3.1, T4):
   // mirrors index.ts's wiring so the headless daemon doesn't accumulate the

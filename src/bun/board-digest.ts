@@ -16,6 +16,7 @@ import { prStatusForTask } from "./pr-watch.ts";
 import { listProgress } from "./progress-watch.ts";
 import { listSuggestions, type Suggestion } from "./suggestions.ts";
 import { lastActivityAt } from "./activity-clock.ts";
+import { blockedByFor } from "./dependencies.ts";
 
 export interface DigestCard {
   id: string;
@@ -68,7 +69,8 @@ function digestCard(
   const pr = prStatusForTask(t.id);
   const lease = leaseInfoForTask(t, ctx.leases);
   const progressActive = ctx.progress.some((p) => p.taskId === t.id && p.active);
-  const status = cardStatus({ ...t, lastActivityAt: lastActivityAt(t) }, { pr, lease, now: ctx.now, progressActive });
+  const blockedBy = blockedByFor(t.id);
+  const status = cardStatus({ ...t, lastActivityAt: lastActivityAt(t), blockedBy }, { pr, lease, now: ctx.now, progressActive });
   return {
     id: t.id,
     title: t.title,
@@ -81,7 +83,10 @@ function digestCard(
     needsYou: status.needsYou ? `${status.needsYou.reason} → ${status.needsYou.actionLabel}` : null,
     pr: pr ? prBadge(pr).title : null,
     prUrl: pr?.url ?? t.prUrl ?? null,
-    leases: lease.holds.map((l) => `holds the ${l}`),
+    leases: [
+      ...lease.holds.map((l) => `holds the ${l}`),
+      ...(blockedBy ?? []).filter((d) => !d.satisfied).map((d) => `blocked by "${d.title}" [${d.taskId.slice(0, 8)}] (${d.detail})`),
+    ],
     progress: ctx.progress.filter((p) => p.taskId === t.id).map((p) => progressLine(p).text),
     updated: formatAge(ctx.now - t.updatedAt),
   };

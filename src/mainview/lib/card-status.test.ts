@@ -112,3 +112,12 @@ test("formatAge", () => {
   expect(formatAge(12 * 60_000)).toBe("12m");
   expect(formatAge(2 * 3_600_000)).toBe("2h");
 });
+
+test("a card blocked by another card says what it's waiting on — until it lands", () => {
+  const dep = { taskId: "d", title: "procexec fix", satisfied: false, detail: "PR #201 · checks running" };
+  const t = task({ column: "blocked", blockedBy: [dep] });
+  expect(status(t)).toMatchObject({ line: 'Waiting on "procexec fix" · PR #201 · checks running', tone: "warning", needsYou: null });
+  expect(status(task({ column: "blocked", blockedBy: [dep, { ...dep, taskId: "e" }] })).line).toContain("(+1 more)");
+  // Satisfied dependencies don't hold the card.
+  expect(status(task({ column: "ready", blockedBy: [{ ...dep, satisfied: true }] })).line).not.toContain("Waiting on");
+});
