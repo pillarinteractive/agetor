@@ -18,7 +18,7 @@
  * Dragging the card back to In Review (or Backlog) withdraws the sign-off.
  */
 import type { Task, TaskPrStatus } from "../shared/types.ts";
-import { MERGE_TRAIN_PREF, activeTrain, advanceTrain, buildTrain, manualTrainEligible, parseTrainConfig, shouldDepart, skipsTrain, trainEligible } from "./merge-train.ts";
+import { MERGE_TRAIN_PREF, activeTrain, advanceTrain, buildTrain, manualTrainEligible, parseTrainConfig, replaceTrain, shouldDepart, skipsTrain, trainCiStarted, trainEligible } from "./merge-train.ts";
 import { preferences, tasks } from "./db.ts";
 import { recordActivity } from "./activity.ts";
 import { mergeQueue, setMergeQueued } from "./merge-intent.ts";
@@ -174,8 +174,15 @@ export function mergeQueueTick(now = Date.now()): Promise<void> {
  */
 export function departTrainNow(): Promise<{ train: { pr: number; url: string; members: number[] } } | { error: string }> {
   return exclusive(async () => {
+    // A train that hasn't started CI yet is cheaper to replace than to wait
+    // for: close it and send one bigger train (its PRs ride the new one).
     const out = activeTrain();
-    if (out) return { error: `merge train #${out.pr} is already out — it has to land or disband first` };
+    if (out) {
+      if (await trainCiStarted(out)) {
+        return { error: `merge train #${out.pr} is already running CI — it has to land or disband first` };
+      }
+      await replaceTrain(out);
+    }
     const cards = tasks.list().filter((t) => t.column === "merge" && t.archivedAt == null && !t.pipelineParentId && t.branch);
     const ready: { task: Task; pr: TaskPrStatus }[] = [];
     const left: string[] = [];

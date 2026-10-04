@@ -234,6 +234,22 @@ export function skipsTrain(pr: TaskPrStatus): boolean {
   return trainSkip.has(`${pr.number}:${pr.headSha ?? ""}`);
 }
 
+/** Has the train's CI actually started — any check run in progress or done?
+ *  (Queued-only checks haven't used a runner yet.) */
+export async function trainCiStarted(t: Train): Promise<boolean> {
+  const checks = await getGitHubPullChecks({ dir: t.project, number: t.pr });
+  if (!checks.ok) return true; // unknown: assume started, don't throw work away
+  return checks.checkRuns.some((r) => r.status !== "queued" && r.status !== "pending" && r.status !== "waiting" && r.status !== "requested" && r.name !== "Vercel Preview Comments");
+}
+
+/** Close a train that hasn't started CI so a bigger one can replace it. Its
+ *  members aren't marked to merge alone — they ride the replacement. */
+export async function replaceTrain(t: Train): Promise<void> {
+  await closeGitHubPull({ dir: t.project, number: t.pr, comment: "Replaced by a larger merge train sent by hand — these PRs ride that one." });
+  await git(["push", "--quiet", "origin", "--delete", t.branch], t.project);
+  saveTrain(null);
+}
+
 async function disband(t: Train, why: string, prs: Map<string, TaskPrStatus | null>): Promise<void> {
   await closeGitHubPull({ dir: t.project, number: t.pr, comment: `Disbanding this merge train: ${why}. Agetor merges these PRs one at a time instead.` });
   await git(["push", "--quiet", "origin", "--delete", t.branch], t.project);
