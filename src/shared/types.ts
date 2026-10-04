@@ -1738,6 +1738,9 @@ export interface Task {
   /** Cards this one is blocked by (`card_dependencies`, src/bun/dependencies.ts),
    *  server-decorated; absent when it has none. */
   blockedBy?: TaskDependency[];
+  /** Cards waiting on this one (the reverse of `blockedBy`), server-decorated;
+   *  absent when none. */
+  blocking?: { taskId: string; title: string }[];
   /** When this card's agents last produced anything (the newest run event of
    *  the running task, or for a running pipeline the quietest active step).
    *  Server-decorated for running cards only; drives the "quiet" warning. */

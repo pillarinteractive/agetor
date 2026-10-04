@@ -39,7 +39,7 @@ import { buildEli5Prompt, eli5TaskTitle } from "../shared/clone-eli5.ts";
 import { CLONE_PROVIDERS, isGitProvider } from "../shared/clone-input.ts";
 import { stalledSince } from "./stall-registry.ts";
 import { lastActivityAt } from "./activity-clock.ts";
-import { blockedByFor, readDependencies, setDependencies } from "./dependencies.ts";
+import { blockedByFor, blockingFor, readDependencies, setDependencies } from "./dependencies.ts";
 import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
 import {
@@ -284,7 +284,7 @@ function withRunningSubagents(t: Task): Task & { runningSubagents: number } {
   // `stalledSince` rides the same decoration: transient in-memory server
   // state (the turn-stall watchdog's mark) that the DB-derived Task can't
   // carry — see stall-registry.ts.
-  return { ...t, runningSubagents, stalledSince: stalledSince(t.id), lastActivityAt: lastActivityAt(t), blockedBy: blockedByFor(t.id) };
+  return { ...t, runningSubagents, stalledSince: stalledSince(t.id), lastActivityAt: lastActivityAt(t), blockedBy: blockedByFor(t.id), blocking: blockingFor(t.id) };
 }
 
 // Turn raw path strings into references: keep only existing absolute paths,
@@ -4437,6 +4437,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               stalledSince: stalledSince(t.id),
               lastActivityAt: lastActivityAt(t, (id) => byId.get(id)),
               blockedBy: blockedByFor(t.id, deps),
+              blocking: blockingFor(t.id, deps),
             })),
             { headers: corsHeaders(req) },
           );

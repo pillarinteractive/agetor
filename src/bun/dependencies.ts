@@ -96,6 +96,18 @@ export function blockedByFor(taskId: string, map: DepMap = readDependencies()): 
   return ids.map((id) => dependencyOf(tasks.get(id), id));
 }
 
+/** Cards still waiting on `taskId` (dependencies cleared once acted on, so
+ *  every entry is a live wait). */
+export function blockingFor(taskId: string, map: DepMap = readDependencies()): { taskId: string; title: string }[] | undefined {
+  const out = Object.entries(map)
+    .filter(([, ids]) => ids.includes(taskId))
+    .flatMap(([id]) => {
+      const t = tasks.get(id);
+      return t && t.archivedAt == null ? [{ taskId: id, title: t.title }] : [];
+    });
+  return out.length ? out : undefined;
+}
+
 export function unblockedMessage(deps: TaskDependency[]): string {
   const list = deps.map((d) => `"${d.title}" (${d.detail})`).join(", ");
   return (

@@ -9,6 +9,7 @@ import type { PipelineRunState, Task, TaskPrStatus } from "../../shared/types.ts
 import { blockReasonLine, handoffHeadline } from "../../shared/pipeline.ts";
 import type { TaskLeaseInfo } from "./leases.ts";
 import { ordinal } from "../../shared/block-reason.ts";
+import { shortCardName } from "./card-names.ts";
 
 export type NeedsYouAction = "open" | "retry" | "open-pr";
 
@@ -127,9 +128,9 @@ export function cardStatus(
   // its live line (the chip still shows the dependency).
   const waitingOn = (task.blockedBy ?? []).filter((d) => !d.satisfied);
   if (waitingOn.length && task.column !== "running" && task.column !== "done") {
-    const first = waitingOn[0]!;
-    const more = waitingOn.length > 1 ? ` (+${waitingOn.length - 1} more)` : "";
-    return { line: `Waiting on "${first.title}" · ${first.detail}${more}`, tone: "warning", needsYou: null };
+    const names = waitingOn.map((d) => shortCardName(d.title)).join(", ");
+    const detail = waitingOn.length === 1 ? ` · ${waitingOn[0]!.detail}` : "";
+    return { line: `Waiting on ${names}${detail}`, tone: "warning", needsYou: null };
   }
 
   // Ready to Merge: signed off — Agetor is working the PR to green and will

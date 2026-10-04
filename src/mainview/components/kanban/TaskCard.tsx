@@ -15,24 +15,11 @@ import { prBadge, useTaskPr } from "@/lib/prs";
 import { cardStatus } from "@/lib/card-status";
 import { ordinal } from "../../../shared/block-reason.ts";
 import { progressFraction, progressLine, useTaskProgress } from "@/lib/progress";
+import { blockerColor, shortCardName, splitCardTitle } from "@/lib/card-names";
 
 // The theme's --destructive is a dark fill meant for buttons (30% lightness
 // in dark mode) — unreadable as text on a dark card. Text uses a lighter red.
 const DANGER_TEXT = "text-red-600 dark:text-red-400";
-
-/** "Issue #182: [review] Public pages…" → number chip + the readable rest. */
-export function splitCardTitle(title: string): { issue: string | null; text: string } {
-  const m = /^Issue #(\d+):\s*(?:\[[^\]]*\]\s*)?([\s\S]*)$/.exec(title);
-  return m ? { issue: m[1]!, text: m[2]! || title } : { issue: null, text: title };
-}
-
-/** A dependency's title, short enough for a chip: its issue number when it
- *  has one, else the first few words. */
-function shortTitle(title: string): string {
-  const t = splitCardTitle(title);
-  if (t.issue) return `#${t.issue}`;
-  return t.text.length > 28 ? `${t.text.slice(0, 27)}…` : t.text;
-}
 
 
 interface Props {
@@ -155,6 +142,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
   const TypeIcon = taskTypeIcon(type.icon);
   const runningSubagents = task.runningSubagents ?? 0;
   const title = splitCardTitle(task.title);
+  const waitingTags = (task.blockedBy ?? []).filter((d) => !d.satisfied);
 
   return (
     <Card
@@ -225,6 +213,34 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
             {title.text}
           </CardTitle>
         </div>
+        {/* Dependency tags: a card that blocks others wears its own color
+         *  ("blocks 3"); each card waiting on it wears that same color with its
+         *  short name ("#214"). */}
+        {!archived && (waitingTags.length > 0 || (task.blocking?.length ?? 0) > 0) && (
+          <div className="flex flex-wrap items-center gap-1">
+            {(task.blocking?.length ?? 0) > 0 && (
+              <span
+                className={cn("inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-semibold ring-1", blockerColor(task.id))}
+                data-testid="blocks-tag"
+                title={`Blocks: ${task.blocking!.map((b) => b.title).join(", ")}`}
+              >
+                <Link2 className="size-3" />
+                {title.issue ? `#${title.issue} · ` : ""}blocks {task.blocking!.length}
+              </span>
+            )}
+            {waitingTags.map((d) => (
+              <span
+                key={d.taskId}
+                className={cn("inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-semibold ring-1", blockerColor(d.taskId))}
+                data-testid="blocked-by-chip"
+                title={`Waiting on "${d.title}" — ${d.detail}`}
+              >
+                <Link2 className="size-3" />
+                waits on {shortCardName(d.title)}
+              </span>
+            ))}
+          </div>
+        )}
         {!archived && (
           <p
             data-testid="card-status"
@@ -281,14 +297,6 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
         <div className="flex min-h-6 items-center gap-2" onClick={(e) => e.stopPropagation()}>
           {primary}
           <div className="ml-auto flex min-w-0 items-center gap-1.5 text-[11px] text-muted-foreground">
-            {(task.blockedBy ?? [])
-              .filter((d) => !d.satisfied)
-              .map((d) => (
-                <span key={d.taskId} className="flex items-center gap-0.5 text-warning" data-testid="blocked-by-chip" title={`Blocked by "${d.title}" — ${d.detail}`}>
-                  <Link2 className="size-3" />
-                  {shortTitle(d.title)}
-                </span>
-              ))}
             {lease.holds.map((label) => (
               <span key={label} className="flex items-center gap-0.5 text-info" data-testid="lease-badge" title={`Holds the ${label} lease`}>
                 <Lock className="size-3" />
