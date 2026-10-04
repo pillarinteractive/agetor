@@ -11,6 +11,7 @@
 import type { FollowUpAction, FollowUpPreset, Task } from "../shared/types.ts";
 import { agentProfiles, preferences } from "./db.ts";
 import { runPipelineFollowUp } from "./pipeline-runner.ts";
+import { prFollowUpActions, prFollowUpInstructions, prStatusForTask } from "./pr-watch.ts";
 
 export const FOLLOW_UPS_PREF = "pipeline_followups";
 const MATCHED_SAMPLE = 3;
@@ -119,7 +120,9 @@ function agentIdByName(name: string): string | null {
 export async function listFollowUps(task: Task): Promise<{ actions: FollowUpAction[]; changedFiles: number }> {
   const presets = parseFollowUpPresets(preferences.get(FOLLOW_UPS_PREF));
   const changed = await changedFilesForTask(task);
-  return { actions: suggestFollowUps(presets, changed, agentIdByName), changedFiles: changed.length };
+  // The PR's own blockers (failing CI, unresolved review) come first.
+  const fromPr = prFollowUpActions(prStatusForTask(task.id));
+  return { actions: [...fromPr, ...suggestFollowUps(presets, changed, agentIdByName)], changedFiles: changed.length };
 }
 
 /** Run a preset (optionally with the user's extra request) or a custom
@@ -129,6 +132,14 @@ export async function startFollowUp(
   body: { presetId?: unknown; profileId?: unknown; request?: unknown },
 ): Promise<{ task: Task } | { error: string; status: 400 | 404 | 409 }> {
   const request = typeof body.request === "string" ? body.request.trim() : "";
+  if (typeof body.presetId === "string" && body.presetId.startsWith("pr:")) {
+    const pr = prFollowUpInstructions(body.presetId, prStatusForTask(parentId));
+    if (!pr) return { error: "the pull request no longer needs that — refresh", status: 409 };
+    const action = prFollowUpActions(prStatusForTask(parentId)).find((a) => a.id === body.presetId);
+    if (!action?.agentId) return { error: `agent "${action?.agentName ?? "?"}" not found`, status: 400 };
+    const instructions = request ? `${pr.instructions}\n\n## The user's request\n${request}` : pr.instructions;
+    return runPipelineFollowUp(parentId, { profileId: action.agentId, name: pr.name, instructions });
+  }
   if (typeof body.presetId === "string" && body.presetId) {
     const preset = parseFollowUpPresets(preferences.get(FOLLOW_UPS_PREF)).find((p) => p.id === body.presetId);
     if (!preset) return { error: "unknown follow-up", status: 400 };

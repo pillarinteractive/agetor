@@ -491,6 +491,15 @@ export function pipelineUpdateColumn(taskId: string, runId: string | null, next:
   updateColumn(taskId, runId, next, "pipeline");
 }
 
+/** Move a task whose pull request merged to Done (src/bun/pr-watch.ts),
+ *  through the same `updateColumn` path as any other transition so the board
+ *  and CLI hear about it. */
+export function moveMergedTaskToDone(taskId: string): void {
+  const task = tasks.get(taskId);
+  if (!task || task.column === "done") return;
+  updateColumn(taskId, task.runId ?? null, "done");
+}
+
 /**
  * M7: true when `task` is a pipeline step row (`pipelineParentId` set) whose
  * parent pipeline task no longer exists — the parent row was itself deleted

@@ -4486,15 +4486,30 @@ export type GlobalEvent =
       kind: "leases";
       leases: LeaseStatus[];
       ts: number;
+    }
+  | {
+      /** A watched task's pull request changed (opened, checks, review
+       *  threads, merged). Carries every watched PR so the board replaces its
+       *  copy wholesale. See `src/bun/pr-watch.ts`. */
+      kind: "prs";
+      prs: TaskPrStatus[];
+      ts: number;
     };
 
-/**
- * A shared resource that one checkout holds at a time — a lab host, a
- * hardware rig — watched by running a project-provided command. Configured
- * as a JSON array of these in the `lease_watchers` preference (e.g. `agetor
- * config lease_watchers '[{"project":"/path/to/repo","label":"lab",
- * "command":"lab/vm/plab lease --json"}]'`). See `src/bun/lease-watch.ts`.
- */
+/** A task's pull request as the PR watcher last saw it. */
+export interface TaskPrStatus {
+  taskId: string;
+  number: number;
+  url: string;
+  state: "open" | "closed" | "merged";
+  draft: boolean;
+  /** Rolled up from the head commit's check runs. */
+  checks: "none" | "pending" | "success" | "failure";
+  failingChecks: { name: string; url: string | null }[];
+  unresolvedThreads: number;
+  checkedAt: number;
+}
+
 /**
  * A follow-up preset for finished pipelines ("Open PR", "Run VM tests", …),
  * configured as a JSON array in the `pipeline_followups` preference. See
@@ -4527,6 +4542,13 @@ export interface FollowUpAction {
   matched: string[];
 }
 
+/**
+ * A shared resource that one checkout holds at a time — a lab host, a
+ * hardware rig — watched by running a project-provided command. Configured
+ * as a JSON array of these in the `lease_watchers` preference (e.g. `agetor
+ * config lease_watchers '[{"project":"/path/to/repo","label":"lab",
+ * "command":"lab/vm/plab lease --json"}]'`). See `src/bun/lease-watch.ts`.
+ */
 export interface LeaseWatcherConfig {
   /** Project (repo) path the command runs in; also scopes the Blocked-card
    *  hint to that project's tasks. */

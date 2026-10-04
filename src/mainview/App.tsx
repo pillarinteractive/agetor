@@ -28,10 +28,12 @@ import {
 } from "lucide-react";
 import { api, type AgentModelMap, type HarnessModelMap } from "@/lib/api";
 import { Button } from "@/components/ui/button";
-import { clampFontSizePercent, COLUMNS, USAGE_SUPPORTED_KINDS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type HarnessQuota, type LeaseStatus, type Project, type Task, type TaskType } from "../shared/types.ts";
+import { clampFontSizePercent, COLUMNS, USAGE_SUPPORTED_KINDS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type HarnessQuota, type LeaseStatus, type Project, type TaskPrStatus, type Task, type TaskType } from "../shared/types.ts";
 import { parseIssueUrl } from "../shared/issue-task.ts";
 import { isPipelineColumnRunnerOwned } from "../shared/pipeline.ts";
 import { LeaseContext } from "@/lib/leases";
+import { PrContext } from "@/lib/prs";
+import { IssuesPage } from "@/components/issues/IssuesPage";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
 import { ContextMenu, type ContextMenuItem } from "@/components/ui/context-menu";
@@ -196,7 +198,8 @@ const ICON_BY_ACTION: Record<TaskMenuAction, LucideIcon> = {
 type AppView =
   | { kind: "board" }
   | { kind: "pipelines"; pipelineId: string | null; editing: boolean }
-  | { kind: "pipeline-run"; taskId: string };
+  | { kind: "pipeline-run"; taskId: string }
+  | { kind: "issues" };
 
 /**
  * The actual app tree. Split out from the default-exported `App` so it can
@@ -327,6 +330,8 @@ function AppInner() {
   const [tmuxDialogOpen, setTmuxDialogOpen] = useState(false);
   const [updateSnapshot, setUpdateSnapshot] = useState<UpdateSnapshot | null>(null);
   const [leases, setLeases] = useState<LeaseStatus[]>([]);
+  const [prs, setPrs] = useState<ReadonlyMap<string, TaskPrStatus>>(new Map());
+  const applyPrs = useCallback((list: TaskPrStatus[]) => setPrs(new Map(list.map((p) => [p.taskId, p]))), []);
   const [homeDir, setHomeDir] = useState<string>("");
   // Active data dir resolved server-side (~/.agetor for the packaged .app,
   // ~/.agetor-dev when launched via `bun run dev` / `dev:hmr`). Threaded to
@@ -626,6 +631,7 @@ function AppInner() {
     api.getUpdateStatus().then(setUpdateSnapshot).catch(() => { /* fine */ });
     // Same for lease badges: later changes arrive as `leases` events.
     api.getLeases().then(setLeases).catch(() => { /* fine */ });
+    api.getPrs().then(applyPrs).catch(() => { /* fine */ });
     // Skip poll ticks while the window is hidden — a backgrounded kanban
     // board has no reason to keep re-fetching + re-rendering every 2s/15s.
     // The intervals themselves keep running (cheap — it's just the fetch +
@@ -1118,6 +1124,11 @@ function AppInner() {
         setLeases(ev.leases);
         return;
       }
+      // Pull request badges (src/bun/pr-watch.ts).
+      if (ev.kind === "prs") {
+        applyPrs(ev.prs);
+        return;
+      }
       // "Already looking at it" — the run panel is open on the task, OR the
       // full-page pipeline run view is showing it (L-A3: a pipeline parent
       // never opens in the panel, so `selectedIdRef` alone would toast a
@@ -1475,6 +1486,15 @@ function AppInner() {
   const openPipelinesPage = useCallback(() => {
     navigate({ kind: "pipelines", pipelineId: null, editing: false });
   }, [navigate]);
+  const openIssuesPage = useCallback(() => {
+    navigate({ kind: "issues" });
+  }, [navigate]);
+  // From the issue queue: open the card working on an issue (a pipeline
+  // task opens its run view, like a board click).
+  const openTaskById = useCallback((taskId: string) => {
+    const t = tasksRef.current.find((x) => x.id === taskId);
+    if (t) openTask(t);
+  }, [openTask]);
   /** Switch Settings' "Open pipelines page"/"Edit"/"New pipeline" affordances
    *  to the matching app-level view — Settings closes itself in the same
    *  gesture (see the `SettingsDialog` `onOpenPipelines` prop below). Routed
@@ -2053,6 +2073,16 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
             <FolderGit2 className="size-4" />
           </Button>
           <Button
+            variant={view.kind === "issues" ? "secondary" : "ghost"}
+            size="icon"
+            data-testid="issues-button"
+            onClick={openIssuesPage}
+            aria-label="Issues"
+            title="Issues"
+          >
+            <CircleDot className="size-4" />
+          </Button>
+          <Button
             variant={view.kind === "pipelines" || view.kind === "pipeline-run" ? "secondary" : "ghost"}
             size="icon"
             data-testid="pipelines-button"
@@ -2190,6 +2220,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                   <div className="kanban-scroll absolute inset-0 overflow-x-scroll">
                     <DndContext sensors={sensors} onDragEnd={onDragEnd}>
                       <LeaseContext.Provider value={leases}>
+                      <PrContext.Provider value={prs}>
                       <div className="flex gap-3 p-4">
                         {visibleColumns.map((c) => (
                           <Column
@@ -2212,6 +2243,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                           />
                         ))}
                       </div>
+                      </PrContext.Provider>
                       </LeaseContext.Provider>
                     </DndContext>
                   </div>
@@ -2239,6 +2271,19 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                     </div>
                   )}
                 </div>
+              </motion.div>
+            )}
+
+            {view.kind === "issues" && (
+              <motion.div
+                key="issues"
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -8 }}
+                transition={{ duration: 0.18 }}
+                className="flex min-h-0 flex-1 flex-col"
+              >
+                <IssuesPage projects={projects} onBack={() => setView({ kind: "board" })} onOpenTask={openTaskById} />
               </motion.div>
             )}
 

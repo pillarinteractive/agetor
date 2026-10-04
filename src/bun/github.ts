@@ -2324,6 +2324,38 @@ export async function applyGitHubSuggestion(input: ApplyGitHubSuggestionInput): 
   return { ok: true, message: "Suggestion applied." };
 }
 
+/** The newest pull request (any state) whose head is `branch` in this repo —
+ *  how the PR watcher finds a PR an agent opened with `gh pr create`, which
+ *  Agetor never saw. `pull: null` when there is none. */
+export async function findGitHubPullForBranch(input: { dir: string; branch: string }): Promise<
+  | { ok: true; pull: { number: number; htmlUrl: string; state: "open" | "closed"; draft: boolean; mergedAt: string | null } | null }
+  | GitHubListError
+> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  const token = await githubToken(repo.remoteHost ?? null);
+  const url = new URL(`${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/pulls`);
+  url.searchParams.set("head", `${repo.owner}:${input.branch}`);
+  url.searchParams.set("state", "all");
+  url.searchParams.set("per_page", "1");
+  const res = await fetchGitHub(url.toString(), token, "application/vnd.github+json");
+  if (!("status" in res)) return res;
+  const json = await res.json().catch(() => null);
+  if (!res.ok) return { ok: false, error: apiError(json, res.status, res.statusText) };
+  const first = Array.isArray(json) ? (json[0] as Record<string, unknown> | undefined) : undefined;
+  if (!first || typeof first.number !== "number") return { ok: true, pull: null };
+  return {
+    ok: true,
+    pull: {
+      number: first.number,
+      htmlUrl: String(first.html_url ?? ""),
+      state: first.state === "closed" ? "closed" : "open",
+      draft: first.draft === true,
+      mergedAt: typeof first.merged_at === "string" ? first.merged_at : null,
+    },
+  };
+}
+
 export async function getGitHubPullChecks(input: GitHubItemNumberInput): Promise<GitHubChecksResponse> {
   const repo = await repoForDir(input.dir);
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
