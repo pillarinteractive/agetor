@@ -1,4 +1,4 @@
-export type ColumnId = "backlog" | "ready" | "running" | "blocked" | "review" | "done";
+export type ColumnId = "backlog" | "ready" | "running" | "blocked" | "review" | "merge" | "done";
 
 /**
  * The exact `HarnessStatus.reason` string the server emits when claude-code
@@ -246,14 +246,27 @@ export function isInternalStatusSentinel(data: string): boolean {
  * prose that won't follow a change here. */
 export const GIT_HOST_TOKENS_SECTION = "Git host tokens";
 
+/** The board's columns, left to right. "ready" (queued to run, or a stopped
+ *  pipeline) is still a task state but has no column of its own — those
+ *  cards show in Backlog ({@link boardColumnOf}). In Review is the human
+ *  sign-off on a PR; Ready to Merge is that sign-off — Agetor works the PR to
+ *  green and merges it (src/bun/merge-queue.ts). */
 export const COLUMNS: { id: ColumnId; label: string }[] = [
   { id: "backlog", label: "Backlog" },
-  { id: "ready", label: "Ready" },
   { id: "running", label: "Running" },
   { id: "blocked", label: "Blocked" },
-  { id: "review", label: "Review" },
+  { id: "review", label: "In Review" },
+  { id: "merge", label: "Ready to Merge" },
   { id: "done", label: "Done" },
 ];
+
+/** Every column a task can be in, including ones the board folds away. */
+export const ALL_COLUMN_IDS: ColumnId[] = ["backlog", "ready", "running", "blocked", "review", "merge", "done"];
+
+/** The board column a task shows in. */
+export function boardColumnOf(column: ColumnId): ColumnId {
+  return column === "ready" ? "backlog" : column;
+}
 
 /**
  * Heuristic patterns we use to detect "the agent is waiting on the user" from

@@ -224,3 +224,16 @@ fixed issues stayed open. When a card's PR merges (seen by the PR watcher, inclu
 restart), the issue it fixes — its `issueUrl`, else a `Fixes/Closes/Resolves #N` line in its prompt — is closed with
 a "Fixed by #PR, merged into develop" comment. `closed_issues` preference remembers what was closed; an issue
 already closed is left alone.
+
+## Columns: In Review and Ready to Merge (`feat/review-merge-columns`)
+
+Board: Backlog · Running · Blocked · In Review · Ready to Merge · Done. "ready" is still a task state (queued, or a
+stopped pipeline) but shows in Backlog (`boardColumnOf`).
+- **In Review** = the user's review of the PR. A finished run without a PR says "No PR yet" (needs you); a green PR
+  says "checks pass — review and sign off". Finish / Open PR write a reviewer-ready PR description (Summary, Why,
+  Impact, How it was verified, Review focus).
+- **Ready to Merge** = sign-off (`src/bun/merge-queue.ts`, intent in `merge_queue` pref via `merge-intent.ts`).
+  Every minute, one next step per card: open PR → resolve conflicts → update from base → Fix CI → address review →
+  wait for checks → squash-merge (`merge_method` pref). Each automatic step once per PR head, ≤4 fix-ups per card.
+  A pipeline's fix-up run returns the card to Ready to Merge (runner honours the intent), not In Review. Dragging
+  back to In Review/Backlog withdraws the sign-off. Merged → Done + issue closed.

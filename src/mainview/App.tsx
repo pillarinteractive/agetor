@@ -30,7 +30,7 @@ import {
 } from "lucide-react";
 import { api, type AgentModelMap, type HarnessModelMap } from "@/lib/api";
 import { Button } from "@/components/ui/button";
-import { clampFontSizePercent, COLUMNS, USAGE_SUPPORTED_KINDS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type HarnessQuota, type LeaseStatus, type Project, type TaskPrStatus, type TaskProgress, type Task, type TaskType } from "../shared/types.ts";
+import { boardColumnOf, clampFontSizePercent, COLUMNS, USAGE_SUPPORTED_KINDS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type HarnessQuota, type LeaseStatus, type Project, type TaskPrStatus, type TaskProgress, type Task, type TaskType } from "../shared/types.ts";
 import { parseIssueUrl } from "../shared/issue-task.ts";
 import { isPipelineColumnRunnerOwned } from "../shared/pipeline.ts";
 import { LeaseContext } from "@/lib/leases";
@@ -159,10 +159,11 @@ function ErrorToast({ error, onDismiss }: { error: string | null; onDismiss: () 
  *  is visible (see `Column`'s `emptyHint` prop). Review/done intentionally
  *  have no entry — an empty Review/Done column needs no explanation. */
 const EMPTY_COLUMN_HINT: Partial<Record<ColumnId, string>> = {
-  backlog: "Ideas you haven't queued yet",
-  ready: "Tasks return here when a run needs another go",
+  backlog: "Ideas you haven't queued yet, and runs to go again",
   running: "Agents working right now",
   blocked: "Needs your attention",
+  review: "PRs waiting for your sign-off",
+  merge: "Signed off — Agetor gets these green and merges them",
 };
 
 /** One icon per `TaskMenuAction`, for the task context menu built from
@@ -1571,7 +1572,7 @@ function AppInner() {
     const col = e.over?.id as ColumnId | undefined;
     if (!col) return;
     const t = tasksRef.current.find((x) => x.id === id);
-    if (!t || t.column === col) return;
+    if (!t || boardColumnOf(t.column) === col) return;
     // Dropping a blocked pipeline on Running is a Retry — e.g. once the lease
     // it was waiting on frees up. The runner moves the card itself.
     if (t.pipelineId && t.pipelineRun?.status === "blocked" && col === "running") {
@@ -2298,7 +2299,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                             key={c.id}
                             id={c.id}
                             label={c.label}
-                            tasks={visibleTasks.filter((t) => t.column === c.id)}
+                            tasks={visibleTasks.filter((t) => boardColumnOf(t.column) === c.id)}
                             homeDir={homeDir}
                             onStart={start}
                             onCancel={cancel}

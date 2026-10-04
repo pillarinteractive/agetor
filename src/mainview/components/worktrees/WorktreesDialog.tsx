@@ -12,6 +12,7 @@ import { useConfirm } from "@/components/ui/confirm";
 import { abbreviateHome } from "@/lib/utils";
 import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
 import {
+  boardColumnOf,
   COLUMNS,
   type ColumnId,
   type Project,
@@ -86,7 +87,7 @@ function statusValue(w: WorktreeInfo): string {
 
 function statusLabel(w: WorktreeInfo): string {
   if (w.column == null) return "";
-  return COLUMNS.find((c) => c.id === w.column)?.label ?? w.column;
+  return COLUMNS.find((c) => c.id === boardColumnOf(w.column as ColumnId))?.label ?? w.column;
 }
 
 type SortField = "updated" | "project" | "status" | "branch";

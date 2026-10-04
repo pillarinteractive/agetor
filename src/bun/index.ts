@@ -19,6 +19,7 @@ import { startPrWatchLoop } from "./pr-watch.ts";
 import { startProgressWatchLoop } from "./progress-watch.ts";
 import { startConductorLoop } from "./conductor.ts";
 import { startDependencyLoop } from "./dependencies.ts";
+import { startMergeQueueLoop } from "./merge-queue.ts";
 import { getMainWindow, setMainWindow } from "./window.ts";
 import { makeWindowLifecycle, type Frame } from "./window-lifecycle.ts";
 import { focusWindow } from "./window-focus.ts";
@@ -519,6 +520,10 @@ startConductorLoop();
 // Card dependencies (src/bun/dependencies.ts): move a card on once what
 // it was blocked by has landed.
 startDependencyLoop();
+
+// Ready to Merge (src/bun/merge-queue.ts): work signed-off PRs to green and
+// merge them.
+startMergeQueueLoop();
 
 /** Lifecycle wrapper around BrowserWindow construction. Handles:
  *   - idempotency (concurrent reopen events share one in-flight build),

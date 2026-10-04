@@ -69,8 +69,8 @@ describe("cardStatus — pipelines", () => {
     history: [{ seq: 4, stepId: "finish", taskId: "s4", startedAt: 0, endedAt: 1, outcome: "succeeded", handoff: handoff("Committed the fix"), nextStepIds: [] }],
   }), ...o });
 
-  test("finished without a PR: review the result", () => {
-    expect(status(finished())).toMatchObject({ line: "Finished: Committed the fix", needsYou: { actionLabel: "Review" } });
+  test("finished without a PR: In Review needs a PR first", () => {
+    expect(status(finished())).toMatchObject({ line: "No PR yet — Committed the fix", tone: "warning", needsYou: { actionLabel: "Open" } });
   });
 
   test("finished with a PR: the PR leads — inherited CI waits, own CI needs a fix, green is ready to merge", () => {
@@ -78,7 +78,7 @@ describe("cardStatus — pipelines", () => {
     expect(status(finished(), { pr: inherited })).toMatchObject({ line: "PR #177: waiting on develop (same checks fail there)", needsYou: null });
     const own = pr({ checks: "failure", failingChecks: [{ name: "lint", url: null, alsoOnBase: false }] });
     expect(status(finished(), { pr: own })).toMatchObject({ tone: "danger", needsYou: { actionLabel: "Fix CI" } });
-    expect(status(finished(), { pr: pr() })).toMatchObject({ line: "PR #177: ready to merge", needsYou: { action: "open-pr" } });
+    expect(status(finished(), { pr: pr() })).toMatchObject({ line: "PR #177: checks pass — review and sign off", needsYou: { action: "open-pr", actionLabel: "Review PR" } });
     expect(status(finished(), { pr: pr({ state: "merged" }) })).toMatchObject({ line: "PR #177 merged", needsYou: null });
   });
 
@@ -120,4 +120,20 @@ test("a card blocked by another card says what it's waiting on — until it land
   expect(status(task({ column: "blocked", blockedBy: [dep, { ...dep, taskId: "e" }] })).line).toContain("(+1 more)");
   // Satisfied dependencies don't hold the card.
   expect(status(task({ column: "ready", blockedBy: [{ ...dep, satisfied: true }] })).line).not.toContain("Waiting on");
+});
+
+describe("cardStatus — Ready to Merge", () => {
+  const inMerge = (o: Partial<Task> = {}) => task({ column: "merge", ...o });
+  test("says which part of getting to merged it's on", () => {
+    expect(status(inMerge())).toMatchObject({ line: "Opening a PR so it can merge" });
+    expect(status(inMerge(), { pr: pr({ checks: "pending" }) })).toMatchObject({ line: "PR #177: merges when checks pass", needsYou: null });
+    expect(status(inMerge(), { pr: pr({ checks: "success" }) })).toMatchObject({ line: "PR #177: green — merging", tone: "success" });
+    expect(status(inMerge(), { pr: pr({ checks: "success", behindBy: 2 }) }).line).toBe("PR #177: updating from develop, then merging");
+    expect(status(inMerge(), { pr: pr({ checks: "success", unresolvedThreads: 1 }) }).line).toBe("PR #177: addressing review comments, then merging");
+    expect(status(inMerge(), { pr: pr({ checks: "failure", failingChecks: [{ name: "web / vitest", url: null, alsoOnBase: false }] }) }).line).toBe("PR #177: CI failing — fixing before merge");
+  });
+  test("a closed or draft PR needs the user", () => {
+    expect(status(inMerge(), { pr: pr({ state: "closed" }) }).needsYou).not.toBeNull();
+    expect(status(inMerge(), { pr: pr({ draft: true }) }).needsYou).not.toBeNull();
+  });
 });

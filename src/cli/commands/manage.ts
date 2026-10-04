@@ -4,11 +4,11 @@ import { getClient, type Flags } from "../context.ts";
 import { resolveTask } from "../resolve.ts";
 import { c, out, printJson } from "../output.ts";
 import { ApiError, type PatchTaskInput } from "../api-client.ts";
-import { COLUMNS } from "../../shared/types.ts";
+import { ALL_COLUMN_IDS } from "../../shared/types.ts";
 import { flagValue } from "../args.ts";
 import { usageError } from "../usage.ts";
 
-const COLUMN_IDS = COLUMNS.map((col) => col.id);
+const COLUMN_IDS = ALL_COLUMN_IDS;
 
 export async function cmdEdit(args: string[], flags: Flags): Promise<void> {
   const ref = args[0];

@@ -22,7 +22,7 @@ const PR_WATCH_INTERVAL_MS = 60_000;
 /** Agent that runs the PR follow-ups; `pr_followup_agent` overrides it. */
 export const PR_FOLLOWUP_AGENT_PREF = "pr_followup_agent";
 const DEFAULT_PR_FOLLOWUP_AGENT = "Builder";
-const WATCHED_COLUMNS = new Set(["running", "blocked", "review", "done"]);
+const WATCHED_COLUMNS = new Set(["running", "blocked", "review", "merge", "done"]);
 /** "true" starts Fix CI on its own when a PR's own checks fail. */
 /** "true" / "false"; unset = on for pipeline cards (a pipeline owns its PR
  *  until it merges), off for plain tasks. */
@@ -412,7 +412,7 @@ async function maybeAutoFix(task: Task, pr: TaskPrStatus): Promise<void> {
 export const PR_FIX_CI_ACTION = "pr:fix-ci";
 export const PR_REVIEW_ACTION = "pr:review";
 
-function prAgent(): { name: string; id: string | null } {
+export function prAgent(): { name: string; id: string | null } {
   const name = preferences.get(PR_FOLLOWUP_AGENT_PREF)?.trim() || DEFAULT_PR_FOLLOWUP_AGENT;
   const id = agentProfiles.list().find((p) => p.name.toLowerCase() === name.toLowerCase())?.id ?? null;
   return { name, id };

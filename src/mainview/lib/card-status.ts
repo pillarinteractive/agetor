@@ -72,9 +72,9 @@ function prPhrase(pr: TaskPrStatus): { text: string; tone: CardStatus["tone"]; n
   }
   if (pr.checks === "pending") return { text: `PR #${pr.number}: checks running`, tone: "info", needsYou: null };
   return {
-    text: `PR #${pr.number}: ready to merge`,
+    text: `PR #${pr.number}: checks pass — review and sign off`,
     tone: "success",
-    needsYou: { reason: `PR #${pr.number} ready to merge`, action: "open-pr", actionLabel: "Open PR" },
+    needsYou: { reason: `PR #${pr.number} ready for your review`, action: "open-pr", actionLabel: "Review PR" },
   };
 }
 
@@ -86,6 +86,25 @@ function quietFor(task: Task, ctx: { now: number; progressActive?: boolean }): s
   if (ctx.progressActive || task.lastActivityAt == null) return null;
   const ms = ctx.now - task.lastActivityAt;
   return ms >= QUIET_AFTER_MS ? formatAge(ms) : null;
+}
+
+function mergeStatus(pr: TaskPrStatus | null): CardStatus {
+  if (!pr) return { line: "Opening a PR so it can merge", tone: "info", needsYou: null };
+  const n = `PR #${pr.number}`;
+  if (pr.state === "closed") {
+    return { line: `${n} was closed — can't merge`, tone: "danger", needsYou: { reason: `${n} was closed`, action: "open", actionLabel: "Open" } };
+  }
+  if (pr.draft) return { line: `${n} is a draft — can't merge`, tone: "warning", needsYou: { reason: `${n} is a draft`, action: "open-pr", actionLabel: "Open PR" } };
+  if ((pr.behindBy ?? 0) > 0) return { line: `${n}: updating from ${pr.baseRef ?? "base"}, then merging`, tone: "info", needsYou: null };
+  if (pr.checks === "failure") {
+    const p = prPhrase(pr);
+    return p.needsYou
+      ? { line: `${n}: CI failing — fixing before merge`, tone: "warning", needsYou: null }
+      : { line: `${n}: waiting on ${pr.baseRef ?? "base"} (same checks fail there)`, tone: "warning", needsYou: null };
+  }
+  if (pr.unresolvedThreads > 0) return { line: `${n}: addressing review comments, then merging`, tone: "info", needsYou: null };
+  if (pr.checks === "success") return { line: `${n}: green — merging`, tone: "success", needsYou: null };
+  return { line: `${n}: merges when checks pass`, tone: "info", needsYou: null };
 }
 
 export function cardStatus(
@@ -112,6 +131,10 @@ export function cardStatus(
     const more = waitingOn.length > 1 ? ` (+${waitingOn.length - 1} more)` : "";
     return { line: `Waiting on "${first.title}" · ${first.detail}${more}`, tone: "warning", needsYou: null };
   }
+
+  // Ready to Merge: signed off — Agetor is working the PR to green and will
+  // merge it (src/bun/merge-queue.ts). Say which part it's on.
+  if (task.column === "merge") return mergeStatus(pr);
 
   const run = task.pipelineRun ?? null;
   if (run) {
@@ -185,10 +208,11 @@ export function cardStatus(
       return { line: p.text, tone: p.tone, needsYou: task.column === "done" ? null : p.needsYou };
     }
     if (task.column === "done") return { line: headline || "Done", tone: "muted", needsYou: null };
+    // In Review is for a PR; a finished run without one needs one first.
     return {
-      line: headline ? `Finished: ${headline}` : "Finished",
-      tone: "success",
-      needsYou: { reason: "finished — review the result", action: "open", actionLabel: "Review" },
+      line: headline ? `No PR yet — ${headline}` : "Finished, but no PR yet",
+      tone: "warning",
+      needsYou: { reason: "finished without a PR — open one to review", action: "open", actionLabel: "Open" },
     };
   }
 

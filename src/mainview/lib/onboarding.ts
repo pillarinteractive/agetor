@@ -16,7 +16,7 @@ export interface OnboardingStep {
 }
 
 /** Task columns that count as "the run step is done" — anything that has left backlog/ready. */
-const RUN_DONE_COLUMNS: ReadonlySet<ColumnId> = new Set(["running", "review", "done", "blocked"]);
+const RUN_DONE_COLUMNS: ReadonlySet<ColumnId> = new Set(["running", "review", "merge", "done", "blocked"]);
 
 /**
  * Pure derivation of the 4 onboarding steps from live app state. Always

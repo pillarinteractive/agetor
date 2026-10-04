@@ -1,12 +1,12 @@
 import { getClient, type Flags } from "../context.ts";
 import { c, out, printJson, table } from "../output.ts";
 import type { Task } from "../../shared/types.ts";
-import { COLUMNS } from "../../shared/types.ts";
+import { ALL_COLUMN_IDS } from "../../shared/types.ts";
 import { flagValue } from "../args.ts";
 import { fxAutoResumeCountdownText, isTaskFxPaused } from "../../shared/fx-recovery.ts";
 import { pipelineStepProgress } from "../../shared/pipeline.ts";
 
-const COLUMN_IDS = COLUMNS.map((col) => col.id);
+const COLUMN_IDS = ALL_COLUMN_IDS;
 
 const COLUMN_GLYPH: Record<string, string> = {
   backlog: "·",

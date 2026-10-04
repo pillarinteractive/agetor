@@ -31,6 +31,7 @@ import { randomUUID } from "node:crypto";
 import { recordActivity } from "./activity.ts";
 import { syncBaseNote } from "./sync-base.ts";
 import { logBlocks, newBlocks } from "./block-log.ts";
+import { isMergeQueued } from "./merge-intent.ts";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { agentProfiles, backlog, dataDir, harnesses, pipelines, runs, tasks } from "./db.ts";
@@ -352,7 +353,9 @@ function persist(parentId: string, run: PipelineRunState, opts?: { preserveStatu
     done: "review",
     cancelled: "ready",
   };
-  const nextColumn = columnFor[run.status];
+  // A signed-off card (Ready to Merge) comes back there when a fix-up run
+  // finishes, not to In Review (src/bun/merge-intent.ts).
+  const nextColumn = run.status === "done" && isMergeQueued(parentId) ? "merge" : columnFor[run.status];
   if (nextColumn && parent && parent.column !== nextColumn && previousStatus !== run.status) {
     pipelineUpdateColumn(parentId, null, nextColumn);
   }
