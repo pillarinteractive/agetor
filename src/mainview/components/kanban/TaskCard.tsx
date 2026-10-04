@@ -238,26 +238,6 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
                 {fxPausedBadgeText(task.fxRecovery, fxAutoResumeCountdown)}
               </Badge>
             )}
-            {/* The task's pull request, as the PR watcher last saw it (src/bun/pr-watch.ts). */}
-            {pr && prInfo && (
-              <Badge
-                variant="outline"
-                className={cn(
-                  "gap-1 text-[10px] shrink-0",
-                  prInfo.tone === "danger" && "text-destructive border-destructive/40",
-                  prInfo.tone === "warning" && "text-warning border-warning/40",
-                  prInfo.tone === "success" && "text-success border-success/40",
-                  prInfo.tone === "merged" && "text-info border-info/40",
-                  prInfo.tone === "muted" && "text-muted-foreground",
-                )}
-                data-testid="pr-badge"
-                data-tone={prInfo.tone}
-                title={prInfo.title}
-              >
-                <GitPullRequest className="size-3" />
-                {prInfo.text}
-              </Badge>
-            )}
             {/* This card's worktree holds a watched lease (src/bun/lease-watch.ts). */}
             {lease.holds.map((label) => (
               <Badge
@@ -328,6 +308,26 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
         >
           {abbreviateHome(task.workdir, homeDir)}
         </p>
+        {/* The task's pull request, as the PR watcher last saw it (src/bun/pr-watch.ts). */}
+        {pr && prInfo && (
+          <Badge
+            variant="outline"
+            className={cn(
+              "w-fit gap-1 text-[10px]",
+              prInfo.tone === "danger" && "text-destructive border-destructive/40",
+              prInfo.tone === "warning" && "text-warning border-warning/40",
+              prInfo.tone === "success" && "text-success border-success/40",
+              prInfo.tone === "merged" && "text-info border-info/40",
+              prInfo.tone === "muted" && "text-muted-foreground",
+            )}
+            data-testid="pr-badge"
+            data-tone={prInfo.tone}
+            title={prInfo.title}
+          >
+            <GitPullRequest className="size-3" />
+            {prInfo.text}
+          </Badge>
+        )}
         {(task.branch || task.baseRef) && (
           <div className="flex items-center gap-1 text-[10px] font-mono text-muted-foreground">
             <GitBranch className="size-3 shrink-0" />
