@@ -2284,7 +2284,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                     <DndContext sensors={sensors} onDragEnd={onDragEnd}>
                       <LeaseContext.Provider value={leases}>
                       <PrContext.Provider value={prs}>
-                      <div className="flex gap-3 p-4">
+                      <div className="flex min-w-full gap-3 p-4">
                         {visibleColumns.map((c) => (
                           <Column
                             key={c.id}

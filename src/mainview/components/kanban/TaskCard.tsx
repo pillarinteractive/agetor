@@ -3,7 +3,6 @@ import { useDraggable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
 import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, CircleAlert, FolderOpen, GitBranch, GitCompare, GitPullRequest, ListTodo, Lock, LockOpen, MessageCircleQuestion, Paperclip, PauseCircle, Play, Square, Terminal, Trash2 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { abbreviateHome, cn } from "@/lib/utils";
 import { taskTypeIcon } from "@/lib/task-type-icon";
@@ -18,6 +17,29 @@ import { prBadge, useTaskPr } from "@/lib/prs";
 import { cardStatus } from "@/lib/card-status";
 import { ordinal } from "../../../shared/block-reason.ts";
 import { progressFraction, progressLine, useTaskProgress } from "@/lib/progress";
+
+type ChipTone = "info" | "success" | "warning" | "danger" | "muted" | "merged";
+
+/** The card's chip style: one size, readable contrast, tinted by tone. */
+function chip(tone: ChipTone): string {
+  return cn(
+    "inline-flex max-w-full items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-medium leading-tight",
+    tone === "info" && "bg-info/15 text-info",
+    tone === "success" && "bg-success/15 text-success",
+    tone === "warning" && "bg-warning/15 text-warning",
+    tone === "danger" && "bg-destructive/15 text-destructive",
+    tone === "merged" && "bg-violet-500/15 text-violet-400",
+    tone === "muted" && "bg-muted text-muted-foreground",
+  );
+}
+
+/** "Issue #182: [review] Public pages…" → number chip + the readable rest. */
+export function splitCardTitle(title: string): { issue: string | null; text: string } {
+  const m = /^Issue #(\d+):\s*(?:\[[^\]]*\]\s*)?([\s\S]*)$/.exec(title);
+  return m ? { issue: m[1]!, text: m[2]! || title } : { issue: null, text: title };
+}
+
+const repoName = (dir: string) => dir.replace(/\/+$/, "").split("/").pop() || dir;
 
 interface Props {
   task: Task;
@@ -110,6 +132,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
   const type = taskTypeMeta(task.taskType);
   const TypeIcon = taskTypeIcon(type.icon);
   const runningSubagents = task.runningSubagents ?? 0;
+  const title = splitCardTitle(task.title);
 
   return (
     <Card
@@ -169,137 +192,21 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
           aria-label="New messages"
         />
       )}
-      <CardHeader className="pb-2 space-y-1">
-        <div className="flex items-center justify-between gap-2">
-          <div className="flex min-w-0 flex-wrap items-center gap-1.5">
-            <TypeIcon
-              className={cn("size-3.5 shrink-0", type.iconClass)}
-              aria-label={type.label}
-            />
-            {runningSubagents > 0 && (
-              <Badge
-                variant="outline"
-                className="gap-1 text-[10px] shrink-0"
-                title={`${runningSubagents} background task${runningSubagents > 1 ? "s" : ""} running`}
-              >
-                <Bot className="size-3" />
-                {runningSubagents}
-              </Badge>
-            )}
-            {task.openTerminalCount > 0 && (
-              <Badge
-                variant="outline"
-                className="gap-1 text-[10px] shrink-0"
-                title={`${task.openTerminalCount} open terminal${task.openTerminalCount > 1 ? "s" : ""}`}
-              >
-                <Terminal className="size-3" />
-                {task.openTerminalCount}
-              </Badge>
-            )}
-            {task.todoProgress && task.todoProgress.total > 0 && (
-              <Badge
-                variant="outline"
-                className={cn(
-                  "gap-1 text-[10px] shrink-0",
-                  task.todoProgress.completed === task.todoProgress.total
-                    ? "text-success"
-                    : "text-muted-foreground",
-                )}
-                title={`${task.todoProgress.completed} of ${task.todoProgress.total} tasks done`}
-              >
-                <ListTodo className="size-3" />
-                {task.todoProgress.completed}/{task.todoProgress.total}
-              </Badge>
-            )}
-            {task.sentFiles && task.sentFiles.length > 0 && (
-              <Badge
-                variant="outline"
-                className="gap-1 text-[10px] shrink-0"
-                data-testid="sent-files-badge"
-                title={`${task.sentFiles.length} file${task.sentFiles.length === 1 ? "" : "s"} sent · ${[...task.sentFiles]
-                  .sort((a, b) => b.sentAt - a.sentAt)
-                  .slice(0, 5)
-                  .map((f) => sentFileBasename(f.path))
-                  .join(", ")}`}
-              >
-                <Paperclip className="size-3" />
-                {task.sentFiles.length}
-              </Badge>
-            )}
-            {/* fx's response is paused on a resumable Gateway checkpoint
-             *  (`Task.fxRecovery`, server-managed — see `TaskFxRecovery` in
-             *  shared/types.ts). Gated on the shared `isTaskFxPaused` helper,
-             *  never on `task.agent`, so it stays correct if fx is ever
-             *  aliased under a different harness id. Text/title come from
-             *  `fxPausedBadgeText`/`fxPausedBadgeTitle` (`@/lib/fx-auto-resume`)
-             *  — "paused" or a live "auto-resume m:ss" countdown, with a
-             *  tooltip explaining why (or why not) an auto-resume is pending. */}
-            {isTaskFxPaused(task) && task.fxRecovery && (
-              <Badge
-                variant="outline"
-                className="gap-1 text-[10px] shrink-0 text-warning border-warning/40"
-                data-testid="fx-paused-badge"
-                title={fxPausedBadgeTitle(task.fxRecovery)}
-              >
-                <PauseCircle className="size-3" />
-                {fxPausedBadgeText(task.fxRecovery, fxAutoResumeCountdown)}
-              </Badge>
-            )}
-            {/* This card's worktree holds a watched lease (src/bun/lease-watch.ts). */}
-            {lease.holds.map((label) => (
-              <Badge
-                key={label}
-                variant="outline"
-                className="gap-1 text-[10px] shrink-0 text-info border-info/40"
-                data-testid="lease-badge"
-                title={`Holds the ${label} lease`}
-              >
-                <Lock className="size-3" />
-                {label}
-              </Badge>
-            ))}
-          </div>
-          {/* A pipeline task's badge is the pipeline name + step progress
-           *  (D5/D9, docs/plans/pipelines.md) — the profile is per-step, not
-           *  per-task, so it replaces the agent-profile badge outright
-           *  rather than sitting alongside it. Otherwise: when the task was
-           *  launched from a saved agent profile, show its name (with the
-           *  harness id as the tooltip) instead of the raw harness id — the
-           *  snapshot is server-managed and always present once
-           *  `agentProfileId` is set (plan D1/D14), so no live profile
-           *  lookup is needed here. */}
-          {task.pipelineRun ? (
-            <PipelineBadge run={task.pipelineRun} className="shrink-0" />
-          ) : task.agentProfile ? (
-            <Badge
-              variant="secondary"
-              className="gap-1 shrink-0"
-              data-testid="task-card-agent-profile"
-              title={task.agent}
-            >
-              <AgentIcon kind={task.agentProfile.harnessKind} className="size-3" />
-              {task.agentProfile.name}
-            </Badge>
-          ) : (
-            <Badge variant="secondary" className="gap-1 shrink-0">
-              <AgentIcon kind={task.agent} className="size-3" />
-              {task.agent}
-            </Badge>
-          )}
+      <CardHeader className="space-y-1.5 p-3 pb-2">
+        <div className="flex items-start gap-1.5">
+          <TypeIcon className={cn("mt-0.5 size-3.5 shrink-0", type.iconClass)} aria-label={type.label} />
+          <CardTitle className="min-w-0 flex-1 break-words text-[13px] font-semibold leading-snug line-clamp-3" title={task.title}>
+            {title.issue && <span className="mr-1 font-mono font-medium text-muted-foreground">#{title.issue}</span>}
+            {title.text}
+          </CardTitle>
         </div>
-        {(task.model || task.mode) && (
-          <span className="self-end text-[10px] font-mono text-muted-foreground">
-            {[task.model, task.mode].filter(Boolean).join(" · ")}
-          </span>
-        )}
-        <CardTitle className="text-sm break-words">{task.title}</CardTitle>
         {!archived && (
           <p
             data-testid="card-status"
             data-tone={status.tone}
             title={status.needsYou ? `Needs you: ${status.needsYou.reason}` : status.line}
             className={cn(
-              "flex items-start gap-1 text-[11px] leading-snug",
+              "flex items-start gap-1 text-xs leading-snug",
               status.tone === "danger" && "text-destructive",
               status.tone === "warning" && "text-warning",
               status.tone === "success" && "text-success",
@@ -307,7 +214,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
               status.tone === "muted" && "text-muted-foreground",
             )}
           >
-            {status.needsYou && <CircleAlert className="mt-px size-3 shrink-0" aria-label="Needs you" />}
+            {status.needsYou && <CircleAlert className="mt-0.5 size-3 shrink-0" aria-label="Needs you" />}
             <span className="line-clamp-2">{status.line}</span>
           </p>
         )}
@@ -316,11 +223,11 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
             const line = progressLine(p);
             const fraction = p.active ? progressFraction(p.counts) : null;
             return (
-              <div key={`${p.project}:${p.label}`} data-testid="card-progress" className="flex flex-col gap-0.5">
+              <div key={`${p.project}:${p.label}`} data-testid="card-progress" className="flex flex-col gap-1">
                 <p
                   title={p.current ?? line.text}
                   className={cn(
-                    "truncate text-[11px] leading-snug",
+                    "truncate text-xs leading-snug",
                     line.tone === "danger" && "text-destructive",
                     line.tone === "success" && "text-success",
                     line.tone === "info" && "text-info",
@@ -342,61 +249,120 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
             );
           })}
       </CardHeader>
-      <CardContent className="space-y-2">
-        {/* Blocked waiting on a watched lease: its place in the queue and
-         *  whether it's free yet (the first in line is retried automatically
-         *  when it frees — src/bun/lease-watch.ts). */}
-        {lease.waiting.map((w) => (
-          <p
-            key={w.label}
-            className={cn("flex items-center gap-1 text-[10px]", w.free ? "text-success" : "text-warning")}
-            data-testid="lease-wait-hint"
-          >
-            {w.free ? <LockOpen className="size-3 shrink-0" /> : <Lock className="size-3 shrink-0" />}
-            <span className="truncate">
-              {w.free ? `${w.label} free` : `${w.label} held by ${w.heldBy}`}
-              {` · ${ordinal(w.position)} of ${w.queueLength} in line`}
+      <CardContent className="space-y-2 p-3 pt-0">
+        {/* One row of chips: what runs it (pipeline / agent), its PR, leases,
+         *  and the small live counters. */}
+        <div className="flex flex-wrap items-center gap-1">
+          {/* A pipeline task's chip is the pipeline name + step progress
+           *  (D5/D9, docs/plans/pipelines.md) — the profile is per-step, not
+           *  per-task, so it replaces the agent-profile chip outright. */}
+          {task.pipelineRun ? (
+            <PipelineBadge run={task.pipelineRun} />
+          ) : task.agentProfile ? (
+            <span className={chip("muted")} data-testid="task-card-agent-profile" title={task.agent}>
+              <AgentIcon kind={task.agentProfile.harnessKind} className="size-3" />
+              {task.agentProfile.name}
             </span>
-          </p>
-        ))}
-        <p className="text-xs text-muted-foreground line-clamp-2">{task.prompt}</p>
+          ) : (
+            <span className={chip("muted")}>
+              <AgentIcon kind={task.agent} className="size-3" />
+              {task.agent}
+            </span>
+          )}
+          {/* The task's pull request, as the PR watcher last saw it (src/bun/pr-watch.ts). */}
+          {pr && prInfo && (
+            <span className={chip(prInfo.tone)} data-testid="pr-badge" data-tone={prInfo.tone} title={prInfo.title}>
+              <GitPullRequest className="size-3 shrink-0" />
+              <span className="truncate">{prInfo.text}</span>
+            </span>
+          )}
+          {/* This card's worktree holds a watched lease (src/bun/lease-watch.ts). */}
+          {lease.holds.map((label) => (
+            <span key={label} className={chip("info")} data-testid="lease-badge" title={`Holds the ${label} lease`}>
+              <Lock className="size-3" />
+              {label}
+            </span>
+          ))}
+          {/* Blocked waiting on a watched lease: its place in the queue and
+           *  whether it's free yet (the first in line is retried automatically
+           *  when it frees — src/bun/lease-watch.ts). */}
+          {lease.waiting.map((w) => (
+            <span
+              key={w.label}
+              className={chip(w.free ? "success" : "warning")}
+              data-testid="lease-wait-hint"
+              title={w.free ? `${w.label} is free` : `${w.label} held by ${w.heldBy}`}
+            >
+              {w.free ? <LockOpen className="size-3" /> : <Lock className="size-3" />}
+              {w.label} · {ordinal(w.position)} of {w.queueLength}
+            </span>
+          ))}
+          {runningSubagents > 0 && (
+            <span className={chip("muted")} title={`${runningSubagents} background task${runningSubagents > 1 ? "s" : ""} running`}>
+              <Bot className="size-3" />
+              {runningSubagents}
+            </span>
+          )}
+          {task.openTerminalCount > 0 && (
+            <span className={chip("muted")} title={`${task.openTerminalCount} open terminal${task.openTerminalCount > 1 ? "s" : ""}`}>
+              <Terminal className="size-3" />
+              {task.openTerminalCount}
+            </span>
+          )}
+          {task.todoProgress && task.todoProgress.total > 0 && (
+            <span
+              className={chip(task.todoProgress.completed === task.todoProgress.total ? "success" : "muted")}
+              title={`${task.todoProgress.completed} of ${task.todoProgress.total} tasks done`}
+            >
+              <ListTodo className="size-3" />
+              {task.todoProgress.completed}/{task.todoProgress.total}
+            </span>
+          )}
+          {task.sentFiles && task.sentFiles.length > 0 && (
+            <span
+              className={chip("muted")}
+              data-testid="sent-files-badge"
+              title={`${task.sentFiles.length} file${task.sentFiles.length === 1 ? "" : "s"} sent · ${[...task.sentFiles]
+                .sort((a, b) => b.sentAt - a.sentAt)
+                .slice(0, 5)
+                .map((f) => sentFileBasename(f.path))
+                .join(", ")}`}
+            >
+              <Paperclip className="size-3" />
+              {task.sentFiles.length}
+            </span>
+          )}
+          {/* fx's response is paused on a resumable Gateway checkpoint
+           *  (`Task.fxRecovery`, server-managed — see `TaskFxRecovery` in
+           *  shared/types.ts). Gated on the shared `isTaskFxPaused` helper,
+           *  never on `task.agent`. */}
+          {isTaskFxPaused(task) && task.fxRecovery && (
+            <span className={chip("warning")} data-testid="fx-paused-badge" title={fxPausedBadgeTitle(task.fxRecovery)}>
+              <PauseCircle className="size-3" />
+              {fxPausedBadgeText(task.fxRecovery, fxAutoResumeCountdown)}
+            </span>
+          )}
+        </div>
+        {/* A plain task's prompt says something the title doesn't; an issue
+         *  or pipeline card's prompt just restates the title. */}
+        {!task.issueUrl && !task.pipelineRun && task.prompt.trim() !== task.title.trim() && (
+          <p className="text-xs text-muted-foreground line-clamp-2">{task.prompt}</p>
+        )}
         <p
-          className="text-[10px] text-muted-foreground/70 font-mono truncate"
-          title={task.workdir}
+          className="flex min-w-0 items-center gap-1 text-[11px] text-muted-foreground"
+          title={[abbreviateHome(task.workdir, homeDir), task.branch, task.model && task.mode ? `${task.model} · ${task.mode}` : task.model]
+            .filter(Boolean)
+            .join("\n")}
         >
-          {abbreviateHome(task.workdir, homeDir)}
+          <span className="shrink-0 font-medium">{repoName(task.workdir)}</span>
+          {task.branch && (
+            <>
+              <GitBranch className="size-3 shrink-0" />
+              <span className="min-w-0 truncate font-mono">{task.branch}</span>
+            </>
+          )}
+          {task.model && <span className="ml-auto shrink-0 pl-1 font-mono opacity-80">{task.model}</span>}
         </p>
-        {/* The task's pull request, as the PR watcher last saw it (src/bun/pr-watch.ts). */}
-        {pr && prInfo && (
-          <Badge
-            variant="outline"
-            className={cn(
-              "w-fit gap-1 text-[10px]",
-              prInfo.tone === "danger" && "text-destructive border-destructive/40",
-              prInfo.tone === "warning" && "text-warning border-warning/40",
-              prInfo.tone === "success" && "text-success border-success/40",
-              prInfo.tone === "merged" && "text-info border-info/40",
-              prInfo.tone === "muted" && "text-muted-foreground",
-            )}
-            data-testid="pr-badge"
-            data-tone={prInfo.tone}
-            title={prInfo.title}
-          >
-            <GitPullRequest className="size-3" />
-            {prInfo.text}
-          </Badge>
-        )}
-        {(task.branch || task.baseRef) && (
-          <div className="flex items-center gap-1 text-[10px] font-mono text-muted-foreground">
-            <GitBranch className="size-3 shrink-0" />
-            <span className="truncate">
-              {task.branch ?? "(not yet created)"}
-              {task.baseRef && (
-                <span className="ml-1 opacity-70">· {task.baseRef.slice(0, 7)}</span>
-              )}
-            </span>
-          </div>
-        )}
         <div className="flex gap-1" onClick={(e) => e.stopPropagation()}>
           {archived ? (
             <Button size="sm" variant="secondary" onClick={() => onOpen(task)}>

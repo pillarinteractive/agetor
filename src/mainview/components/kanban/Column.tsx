@@ -1,4 +1,4 @@
-import { memo } from "react";
+import { memo, useState } from "react";
 import { useDroppable } from "@dnd-kit/core";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
@@ -46,13 +46,23 @@ function sameTasks(a: Task[], b: Task[]): boolean {
   return a.every((t, i) => t === b[i]);
 }
 
+/** Done keeps piling up; show the newest few and fold the rest. */
+const COLLAPSE_AFTER: Partial<Record<ColumnId, number>> = { done: 5 };
+
 function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive, emptyHint, selectedTaskId, onContextMenu }: Props) {
   const { setNodeRef, isOver } = useDroppable({ id });
+  const [expanded, setExpanded] = useState(false);
+  const limit = COLLAPSE_AFTER[id];
+  const sorted = limit ? [...tasks].sort((a, b) => b.updatedAt - a.updatedAt) : tasks;
+  const shown = limit && !expanded ? sorted.slice(0, limit) : sorted;
+  const hidden = sorted.length - shown.length;
   return (
     <div
       ref={setNodeRef}
       className={cn(
-        "flex w-72 shrink-0 flex-col gap-3 rounded-lg border border-border/40 bg-muted/30 p-3",
+        // Columns share the board's width (wider cards wrap titles less, so
+        // they're shorter), within a readable range.
+        "flex min-w-[17rem] max-w-[26rem] flex-1 flex-col gap-3 rounded-lg border border-border/40 bg-muted/30 p-2.5",
         isOver && "border-primary/60 bg-muted/60",
       )}
     >
@@ -66,7 +76,7 @@ function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, on
         {tasks.length === 0 && emptyHint && (
           <p className="pointer-events-none px-1 text-xs text-muted-foreground">{emptyHint}</p>
         )}
-        {tasks.map((t) => (
+        {shown.map((t) => (
           <TaskCard
             key={t.id}
             task={t}
@@ -83,6 +93,15 @@ function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, on
             onContextMenu={onContextMenu}
           />
         ))}
+        {limit && sorted.length > limit && (
+          <button
+            type="button"
+            onClick={() => setExpanded((v) => !v)}
+            className="rounded-md border border-dashed border-border/60 px-2 py-1.5 text-xs text-muted-foreground hover:bg-muted/60 hover:text-foreground"
+          >
+            {expanded ? "Show fewer" : `Show ${hidden} more`}
+          </button>
+        )}
       </div>
     </div>
   );
