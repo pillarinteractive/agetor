@@ -38,6 +38,14 @@ export function recordActivity(taskId: string, entry: Omit<ActivityEntry, "ts"> 
   }
 }
 
+/** Append unless the timeline already has this exact entry — for watchers
+ *  that re-derive state from scratch after a restart (the PR watcher sees
+ *  every PR "open" and "merged" again) and shouldn't log it twice. */
+export function recordActivityOnce(taskId: string, entry: Omit<ActivityEntry, "ts">): void {
+  if (readLogged(taskId).some((e) => e.kind === entry.kind && e.text === entry.text)) return;
+  recordActivity(taskId, entry);
+}
+
 function readLogged(taskId: string): ActivityEntry[] {
   const file = fileFor(taskId);
   if (!existsSync(file)) return [];

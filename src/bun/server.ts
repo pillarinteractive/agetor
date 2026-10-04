@@ -38,6 +38,7 @@ import { cancelClone, cloneAuthHeader, cloneRepo, defaultCloneDest, resolveClone
 import { buildEli5Prompt, eli5TaskTitle } from "../shared/clone-eli5.ts";
 import { CLONE_PROVIDERS, isGitProvider } from "../shared/clone-input.ts";
 import { stalledSince } from "./stall-registry.ts";
+import { lastActivityAt } from "./activity-clock.ts";
 import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
 import {
@@ -281,7 +282,7 @@ function withRunningSubagents(t: Task): Task & { runningSubagents: number } {
   // `stalledSince` rides the same decoration: transient in-memory server
   // state (the turn-stall watchdog's mark) that the DB-derived Task can't
   // carry — see stall-registry.ts.
-  return { ...t, runningSubagents, stalledSince: stalledSince(t.id) };
+  return { ...t, runningSubagents, stalledSince: stalledSince(t.id), lastActivityAt: lastActivityAt(t) };
 }
 
 // Turn raw path strings into references: keep only existing absolute paths,
@@ -4411,14 +4412,17 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       "/tasks": {
         GET: authed((req) => {
           const counts = subagents.runningCountsByTask();
+          const allTasks = tasks.list();
+          const byId = new Map(allTasks.map((t) => [t.id, t]));
           return json(
-            tasks.list().map((t) => ({
+            allTasks.map((t) => ({
               ...t,
               // M-S3: the list route ships the trimmed pipelineRun variant
               // (no handoffs, no profile snapshots) — see the field's doc.
               ...(t.pipelineRun ? { pipelineRun: trimPipelineRunForList(t.pipelineRun) } : {}),
               runningSubagents: counts.get(t.id) ?? 0,
               stalledSince: stalledSince(t.id),
+              lastActivityAt: lastActivityAt(t, (id) => byId.get(id)),
             })),
             { headers: corsHeaders(req) },
           );

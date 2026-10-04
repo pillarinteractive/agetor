@@ -167,3 +167,19 @@ ordinary task (isolation none, workdir `~/.agetor/conductor` holding its CLAUDE.
   (rewritten at every start). Delete/archive the Conductor task to start a fresh one.
 - Testing without touching the board: a throwaway daemon with its own data dir, port and tmux socket —
   `AGETOR_DATA_DIR=<tmp> AGETOR_API_PORT=4319 AGETOR_TMUX_SOCKET=agetor-ct bun src/bun/headless.ts`.
+
+## Real block reasons, quiet cards, lab queue (`feat/stuck-reasons`)
+
+- **Block reasons** (`src/shared/block-reason.ts`): a blocked card says "Waiting for lab" only when its step's block
+  text mentions the lease (its label, "lease", "plab", "held by"); anything else shows the step's own reason. The
+  suggestions engine uses the same check.
+- **Lab queue** (`src/bun/lease-watch.ts`): each `LeaseStatus` carries `queue` — the cards blocked on that lease,
+  longest waiting first. Cards show "2nd of 3 in line". When the lease is free the first in line is retried
+  automatically (one every 5 min per lease, once per block; activity entry). Off: `agetor config lease_autoretry false`.
+- **Quiet cards** (`src/bun/activity-clock.ts`): running cards carry `lastActivityAt` (newest run event; for a pipeline
+  the quietest active step — any harness). After 20 min quiet the card warns "quiet 25m" and lands in Needs you with
+  Check — unless a lab/E2E run on it is reporting live progress.
+- **Done cards' PRs**: each Done card's PR is looked up once after startup, so a PR merged before a restart shows
+  "merged" instead of the final handoff's old CI headline. PR timeline entries re-derived after a restart aren't
+  logged twice (`recordActivityOnce`).
+- E2E live progress: Pillar PR #197 — watcher `{"label":"e2e","command":"node apps/web/scripts/e2e-progress.mjs --json"}`.

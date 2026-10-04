@@ -41,7 +41,10 @@ describe("tasksToWatch", () => {
       task({ id: "open-done", column: "done" }),
       task({ id: "merged", column: "review" }),
     ];
-    expect(tasksToWatch(list, known).map((t) => t.id)).toEqual(["review", "open-done"]);
+    // A Done card is looked up once (it may have merged before a restart)…
+    expect(tasksToWatch(list, known, new Set()).map((t) => t.id)).toEqual(["review", "done-unknown", "open-done"]);
+    // …then only while its PR is open.
+    expect(tasksToWatch(list, known, new Set(["done-unknown"])).map((t) => t.id)).toEqual(["review", "open-done"]);
   });
 });
 

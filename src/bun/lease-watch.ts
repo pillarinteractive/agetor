@@ -15,8 +15,15 @@ import type { LeaseStatus, LeaseWatcherConfig, Task } from "../shared/types.ts";
 import { preferences, tasks } from "./db.ts";
 import { publishGlobalEvent } from "./orchestrator.ts";
 import { recordActivity } from "./activity.ts";
+import { leaseQueue, ordinal } from "../shared/block-reason.ts";
+import { retryPipelineStep } from "./pipeline-runner.ts";
 
 export const LEASE_WATCHERS_PREF = "lease_watchers";
+/** "false" turns off retrying the first queued card when a lease frees. */
+export const LEASE_AUTORETRY_PREF = "lease_autoretry";
+// After an automatic retry, give that card this long to take the lease
+// before the next one in line is tried.
+const AUTORETRY_GAP_MS = 5 * 60_000;
 const DEFAULT_INTERVAL_SEC = 30;
 const MIN_INTERVAL_SEC = 5;
 const TICK_MS = 5_000;
@@ -117,7 +124,8 @@ function sameObservation(a: LeaseStatus | undefined, b: LeaseStatus): boolean {
     a.holderTaskId === b.holderTaskId &&
     a.holderTitle === b.holderTitle &&
     a.checkout === b.checkout &&
-    a.error === b.error
+    a.error === b.error &&
+    JSON.stringify(a.queue ?? []) === JSON.stringify(b.queue ?? [])
   );
 }
 
@@ -173,6 +181,7 @@ async function probe(w: LeaseWatcherConfig): Promise<void> {
         since: result.held ? result.since : null,
         checkedAt: Date.now(),
         error: null,
+        queue: queueFor(w),
       };
     } else {
       // Keep the last known holder: a flaky probe (host briefly unreachable)
@@ -188,6 +197,7 @@ async function probe(w: LeaseWatcherConfig): Promise<void> {
         since: prev?.since ?? null,
         checkedAt: Date.now(),
         error: result.error,
+        queue: queueFor(w),
       };
     }
     // A watcher removed from the preference while this probe ran is gone.
@@ -203,8 +213,44 @@ async function probe(w: LeaseWatcherConfig): Promise<void> {
   }
 }
 
-/** One scheduler pass: drop watchers no longer configured, probe the due
- *  ones. Exported for tests. */
+function queueFor(w: Pick<LeaseWatcherConfig, "project" | "label">): NonNullable<LeaseStatus["queue"]> {
+  return leaseQueue(tasks.list(), w).map(({ task, since }) => ({ taskId: task.id, title: task.title, since }));
+}
+
+const lastAutoRetryAt = new Map<string, number>();
+/** Blocks already retried automatically (`<taskId>:<blockedAt>`): a card
+ *  that blocks again for the same reason isn't retried in a loop — only a
+ *  new block gets a new automatic retry. */
+const autoRetried = new Set<string>();
+
+/** When a lease is free and cards are queued for it, retry the first one —
+ *  at most one every AUTORETRY_GAP_MS per lease. Exported for tests. */
+export async function autoRetryQueued(now = Date.now()): Promise<string | null> {
+  if (preferences.get(LEASE_AUTORETRY_PREF) === "false") return null;
+  for (const [key, s] of statuses) {
+    if (s.held || s.error || !s.queue?.length) continue;
+    if (now - (lastAutoRetryAt.get(key) ?? 0) < AUTORETRY_GAP_MS) continue;
+    const next = s.queue.find((q) => !autoRetried.has(`${q.taskId}:${q.since}`));
+    if (!next) continue;
+    autoRetried.add(`${next.taskId}:${next.since}`);
+    lastAutoRetryAt.set(key, now);
+    const r = await retryPipelineStep(next.taskId);
+    recordActivity(next.taskId, {
+      kind: "lease",
+      text:
+        "error" in r
+          ? `The ${s.label} is free, but the automatic retry failed: ${r.error}`
+          : `The ${s.label} is free — retried automatically (${ordinal(s.queue.indexOf(next) + 1)} in line)`,
+      tone: "error" in r ? "warning" : "info",
+    });
+    return next.taskId;
+  }
+  return null;
+}
+
+/** One scheduler pass: drop watchers no longer configured, refresh each
+ *  lease's queue, retry the first queued card of a free lease, probe the
+ *  due ones. Exported for tests. */
 export function leaseWatchTick(now = Date.now()): Promise<void>[] {
   const watchers = parseLeaseWatchers(preferences.get(LEASE_WATCHERS_PREF));
   const wanted = new Set(watchers.map(keyOf));
@@ -216,7 +262,19 @@ export function leaseWatchTick(now = Date.now()): Promise<void>[] {
       removed = true;
     }
   }
-  if (removed) publish();
+  // Cards block and unblock between probes; keep the queues current.
+  let queues = removed;
+  for (const w of watchers) {
+    const s = statuses.get(keyOf(w));
+    if (!s) continue;
+    const q = queueFor(w);
+    if (JSON.stringify(q) !== JSON.stringify(s.queue ?? [])) {
+      statuses.set(keyOf(w), { ...s, queue: q });
+      queues = true;
+    }
+  }
+  if (queues) publish();
+  void autoRetryQueued(now).catch(() => undefined);
   const started: Promise<void>[] = [];
   for (const w of watchers) {
     const key = keyOf(w);
@@ -245,4 +303,6 @@ export function resetLeaseWatchForTests(): void {
   statuses.clear();
   lastProbeAt.clear();
   inFlight.clear();
+  lastAutoRetryAt.clear();
+  autoRetried.clear();
 }

@@ -19,6 +19,7 @@ import type { LeaseStatus, Task, TaskPrStatus } from "../shared/types.ts";
 import { handoffHeadline } from "../shared/pipeline.ts";
 import { runs, tasks } from "./db.ts";
 import { listLeases } from "./lease-watch.ts";
+import { blockInfo, blockMentionsLease } from "../shared/block-reason.ts";
 import { prStatusForTask, staleAgainstBase } from "./pr-watch.ts";
 import { parseFollowUpPresets, FOLLOW_UPS_PREF, startFollowUp } from "./pipeline-followups.ts";
 import { preferences } from "./db.ts";
@@ -60,26 +61,13 @@ export const DEPS_UNBLOCK_MESSAGE =
   "You're unblocked — a missing node_modules is part of setting up verification, not a failure. This worktree is " +
   "fresh, so install dependencies first from the repo root: `pnpm install --frozen-lockfile` (fast: it hard-links " +
   "from the pnpm store). Then rerun the full verification and carry on with your step.";
-const LEASE_PATTERN = /\blease\b|\blab\b|plab|held by/i;
-
-function blockText(task: Task): { stepTaskId: string | null; stepName: string; text: string; questions: string[] } | null {
-  const run = task.pipelineRun;
-  const block = run?.status === "blocked" ? run.blocked[0] : undefined;
-  if (!run || !block) return null;
-  const record = [...run.history].reverse().find((r) => r.taskId === block.taskId) ?? null;
-  const h = record?.handoff;
-  const stepName = run.snapshot?.graph.steps.find((s) => s.id === block.stepId)?.name ?? block.stepId ?? "a step";
-  const text = [block.message, h?.summary, h?.reason, ...(h?.openQuestions ?? [])].filter(Boolean).join("\n");
-  return { stepTaskId: block.taskId, stepName, text, questions: h?.openQuestions ?? [] };
-}
-
 /** The suggestion for one card, if any. Pure; exported for tests. */
 export function suggestFor(
   task: Task,
   ctx: { pr: TaskPrStatus | null; leases: LeaseStatus[]; hasOpenPrPreset: boolean },
 ): Suggestion | null {
   const base = { taskId: task.id, taskTitle: task.title };
-  const block = blockText(task);
+  const block = blockInfo(task);
 
   const needsDeps = !!block && DEPS_PATTERN.test(block.text);
   const needsEnv = !!block && ENV_PATTERN.test(block.text);
@@ -100,8 +88,10 @@ export function suggestFor(
     };
   }
 
-  if (block && LEASE_PATTERN.test(block.text)) {
-    const lease = ctx.leases.find((l) => l.project.replace(/\/+$/, "") === task.workdir.replace(/\/+$/, ""));
+  if (block) {
+    const lease = ctx.leases.find(
+      (l) => l.project.replace(/\/+$/, "") === task.workdir.replace(/\/+$/, "") && blockMentionsLease(block.text, l.label),
+    );
     if (lease && !lease.held && !lease.error) {
       return {
         ...base,

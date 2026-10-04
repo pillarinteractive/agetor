@@ -31,6 +31,8 @@ function makeLease(overrides: Partial<LeaseStatus> = {}): LeaseStatus {
   };
 }
 
+const queued = (...ids: string[]) => ids.map((taskId, i) => ({ taskId, title: taskId, since: i }));
+
 describe("leaseInfoForTask", () => {
   test("the holder gets a badge per lease it holds", () => {
     const leases = [
@@ -40,39 +42,43 @@ describe("leaseInfoForTask", () => {
     expect(leaseInfoForTask(makeTask(), leases).holds).toEqual(["lab"]);
   });
 
-  test("a blocked card in the same project hears who holds the lease", () => {
-    const leases = [makeLease({ held: true, holderTaskId: "task-2", holderTitle: "E2E" })];
-    const info = leaseInfoForTask(makeTask({ column: "blocked", workdir: "/repo/" }), leases);
+  test("a queued blocked card hears who holds the lease and its place in line", () => {
+    const leases = [makeLease({ held: true, holderTaskId: "task-2", holderTitle: "E2E", queue: queued("task-3", "task-1") })];
+    const info = leaseInfoForTask(makeTask({ column: "blocked" }), leases);
     expect(info.holds).toEqual([]);
-    expect(info.waiting).toEqual([{ label: "lab", heldBy: "E2E", free: false }]);
+    expect(info.waiting).toEqual([{ label: "lab", heldBy: "E2E", free: false, position: 2, queueLength: 2 }]);
   });
 
-  test("a blocked card is told when the lease is free", () => {
-    const info = leaseInfoForTask(makeTask({ column: "blocked" }), [makeLease()]);
-    expect(info.waiting).toEqual([{ label: "lab", heldBy: null, free: true }]);
+  test("a queued card is told when the lease is free", () => {
+    const info = leaseInfoForTask(makeTask({ column: "blocked" }), [makeLease({ queue: queued("task-1") })]);
+    expect(info.waiting).toEqual([{ label: "lab", heldBy: null, free: true, position: 1, queueLength: 1 }]);
+  });
+
+  test("a blocked card that isn't waiting on the lease gets no lease hint, even when it's busy", () => {
+    const leases = [makeLease({ held: true, holderTaskId: "task-2", holderTitle: "VM tests", queue: [] })];
+    expect(leaseInfoForTask(makeTask({ column: "blocked" }), leases).waiting).toEqual([]);
   });
 
   test("a holder outside Agetor is named by its owner string", () => {
-    const leases = [makeLease({ held: true, owner: "me@host:/elsewhere pid=1 since=x" })];
+    const leases = [makeLease({ held: true, owner: "me@host:/elsewhere pid=1 since=x", queue: queued("task-1") })];
     expect(leaseInfoForTask(makeTask({ column: "blocked" }), leases).waiting[0]!.heldBy).toBe(
       "me@host:/elsewhere pid=1 since=x",
     );
   });
 
   test("a failing probe that never saw a holder doesn't claim the lease is free", () => {
-    const failing = makeLease({ error: "exited 1: usage" });
+    const failing = makeLease({ error: "exited 1: usage", queue: queued("task-1") });
     expect(leaseInfoForTask(makeTask({ column: "blocked" }), [failing]).waiting).toEqual([]);
-    const stale = makeLease({ error: "timeout", held: true, holderTaskId: "task-2", holderTitle: "E2E" });
+    const stale = makeLease({ error: "timeout", held: true, holderTaskId: "task-2", holderTitle: "E2E", queue: queued("task-1") });
     expect(leaseInfoForTask(makeTask({ column: "blocked" }), [stale]).waiting).toEqual([
-      { label: "lab", heldBy: "E2E", free: false },
+      { label: "lab", heldBy: "E2E", free: false, position: 1, queueLength: 1 },
     ]);
   });
 
-  test("no hint outside Blocked, for other projects, or on the holder itself", () => {
-    const held = makeLease({ held: true, holderTaskId: "task-2" });
+  test("no hint outside Blocked or on the holder itself", () => {
+    const held = makeLease({ held: true, holderTaskId: "task-2", queue: queued("task-1") });
     expect(leaseInfoForTask(makeTask({ column: "review" }), [held]).waiting).toEqual([]);
-    expect(leaseInfoForTask(makeTask({ column: "blocked", workdir: "/other" }), [held]).waiting).toEqual([]);
-    const mine = makeLease({ held: true, holderTaskId: "task-1" });
+    const mine = makeLease({ held: true, holderTaskId: "task-1", queue: queued("task-1") });
     expect(leaseInfoForTask(makeTask({ column: "blocked" }), [mine]).waiting).toEqual([]);
   });
 });

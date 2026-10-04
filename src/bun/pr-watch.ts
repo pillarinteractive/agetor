@@ -14,7 +14,7 @@ import type { FollowUpAction, Task, TaskPrStatus } from "../shared/types.ts";
 import { agentProfiles, preferences, tasks } from "./db.ts";
 import { findGitHubPullForBranch, getGitHubCompare, getGitHubPullChecks, getGitHubPullReviewThreads, getGitHubRefCheckRuns } from "./github.ts";
 import { runPipelineFollowUp } from "./pipeline-runner.ts";
-import { recordActivity } from "./activity.ts";
+import { recordActivity, recordActivityOnce } from "./activity.ts";
 import { isTaskRunLive, moveMergedTaskToDone, publishGlobalEvent } from "./orchestrator.ts";
 
 const PR_WATCH_INTERVAL_MS = 60_000;
@@ -40,16 +40,26 @@ export function prStatusForTask(taskId: string): TaskPrStatus | null {
   return statuses.get(taskId) ?? null;
 }
 
+/** Done cards already looked up once since startup — so a Done card whose PR
+ *  merged before a restart (or that never had one) is asked about once, not
+ *  every tick. */
+const checkedDone = new Set<string>();
+
 /** Tasks worth a GitHub round-trip: live board cards (never a pipeline's
  *  hidden step rows, which share their parent's branch) with a branch, in a
- *  column where a PR can exist. A card in Done is only followed while its
- *  PR is still open, so a merged or abandoned one drops out. */
-export function tasksToWatch(list: Task[], known: ReadonlyMap<string, TaskPrStatus>): Task[] {
+ *  column where a PR can exist. A card in Done is looked up once (so a PR
+ *  merged before a restart shows as merged, not as its last CI run), then
+ *  only followed while its PR is still open. */
+export function tasksToWatch(
+  list: Task[],
+  known: ReadonlyMap<string, TaskPrStatus>,
+  doneChecked: ReadonlySet<string> = checkedDone,
+): Task[] {
   return list.filter((t) => {
     if (t.archivedAt != null || t.pipelineParentId || !t.branch) return false;
     if (!WATCHED_COLUMNS.has(t.column)) return false;
     const prev = known.get(t.id);
-    if (t.column === "done") return prev?.state === "open";
+    if (t.column === "done") return prev ? prev.state === "open" : !doneChecked.has(t.id);
     return prev?.state !== "merged";
   });
 }
@@ -177,10 +187,12 @@ export async function prWatchTick(): Promise<void> {
       } catch {
         continue; // network hiccup: keep the last status, try next tick
       }
+      if (task.column === "done") checkedDone.add(task.id);
       if (!next) continue;
       const prev = statuses.get(task.id);
       statuses.set(task.id, next);
-      for (const e of prActivity(prev, next)) recordActivity(task.id, e);
+      // First sight after a restart re-derives "opened"/"merged"; don't log them twice.
+      for (const e of prActivity(prev, next)) (prev ? recordActivity : recordActivityOnce)(task.id, e);
       if (!task.prUrl && next.url) tasks.update(task.id, { prUrl: next.url });
       if (next.state === "merged" && prev?.state !== "merged" && canMoveToDone(task)) moveMergedTaskToDone(task.id);
       if (!same(prev, next)) changed = true;
@@ -242,6 +254,7 @@ export function resetPrWatchForTests(): void {
   if (loop) clearInterval(loop);
   loop = null;
   statuses.clear();
+  checkedDone.clear();
   inFlight = false;
 }
 

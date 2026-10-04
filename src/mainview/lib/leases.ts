@@ -9,27 +9,29 @@ export const LeaseContext = createContext<LeaseStatus[]>([]);
 export interface TaskLeaseInfo {
   /** Labels of the leases this card's worktree holds — one badge each. */
   holds: string[];
-  /** For a Blocked card: each of its project's leases it doesn't hold, and
-   *  who has it, so the user can tell when a retry would get through. */
-  waiting: { label: string; heldBy: string | null; free: boolean }[];
+  /** For a Blocked card whose block says it's waiting on a lease: that lease,
+   *  who has it, and the card's place in its queue (1 = next). A card blocked
+   *  for any other reason gets none, even when the lab is busy. */
+  waiting: { label: string; heldBy: string | null; free: boolean; position: number; queueLength: number }[];
 }
-
-const trimSlash = (p: string) => p.replace(/\/+$/, "");
 
 export function leaseInfoForTask(task: Task, leases: LeaseStatus[]): TaskLeaseInfo {
   const holds = leases.filter((l) => l.held && l.holderTaskId === task.id).map((l) => l.label);
   const waiting =
     task.column === "blocked"
-      ? leases
-          .filter((l) => trimSlash(l.project) === trimSlash(task.workdir) && l.holderTaskId !== task.id)
+      ? leases.flatMap((l) => {
+          const i = (l.queue ?? []).findIndex((q) => q.taskId === task.id);
           // A failing probe with no known holder knows nothing — never claim
           // the resource is free on its say-so.
-          .filter((l) => l.held || !l.error)
-          .map((l) => ({
+          if (i < 0 || l.holderTaskId === task.id || (!l.held && l.error)) return [];
+          return [{
             label: l.label,
             heldBy: l.held ? (l.holderTitle ?? l.owner ?? "another checkout") : null,
             free: !l.held,
-          }))
+            position: i + 1,
+            queueLength: l.queue!.length,
+          }];
+        })
       : [];
   return { holds, waiting };
 }

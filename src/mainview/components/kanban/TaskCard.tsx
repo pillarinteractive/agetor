@@ -16,6 +16,7 @@ import { PipelineBadge } from "@/components/pipelines";
 import { useTaskLeaseInfo } from "@/lib/leases";
 import { prBadge, useTaskPr } from "@/lib/prs";
 import { cardStatus } from "@/lib/card-status";
+import { ordinal } from "../../../shared/block-reason.ts";
 import { progressFraction, progressLine, useTaskProgress } from "@/lib/progress";
 
 interface Props {
@@ -56,7 +57,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
   // Live lab/E2E run progress in this card's checkout (src/bun/progress-watch.ts).
   const progress = useTaskProgress(task.id);
   // One plain sentence: what the card is doing, or what it's waiting on.
-  const status = cardStatus(task, { pr, lease, now: Date.now() });
+  const status = cardStatus(task, { pr, lease, now: Date.now(), progressActive: progress.some((p) => p.active) });
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: task.id,
     // Archived cards are immutable until unarchived — block drag-to-column so
@@ -342,9 +343,9 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
           })}
       </CardHeader>
       <CardContent className="space-y-2">
-        {/* Blocked, and its project has a watched lease: say whether it's
-         *  free yet, so the user knows when a retry (drag to Running) can
-         *  get through. */}
+        {/* Blocked waiting on a watched lease: its place in the queue and
+         *  whether it's free yet (the first in line is retried automatically
+         *  when it frees — src/bun/lease-watch.ts). */}
         {lease.waiting.map((w) => (
           <p
             key={w.label}
@@ -352,7 +353,10 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
             data-testid="lease-wait-hint"
           >
             {w.free ? <LockOpen className="size-3 shrink-0" /> : <Lock className="size-3 shrink-0" />}
-            <span className="truncate">{w.free ? `${w.label} free — retry` : `${w.label} held by ${w.heldBy}`}</span>
+            <span className="truncate">
+              {w.free ? `${w.label} free` : `${w.label} held by ${w.heldBy}`}
+              {` · ${ordinal(w.position)} of ${w.queueLength} in line`}
+            </span>
           </p>
         ))}
         <p className="text-xs text-muted-foreground line-clamp-2">{task.prompt}</p>

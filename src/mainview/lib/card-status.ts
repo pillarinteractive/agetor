@@ -8,6 +8,7 @@
 import type { PipelineRunState, Task, TaskPrStatus } from "../../shared/types.ts";
 import { handoffHeadline } from "../../shared/pipeline.ts";
 import type { TaskLeaseInfo } from "./leases.ts";
+import { ordinal } from "../../shared/block-reason.ts";
 
 export type NeedsYouAction = "open" | "retry" | "open-pr";
 
@@ -77,9 +78,19 @@ function prPhrase(pr: TaskPrStatus): { text: string; tone: CardStatus["tone"]; n
   };
 }
 
+/** How long a running card's agents have said nothing, once that's past
+ *  {@link QUIET_AFTER_MS} — or null. A live lab/E2E run reporting progress
+ *  isn't quiet: a long test command legitimately produces no transcript. */
+export const QUIET_AFTER_MS = 20 * 60_000;
+function quietFor(task: Task, ctx: { now: number; progressActive?: boolean }): string | null {
+  if (ctx.progressActive || task.lastActivityAt == null) return null;
+  const ms = ctx.now - task.lastActivityAt;
+  return ms >= QUIET_AFTER_MS ? formatAge(ms) : null;
+}
+
 export function cardStatus(
   task: Task,
-  ctx: { pr: TaskPrStatus | null; lease: TaskLeaseInfo; now: number },
+  ctx: { pr: TaskPrStatus | null; lease: TaskLeaseInfo; now: number; progressActive?: boolean },
 ): CardStatus {
   const { pr, lease, now } = ctx;
   const asked = (task.pendingInteractionCount ?? 0) > 0;
@@ -95,6 +106,7 @@ export function cardStatus(
   const run = task.pipelineRun ?? null;
   if (run) {
     if (run.status === "running") {
+      const quiet = quietFor(task, ctx);
       const now_ = run.active
         .map((a) => {
           const rec = latestRecord(run, a.taskId);
@@ -102,17 +114,35 @@ export function cardStatus(
         })
         .join(" + ");
       const holds = lease.holds.length ? ` · holds ${lease.holds.join(", ")}` : "";
+      if (quiet) {
+        const step = stepName(run, run.active[0]?.stepId);
+        return {
+          line: `${now_ || "Starting"}${holds} · quiet ${quiet}`,
+          tone: "warning",
+          needsYou: { reason: `${step} has been quiet for ${quiet}`, action: "open", actionLabel: "Check" },
+        };
+      }
       return { line: `${now_ || "Starting"}${holds}`, tone: "info", needsYou: null };
     }
 
     if (run.status === "blocked") {
       const waiting = lease.waiting.find((w) => !w.free);
+      const inLine = (w: { position: number; queueLength: number }) =>
+        w.queueLength > 1 ? `, ${ordinal(w.position)} of ${w.queueLength} in line` : "";
       if (waiting) {
-        return { line: `Waiting for ${waiting.label} (held by ${waiting.heldBy})`, tone: "warning", needsYou: null };
+        return {
+          line: `Waiting for ${waiting.label} (held by ${waiting.heldBy}${inLine(waiting)})`,
+          tone: "warning",
+          needsYou: null,
+        };
       }
       const freed = lease.waiting.find((w) => w.free);
       const block = run.blocked[0];
       const step = stepName(run, block?.stepId);
+      if (freed && freed.position > 1) {
+        // Someone ahead in line gets the free lease first.
+        return { line: `Waiting for ${freed.label}${inLine(freed)}`, tone: "warning", needsYou: null };
+      }
       if (freed) {
         return {
           line: `${step} blocked — ${freed.label} is free now`,
@@ -155,6 +185,14 @@ export function cardStatus(
   // A single-agent task.
   if (task.column === "running") {
     const todos = task.todoProgress && task.todoProgress.total > 0 ? ` · ${task.todoProgress.completed}/${task.todoProgress.total} todos` : "";
+    const quiet = quietFor(task, ctx);
+    if (quiet) {
+      return {
+        line: `Working${todos} · quiet ${quiet}`,
+        tone: "warning",
+        needsYou: { reason: `quiet for ${quiet}`, action: "open", actionLabel: "Check" },
+      };
+    }
     return { line: `Working${todos}`, tone: "info", needsYou: null };
   }
   if (task.column === "blocked") {

@@ -18,7 +18,7 @@ const task = (o: Partial<Task>) => ({ id: "t", title: "T", column: "running", pe
 const pr = (o: Partial<TaskPrStatus> = {}): TaskPrStatus => ({
   taskId: "t", number: 177, url: "u", state: "open", draft: false, baseRef: "develop", headSha: "s", checks: "success", failingChecks: [], unresolvedThreads: 0, checkedAt: 0, ...o,
 });
-const status = (t: Task, o: { pr?: TaskPrStatus | null; lease?: TaskLeaseInfo } = {}) => cardStatus(t, { pr: o.pr ?? null, lease: o.lease ?? noLease, now: NOW });
+const status = (t: Task, o: { pr?: TaskPrStatus | null; lease?: TaskLeaseInfo; progressActive?: boolean } = {}) => cardStatus(t, { pr: o.pr ?? null, lease: o.lease ?? noLease, now: NOW, progressActive: o.progressActive });
 
 describe("cardStatus — pipelines", () => {
   test("running: the active step and how long it's been going, plus a held lease", () => {
@@ -28,12 +28,31 @@ describe("cardStatus — pipelines", () => {
 
   test("blocked on a lease held elsewhere: waiting, nothing for the user to do", () => {
     const t = task({ column: "blocked", pipelineRun: run({ status: "blocked", blocked: [{ taskId: "s1", stepId: "build", kind: "step-blocked", message: "m" }] }) });
-    expect(status(t, { lease: { holds: [], waiting: [{ label: "lab", heldBy: "E2E", free: false }] } })).toMatchObject({ line: "Waiting for lab (held by E2E)", needsYou: null });
+    expect(status(t, { lease: { holds: [], waiting: [{ label: "lab", heldBy: "E2E", free: false, position: 1, queueLength: 1 }] } })).toMatchObject({ line: "Waiting for lab (held by E2E)", needsYou: null });
+  });
+
+  test("second in line for a busy lease says so", () => {
+    const t = task({ column: "blocked", pipelineRun: run({ status: "blocked", blocked: [{ taskId: "s1", stepId: "build", kind: "step-blocked", message: "m" }] }) });
+    expect(status(t, { lease: { holds: [], waiting: [{ label: "lab", heldBy: "E2E", free: false, position: 2, queueLength: 3 }] } }).line).toBe("Waiting for lab (held by E2E, 2nd of 3 in line)");
+  });
+
+  test("free lease but someone is ahead in line: still waiting, nothing to do", () => {
+    const t = task({ column: "blocked", pipelineRun: run({ status: "blocked", blocked: [{ taskId: "s1", stepId: "build", kind: "step-blocked", message: "m" }] }) });
+    expect(status(t, { lease: { holds: [], waiting: [{ label: "lab", heldBy: null, free: true, position: 2, queueLength: 2 }] } })).toMatchObject({ line: "Waiting for lab, 2nd of 2 in line", needsYou: null });
+  });
+
+  test("running but quiet past the threshold: a warning the user should check", () => {
+    const t = task({ lastActivityAt: NOW - 25 * 60_000, pipelineRun: run({ active: [{ stepId: "build", taskId: "s1", seq: 3 }], history: [{ seq: 3, stepId: "build", taskId: "s1", startedAt: NOW - 3_600_000, endedAt: null, outcome: null, handoff: null, nextStepIds: [] }] }) });
+    expect(status(t)).toMatchObject({ line: "Build · 1h · quiet 25m", tone: "warning", needsYou: { reason: "Build has been quiet for 25m", actionLabel: "Check" } });
+    // A lab/E2E run reporting live progress isn't quiet.
+    expect(status(t, { progressActive: true })).toMatchObject({ tone: "info", needsYou: null });
+    // Recent activity isn't quiet either.
+    expect(status({ ...t, lastActivityAt: NOW - 60_000 })).toMatchObject({ tone: "info", needsYou: null });
   });
 
   test("blocked, lease now free: retry is the user's move", () => {
     const t = task({ column: "blocked", pipelineRun: run({ status: "blocked", blocked: [{ taskId: "s1", stepId: "build", kind: "step-blocked", message: "m" }] }) });
-    expect(status(t, { lease: { holds: [], waiting: [{ label: "lab", heldBy: null, free: true }] } }).needsYou).toMatchObject({ action: "retry", actionLabel: "Retry" });
+    expect(status(t, { lease: { holds: [], waiting: [{ label: "lab", heldBy: null, free: true, position: 1, queueLength: 1 }] } }).needsYou).toMatchObject({ action: "retry", actionLabel: "Retry" });
   });
 
   test("blocked step explains itself with its handoff headline", () => {

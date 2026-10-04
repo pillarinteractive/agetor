@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useContext, useEffect, useMemo, useState } from "react";
 import { ChevronDown, CircleAlert, Sparkles } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { cardStatus, needsYouList, type NeedsYouAction } from "@/lib/card-status";
 import { leaseInfoForTask } from "@/lib/leases";
+import { ProgressContext } from "@/lib/progress";
 import { cn } from "@/lib/utils";
 import type { LeaseStatus, Task, TaskPrStatus } from "../../../shared/types.ts";
 
@@ -67,15 +68,17 @@ export function NeedsYouBar({
       setBusy(null);
     }
   };
+  const progress = useContext(ProgressContext);
   const items = useMemo(() => {
     const now = Date.now();
+    const live = new Set(progress.filter((p) => p.active).map((p) => p.taskId));
     return needsYouList(
       tasks.map((task) => ({
         task,
-        status: cardStatus(task, { pr: prs.get(task.id) ?? null, lease: leaseInfoForTask(task, leases), now }),
+        status: cardStatus(task, { pr: prs.get(task.id) ?? null, lease: leaseInfoForTask(task, leases), now, progressActive: live.has(task.id) }),
       })),
     );
-  }, [tasks, prs, leases]);
+  }, [tasks, prs, leases, progress]);
 
   if (items.length === 0 && suggestions.length === 0 && !notice) return null;
   // A card with a suggestion shows it instead of its plain Needs-you line.

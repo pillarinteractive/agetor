@@ -194,7 +194,8 @@ export function snapshot(d: BoardDigest, finished: Map<string, string> = finishe
       title: c.title,
       facts: {
         column: c.column,
-        "needs you": c.needsYou ?? "",
+        // Ages ("quiet 25m", "· 1h 8m") change every minute; they aren't news.
+        "needs you": stripAges(c.needsYou ?? ""),
         pipeline: c.pipeline?.status ?? "",
         PR: c.pr ?? "",
         "lab/E2E run": finished.get(c.id) ?? "",
@@ -206,6 +207,8 @@ export function snapshot(d: BoardDigest, finished: Map<string, string> = finishe
   }
   return snap;
 }
+
+const stripAges = (s: string) => s.replace(/\b\d+h(?: \d+m)?\b|\b\d+m\b|just now/g, "…");
 
 function finishedRuns(): Map<string, string> {
   const out = new Map<string, string>();

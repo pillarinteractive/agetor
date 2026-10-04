@@ -15,6 +15,7 @@ import { listLeases } from "./lease-watch.ts";
 import { prStatusForTask } from "./pr-watch.ts";
 import { listProgress } from "./progress-watch.ts";
 import { listSuggestions, type Suggestion } from "./suggestions.ts";
+import { lastActivityAt } from "./activity-clock.ts";
 
 export interface DigestCard {
   id: string;
@@ -66,7 +67,8 @@ function digestCard(
 ): DigestCard {
   const pr = prStatusForTask(t.id);
   const lease = leaseInfoForTask(t, ctx.leases);
-  const status = cardStatus(t, { pr, lease, now: ctx.now });
+  const progressActive = ctx.progress.some((p) => p.taskId === t.id && p.active);
+  const status = cardStatus({ ...t, lastActivityAt: lastActivityAt(t) }, { pr, lease, now: ctx.now, progressActive });
   return {
     id: t.id,
     title: t.title,

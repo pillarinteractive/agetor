@@ -1715,6 +1715,10 @@ export interface Task {
    * stalled.
    */
   stalledSince?: number | null;
+  /** When this card's agents last produced anything (the newest run event of
+   *  the running task, or for a running pipeline the quietest active step).
+   *  Server-decorated for running cards only; drives the "quiet" warning. */
+  lastActivityAt?: number | null;
 }
 
 /** Why a worktree is flagged `stale` in {@link WorktreeInfo}. A worktree can
@@ -4594,6 +4598,9 @@ export interface LeaseStatus {
   checkedAt: number;
   /** Why the last probe failed; the previous held/holder stay as they were. */
   error: string | null;
+  /** Blocked cards whose block says they're waiting on this lease, longest
+   *  waiting first — the order they're retried in when it frees. */
+  queue?: { taskId: string; title: string; since: number }[];
 }
 
 /**
