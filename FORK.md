@@ -128,3 +128,13 @@ Settings → General (`keepAwakeWhileRunning` preference). Closing the lid still
 - **Activity** timeline in the run view (`src/bun/activity.ts`): steps derived from the run's history, plus PR, CI,
   review, merge, lease and auto-fix events appended to `<dataDir>/activity/<taskId>.jsonl` as they happen.
 - The run view header leads with the card's title; a step's panel strip names the card it belongs to.
+
+## Orchestrator suggestions, layer 1 (`feat/suggestions`)
+
+`src/bun/suggestions.ts` recognises situations that used to need a person and proposes the fix; they appear at the top
+of the Needs you bar with **Apply**. Nothing runs without the click, and each suggestion is recomputed at apply time.
+Rules: step blocked on the test environment (`DATABASE_URL`/`.env.local`) → message it to use CI's placeholder; step
+blocked on a lease that's free → Retry; PR behind its base whose failing checks pass on the base → Update branch;
+finished run with commits and no PR → Open PR preset; blocked step with open questions → show the first one.
+The PR watcher also records `behindBy` and `passesOnBase`, so a failure the base has since fixed isn't treated as the
+PR's own (no Fix CI / auto-fix). Layer 2 (a Conductor agent you chat with) is planned.
