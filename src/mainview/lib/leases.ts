@@ -22,6 +22,9 @@ export function leaseInfoForTask(task: Task, leases: LeaseStatus[]): TaskLeaseIn
     task.column === "blocked"
       ? leases
           .filter((l) => trimSlash(l.project) === trimSlash(task.workdir) && l.holderTaskId !== task.id)
+          // A failing probe with no known holder knows nothing — never claim
+          // the resource is free on its say-so.
+          .filter((l) => l.held || !l.error)
           .map((l) => ({
             label: l.label,
             heldBy: l.held ? (l.holderTitle ?? l.owner ?? "another checkout") : null,
