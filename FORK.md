@@ -96,3 +96,9 @@ becomes the Result. Presets live in the `pipeline_followups` preference:
 `agent` is a profile name; `suggestWhen` globs (`**` crosses directories; a slash-less pattern matches a file name
 anywhere) mark the preset **Suggested** when the branch changed a matching file. Nothing runs until the user clicks.
 Edit with `agetor config pipeline_followups '<json>'`; the board's current presets are Open PR, Run VM tests, Run E2E, Explain.
+
+## Keep awake (`feat/keep-awake`)
+
+While any task is running, Agetor holds `caffeinate -i -s -w <pid>` so long agent turns aren't cut off by the Mac
+sleeping ("Your computer went to sleep mid-response"); it's released when nothing is running. On by default; toggle in
+Settings → General (`keepAwakeWhileRunning` preference). Closing the lid still sleeps the Mac unless a display is attached.
