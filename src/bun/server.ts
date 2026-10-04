@@ -218,7 +218,7 @@ import { armForceQuit, broadcastAppEvent, subscribeAppEvents } from "./quit-guar
 import { consumePendingOpenTask } from "./pending-open.ts";
 import { binaryPreviewKind, contentTypeForPreviewPath, isImagePath } from "../shared/attachments.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
-import { PIPELINE_CONTROL_CHAR_RE, validatePipelineGraph } from "../shared/pipeline.ts";
+import { PIPELINE_CONTROL_CHAR_RE, isPipelineColumnRunnerOwned, validatePipelineGraph } from "../shared/pipeline.ts";
 import type { AgentProfilePatch } from "./db.ts";
 
 // Re-export so existing call sites (index.ts → webview URL) keep working.
@@ -4440,8 +4440,15 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           // (`persist()` in pipeline-runner.ts — running/blocked/review/
           // ready) — a manual drag would desync the card from the run and
           // trip `handleColumnChange`. A same-value resend is a no-op and
-          // passes, like the profile-bound-field guard below.
-          if (before.pipelineId != null && "column" in patch && patch.column !== before.column) {
+          // passes, like the profile-bound-field guard below. A finished or
+          // stopped run no longer moves its card, so the user can (e.g. Review
+          // → Done, which is what makes the card archivable).
+          if (
+            before.pipelineId != null &&
+            "column" in patch &&
+            patch.column !== before.column &&
+            isPipelineColumnRunnerOwned(before.pipelineRun)
+          ) {
             return json(
               { error: "pipeline task's column is managed by its run" },
               { status: 409, headers: corsHeaders(req) },

@@ -30,6 +30,7 @@ import { api, type AgentModelMap, type HarnessModelMap } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { clampFontSizePercent, COLUMNS, USAGE_SUPPORTED_KINDS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type HarnessQuota, type Project, type Task, type TaskType } from "../shared/types.ts";
 import { parseIssueUrl } from "../shared/issue-task.ts";
+import { isPipelineColumnRunnerOwned } from "../shared/pipeline.ts";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
 import { ContextMenu, type ContextMenuItem } from "@/components/ui/context-menu";
@@ -1507,10 +1508,11 @@ function AppInner() {
     if (!col) return;
     const t = tasksRef.current.find((x) => x.id === id);
     if (!t || t.column === col) return;
-    // A pipeline PARENT's column is runner-owned (mirrors `pipelineRun.status`;
-    // the server 409s a `column` patch on it) — refuse the drop and say why,
-    // instead of an optimistic flip that snaps back with a raw 409 (L-A4).
-    if (t.pipelineId) {
+    // A pipeline PARENT's column is runner-owned while its run is live (mirrors
+    // `pipelineRun.status`; the server 409s a `column` patch on it) — refuse
+    // the drop and say why, instead of an optimistic flip that snaps back with
+    // a raw 409 (L-A4). A finished or stopped run's card moves freely.
+    if (t.pipelineId && isPipelineColumnRunnerOwned(t.pipelineRun)) {
       toast("This pipeline task's column is managed by its run.");
       return;
     }
