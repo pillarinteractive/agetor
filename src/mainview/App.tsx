@@ -28,10 +28,11 @@ import {
 } from "lucide-react";
 import { api, type AgentModelMap, type HarnessModelMap } from "@/lib/api";
 import { Button } from "@/components/ui/button";
-import { clampFontSizePercent, COLUMNS, USAGE_SUPPORTED_KINDS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type HarnessQuota, type LeaseStatus, type Project, type Task, type TaskType } from "../shared/types.ts";
+import { clampFontSizePercent, COLUMNS, USAGE_SUPPORTED_KINDS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type HarnessQuota, type LeaseStatus, type Project, type TaskPrStatus, type Task, type TaskType } from "../shared/types.ts";
 import { parseIssueUrl } from "../shared/issue-task.ts";
 import { isPipelineColumnRunnerOwned } from "../shared/pipeline.ts";
 import { LeaseContext } from "@/lib/leases";
+import { PrContext } from "@/lib/prs";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
 import { ContextMenu, type ContextMenuItem } from "@/components/ui/context-menu";
@@ -327,6 +328,8 @@ function AppInner() {
   const [tmuxDialogOpen, setTmuxDialogOpen] = useState(false);
   const [updateSnapshot, setUpdateSnapshot] = useState<UpdateSnapshot | null>(null);
   const [leases, setLeases] = useState<LeaseStatus[]>([]);
+  const [prs, setPrs] = useState<ReadonlyMap<string, TaskPrStatus>>(new Map());
+  const applyPrs = useCallback((list: TaskPrStatus[]) => setPrs(new Map(list.map((p) => [p.taskId, p]))), []);
   const [homeDir, setHomeDir] = useState<string>("");
   // Active data dir resolved server-side (~/.agetor for the packaged .app,
   // ~/.agetor-dev when launched via `bun run dev` / `dev:hmr`). Threaded to
@@ -626,6 +629,7 @@ function AppInner() {
     api.getUpdateStatus().then(setUpdateSnapshot).catch(() => { /* fine */ });
     // Same for lease badges: later changes arrive as `leases` events.
     api.getLeases().then(setLeases).catch(() => { /* fine */ });
+    api.getPrs().then(applyPrs).catch(() => { /* fine */ });
     // Skip poll ticks while the window is hidden — a backgrounded kanban
     // board has no reason to keep re-fetching + re-rendering every 2s/15s.
     // The intervals themselves keep running (cheap — it's just the fetch +
@@ -1116,6 +1120,11 @@ function AppInner() {
       // Lease badges are board-scoped too (src/bun/lease-watch.ts).
       if (ev.kind === "leases") {
         setLeases(ev.leases);
+        return;
+      }
+      // Pull request badges (src/bun/pr-watch.ts).
+      if (ev.kind === "prs") {
+        applyPrs(ev.prs);
         return;
       }
       // "Already looking at it" — the run panel is open on the task, OR the
@@ -2190,6 +2199,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                   <div className="kanban-scroll absolute inset-0 overflow-x-scroll">
                     <DndContext sensors={sensors} onDragEnd={onDragEnd}>
                       <LeaseContext.Provider value={leases}>
+                      <PrContext.Provider value={prs}>
                       <div className="flex gap-3 p-4">
                         {visibleColumns.map((c) => (
                           <Column
@@ -2212,6 +2222,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                           />
                         ))}
                       </div>
+                      </PrContext.Provider>
                       </LeaseContext.Provider>
                     </DndContext>
                   </div>

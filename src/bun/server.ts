@@ -49,6 +49,7 @@ import {
 } from "./agents.ts";
 import type { UpdaterSnapshot } from "./updater.ts";
 import { listLeases } from "./lease-watch.ts";
+import { listPrStatuses } from "./pr-watch.ts";
 import { listFollowUps, startFollowUp } from "./pipeline-followups.ts";
 import {
   bundledTmuxAvailable,
@@ -3267,6 +3268,12 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // the board loads this once, then follows `leases` global events.
       "/leases": {
         GET: authed((req) => json(listLeases(), { headers: corsHeaders(req) })),
+      },
+
+      // Every watched task's pull request (src/bun/pr-watch.ts); the board
+      // loads this once, then follows `prs` global events.
+      "/prs": {
+        GET: authed((req) => json(listPrStatuses(), { headers: corsHeaders(req) })),
       },
 
       // Cross-session UI preferences. Currently used by NewTaskForm to

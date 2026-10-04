@@ -4,6 +4,7 @@ import { db, dataDir, subagents } from "./db.ts";
 import { reconcileOrphans, rearmFxAutoResumes, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
 import { initPipelineRunner, reconcilePipelineRuns } from "./pipeline-runner.ts";
 import { startLeaseWatchLoop } from "./lease-watch.ts";
+import { startPrWatchLoop } from "./pr-watch.ts";
 import { ensureDisclaimedServer } from "./tmux-resolution.ts";
 import { startApiServer, attachedClientCount } from "./server.ts";
 import { rehydratePath } from "./login-path.ts";
@@ -172,6 +173,8 @@ export async function runDaemon(): Promise<void> {
   startPeriodicDiscovery();
   // Lease badges — same as index.ts; the loop's timer is unref'd.
   startLeaseWatchLoop();
+  // PR watcher — same as index.ts; timer is unref'd.
+  startPrWatchLoop();
 
   // Idle-session reaper (docs/plans/reduce-cpu-and-memory.md §3.1, T4):
   // mirrors index.ts's wiring so the headless daemon doesn't accumulate the

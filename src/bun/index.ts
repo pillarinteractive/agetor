@@ -14,6 +14,7 @@ import { broadcastAppEvent, consumeForceQuit } from "./quit-guard.ts";
 import { refreshAllModels, startPeriodicDiscovery } from "./model-discovery.ts";
 import { startUpdaterLoop, applyUpdate, checkForUpdate, getUpdateSnapshot } from "./updater.ts";
 import { startLeaseWatchLoop } from "./lease-watch.ts";
+import { startPrWatchLoop } from "./pr-watch.ts";
 import { getMainWindow, setMainWindow } from "./window.ts";
 import { makeWindowLifecycle, type Frame } from "./window-lifecycle.ts";
 import { focusWindow } from "./window-focus.ts";
@@ -494,6 +495,10 @@ startUpdaterLoop();
 // Lease badges (src/bun/lease-watch.ts): probe each `lease_watchers` command
 // and publish who holds the resource. A no-op until one is configured.
 startLeaseWatchLoop();
+
+// Follow each task's pull request (src/bun/pr-watch.ts): badge, Fix CI /
+// Address review follow-ups, and Done on merge.
+startPrWatchLoop();
 
 /** Lifecycle wrapper around BrowserWindow construction. Handles:
  *   - idempotency (concurrent reopen events share one in-flight build),

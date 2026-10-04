@@ -515,6 +515,8 @@ function describeGlobalEvent(event: GlobalEvent): string {
       return `pipeline:${event.status}`;
     case "leases":
       return `leases:${event.leases.length}`;
+    case "prs":
+      return `prs:${event.prs.length}`;
     default:
       return assertNever(event);
   }

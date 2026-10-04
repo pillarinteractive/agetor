@@ -5,6 +5,7 @@ import type {
   AppEvent,
   FollowUpAction,
   LeaseStatus,
+  TaskPrStatus,
   BranchInfo,
   BranchNamingConfig,
   ColumnId,
@@ -472,6 +473,8 @@ export const api = {
   getUpdateStatus: () => j<UpdateSnapshot>("/updates/status"),
   /** Every lease watcher's latest status (src/bun/lease-watch.ts). */
   getLeases: () => j<LeaseStatus[]>("/leases"),
+  /** Every watched task's pull request (src/bun/pr-watch.ts). */
+  getPrs: () => j<TaskPrStatus[]>("/prs"),
   checkForUpdate: () => j<UpdateSnapshot>("/updates/check", { method: "POST" }),
   applyUpdate: () => j<{ ok: true }>("/updates/apply", { method: "POST" }),
   listAgents: () => j<AgentStatus[]>("/agents"),

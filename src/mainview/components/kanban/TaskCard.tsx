@@ -1,7 +1,7 @@
 import { memo } from "react";
 import { useDraggable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, FolderOpen, GitBranch, GitCompare, ListTodo, Lock, LockOpen, MessageCircleQuestion, Paperclip, PauseCircle, Play, Square, Terminal, Trash2 } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, FolderOpen, GitBranch, GitCompare, GitPullRequest, ListTodo, Lock, LockOpen, MessageCircleQuestion, Paperclip, PauseCircle, Play, Square, Terminal, Trash2 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -14,6 +14,7 @@ import { isTaskFxPaused } from "../../../shared/fx-recovery.ts";
 import { AgentIcon } from "./AgentIcon";
 import { PipelineBadge } from "@/components/pipelines";
 import { useTaskLeaseInfo } from "@/lib/leases";
+import { prBadge, useTaskPr } from "@/lib/prs";
 
 interface Props {
   task: Task;
@@ -48,6 +49,8 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
   const fxAutoResumeAt = task.fxRecovery?.autoResume?.at ?? null;
   const fxAutoResumeCountdown = useCountdown(fxAutoResumeAt);
   const lease = useTaskLeaseInfo(task);
+  const pr = useTaskPr(task.id);
+  const prInfo = pr ? prBadge(pr) : null;
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: task.id,
     // Archived cards are immutable until unarchived — block drag-to-column so
@@ -233,6 +236,26 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
               >
                 <PauseCircle className="size-3" />
                 {fxPausedBadgeText(task.fxRecovery, fxAutoResumeCountdown)}
+              </Badge>
+            )}
+            {/* The task's pull request, as the PR watcher last saw it (src/bun/pr-watch.ts). */}
+            {pr && prInfo && (
+              <Badge
+                variant="outline"
+                className={cn(
+                  "gap-1 text-[10px] shrink-0",
+                  prInfo.tone === "danger" && "text-destructive border-destructive/40",
+                  prInfo.tone === "warning" && "text-warning border-warning/40",
+                  prInfo.tone === "success" && "text-success border-success/40",
+                  prInfo.tone === "merged" && "text-info border-info/40",
+                  prInfo.tone === "muted" && "text-muted-foreground",
+                )}
+                data-testid="pr-badge"
+                data-tone={prInfo.tone}
+                title={prInfo.title}
+              >
+                <GitPullRequest className="size-3" />
+                {prInfo.text}
               </Badge>
             )}
             {/* This card's worktree holds a watched lease (src/bun/lease-watch.ts). */}
