@@ -52,6 +52,7 @@ import { listLeases } from "./lease-watch.ts";
 import { listPrStatuses } from "./pr-watch.ts";
 import { createTaskFromIssue, listIssueQueue } from "./issue-queue.ts";
 import { listActivity } from "./activity.ts";
+import { applySuggestion, listSuggestions } from "./suggestions.ts";
 import { listFollowUps, startFollowUp } from "./pipeline-followups.ts";
 import {
   bundledTmuxAvailable,
@@ -4880,6 +4881,24 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // Follow-ups on a finished pipeline (src/bun/pipeline-followups.ts):
       // GET lists the configured presets, flagging the ones the branch's
       // changed files make worth running; POST runs one (or a custom request).
+      // Orchestrator suggestions (src/bun/suggestions.ts): recognised
+      // situations with a ready fix; POST applies one after re-checking it.
+      "/suggestions": {
+        GET: authed((req) => json(listSuggestions(), { headers: corsHeaders(req) })),
+      },
+      "/suggestions/apply": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { taskId?: unknown; id?: unknown };
+          if (typeof body.taskId !== "string" || typeof body.id !== "string") {
+            return json({ error: "taskId and id required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await applySuggestion(body.taskId, body.id);
+          return "error" in result
+            ? json({ error: result.error }, { status: result.status, headers: corsHeaders(req) })
+            : json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
       // A card's activity timeline, newest first (src/bun/activity.ts).
       "/tasks/:id/activity": {
         GET: authed((req) => {

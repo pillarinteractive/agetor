@@ -1,5 +1,6 @@
-import { useMemo, useState } from "react";
-import { ChevronDown, CircleAlert } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { ChevronDown, CircleAlert, Sparkles } from "lucide-react";
+import { api, ApiError } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { cardStatus, needsYouList, type NeedsYouAction } from "@/lib/card-status";
 import { leaseInfoForTask } from "@/lib/leases";
@@ -30,6 +31,42 @@ export function NeedsYouBar({
   onOpenPr: (url: string) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
+  // Orchestrator suggestions (src/bun/suggestions.ts), refetched whenever a
+  // card, PR or lease changes.
+  type Suggestion = Awaited<ReturnType<typeof api.getSuggestions>>[number];
+  const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const changeKey = useMemo(
+    () => `${tasks.map((t) => `${t.id}:${t.updatedAt}:${t.column}`).join(",")}|${[...prs.values()].map((p) => `${p.number}:${p.checks}:${p.behindBy ?? ""}`).join(",")}|${leases.map((l) => `${l.label}:${l.held}`).join(",")}`,
+    [tasks, prs, leases],
+  );
+  useEffect(() => {
+    let alive = true;
+    api.getSuggestions().then((s) => alive && setSuggestions(s)).catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [changeKey]);
+
+  const apply = async (s: Suggestion) => {
+    if (s.apply.kind === "open") {
+      const t = tasks.find((x) => x.id === s.taskId);
+      if (t) onOpen(t);
+      return;
+    }
+    setBusy(s.id);
+    setNotice(null);
+    try {
+      const r = await api.applySuggestion(s.taskId, s.id);
+      setNotice(`${s.taskTitle}: ${r.message}`);
+      setSuggestions((cur) => cur.filter((x) => x.id !== s.id));
+    } catch (e) {
+      setNotice(`${s.taskTitle}: ${e instanceof ApiError ? e.message : "couldn't apply that"}`);
+    } finally {
+      setBusy(null);
+    }
+  };
   const items = useMemo(() => {
     const now = Date.now();
     return needsYouList(
@@ -40,8 +77,11 @@ export function NeedsYouBar({
     );
   }, [tasks, prs, leases]);
 
-  if (items.length === 0) return null;
-  const shown = expanded ? items : items.slice(0, COLLAPSED_COUNT);
+  if (items.length === 0 && suggestions.length === 0 && !notice) return null;
+  // A card with a suggestion shows it instead of its plain Needs-you line.
+  const suggested = new Set(suggestions.map((s) => s.taskId));
+  const rest = items.filter((i) => !suggested.has(i.task.id));
+  const shown = expanded ? rest : rest.slice(0, COLLAPSED_COUNT);
 
   const act = (task: Task, action: NeedsYouAction) => {
     if (action === "retry") onRetry(task);
@@ -55,8 +95,40 @@ export function NeedsYouBar({
     <div data-testid="needs-you-bar" className="mx-4 mt-3 rounded-md border border-warning/40 bg-warning/5 px-3 py-2">
       <div className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-warning">
         <CircleAlert className="size-3.5" aria-hidden />
-        Needs you · {items.length}
+        Needs you · {suggestions.length + rest.length}
       </div>
+      {suggestions.length > 0 && (
+        <ul className="mb-1 flex flex-col gap-1" data-testid="suggestions">
+          {suggestions.map((s) => (
+            <li key={s.id} data-testid="suggestion" className="flex items-center gap-2 text-xs">
+              <Sparkles className="size-3 shrink-0 text-info" aria-hidden />
+              <button
+                type="button"
+                onClick={() => {
+                  const t = tasks.find((x) => x.id === s.taskId);
+                  if (t) onOpen(t);
+                }}
+                className="min-w-0 flex-1 truncate text-left hover:underline"
+                title={`${s.taskTitle} — ${s.title}\n${s.detail}`}
+              >
+                <span className="font-medium">{s.taskTitle}</span>
+                <span className="text-muted-foreground"> — {s.title}</span>
+              </button>
+              <Button
+                type="button"
+                size="sm"
+                data-testid="suggestion-apply"
+                disabled={busy !== null}
+                onClick={() => void apply(s)}
+                className="h-6 shrink-0 px-2 text-[11px]"
+              >
+                {busy === s.id ? "Applying…" : s.apply.kind === "open" ? "Open" : "Apply"}
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+      {notice && <p className="mb-1 text-[11px] text-muted-foreground">{notice}</p>}
       <ul className="flex flex-col gap-1">
         {shown.map(({ task, status }) => (
           <li key={task.id} data-testid="needs-you-item" className="flex items-center gap-2 text-xs">
@@ -82,13 +154,13 @@ export function NeedsYouBar({
           </li>
         ))}
       </ul>
-      {items.length > COLLAPSED_COUNT && (
+      {rest.length > COLLAPSED_COUNT && (
         <button
           type="button"
           onClick={() => setExpanded((v) => !v)}
           className="mt-1 flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
         >
-          {expanded ? "Show fewer" : `Show all ${items.length}`}
+          {expanded ? "Show fewer" : `Show all ${rest.length}`}
           <ChevronDown className={cn("size-3 transition-transform", expanded && "rotate-180")} aria-hidden />
         </button>
       )}

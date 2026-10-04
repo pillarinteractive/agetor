@@ -37,7 +37,17 @@ function latestRecord(run: PipelineRunState, taskId: string | null | undefined) 
 }
 
 function prPhrase(pr: TaskPrStatus): { text: string; tone: CardStatus["tone"]; needsYou: CardStatus["needsYou"] } {
-  const own = pr.failingChecks.filter((c) => !c.alsoOnBase && c.name !== "required");
+  const behind = (pr.behindBy ?? 0) > 0;
+  // Same rule as pr-watch.ts ownFailures: inherited, rollup, and (when behind)
+  // already-fixed-on-base failures aren't the PR's.
+  const own = pr.failingChecks.filter((c) => !c.alsoOnBase && c.name !== "required" && !(behind && c.passesOnBase));
+  if (pr.checks === "failure" && own.length === 0 && behind && pr.failingChecks.some((c) => c.passesOnBase)) {
+    return {
+      text: `PR #${pr.number}: behind ${pr.baseRef ?? "base"}, which fixed its failing checks — update the branch`,
+      tone: "warning",
+      needsYou: { reason: `PR #${pr.number} needs its branch updated`, action: "open", actionLabel: "Open" },
+    };
+  }
   if (pr.checks === "failure" && own.length > 0) {
     return {
       text: `PR #${pr.number}: CI failing (${own.map((c) => c.name).slice(0, 2).join(", ")})`,

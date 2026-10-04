@@ -4509,8 +4509,11 @@ export interface TaskPrStatus {
   /** Rolled up from the head commit's check runs. */
   checks: "none" | "pending" | "success" | "failure";
   /** `alsoOnBase`: the same check fails on the tip of the base branch, so the
-   *  PR inherited it rather than caused it. */
-  failingChecks: { name: string; url: string | null; alsoOnBase: boolean }[];
+   *  PR inherited it rather than caused it. `passesOnBase`: it passes on the
+   *  base's tip — with `behindBy > 0`, the base may already have fixed it. */
+  failingChecks: { name: string; url: string | null; alsoOnBase: boolean; passesOnBase?: boolean }[];
+  /** Commits the PR's head is behind its base; null when unknown. */
+  behindBy?: number | null;
   unresolvedThreads: number;
   checkedAt: number;
 }
