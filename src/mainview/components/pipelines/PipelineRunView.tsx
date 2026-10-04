@@ -470,7 +470,9 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
   // whole graph on every 2s poll.
   const graphSignature = useMemo(() => {
     if (!effectiveGraph) return null;
-    if (snapshotCapturedAt != null) return `snap:${snapshotCapturedAt}`;
+    // + the step count: a follow-up (runPipelineFollowUp) appends a step to
+    // the otherwise-frozen snapshot, and the canvas must draw it.
+    if (snapshotCapturedAt != null) return `snap:${snapshotCapturedAt}:${effectiveGraph.steps.length}`;
     return `live:${effectiveGraph.steps.map((s) => s.id).join(",")}:${effectiveGraph.edges.map((e) => e.id).join(",")}`;
   }, [effectiveGraph, snapshotCapturedAt]);
   const effectiveGraphRef = useRef<PipelineGraph | null>(null);
