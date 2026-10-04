@@ -62,4 +62,20 @@ Without the vendored helpers and `dist/`, `electrobun dev --watch` crashes its w
   new session fails with `getcwd: cannot access parent directories` until the server restarts
   (`tmux -L agetor kill-server`, which also ends running agent turns).
 - A finished pipeline lands in Review, and the server refuses column changes on pipeline tasks, so the board's Done
-  button fails and Archive (Done-only) never appears. Not fixed yet.
+  button fails and Archive (Done-only) never appears. Fixed on `fix/pipeline-review-to-done`.
+- **Port trap:** `agetor daemon start --data-dir ~/.agetor-dev` binds the default port 4317, not 4318, and Bun lets it
+  share 4317 with the running app, so CLI and UI requests can reach either core. Always set `AGETOR_API_PORT=4318` for
+  a sandbox core and check `~/.agetor-dev/agetor-core.json` shows 4318 before sending it anything.
+  (`bun run sync:dev` already passes 4318.)
+
+## Lease badges (`feat/lease-watch`)
+
+The `lease_watchers` preference lists commands Agetor polls to show who holds a shared resource. For Pillar's lab:
+
+```bash
+agetor config lease_watchers '[{"project":"/Users/markedmiston/Dev/pillar","label":"lab","command":"lab/vm/plab lease --json","intervalSec":30}]'
+```
+
+The command runs in `project` and must print `{"held": false}` or `{"held": true, "checkout": "<holder's repo root>"}`
+(`plab lease --json` does, from Pillar's `feature/plab-worktrees-lease-json`). The holder's card gets a lock badge,
+Blocked cards in that project show who holds it or that it's free, and dropping a blocked pipeline on Running retries it.
