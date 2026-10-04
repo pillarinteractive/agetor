@@ -18,7 +18,7 @@
  * Dragging the card back to In Review (or Backlog) withdraws the sign-off.
  */
 import type { Task, TaskPrStatus } from "../shared/types.ts";
-import { MERGE_TRAIN_PREF, activeTrain, advanceTrain, buildTrain, parseTrainConfig, shouldDepart, skipsTrain, trainEligible } from "./merge-train.ts";
+import { MERGE_TRAIN_PREF, activeTrain, advanceTrain, buildTrain, manualTrainEligible, parseTrainConfig, shouldDepart, skipsTrain, trainEligible } from "./merge-train.ts";
 import { preferences, tasks } from "./db.ts";
 import { recordActivity } from "./activity.ts";
 import { mergeQueue, setMergeQueued } from "./merge-intent.ts";
@@ -154,7 +154,58 @@ async function take(task: Task, pr: TaskPrStatus | null, step: MergeStep): Promi
  *  window after a restart). */
 const readySince = new Map<string, number>();
 
-export async function mergeQueueTick(now = Date.now()): Promise<void> {
+/** One merge-queue action at a time: the minute tick and the user's "Merge
+ *  together" button must never build two trains or merge the same PR twice. */
+let busy: Promise<unknown> = Promise.resolve();
+function exclusive<T>(fn: () => Promise<T>): Promise<T> {
+  const next = busy.then(fn, fn);
+  busy = next.catch(() => undefined);
+  return next;
+}
+
+export function mergeQueueTick(now = Date.now()): Promise<void> {
+  return exclusive(() => tick(now));
+}
+
+/**
+ * The "Merge together" button: send a train now with every signed-off card in
+ * Ready to Merge that can go (largest project/base group), without waiting
+ * for the window or for each PR's own checks.
+ */
+export function departTrainNow(): Promise<{ train: { pr: number; url: string; members: number[] } } | { error: string }> {
+  return exclusive(async () => {
+    const out = activeTrain();
+    if (out) return { error: `merge train #${out.pr} is already out — it has to land or disband first` };
+    const cards = tasks.list().filter((t) => t.column === "merge" && t.archivedAt == null && !t.pipelineParentId && t.branch);
+    const ready: { task: Task; pr: TaskPrStatus }[] = [];
+    const left: string[] = [];
+    for (const t of cards) {
+      const pr = prStatusForTask(t.id);
+      let mergeability: { mergeable: boolean | null; mergeableState: string } | null = null;
+      if (pr?.state === "open") {
+        const m = await getGitHubPullMergeability({ dir: t.workdir, number: pr.number }).catch(() => null);
+        if (m && m.ok) mergeability = { mergeable: m.mergeable, mergeableState: m.mergeableState };
+      }
+      if (pr && manualTrainEligible(pr, mergeability)) ready.push({ task: t, pr });
+      else left.push(pr ? `#${pr.number}` : t.title.slice(0, 30));
+    }
+    const groups = new Map<string, typeof ready>();
+    for (const r of ready) {
+      const key = `${r.task.workdir}\0${r.pr.baseRef ?? ""}`;
+      groups.set(key, [...(groups.get(key) ?? []), r]);
+    }
+    const group = [...groups.values()].sort((x, y) => y.length - x.length)[0] ?? [];
+    if (group.length < 2) {
+      return { error: `need at least two PRs that can go together (ready: ${group.length}${left.length ? `; not ready: ${left.join(", ")}` : ""})` };
+    }
+    const train = await buildTrain(group.slice(0, 12));
+    if (!train) return { error: "couldn't build the train — fewer than two PRs merged cleanly together (see the cards' timelines)" };
+    for (const m of train.members) readySince.delete(m.taskId);
+    return { train: { pr: train.pr, url: train.url, members: train.members.map((m) => m.pr) } };
+  });
+}
+
+async function tick(now: number): Promise<void> {
   const list = tasks.list();
   // The column is the user's say: in Ready to Merge → signed off; dragged
   // back to In Review / Backlog → withdrawn. Running/Blocked/Done keep it

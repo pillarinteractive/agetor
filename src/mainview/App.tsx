@@ -1504,6 +1504,13 @@ function AppInner() {
   const openPipelinesPage = useCallback(() => {
     navigate({ kind: "pipelines", pipelineId: null, editing: false });
   }, [navigate]);
+  // "Merge together" on Ready to Merge: send a merge train now.
+  const mergeTogether = useCallback(() => {
+    api
+      .departMergeTrain()
+      .then((r) => toast.success(`Merge train #${r.train.pr} is out`, { description: `${r.train.members.map((n) => `#${n}`).join(", ")} — CI runs once; it merges when green.` }))
+      .catch((e) => toast.error("Couldn't send a merge train", { description: e instanceof Error ? e.message : String(e) }));
+  }, []);
   const openIssuesPage = useCallback(() => {
     navigate({ kind: "issues" });
   }, [navigate]);
@@ -2312,6 +2319,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                             emptyHint={onboardingVisibility.showChecklist ? EMPTY_COLUMN_HINT[c.id] : undefined}
                             selectedTaskId={selected?.id ?? null}
                             onContextMenu={openTaskMenu}
+                            onMergeTogether={c.id === "merge" ? mergeTogether : undefined}
                           />
                         ))}
                       </div>

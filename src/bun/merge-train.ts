@@ -103,6 +103,15 @@ export function trainEligible(pr: TaskPrStatus | null, mergeability: { mergeable
   return true;
 }
 
+/** For a train the user sends by hand: the train's own CI checks the combined
+ *  change, so a PR's own checks may still be running — only a PR that is
+ *  failing, conflicting, draft or has open review threads stays behind. Pure. */
+export function manualTrainEligible(pr: TaskPrStatus | null, mergeability: { mergeable: boolean | null; mergeableState: string } | null): boolean {
+  if (!pr || pr.state !== "open" || pr.draft || pr.checks === "failure" || pr.unresolvedThreads > 0) return false;
+  if (mergeability?.mergeable === false || mergeability?.mergeableState === "dirty") return false;
+  return true;
+}
+
 /** Should these ready cards leave now as a train? Pure. */
 export function shouldDepart(readySince: number[], cfg: TrainConfig, now: number): boolean {
   if (!cfg.enabled || readySince.length < 2) return false;

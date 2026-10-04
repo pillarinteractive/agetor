@@ -83,3 +83,13 @@ test("assembling: one squashed commit per PR on the latest base; a PR that confl
   const log = await sh(repo, "git", "log", "--format=%s", "origin/develop..origin/agetor/merge-train-x");
   expect(log.split("\n")).toEqual(["fix: feat-b (#2)", "fix: feat-a (#1)"]); // three wip commits squashed into one
 }, 30_000);
+
+test("sent by hand: a PR whose own checks are still running can ride; failing, conflicting, draft or commented ones can't", async () => {
+  const { manualTrainEligible } = await import("./merge-train.ts");
+  expect(manualTrainEligible(pr({ checks: "pending" }), clean)).toBe(true);
+  expect(manualTrainEligible(pr({ checks: "success" }), clean)).toBe(true);
+  expect(manualTrainEligible(pr({ checks: "failure" }), clean)).toBe(false);
+  expect(manualTrainEligible(pr(), { mergeable: false, mergeableState: "dirty" })).toBe(false);
+  expect(manualTrainEligible(pr({ draft: true }), clean)).toBe(false);
+  expect(manualTrainEligible(pr({ unresolvedThreads: 2 }), clean)).toBe(false);
+});

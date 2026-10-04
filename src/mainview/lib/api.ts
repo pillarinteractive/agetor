@@ -479,6 +479,9 @@ export const api = {
   /** Replace the cards a card is blocked by (src/bun/dependencies.ts). */
   setBlockedBy: (taskId: string, ids: string[]) =>
     j<{ blockedBy: unknown[] }>(`/tasks/${encodeURIComponent(taskId)}/blocked-by`, { method: "PUT", body: JSON.stringify({ ids }) }, { retry: false }),
+  /** Send a merge train now (src/bun/merge-queue.ts `departTrainNow`). */
+  departMergeTrain: () =>
+    j<{ train: { pr: number; url: string; members: number[] } }>("/merge-train/depart", { method: "POST" }, { retry: false }),
   getConductor: () => j<{ taskId: string | null }>("/conductor"),
   startConductor: () => j<Task>("/conductor", { method: "POST" }, { retry: false }),
   /** Every watched task's pull request (src/bun/pr-watch.ts). */

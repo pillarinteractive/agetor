@@ -24,6 +24,8 @@ interface Props {
    *  and stays inside the existing droppable container so dnd-kit's drop
    *  zone is unaffected. */
   emptyHint?: string;
+  /** Ready to Merge only: send a merge train now (src/bun/merge-queue.ts). */
+  onMergeTogether?: () => void;
   /** Id of the task currently open in the run panel (App.tsx's `selected`),
    *  or null/undefined when no panel is open. Threaded down to each
    *  `TaskCard` as `isOpen` so the unread dot is suppressed for the task
@@ -49,7 +51,7 @@ function sameTasks(a: Task[], b: Task[]): boolean {
 /** Done keeps piling up; show the newest few and fold the rest. */
 const COLLAPSE_AFTER: Partial<Record<ColumnId, number>> = { done: 5 };
 
-function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive, emptyHint, selectedTaskId, onContextMenu }: Props) {
+function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive, emptyHint, selectedTaskId, onContextMenu, onMergeTogether }: Props) {
   const { setNodeRef, isOver } = useDroppable({ id });
   const [expanded, setExpanded] = useState(false);
   const limit = COLLAPSE_AFTER[id];
@@ -70,6 +72,17 @@ function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, on
         <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
           {label}
         </h2>
+        {onMergeTogether && tasks.length >= 2 && (
+          <button
+            type="button"
+            data-testid="merge-together"
+            onClick={onMergeTogether}
+            title="Merge these PRs as one train now: one squashed commit per PR, CI runs once, then rebase-merged"
+            className="ml-auto mr-2 rounded-md border border-border/60 px-1.5 py-0.5 text-[11px] font-medium text-muted-foreground hover:bg-muted hover:text-foreground"
+          >
+            Merge together
+          </button>
+        )}
         <Badge variant="outline">{tasks.length}</Badge>
       </div>
       <div className="flex flex-col gap-2">
@@ -136,5 +149,6 @@ export const Column = memo(ColumnImpl, (prev, next) => (
   prev.emptyHint === next.emptyHint &&
   prev.selectedTaskId === next.selectedTaskId &&
   prev.onContextMenu === next.onContextMenu &&
+  prev.onMergeTogether === next.onMergeTogether &&
   sameTasks(prev.tasks, next.tasks)
 ));

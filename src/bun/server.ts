@@ -41,6 +41,7 @@ import { stalledSince } from "./stall-registry.ts";
 import { lastActivityAt } from "./activity-clock.ts";
 import { blockedByFor, blockingFor, readDependencies, setDependencies } from "./dependencies.ts";
 import { activeTrain, mergedViaTrain, trainFor } from "./merge-train.ts";
+import { departTrainNow } from "./merge-queue.ts";
 import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
 import {
@@ -3322,6 +3323,16 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             });
           }
           return json(digest, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // "Merge together": send a merge train now (src/bun/merge-queue.ts).
+      "/merge-train/depart": {
+        POST: authed(async (req) => {
+          const r = await departTrainNow();
+          return "error" in r
+            ? json({ error: r.error }, { status: 409, headers: corsHeaders(req) })
+            : json(r, { headers: corsHeaders(req) });
         }),
       },
 
