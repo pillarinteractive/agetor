@@ -248,3 +248,11 @@ Retry — and `releaseSlotWaits` (every 10s) launches the longest-waiting first.
 settles. Heavy steps match by name prefix. Plain tasks count toward `max` but are never held.
 Don't set `build.bunVersion`: Electrobun 1.18's native channel (window drag, etc.) breaks on Bun 1.4.2. The bundled
 Bun 1.3.13 has segfaulted under heavy load (3× on 2026-10-04); the real fix is an Electrobun 2.x upgrade.
+
+## Every card has a GitHub issue (`feat/auto-issues`)
+
+`src/bun/auto-issue.ts`: a card created without an issue, in a project with a GitHub remote, gets one opened in
+the background (title = card title, body = its prompt), then is linked — `issueUrl`, title `Issue #N: …`, `Fixes #N`
+in its prompt — so tags/dependencies show a number and the issue closes when its PR merges. At startup, live cards
+without one are caught up (Done cards are left). Skips pipeline steps, the Conductor, cards from an issue, non-GitHub
+projects. `agetor config auto_issues false` turns it off; never runs under tests unless set to `true`.

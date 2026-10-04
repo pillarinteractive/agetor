@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { basename, isAbsolute, join, resolve } from "node:path";import { db, tasks, runs, harnesses, projects, subagents, backlog, dataDir, preferences, agentProfiles, pipelines } from "./db.ts";
+import { ensureIssueForTask } from "./auto-issue.ts";
 import { markStalled, clearStalled } from "./stall-registry.ts";
 import { spawnAgent, toClaudeModelArg, claudeModelPickerFamily, type SpawnAgentArgs, type SpawnedAgent } from "./agents.ts";
 import { checkHarness, upgradeHintFor } from "./agent-status.ts";
@@ -6091,13 +6092,19 @@ export async function createTask(
         const updated = tasks.update(task.id, {
           references: [...task.references, { path: snapshotPath, isDirectory: false }],
         });
-        if (updated) return { task: updated };
+        if (updated) {
+          void ensureIssueForTask(task.id);
+          return { task: updated };
+        }
       }
     } catch (e) {
       console.warn(`[agetor] failed to write issue thread snapshot for task ${task.id}:`, e);
     }
   }
 
+  // Every card gets a GitHub issue (src/bun/auto-issue.ts) — in the
+  // background, so creating the card never waits on GitHub.
+  void ensureIssueForTask(task.id);
   return { task };
 }
 

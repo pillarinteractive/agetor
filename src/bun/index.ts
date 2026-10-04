@@ -21,6 +21,7 @@ import { startConductorLoop } from "./conductor.ts";
 import { startDependencyLoop } from "./dependencies.ts";
 import { startMergeQueueLoop } from "./merge-queue.ts";
 import { startSlotScheduler } from "./pipeline-runner.ts";
+import { backfillIssues } from "./auto-issue.ts";
 import { getMainWindow, setMainWindow } from "./window.ts";
 import { makeWindowLifecycle, type Frame } from "./window-lifecycle.ts";
 import { focusWindow } from "./window-focus.ts";
@@ -529,6 +530,10 @@ startMergeQueueLoop();
 // Step slots (src/bun/step-slots.ts): start queued pipeline steps as
 // running ones finish.
 startSlotScheduler();
+
+// Every card gets a GitHub issue (src/bun/auto-issue.ts): catch up live
+// cards that don't have one yet.
+void backfillIssues().catch(() => undefined);
 
 /** Lifecycle wrapper around BrowserWindow construction. Handles:
  *   - idempotency (concurrent reopen events share one in-flight build),

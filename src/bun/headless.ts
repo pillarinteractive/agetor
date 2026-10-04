@@ -11,6 +11,7 @@ import { startConductorLoop } from "./conductor.ts";
 import { startDependencyLoop } from "./dependencies.ts";
 import { startMergeQueueLoop } from "./merge-queue.ts";
 import { startSlotScheduler } from "./pipeline-runner.ts";
+import { backfillIssues } from "./auto-issue.ts";
 import { ensureDisclaimedServer } from "./tmux-resolution.ts";
 import { startApiServer, attachedClientCount } from "./server.ts";
 import { rehydratePath } from "./login-path.ts";
@@ -194,6 +195,8 @@ export async function runDaemon(): Promise<void> {
   startMergeQueueLoop();
   // Step slots — same as index.ts; timer is unref'd.
   startSlotScheduler();
+  // Every card gets a GitHub issue — same as index.ts.
+  void backfillIssues().catch(() => undefined);
 
   // Idle-session reaper (docs/plans/reduce-cpu-and-memory.md §3.1, T4):
   // mirrors index.ts's wiring so the headless daemon doesn't accumulate the
