@@ -163,6 +163,12 @@ export function cardStatus(
       if (queued.length && run.active.length === 0) {
         return { line: `${queued.join(" + ")} queued — starts when a slot frees up`, tone: "muted", needsYou: null };
       }
+      // Steps parked on a long command (src/bun/awaits.ts) — woken when it exits.
+      const awaiting = run.blocked.filter((b) => b.kind === "await");
+      if (awaiting.length && awaiting.length === run.active.length) {
+        const what = awaiting.map((b) => b.message.match(/waiting on (.*?) — /)?.[1] ?? "a long command").join(", ");
+        return { line: `${awaiting.map((b) => stepName(run, b.stepId)).join(" + ")} waiting on ${what}${holds}`, tone: "info", needsYou: null };
+      }
       if (quiet) {
         const step = stepName(run, run.active[0]?.stepId);
         return {

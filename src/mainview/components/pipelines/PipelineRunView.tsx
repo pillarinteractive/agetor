@@ -1003,14 +1003,14 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
                       animate={{ opacity: 1, y: 0 }}
                       exit={{ opacity: 0 }}
                       className={
-                        entry.kind === "slot-wait"
+                        entry.kind === "slot-wait" || entry.kind === "await"
                           ? "rounded-md border border-info/40 bg-info/10 p-2.5"
                           : "rounded-md border border-warning/40 bg-warning/10 p-2.5"
                       }
                     >
-                      <p className={`text-xs font-medium ${entry.kind === "slot-wait" ? "text-info" : "text-warning"}`}>
+                      <p className={`text-xs font-medium ${entry.kind === "slot-wait" || entry.kind === "await" ? "text-info" : "text-warning"}`}>
                         {stepName ? `${stepName} — ` : ""}
-                        {entry.kind === "slot-wait" ? "queued — starts when a slot frees up" : entry.kind}
+                        {entry.kind === "slot-wait" ? "queued — starts when a slot frees up" : entry.kind === "await" ? "waiting on a long command — wakes when it finishes" : entry.kind}
                       </p>
                       {blockHandoff ? (
                         <HandoffCard handoff={blockHandoff} className="mt-1.5" />

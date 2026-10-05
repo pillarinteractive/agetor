@@ -1,4 +1,5 @@
 import { writeFileSync, existsSync } from "node:fs";
+import { startAwaitLoop } from "./awaits.ts";
 import { isAbsolute } from "node:path";
 import Electrobun, { ApplicationMenu, BrowserWindow, Screen, Updater, Utils } from "electrobun/bun";
 import { rehydratePath } from "./login-path.ts";
@@ -540,6 +541,7 @@ startMergeQueueLoop();
 // Step slots (src/bun/step-slots.ts): start queued pipeline steps as
 // running ones finish.
 startSlotScheduler();
+startAwaitLoop();
 
 // Every card gets a GitHub issue (src/bun/auto-issue.ts): catch up live
 // cards that don't have one yet.

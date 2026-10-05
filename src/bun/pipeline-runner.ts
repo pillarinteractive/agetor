@@ -34,6 +34,7 @@ import { logBlocks, newBlocks } from "./block-log.ts";
 import { isMergeQueued } from "./merge-intent.ts";
 import { currentSlots, slotDecision, slotUse } from "./step-slots.ts";
 import { isPriority, priorityFirst } from "./priority.ts";
+import { awaitsFor } from "./awaits.ts";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { agentProfiles, backlog, dataDir, harnesses, pipelines, runs, tasks } from "./db.ts";
@@ -390,7 +391,7 @@ function persist(parentId: string, run: PipelineRunState, opts?: { preserveStatu
   tasks.setPipelineRun(parentId, run);
   const parent = tasks.get(parentId);
   // Every new block goes in the block log (src/bun/block-log.ts).
-  const fresh = newBlocks(previousRun?.blocked ?? [], run.blocked).filter((b) => b.kind !== "slot-wait");
+  const fresh = newBlocks(previousRun?.blocked ?? [], run.blocked).filter((b) => b.kind !== "slot-wait" && b.kind !== "await");
   if (fresh.length && parent) {
     logBlocks(
       fresh.map((b) => ({
@@ -2143,6 +2144,23 @@ async function settleStepRun(
       if (isHeldByBackgroundAgents(taskId)) {
         persist(parentId, run);
         return null;
+      }
+
+      // The step handed a long command to agetor-await and ended its turn to
+      // wait (src/bun/awaits.ts): park it — the await watcher wakes it with
+      // the result — instead of nagging it for a handoff.
+      if (classified.kind === "handoff-missing" && parent?.worktreePath) {
+        const out = awaitsFor(parent.worktreePath, historyEntry?.startedAt ?? 0);
+        if (out.length) {
+          upsertBlocked(run, {
+            taskId,
+            stepId: activeEntry.stepId,
+            kind: "await",
+            message: `${stepName} is waiting on ${out.map((a) => `"${a.label}"`).join(", ")} — wakes when it finishes`,
+          });
+          persist(parentId, run);
+          return null;
+        }
       }
 
       if (classified.kind === "handoff-missing" || classified.kind === "handoff-invalid") {

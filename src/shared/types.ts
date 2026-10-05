@@ -565,7 +565,10 @@ export type PipelineBlockKind =
   | "join-incomplete"
   /** Not a problem: the step is queued for a free slot (src/bun/step-slots.ts)
    *  and starts by itself. A run whose only blocks are these reads as running. */
-  | "slot-wait";
+  | "slot-wait"
+  /** Not a problem: the step handed a long command to `agetor-await`
+   *  (src/bun/awaits.ts) and is woken when it exits. Reads as running. */
+  | "await";
 
 /** One currently-active step execution within a {@link PipelineRunState} —
  *  a hidden step task whose turn is running or blocked. Several can coexist

@@ -940,7 +940,7 @@ export function resolveNextSteps(
  * idle/cancelled).
  */
 export function deriveRunStatus(run: PipelineRunState): PipelineRunStatus {
-  if (run.blocked.some((b) => b.kind !== "slot-wait")) return "blocked";
+  if (run.blocked.some((b) => b.kind !== "slot-wait" && b.kind !== "await")) return "blocked";
   // A step waiting for a free slot starts by itself — the run is running.
   if (run.active.length > 0 || run.blocked.length > 0) return "running";
   if (run.status === "cancelled" || run.status === "idle") return run.status;
