@@ -65,3 +65,17 @@ describe("KeepAwake", () => {
     expect(spawned).toHaveLength(2);
   });
 });
+
+test("keep screen on: off unless explicitly turned on, macOS only, and holds caffeinate -d", async () => {
+  const { KeepAwake, keepScreenOnEnabled } = await import("./keep-awake.ts");
+  expect(keepScreenOnEnabled(null, "darwin")).toBe(false);
+  expect(keepScreenOnEnabled("true", "darwin")).toBe(true);
+  expect(keepScreenOnEnabled("true", "linux")).toBe(false);
+  const calls: string[][] = [];
+  const screen = new KeepAwake((argv) => {
+    calls.push(argv);
+    return { kill: () => {}, exited: new Promise<number>(() => {}) } as never;
+  }, ["-d"]);
+  screen.set(true);
+  expect(calls[0]).toEqual(["/usr/bin/caffeinate", "-d", "-w", String(process.pid)]);
+});

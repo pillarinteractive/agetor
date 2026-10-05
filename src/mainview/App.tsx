@@ -27,6 +27,8 @@ import {
   X,
   Sparkles,
   Link2,
+  Sun,
+  SunDim,
   Zap,
   type LucideIcon,
 } from "lucide-react";
@@ -1524,6 +1526,24 @@ function AppInner() {
         .catch((e) => toast.error("Couldn't refresh Ready to Merge", { description: e instanceof Error ? e.message : String(e) })),
     [],
   );
+  // Board header toggle: hold `caffeinate -d` (src/bun/keep-awake.ts).
+  const [keepScreenOn, setKeepScreenOn] = useState(false);
+  useEffect(() => {
+    void api
+      .listPreferences()
+      .then((prefs) => setKeepScreenOn(prefs.keepScreenOn === "true"))
+      .catch(() => {});
+  }, []);
+  const toggleKeepScreenOn = useCallback(() => {
+    setKeepScreenOn((on) => {
+      const next = !on;
+      void api.setPreference("keepScreenOn", String(next)).catch((e) => {
+        setKeepScreenOn(on);
+        toast.error("Couldn't change keep-screen-on", { description: e instanceof Error ? e.message : String(e) });
+      });
+      return next;
+    });
+  }, []);
   const openIssuesPage = useCallback(() => {
     navigate({ kind: "issues" });
   }, [navigate]);
@@ -2159,6 +2179,17 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                 aria-hidden
               />
             )}
+          </Button>
+          <Button
+            variant={keepScreenOn ? "secondary" : "ghost"}
+            size="icon"
+            data-testid="keep-screen-on"
+            onClick={toggleKeepScreenOn}
+            aria-pressed={keepScreenOn}
+            aria-label="Keep screen on"
+            title={keepScreenOn ? "Screen stays on — click to let it sleep again" : "Keep the screen on"}
+          >
+            {keepScreenOn ? <Sun className="size-4" /> : <SunDim className="size-4" />}
           </Button>
           <Button
             variant={view.kind === "issues" ? "secondary" : "ghost"}

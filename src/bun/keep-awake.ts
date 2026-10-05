@@ -9,6 +9,10 @@
  *
  * On by default; the `keepAwakeWhileRunning` preference set to "false" turns
  * it off. macOS only.
+ *
+ * Separately, "Keep screen on" (the board header toggle, `keepScreenOn`
+ * preference, off by default) holds `caffeinate -d` — the display stays on
+ * whether or not anything is running, until it's toggled off or Agetor quits.
  */
 import type { Subprocess } from "bun";
 import type { Task } from "../shared/types.ts";
@@ -16,6 +20,11 @@ import { preferences, tasks } from "./db.ts";
 import { subscribeGlobal } from "./orchestrator.ts";
 
 export const KEEP_AWAKE_PREF_KEY = "keepAwakeWhileRunning";
+export const KEEP_SCREEN_ON_PREF_KEY = "keepScreenOn";
+
+export function keepScreenOnEnabled(pref: string | null, platform: string = process.platform): boolean {
+  return platform === "darwin" && pref === "true";
+}
 const CHECK_MS = 10_000;
 
 export function keepAwakeEnabled(pref: string | null, platform: string = process.platform): boolean {
@@ -33,7 +42,11 @@ type Spawn = (argv: string[]) => Pick<Subprocess, "kill" | "exited">;
 export class KeepAwake {
   private proc: Pick<Subprocess, "kill" | "exited"> | null = null;
 
-  constructor(private readonly spawn: Spawn = (argv) => Bun.spawn(argv, { stdin: "ignore", stdout: "ignore", stderr: "ignore" })) {}
+  constructor(
+    private readonly spawn: Spawn = (argv) => Bun.spawn(argv, { stdin: "ignore", stdout: "ignore", stderr: "ignore" }),
+    /** caffeinate assertions: no idle/system sleep by default; `-d` keeps the display on. */
+    private readonly flags: string[] = ["-i", "-s"],
+  ) {}
 
   get held(): boolean {
     return this.proc !== null;
@@ -42,7 +55,7 @@ export class KeepAwake {
   set(wanted: boolean): void {
     if (wanted && !this.proc) {
       try {
-        const proc = this.spawn(["/usr/bin/caffeinate", "-i", "-s", "-w", String(process.pid)]);
+        const proc = this.spawn(["/usr/bin/caffeinate", ...this.flags, "-w", String(process.pid)]);
         this.proc = proc;
         // If caffeinate dies on its own, let the next check start a new one.
         void proc.exited.then(() => {
@@ -60,19 +73,28 @@ export class KeepAwake {
 }
 
 let loop: ReturnType<typeof setInterval> | null = null;
+let recheck: (() => void) | null = null;
+
+/** Apply a changed keep-awake / keep-screen-on preference right away. */
+export function recheckKeepAwake(): void {
+  recheck?.();
+}
 
 /** Start following the board. Idempotent; the timer is unref'd so it never
  *  keeps the headless daemon alive past its idle shutdown. */
 export function startKeepAwakeLoop(): void {
   if (loop) return;
   const keepAwake = new KeepAwake();
+  const screen = new KeepAwake(undefined, ["-d"]);
   const check = () => {
     try {
+      screen.set(keepScreenOnEnabled(preferences.get(KEEP_SCREEN_ON_PREF_KEY)));
       keepAwake.set(keepAwakeEnabled(preferences.get(KEEP_AWAKE_PREF_KEY)) && hasRunningWork(tasks.list()));
     } catch {
       // A failed read just waits for the next tick.
     }
   };
+  recheck = check;
   check();
   loop = setInterval(check, CHECK_MS);
   loop.unref?.();
@@ -80,5 +102,8 @@ export function startKeepAwakeLoop(): void {
   subscribeGlobal((e) => {
     if (e.kind === "column" || e.kind === "run-status") queueMicrotask(check);
   });
-  process.on("exit", () => keepAwake.set(false));
+  process.on("exit", () => {
+    keepAwake.set(false);
+    screen.set(false);
+  });
 }

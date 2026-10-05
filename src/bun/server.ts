@@ -43,6 +43,7 @@ import { blockedByFor, blockingFor, dependencyTick, readDependencies, setDepende
 import { activeTrain, mergedViaTrain, trainFor } from "./merge-train.ts";
 import { isPriority, readPriority, setPriority } from "./priority.ts";
 import { setMergeQueued } from "./merge-intent.ts";
+import { KEEP_AWAKE_PREF_KEY, KEEP_SCREEN_ON_PREF_KEY, recheckKeepAwake } from "./keep-awake.ts";
 import { departTrainNow, refreshMergeColumn } from "./merge-queue.ts";
 import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
@@ -3420,6 +3421,8 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: "value (string) required" }, { status: 400, headers: corsHeaders(req) });
           }
           preferences.set(req.params.key, body.value);
+          // Keep-awake toggles take effect now, not on the next tick.
+          if (req.params.key === KEEP_SCREEN_ON_PREF_KEY || req.params.key === KEEP_AWAKE_PREF_KEY) recheckKeepAwake();
           return new Response(null, { status: 204, headers: corsHeaders(req) });
         }),
       },
