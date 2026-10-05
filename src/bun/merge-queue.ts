@@ -279,6 +279,8 @@ async function tick(now: number): Promise<void> {
   //    train window for company before merging alone.
   for (const e of evals) {
     if (riding.has(e.t.id)) continue;
+    // A train that landed above moved its members to Done: don't step them.
+    if (tasks.get(e.t.id)?.column !== "merge") continue;
     if (cfg.enabled && eligibleIds.has(e.t.id) && (e.step.kind === "merge" || e.step.kind === "update-branch")) {
       // Company = other ready PRs that could share its train (same project and base).
       const others = eligible.filter(
