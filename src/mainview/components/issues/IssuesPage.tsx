@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { ArrowLeft, CircleDot, ExternalLink as ExternalLinkIcon, Play, RefreshCw, X } from "lucide-react";
+import { ArrowLeft, ChevronDown, ChevronRight, CircleDot, ExternalLink as ExternalLinkIcon, Milestone, Play, RefreshCw, X } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -7,13 +7,17 @@ import { api, ApiError } from "@/lib/api";
 import { usePipelines } from "@/lib/pipelines";
 import { cn } from "@/lib/utils";
 import { ExternalLink } from "../kanban/md-components";
-import type { GitHubListItem, Project, Task } from "../../../shared/types.ts";
+import { groupByMilestone, milestoneProgress } from "@/lib/milestone-groups";
+import type { GitHubListItem, GitHubRepoMilestone, Project, Task } from "../../../shared/types.ts";
 
 type Row = { item: GitHubListItem; task: { id: string; title: string; column: Task["column"] } | null };
 
 const PROJECT_KEY = "agetor.issues.project";
 const PIPELINE_KEY = "agetor.issues.pipeline";
 const LABELS_KEY = "agetor.issues.labels";
+const GROUP_KEY = "agetor.issues.groupByMilestone";
+/** Pages of open issues loaded at most (50 each). */
+const MAX_PAGES = 6;
 
 function remembered(key: string): string | null {
   try {
@@ -63,6 +67,9 @@ export function IssuesPage({
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [busyNumber, setBusyNumber] = useState<number | null>(null);
+  const [grouped, setGrouped] = useState(() => remembered(GROUP_KEY) !== "false");
+  const [milestones, setMilestones] = useState<GitHubRepoMilestone[]>([]);
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   // Every label seen this session, so filtering by one doesn't hide the rest.
   const [seenLabels, setSeenLabels] = useState<string[]>([]);
 
@@ -89,16 +96,27 @@ export function IssuesPage({
   useEffect(() => setSeenLabels([]), [projectPath]);
   useEffect(() => remember(PIPELINE_KEY, pipelineId), [pipelineId]);
   useEffect(() => remember(LABELS_KEY, JSON.stringify(labels)), [labels]);
+  useEffect(() => remember(GROUP_KEY, String(grouped)), [grouped]);
 
   const load = useCallback(async () => {
     if (!projectPath) return;
     setLoading(true);
     setError(null);
     try {
-      const res = await api.getIssueQueue(projectPath, { labels, q: appliedQuery || undefined });
-      setRows(res.items);
+      // Every page, so a milestone's group isn't missing issues past the first 50.
+      let res = await api.getIssueQueue(projectPath, { labels, q: appliedQuery || undefined });
+      const items = [...res.items];
+      for (let page = 2; res.hasMore && page <= MAX_PAGES; page++) {
+        res = await api.getIssueQueue(projectPath, { labels, q: appliedQuery || undefined, page });
+        items.push(...res.items);
+      }
+      setRows(items);
       setRepo(res.repo);
-      setSeenLabels((cur) => [...new Set([...cur, ...res.items.flatMap((r) => r.item.labels.map((l) => l.name))])]);
+      setSeenLabels((cur) => [...new Set([...cur, ...items.flatMap((r) => r.item.labels.map((l) => l.name))])]);
+      void api
+        .listGitHubMilestones({ path: projectPath })
+        .then((m) => setMilestones(m.milestones))
+        .catch(() => setMilestones([]));
     } catch (e) {
       setError(e instanceof ApiError ? e.message : "Couldn't load issues.");
       setRows([]);
@@ -135,6 +153,54 @@ export function IssuesPage({
       setBusyNumber(null);
     }
   };
+
+  const renderRow = ({ item, task }: Row) => (
+          <li key={item.number} data-testid="issue-row" className="flex items-start gap-3 px-4 py-2.5">
+            <div className="min-w-0 flex-1">
+              <div className="flex items-center gap-2 text-sm">
+                <span className="shrink-0 font-mono text-xs text-muted-foreground">#{item.number}</span>
+                <span className="truncate">{item.title}</span>
+                <ExternalLink href={item.htmlUrl} className="shrink-0 text-muted-foreground" aria-label="Open on GitHub">
+                  <ExternalLinkIcon className="size-3" />
+                </ExternalLink>
+              </div>
+              {item.labels.length > 0 && (
+                <div className="mt-1 flex flex-wrap gap-1">
+                  {item.labels.map((l) => (
+                    <Badge key={l.name} variant="outline" className="text-[10px]">
+                      {l.name}
+                    </Badge>
+                  ))}
+                </div>
+              )}
+            </div>
+            {task ? (
+              <button
+                type="button"
+                onClick={() => onOpenTask(task.id)}
+                data-testid="issue-task"
+                className="shrink-0 rounded-md border border-border px-2 py-1 text-left text-[11px] hover:bg-accent/40"
+                title="Open the task working on this issue"
+              >
+                <span className="block max-w-56 truncate">{task.title}</span>
+                <span className="text-muted-foreground">{task.column}</span>
+              </button>
+            ) : (
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                data-testid="issue-fix"
+                disabled={!pipelineId || busyNumber !== null}
+                onClick={() => void fix(item.number)}
+                className="h-7 shrink-0 gap-1 text-xs"
+              >
+                <Play className="size-3" aria-hidden />
+                {busyNumber === item.number ? "Starting…" : "Fix"}
+              </Button>
+            )}
+          </li>
+);
 
   return (
     <div data-testid="issues-page" className="flex h-full min-h-0 w-full flex-col">
@@ -176,6 +242,19 @@ export function IssuesPage({
               ))}
             </select>
           </label>
+          <Button
+            type="button"
+            variant={grouped ? "secondary" : "ghost"}
+            size="sm"
+            onClick={() => setGrouped((g) => !g)}
+            aria-pressed={grouped}
+            data-testid="issues-group-milestone"
+            className="h-8 gap-1.5 text-xs"
+            title="Group issues by milestone"
+          >
+            <Milestone className="size-3.5" aria-hidden />
+            By milestone
+          </Button>
           <Button type="button" variant="ghost" size="icon" onClick={() => void load()} aria-label="Refresh" title="Refresh">
             <RefreshCw className={cn("size-4", loading && "animate-spin")} />
           </Button>
@@ -224,53 +303,52 @@ export function IssuesPage({
         {rows?.length === 0 && !loading && (
           <li className="px-4 py-6 text-center text-xs text-muted-foreground">No open issues match.</li>
         )}
-        {rows?.map(({ item, task }) => (
-          <li key={item.number} data-testid="issue-row" className="flex items-start gap-3 px-4 py-2.5">
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2 text-sm">
-                <span className="shrink-0 font-mono text-xs text-muted-foreground">#{item.number}</span>
-                <span className="truncate">{item.title}</span>
-                <ExternalLink href={item.htmlUrl} className="shrink-0 text-muted-foreground" aria-label="Open on GitHub">
-                  <ExternalLinkIcon className="size-3" />
-                </ExternalLink>
-              </div>
-              {item.labels.length > 0 && (
-                <div className="mt-1 flex flex-wrap gap-1">
-                  {item.labels.map((l) => (
-                    <Badge key={l.name} variant="outline" className="text-[10px]">
-                      {l.name}
-                    </Badge>
-                  ))}
-                </div>
-              )}
-            </div>
-            {task ? (
-              <button
-                type="button"
-                onClick={() => onOpenTask(task.id)}
-                data-testid="issue-task"
-                className="shrink-0 rounded-md border border-border px-2 py-1 text-left text-[11px] hover:bg-accent/40"
-                title="Open the task working on this issue"
-              >
-                <span className="block max-w-56 truncate">{task.title}</span>
-                <span className="text-muted-foreground">{task.column}</span>
-              </button>
-            ) : (
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                data-testid="issue-fix"
-                disabled={!pipelineId || busyNumber !== null}
-                onClick={() => void fix(item.number)}
-                className="h-7 shrink-0 gap-1 text-xs"
-              >
-                <Play className="size-3" aria-hidden />
-                {busyNumber === item.number ? "Starting…" : "Fix"}
-              </Button>
-            )}
-          </li>
-        ))}
+        {grouped
+          ? groupByMilestone(rows ?? [], milestones).map((g) => {
+              const key = String(g.number ?? "none");
+              const open = !collapsed.has(key);
+              const progress = milestoneProgress(g.milestone);
+              if (labels.length + appliedQuery.length > 0 && g.rows.length === 0) return null;
+              return (
+                <li key={key} data-testid="milestone-group">
+                  <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-border bg-muted/60 px-4 py-1.5 text-xs backdrop-blur">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setCollapsed((cur) => {
+                          const next = new Set(cur);
+                          if (next.has(key)) next.delete(key);
+                          else next.add(key);
+                          return next;
+                        })
+                      }
+                      aria-expanded={open}
+                      className="flex min-w-0 items-center gap-1.5 font-semibold"
+                    >
+                      {open ? <ChevronDown className="size-3.5" aria-hidden /> : <ChevronRight className="size-3.5" aria-hidden />}
+                      <Milestone className="size-3.5 text-muted-foreground" aria-hidden />
+                      <span className="truncate">{g.title}</span>
+                    </button>
+                    <span className="text-muted-foreground">{g.rows.length} open</span>
+                    {progress && progress.total > 0 && (
+                      <span className="flex items-center gap-1.5 text-muted-foreground" title={`${progress.done} of ${progress.total} issues closed`}>
+                        <span className="h-1.5 w-16 overflow-hidden rounded-full bg-border">
+                          <span className="block h-full bg-success" style={{ width: `${progress.pct}%` }} />
+                        </span>
+                        {progress.pct}%
+                      </span>
+                    )}
+                    {g.milestone?.htmlUrl && (
+                      <ExternalLink href={g.milestone.htmlUrl} className="ml-auto text-muted-foreground" aria-label="Open milestone on GitHub">
+                        <ExternalLinkIcon className="size-3" />
+                      </ExternalLink>
+                    )}
+                  </div>
+                  {open && <ul className="divide-y divide-border">{g.rows.map(renderRow)}</ul>}
+                </li>
+              );
+            })
+          : rows?.map(renderRow)}
       </ul>
     </div>
   );
