@@ -171,12 +171,12 @@ export async function buildTrain(ready: { task: Task; pr: TaskPrStatus }[]): Pro
     recordActivity(d.member.taskId, { kind: "auto", text: `Left out of a merge train (${d.why}) — merging on its own`, tone: "muted" });
   }
   if (members.length < 2) {
-    await git(["push", "--quiet", "origin", "--delete", branch], project);
+    await git(["push", "--quiet", "--no-verify", "origin", "--delete", branch], project);
     return null;
   }
   const opened = await createGitHubPull({ dir: project, title: trainTitle(members), head: branch, base, body: trainBody(members, base) });
   if (!opened.ok) {
-    await git(["push", "--quiet", "origin", "--delete", branch], project);
+    await git(["push", "--quiet", "--no-verify", "origin", "--delete", branch], project);
     return null;
   }
   const train: Train = { id, project, base, branch, pr: opened.item.number, url: opened.item.htmlUrl, members, createdAt: Date.now() };
@@ -230,7 +230,10 @@ export async function assembleTrain(
       members.push(c);
     }
     if (members.length >= 2) {
-      const pushed = await git(["push", "--quiet", "-u", "origin", branch], dir);
+      // --no-verify: the repo's pre-push hook (lint, vet, tests) re-checks
+      // changes each PR's CI already passed, and can fail on the machine's
+      // load; the train's own CI is the check that counts.
+      const pushed = await git(["push", "--quiet", "--no-verify", "-u", "origin", branch], dir);
       if (!pushed.ok) return { members: [], dropped: [...dropped, ...members.map((member) => ({ member, why: `push failed: ${pushed.stderr}` }))] };
     }
   } finally {
@@ -266,6 +269,31 @@ export async function cancelBranchRuns(dir: string, branch: string): Promise<num
     for (const id of list.stdout.split("\n").filter(Boolean)) {
       const r = await run(["gh", "api", "-X", "POST", `repos/{owner}/{repo}/actions/runs/${id}/cancel`], dir, 20_000, process.env);
       if (r.ok) n++;
+      stuck.add(`${dir}\0${id}`);
+    }
+  }
+  return n;
+}
+
+/** Runs we've asked to cancel. A run whose remaining job is still waiting
+ *  for a self-hosted runner can sit in "queued" after a cancel — GitHub only
+ *  finishes the cancel once a runner picks the job up — so on the next pass
+ *  those get a force-cancel. */
+const stuck = new Set<string>();
+
+export async function forceCancelStuck(): Promise<number> {
+  let n = 0;
+  for (const key of [...stuck]) {
+    const [dir, id] = key.split("\0") as [string, string];
+    const state = await run(["gh", "api", `repos/{owner}/{repo}/actions/runs/${id}`, "-q", ".status"], dir, 20_000, process.env);
+    if (!state.ok || state.stdout === "completed") {
+      stuck.delete(key);
+      continue;
+    }
+    const r = await run(["gh", "api", "-X", "POST", `repos/{owner}/{repo}/actions/runs/${id}/force-cancel`], dir, 20_000, process.env);
+    if (r.ok) {
+      n++;
+      stuck.delete(key);
     }
   }
   return n;
@@ -284,14 +312,14 @@ export async function trainCiStarted(t: Train): Promise<boolean> {
 export async function replaceTrain(t: Train): Promise<void> {
   await closeGitHubPull({ dir: t.project, number: t.pr, comment: "Replaced by a larger merge train sent by hand — these PRs ride that one." });
   await cancelBranchRuns(t.project, t.branch).catch(() => 0);
-  await git(["push", "--quiet", "origin", "--delete", t.branch], t.project);
+  await git(["push", "--quiet", "--no-verify", "origin", "--delete", t.branch], t.project);
   clearTrain(t.id);
 }
 
 async function disband(t: Train, why: string, prs: Map<string, TaskPrStatus | null>): Promise<void> {
   await closeGitHubPull({ dir: t.project, number: t.pr, comment: `Disbanding this merge train: ${why}. Agetor merges these PRs one at a time instead.` });
   await cancelBranchRuns(t.project, t.branch).catch(() => 0);
-  await git(["push", "--quiet", "origin", "--delete", t.branch], t.project);
+  await git(["push", "--quiet", "--no-verify", "origin", "--delete", t.branch], t.project);
   for (const m of t.members) {
     const pr = prs.get(m.taskId);
     trainSkip.add(`${m.pr}:${pr?.headSha ?? m.headSha ?? ""}`);
@@ -317,13 +345,18 @@ async function land(t: Train): Promise<void> {
       }).catch(() => undefined);
     }
   }
-  await git(["push", "--quiet", "origin", "--delete", t.branch], t.project);
+  await git(["push", "--quiet", "--no-verify", "origin", "--delete", t.branch], t.project);
   clearTrain(t.id);
 }
 
 /** Move the active train along: land it when green, disband it when it
  *  fails, conflicts, or a member changed or was withdrawn. */
 export async function advanceTrain(t: Train, prs: Map<string, TaskPrStatus | null>): Promise<"waiting" | "landed" | "disbanded"> {
+  // While the train is out, its members' own CI is redundant: cancel anything
+  // pending on their branches (a late push, a re-run), and force-cancel runs a
+  // plain cancel left stuck in the queue.
+  await forceCancelStuck().catch(() => 0);
+  for (const m of t.members) await cancelBranchRuns(t.project, m.branch).catch(() => 0);
   for (const m of t.members) {
     const task = tasks.get(m.taskId);
     const pr = prs.get(m.taskId);
