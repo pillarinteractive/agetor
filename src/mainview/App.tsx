@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { prNumberFromUrl } from "@/lib/card-names";
 import { AnimatePresence, motion } from "motion/react";
 import { DndContext, type DragEndEvent, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
 import {
@@ -1402,7 +1403,9 @@ function AppInner() {
       if (t.pipelineParentId != null) return false;
       if (t.id === conductorId) return false;
       if (q) {
-        const hay = `${t.title}\n${t.prompt}\n${t.workdir}\n${t.branch ?? ""}`.toLowerCase();
+        // The card's PR number too ("334", "#334", "pr 334"), so a PR link finds its card.
+        const prNum = prNumberFromUrl(t.prUrl);
+        const hay = `${t.title}\n${t.prompt}\n${t.workdir}\n${t.branch ?? ""}${prNum ? `\npr #${prNum} pr ${prNum}` : ""}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
       if (repoFilter.length > 0 && !repoFilter.includes(t.workdir)) return false;

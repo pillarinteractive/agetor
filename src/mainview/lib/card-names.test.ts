@@ -16,3 +16,10 @@ test("short names: the issue number, else the first words", () => {
 test("a blocker's color is stable for its id", () => {
   expect(blockerColor("8927cf40-a7bc")).toBe(blockerColor("8927cf40-a7bc"));
 });
+
+test("prNumberFromUrl reads the PR number from a GitHub PR link", async () => {
+  const { prNumberFromUrl } = await import("./card-names.ts");
+  expect(prNumberFromUrl("https://github.com/Pillar-Interactive/pillar/pull/334")).toBe(334);
+  expect(prNumberFromUrl("https://github.com/o/r/issues/12")).toBeNull();
+  expect(prNumberFromUrl(null)).toBeNull();
+});

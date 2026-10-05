@@ -5,6 +5,12 @@
  */
 
 /** "Issue #182: [review] Public pages…" → number + the readable rest. */
+/** The pull request number in a GitHub PR URL (…/pull/334), or null. */
+export function prNumberFromUrl(url: string | null | undefined): number | null {
+  const m = url?.match(/\/pull\/(\d+)/);
+  return m ? Number(m[1]) : null;
+}
+
 export function splitCardTitle(title: string): { issue: string | null; text: string } {
   const m = /^Issue #(\d+):\s*(?:\[[^\]]*\]\s*)?([\s\S]*)$/.exec(title);
   return m ? { issue: m[1]!, text: m[2]! || title } : { issue: null, text: title };

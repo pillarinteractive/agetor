@@ -15,7 +15,7 @@ import { prBadge, useTaskPr } from "@/lib/prs";
 import { cardStatus } from "@/lib/card-status";
 import { ordinal } from "../../../shared/block-reason.ts";
 import { progressFraction, progressLine, useTaskProgress } from "@/lib/progress";
-import { blockerColor, shortCardName, splitCardTitle } from "@/lib/card-names";
+import { blockerColor, prNumberFromUrl, shortCardName, splitCardTitle } from "@/lib/card-names";
 
 // The theme's --destructive is a dark fill meant for buttons (30% lightness
 // in dark mode) — unreadable as text on a dark card. Text uses a lighter red.
@@ -145,6 +145,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
   const TypeIcon = taskTypeIcon(type.icon);
   const runningSubagents = task.runningSubagents ?? 0;
   const title = splitCardTitle(task.title);
+  const prNumber = pr?.number ?? prNumberFromUrl(task.prUrl);
   const waitingTags = (task.blockedBy ?? []).filter((d) => !d.satisfied);
 
   return (
@@ -213,6 +214,11 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
             title={[task.title, task.branch && `branch ${task.branch}`, task.model && `model ${task.model}`, abbreviateHome(task.workdir, homeDir)].filter(Boolean).join("\n")}
           >
             {title.issue && <span className="mr-1 font-mono font-medium text-muted-foreground">#{title.issue}</span>}
+            {prNumber != null && (
+              <span className="mr-1 font-mono font-medium text-muted-foreground" data-testid="card-pr-number" title={`Pull request #${prNumber}`}>
+                {title.issue ? "→ " : ""}PR #{prNumber}
+              </span>
+            )}
             {title.text}
           </CardTitle>
         </div>
