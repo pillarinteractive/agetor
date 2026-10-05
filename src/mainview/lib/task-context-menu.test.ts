@@ -62,12 +62,14 @@ const ACTION_GROUP: Record<TaskMenuAction, TaskMenuGroup> = {
   "copy-branch": "utility",
   "copy-worktree-path": "utility",
   "blocked-by": "inspect",
+  "priority-on": "inspect",
+  "priority-off": "inspect",
   delete: "danger",
 };
 
 // The sequence tests below predate "Blocked by…"; it has its own tests at the end.
 const actions = (entries: ReturnType<typeof buildTaskContextMenu>) =>
-  entries.map((e) => e.action).filter((a) => a !== "blocked-by");
+  entries.map((e) => e.action).filter((a) => a !== "blocked-by" && a !== "priority-on" && a !== "priority-off");
 
 describe("buildTaskContextMenu", () => {
   test("backlog task, nothing set -> open, start, diff, open-in-finder, delete", () => {

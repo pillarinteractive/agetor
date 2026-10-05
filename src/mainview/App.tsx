@@ -26,6 +26,7 @@ import {
   X,
   Sparkles,
   Link2,
+  Zap,
   type LucideIcon,
 } from "lucide-react";
 import { api, type AgentModelMap, type HarnessModelMap } from "@/lib/api";
@@ -189,6 +190,8 @@ const ICON_BY_ACTION: Record<TaskMenuAction, LucideIcon> = {
   "copy-branch": GitBranch,
   "copy-worktree-path": Copy,
   "blocked-by": Link2,
+  "priority-on": Zap,
+  "priority-off": Zap,
   delete: Trash2,
 };
 
@@ -1974,6 +1977,15 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
       case "blocked-by":
         setBlockedByTask(t);
         break;
+      case "priority-on":
+      case "priority-off": {
+        const on = action === "priority-on";
+        void api
+          .setPriority(t.id, on)
+          .then(() => toast.success(on ? "Priority — it takes a slot now and goes first for the lab" : "Priority removed"))
+          .catch((e) => toast.error("Couldn't change priority", { description: e instanceof Error ? e.message : String(e) }));
+        break;
+      }
       case "delete":
         void del(t);
         break;

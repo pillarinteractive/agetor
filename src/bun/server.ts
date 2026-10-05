@@ -29,7 +29,7 @@ import {
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
 import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
-import { advancePipeline, cancelPipelineRun, isPipelineStepTask, retryPipelineStep, startPipelineRun } from "./pipeline-runner.ts";
+import { advancePipeline, cancelPipelineRun, isPipelineStepTask, releaseSlotWaits, retryPipelineStep, startPipelineRun } from "./pipeline-runner.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
 import { accountUsageDays } from "./account-usage.ts";
@@ -39,8 +39,9 @@ import { buildEli5Prompt, eli5TaskTitle } from "../shared/clone-eli5.ts";
 import { CLONE_PROVIDERS, isGitProvider } from "../shared/clone-input.ts";
 import { stalledSince } from "./stall-registry.ts";
 import { lastActivityAt } from "./activity-clock.ts";
-import { blockedByFor, blockingFor, readDependencies, setDependencies } from "./dependencies.ts";
+import { blockedByFor, blockingFor, dependencyTick, readDependencies, setDependencies } from "./dependencies.ts";
 import { activeTrain, mergedViaTrain, trainFor } from "./merge-train.ts";
+import { isPriority, readPriority, setPriority } from "./priority.ts";
 import { departTrainNow, refreshMergeColumn } from "./merge-queue.ts";
 import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
@@ -286,7 +287,7 @@ function withRunningSubagents(t: Task): Task & { runningSubagents: number } {
   // `stalledSince` rides the same decoration: transient in-memory server
   // state (the turn-stall watchdog's mark) that the DB-derived Task can't
   // carry — see stall-registry.ts.
-  return { ...t, runningSubagents, stalledSince: stalledSince(t.id), lastActivityAt: lastActivityAt(t), blockedBy: blockedByFor(t.id), blocking: blockingFor(t.id), mergeTrain: trainFor(t.id) };
+  return { ...t, runningSubagents, stalledSince: stalledSince(t.id), lastActivityAt: lastActivityAt(t), blockedBy: blockedByFor(t.id), blocking: blockingFor(t.id), mergeTrain: trainFor(t.id), priority: isPriority(t.id) || undefined };
 }
 
 // Turn raw path strings into references: keep only existing absolute paths,
@@ -4449,6 +4450,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const deps = readDependencies();
           const train = activeTrain();
           const via = mergedViaTrain();
+          const prio = readPriority();
           return json(
             allTasks.map((t) => ({
               ...t,
@@ -4461,6 +4463,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               blockedBy: blockedByFor(t.id, deps),
               blocking: blockingFor(t.id, deps),
               mergeTrain: trainFor(t.id, train, via),
+              priority: isPriority(t.id, prio) || undefined,
             })),
             { headers: corsHeaders(req) },
           );
@@ -4985,6 +4988,20 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const r = setDependencies(req.params.id, ids);
           if ("error" in r) return json({ error: r.error }, { status: 400, headers: corsHeaders(req) });
           return json({ blockedBy: blockedByFor(req.params.id) ?? [] }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Priority toggle (src/bun/priority.ts): queued steps launch at once.
+      "/tasks/:id/priority": {
+        PUT: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { on?: unknown };
+          const r = setPriority(req.params.id, body.on === true);
+          if ("error" in r) return json({ error: r.error }, { status: 404, headers: corsHeaders(req) });
+          if (r.priority) {
+            void releaseSlotWaits().catch(() => undefined);
+            void dependencyTick().catch(() => undefined);
+          }
+          return json(r, { headers: corsHeaders(req) });
         }),
       },
 

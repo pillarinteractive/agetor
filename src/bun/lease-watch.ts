@@ -10,6 +10,7 @@
  * {@link LeaseWatcherConfig}. Agetor only reads the lease; acquiring and
  * releasing it stays with the project's own tooling.
  */
+import { priorityFirst } from "./priority.ts";
 import { realpathSync } from "node:fs";
 import type { LeaseStatus, LeaseWatcherConfig, Task } from "../shared/types.ts";
 import { preferences, tasks } from "./db.ts";
@@ -214,7 +215,8 @@ async function probe(w: LeaseWatcherConfig): Promise<void> {
 }
 
 function queueFor(w: Pick<LeaseWatcherConfig, "project" | "label">): NonNullable<LeaseStatus["queue"]> {
-  return leaseQueue(tasks.list(), w).map(({ task, since }) => ({ taskId: task.id, title: task.title, since }));
+  // Priority cards (src/bun/priority.ts) go to the front of the line.
+  return priorityFirst(leaseQueue(tasks.list(), w), (q) => q.task.id).map(({ task, since }) => ({ taskId: task.id, title: task.title, since }));
 }
 
 const lastAutoRetryAt = new Map<string, number>();

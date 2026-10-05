@@ -1,7 +1,7 @@
 import { memo } from "react";
 import { useDraggable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, CircleAlert, FolderOpen, GitCompare, GitPullRequest, ListTodo, Link2, Lock, LockOpen, MessageCircleQuestion, PauseCircle, Play, Square, Trash2 } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, CircleAlert, FolderOpen, GitCompare, GitPullRequest, ListTodo, Link2, Lock, LockOpen, Zap, MessageCircleQuestion, PauseCircle, Play, Square, Trash2 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { abbreviateHome, cn } from "@/lib/utils";
@@ -219,8 +219,18 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
         {/* Dependency tags: a card that blocks others wears its own color
          *  ("blocks 3"); each card waiting on it wears that same color with its
          *  short name ("#214"). */}
-        {!archived && (waitingTags.length > 0 || (task.blocking?.length ?? 0) > 0) && (
+        {!archived && (task.priority || waitingTags.length > 0 || (task.blocking?.length ?? 0) > 0) && (
           <div className="flex flex-wrap items-center gap-1">
+            {task.priority && (
+              <span
+                className="inline-flex items-center gap-1 rounded-md bg-warning/15 px-1.5 py-0.5 text-[11px] font-semibold text-warning ring-1 ring-warning/40"
+                data-testid="priority-tag"
+                title="Priority: takes a slot straight away and goes first for the lab"
+              >
+                <Zap className="size-3" />
+                Priority
+              </span>
+            )}
             {(task.blocking?.length ?? 0) > 0 && (
               <span
                 className={cn("inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-semibold ring-1", blockerColor(task.id))}

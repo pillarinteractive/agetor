@@ -18,6 +18,7 @@ import { prStatusForTask } from "./pr-watch.ts";
 import { recordActivity } from "./activity.ts";
 import { isTaskRunLive, sendInput, startTask } from "./orchestrator.ts";
 import { currentSlots, slotDecision, slotUse } from "./step-slots.ts";
+import { isPriority } from "./priority.ts";
 import { prBadge } from "../mainview/lib/prs.ts";
 import { shortCardName } from "../mainview/lib/card-names.ts";
 
@@ -204,6 +205,7 @@ function noteOnce(taskId: string, text: string): void {
 export function unblockGate(task: Task): { ok: true } | { ok: false; why: string } {
   const action = unblockAction(task);
   if (action !== "message-step" && action !== "message-task") return { ok: true };
+  if (isPriority(task.id)) return { ok: true };
   const slots = currentSlots();
   const use = slotUse(isTaskRunLive, slots);
   let name = "";

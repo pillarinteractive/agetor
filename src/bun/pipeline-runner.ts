@@ -33,6 +33,7 @@ import { syncBaseNote } from "./sync-base.ts";
 import { logBlocks, newBlocks } from "./block-log.ts";
 import { isMergeQueued } from "./merge-intent.ts";
 import { currentSlots, slotDecision, slotUse } from "./step-slots.ts";
+import { isPriority, priorityFirst } from "./priority.ts";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { agentProfiles, backlog, dataDir, harnesses, pipelines, runs, tasks } from "./db.ts";
@@ -275,9 +276,11 @@ export async function releaseSlotWaits(): Promise<number> {
   }
   waiting.sort((a, b) => a.since - b.since);
   let launched = 0;
-  for (const w of waiting) {
+  // Priority cards first, and they don't wait for a free slot.
+  for (const w of priorityFirst(waiting, (x) => x.parentId)) {
     const slots = currentSlots();
-    if (slotUse(isTaskRunLive, slots).total >= slots.max) break;
+    const urgent = isPriority(w.parentId);
+    if (!urgent && slotUse(isTaskRunLive, slots).total >= slots.max) break;
     const ok = await runExclusive(w.parentId, async () => {
       const parent = tasks.get(w.parentId);
       const run = parent?.pipelineRun;
@@ -286,7 +289,7 @@ export async function releaseSlotWaits(): Promise<number> {
       const step = run.snapshot?.graph.steps.find((s) => s.id === w.stepId);
       if (!block?.pending || !step) return false;
       // Still over a limit for this step (e.g. the verification slot)? Leave it queued.
-      if (!slotDecision(step.name, slotUse(isTaskRunLive, slots), slots).ok) return false;
+      if (!urgent && !slotDecision(step.name, slotUse(isTaskRunLive, slots), slots).ok) return false;
       run.blocked = run.blocked.filter((b) => b !== block);
       const previous = block.pending.arrivals.map((a) => ({ stepId: a.fromStepId, seq: a.seq, handoff: a.handoff }));
       const r = await launchTarget(parent, run, step, previous);
@@ -790,7 +793,7 @@ async function launchStep(
   // Step slots (src/bun/step-slots.ts): too many agents at once starve the
   // machine. Over the limit, the step queues — a `slot-wait` block that the
   // slot scheduler (`releaseSlotWaits`) launches when a slot frees.
-  if (!opts?.ignoreSlots) {
+  if (!opts?.ignoreSlots && !isPriority(parent.id)) {
     const slots = currentSlots();
     const decision = slotDecision(step.name, slotUse(isTaskRunLive, slots), slots);
     if (!decision.ok) {

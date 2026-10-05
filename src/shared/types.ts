@@ -1744,6 +1744,9 @@ export interface Task {
   /** Riding (or landed in) a merge train (src/bun/merge-train.ts),
    *  server-decorated. */
   mergeTrain?: { pr: number; url: string; state: "riding" | "merged" };
+  /** Marked priority (src/bun/priority.ts): takes a slot straight away and
+   *  goes first for the lab. Server-decorated; absent when not. */
+  priority?: boolean;
   /** When this card's agents last produced anything (the newest run event of
    *  the running task, or for a running pipeline the quietest active step).
    *  Server-decorated for running cards only; drives the "quiet" warning. */

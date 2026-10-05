@@ -477,6 +477,8 @@ export const api = {
   getProgress: () => j<TaskProgress[]>("/progress"),
   /** The Conductor chat agent (src/bun/conductor.ts). */
   /** Replace the cards a card is blocked by (src/bun/dependencies.ts). */
+  setPriority: (taskId: string, on: boolean) =>
+    j<{ ok: true; priority: boolean }>(`/tasks/${encodeURIComponent(taskId)}/priority`, { method: "PUT", body: JSON.stringify({ on }) }, { retry: false }),
   setBlockedBy: (taskId: string, ids: string[]) =>
     j<{ blockedBy: unknown[] }>(`/tasks/${encodeURIComponent(taskId)}/blocked-by`, { method: "PUT", body: JSON.stringify({ ids }) }, { retry: false }),
   /** Send a merge train now (src/bun/merge-queue.ts `departTrainNow`). */
