@@ -227,7 +227,11 @@ export async function assembleTrain(
         dropped.push({ member: c, why: `commit failed: ${committed.stderr}` });
         continue;
       }
-      members.push(c);
+      // The head actually squashed in — the cached PR status can lag a push
+      // made moments ago (an "update branch" from the merge queue), and a
+      // stale head would read as new commits and disband the train.
+      const head = await git(["rev-parse", `origin/${c.branch}`], dir);
+      members.push(head.ok && head.stdout.trim() ? { ...c, headSha: head.stdout.trim() } : c);
     }
     if (members.length >= 2) {
       // --no-verify: the repo's pre-push hook (lint, vet, tests) re-checks

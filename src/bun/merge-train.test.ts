@@ -82,6 +82,8 @@ test("assembling: one squashed commit per PR on the latest base; a PR that confl
   expect(dropped.map((d) => [d.member.pr, d.why])).toEqual([[3, "conflicts with the other PRs"]]);
   const log = await sh(repo, "git", "log", "--format=%s", "origin/develop..origin/agetor/merge-train-x");
   expect(log.split("\n")).toEqual(["fix: feat-b (#2)", "fix: feat-a (#1)"]); // three wip commits squashed into one
+  // Each member records the head it was squashed from (not a cached, possibly stale one).
+  expect(members[0]!.headSha).toBe(await sh(repo, "git", "rev-parse", "origin/feat-a"));
 }, 30_000);
 
 test("sent by hand: a PR whose own checks are still running can ride; failing, conflicting, draft or commented ones can't", async () => {
