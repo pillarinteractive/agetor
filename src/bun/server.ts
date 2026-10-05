@@ -42,6 +42,7 @@ import { lastActivityAt } from "./activity-clock.ts";
 import { blockedByFor, blockingFor, dependencyTick, readDependencies, setDependencies } from "./dependencies.ts";
 import { activeTrain, mergedViaTrain, trainFor } from "./merge-train.ts";
 import { isPriority, readPriority, setPriority } from "./priority.ts";
+import { setMergeQueued } from "./merge-intent.ts";
 import { departTrainNow, refreshMergeColumn } from "./merge-queue.ts";
 import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
@@ -60,7 +61,7 @@ import { readBlockLog, summarizeBlocks } from "./block-log.ts";
 import { conductorStatus, conductorTaskId, ensureConductor } from "./conductor.ts";
 import { listPrStatuses } from "./pr-watch.ts";
 import { createTaskFromIssue, listIssueQueue } from "./issue-queue.ts";
-import { listActivity } from "./activity.ts";
+import { listActivity, recordActivity } from "./activity.ts";
 import { applySuggestion, listSuggestions } from "./suggestions.ts";
 import { listFollowUps, startFollowUp } from "./pipeline-followups.ts";
 import {
@@ -4710,6 +4711,17 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const updated = tasks.update(req.params.id, patch);
           if (!updated) {
             return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          // Sign-off (src/bun/merge-intent.ts) follows the user's own moves:
+          // into Ready to Merge signs off, out to In Review / Backlog withdraws.
+          // The pipeline runner moving a card while a step works on it doesn't.
+          if (patch.column && patch.column !== before.column && !before.pipelineParentId) {
+            if (patch.column === "merge") setMergeQueued(before.id, true);
+            else if (patch.column === "review" || patch.column === "backlog" || patch.column === "ready") {
+              if (setMergeQueued(before.id, false)) {
+                recordActivity(before.id, { kind: "task", text: "Sign-off withdrawn — moved out of Ready to Merge", tone: "muted" });
+              }
+            }
           }
           // Mirror behavioural changes onto a live claude session via slash
           // commands so the conversation context survives a model/mode/effort

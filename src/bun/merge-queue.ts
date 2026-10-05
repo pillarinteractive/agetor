@@ -221,9 +221,10 @@ export function departTrainNow(): Promise<{ train: { pr: number; url: string; me
 
 async function tick(now: number): Promise<void> {
   const list = tasks.list();
-  // The column is the user's say: in Ready to Merge → signed off; dragged
-  // back to In Review / Backlog → withdrawn. Running/Blocked/Done keep it
-  // (a fix-up step is working on it, or it merged).
+  // In Ready to Merge → signed off. Withdrawing is the user's own move out
+  // of the column (server.ts PATCH); a card the pipeline runner parked in In
+  // Review / Blocked / Running while a follow-up step works keeps its
+  // sign-off, and comes back to Ready to Merge when the run is done.
   for (const t of list) {
     if (t.pipelineParentId) continue;
     if (t.column === "merge" && t.archivedAt == null) setMergeQueued(t.id, true);
@@ -233,10 +234,15 @@ async function tick(now: number): Promise<void> {
   const prs = new Map<string, TaskPrStatus | null>();
   for (const id of mergeQueue()) {
     const t = list.find((x) => x.id === id);
-    if (!t || t.archivedAt != null || t.column === "done" || t.column === "review" || t.column === "backlog" || t.column === "ready") {
+    if (!t || t.archivedAt != null || t.column === "done") {
       setMergeQueued(id, false);
       readySince.delete(id);
-      if (t && (t.column === "review" || t.column === "backlog")) note(t, "Sign-off withdrawn — moved out of Ready to Merge", "muted");
+      continue;
+    }
+    // Signed off but parked outside the column while a step works on it:
+    // keep the sign-off, take no merge step until it's back.
+    if (t.column !== "merge" && t.column !== "running" && t.column !== "blocked") {
+      readySince.delete(id);
       continue;
     }
     const pr = prStatusForTask(id);
