@@ -480,6 +480,7 @@ export const api = {
   setBlockedBy: (taskId: string, ids: string[]) =>
     j<{ blockedBy: unknown[] }>(`/tasks/${encodeURIComponent(taskId)}/blocked-by`, { method: "PUT", body: JSON.stringify({ ids }) }, { retry: false }),
   /** Send a merge train now (src/bun/merge-queue.ts `departTrainNow`). */
+  refreshMergeQueue: () => j<{ ok: true }>("/merge-queue/refresh", { method: "POST" }, { retry: false }),
   departMergeTrain: () =>
     j<{ train: { pr: number; url: string; members: number[] } }>("/merge-train/depart", { method: "POST" }, { retry: false }),
   getConductor: () => j<{ taskId: string | null }>("/conductor"),

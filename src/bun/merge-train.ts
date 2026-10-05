@@ -332,6 +332,11 @@ async function disband(t: Train, why: string, prs: Map<string, TaskPrStatus | nu
   clearTrain(t.id);
 }
 
+async function trainPrState(t: Train): Promise<string | null> {
+  const r = await run(["gh", "pr", "view", String(t.pr), "--json", "state", "-q", ".state"], t.project, 20_000, process.env);
+  return r.ok ? r.stdout.trim() : null;
+}
+
 async function land(t: Train): Promise<void> {
   const via = mergedViaTrain();
   for (const m of t.members) {
@@ -356,6 +361,17 @@ async function land(t: Train): Promise<void> {
 /** Move the active train along: land it when green, disband it when it
  *  fails, conflicts, or a member changed or was withdrawn. */
 export async function advanceTrain(t: Train, prs: Map<string, TaskPrStatus | null>): Promise<"waiting" | "landed" | "disbanded"> {
+  // Merged or closed by hand on GitHub: finish the job (or stand down) rather
+  // than wait on a PR that will never change again.
+  const outside = await trainPrState(t);
+  if (outside === "MERGED") {
+    await land(t);
+    return "landed";
+  }
+  if (outside === "CLOSED") {
+    await disband(t, "its PR was closed", prs);
+    return "disbanded";
+  }
   // While the train is out, its members' own CI is redundant: cancel anything
   // pending on their branches (a late push, a re-run), and force-cancel runs a
   // plain cancel left stuck in the queue.

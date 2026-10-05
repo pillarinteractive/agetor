@@ -226,7 +226,7 @@ async function probe(task: Task): Promise<TaskPrStatus | null> {
 }
 
 /** One pass over the watched tasks. Exported for tests. */
-export async function prWatchTick(): Promise<void> {
+export async function prWatchTick(opts: { column?: Task["column"] } = {}): Promise<void> {
   if (inFlight) return;
   inFlight = true;
   let changed = false;
@@ -239,7 +239,7 @@ export async function prWatchTick(): Promise<void> {
         changed = true;
       }
     }
-    for (const task of tasksToWatch(all, statuses)) {
+    for (const task of tasksToWatch(all, statuses).filter((t) => !opts.column || t.column === opts.column)) {
       let next: TaskPrStatus | null;
       try {
         next = await probe(task);
@@ -266,6 +266,13 @@ export async function prWatchTick(): Promise<void> {
     inFlight = false;
   }
   if (changed) publishGlobalEvent({ kind: "prs", prs: listPrStatuses(), ts: Date.now() });
+}
+
+/** A pass right now for one column's cards (the board's refresh button):
+ *  waits out a pass already running so the result is fresh. */
+export async function refreshPrsNow(column: Task["column"]): Promise<void> {
+  for (let i = 0; inFlight && i < 120; i++) await Bun.sleep(500);
+  await prWatchTick({ column });
 }
 
 /** Timeline entries for what changed between two observations of a PR.

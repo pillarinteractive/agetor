@@ -26,6 +26,8 @@ interface Props {
   emptyHint?: string;
   /** Ready to Merge only: send a merge train now (src/bun/merge-queue.ts). */
   onMergeTogether?: () => void;
+  /** Re-check this column's PRs now (Ready to Merge). */
+  onRefresh?: () => Promise<unknown>;
   /** Id of the task currently open in the run panel (App.tsx's `selected`),
    *  or null/undefined when no panel is open. Threaded down to each
    *  `TaskCard` as `isOpen` so the unread dot is suppressed for the task
@@ -51,7 +53,8 @@ function sameTasks(a: Task[], b: Task[]): boolean {
 /** Done keeps piling up; show the newest few and fold the rest. */
 const COLLAPSE_AFTER: Partial<Record<ColumnId, number>> = { done: 5 };
 
-function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive, emptyHint, selectedTaskId, onContextMenu, onMergeTogether }: Props) {
+function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive, emptyHint, selectedTaskId, onContextMenu, onMergeTogether, onRefresh }: Props) {
+  const [refreshing, setRefreshing] = useState(false);
   const { setNodeRef, isOver } = useDroppable({ id });
   const [expanded, setExpanded] = useState(false);
   const limit = COLLAPSE_AFTER[id];
@@ -72,13 +75,33 @@ function ColumnImpl({ id, label, tasks, homeDir, onStart, onCancel, onDelete, on
         <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
           {label}
         </h2>
+        {onRefresh && (
+          <button
+            type="button"
+            data-testid="column-refresh"
+            disabled={refreshing}
+            onClick={() => {
+              setRefreshing(true);
+              void onRefresh().finally(() => setRefreshing(false));
+            }}
+            title="Check these PRs on GitHub now and take the next merge steps"
+            aria-label="Refresh Ready to Merge"
+            className={cn(
+              "rounded-md border border-border/60 px-1.5 py-0.5 text-[11px] font-medium text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-60",
+              !(onMergeTogether && tasks.length >= 2) && "ml-auto mr-2",
+              onMergeTogether && tasks.length >= 2 && "ml-auto",
+            )}
+          >
+            {refreshing ? "Refreshing…" : "Refresh"}
+          </button>
+        )}
         {onMergeTogether && tasks.length >= 2 && (
           <button
             type="button"
             data-testid="merge-together"
             onClick={onMergeTogether}
             title="Merge these PRs as one train now: one squashed commit per PR, CI runs once, then rebase-merged"
-            className="ml-auto mr-2 rounded-md border border-border/60 px-1.5 py-0.5 text-[11px] font-medium text-muted-foreground hover:bg-muted hover:text-foreground"
+            className={cn("mr-2 rounded-md border border-border/60 px-1.5 py-0.5 text-[11px] font-medium text-muted-foreground hover:bg-muted hover:text-foreground", onRefresh ? "ml-1.5" : "ml-auto")}
           >
             Merge together
           </button>

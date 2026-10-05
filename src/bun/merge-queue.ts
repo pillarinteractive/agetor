@@ -22,7 +22,7 @@ import { MERGE_TRAIN_PREF, activeTrain, advanceTrain, buildTrain, manualTrainEli
 import { preferences, tasks } from "./db.ts";
 import { recordActivity } from "./activity.ts";
 import { mergeQueue, setMergeQueued } from "./merge-intent.ts";
-import { hasConfirmedNoPr, ownFailures, prAgent, prStatusForTask, PR_FIX_CI_ACTION, PR_REVIEW_ACTION } from "./pr-watch.ts";
+import { hasConfirmedNoPr, ownFailures, prAgent, prStatusForTask, PR_FIX_CI_ACTION, PR_REVIEW_ACTION, refreshPrsNow } from "./pr-watch.ts";
 import { getGitHubPullMergeability, mergeGitHubPull, updateGitHubPullBranch } from "./github.ts";
 import { startFollowUp } from "./pipeline-followups.ts";
 
@@ -165,6 +165,13 @@ function exclusive<T>(fn: () => Promise<T>): Promise<T> {
 
 export function mergeQueueTick(now = Date.now()): Promise<void> {
   return exclusive(() => tick(now));
+}
+
+/** The Ready to Merge column's refresh button: re-read its cards' PRs from
+ *  GitHub now, then take the queue's next steps (including an active train). */
+export async function refreshMergeColumn(): Promise<void> {
+  await refreshPrsNow("merge");
+  await mergeQueueTick();
 }
 
 /**

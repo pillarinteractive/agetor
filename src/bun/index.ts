@@ -4,7 +4,7 @@ import Electrobun, { ApplicationMenu, BrowserWindow, Screen, Updater, Utils } fr
 import { rehydratePath } from "./login-path.ts";
 import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts";
 import { db, harnesses, pidFilePath, tasks, dataDir } from "./db.ts";
-import { reconcileOrphans, rearmFxAutoResumes, sweepArchivedTeardowns, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
+import { reconcileOrphans, rearmFxAutoResumes, sweepArchivedTeardowns, sweepDoneTeardowns, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
 import { initPipelineRunner, reconcilePipelineRuns } from "./pipeline-runner.ts";
 import { ensureDisclaimedServer } from "./tmux-resolution.ts";
 import { SESSION_REAP_SWEEP_MS, USAGE_POLL_SWEEP_MS, FONT_SIZE_DEFAULT, FONT_SIZE_BASE_PX } from "../shared/types.ts";
@@ -185,6 +185,16 @@ if (rearmedFxAutoResumeCount > 0) {
 // because agetor quit or crashed before the job fired. Fire-and-forget — it
 // only enqueues jobs onto that queue, keyed to this instance's own task ids.
 sweepArchivedTeardowns();
+
+// Done cards' worktrees: detached once they've sat in Done a while with
+// nothing running (branch kept; re-attaches on reopen). Best-effort.
+setInterval(() => {
+  try {
+    sweepDoneTeardowns();
+  } catch {
+    // background hygiene only
+  }
+}, 5 * 60_000).unref?.();
 
 // Idle-session reaper (docs/plans/reduce-cpu-and-memory.md §3.1, T4): kills
 // claude REPL tmux sessions that have sat idle (no turn in flight, nothing

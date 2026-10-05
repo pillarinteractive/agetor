@@ -6130,7 +6130,7 @@ export async function createTask(
  */
 function enqueueArchiveTeardown(
   task: Task,
-  opts?: { force?: boolean },
+  opts?: { force?: boolean; done?: boolean },
 ): { promise: Promise<void>; result: () => WorktreeTeardownResult | undefined } {
   const kind = resolveHarness(task.agent)?.kind;
   let result: WorktreeTeardownResult | undefined;
@@ -6167,7 +6167,9 @@ function enqueueArchiveTeardown(
     // that started after we enqueued, which we must not tear down under.
     const cur = tasks.get(task.id);
     const liveHandle = cur?.runId ? active.get(cur.runId) : undefined;
-    if (!cur || cur.archivedAt == null || (liveHandle && !liveHandle.cancelled)) {
+    // `done`: the Done-column sweep — the card must still be sitting in Done.
+    const stillWanted = opts?.done ? cur?.column === "done" && cur.archivedAt == null : cur?.archivedAt != null;
+    if (!cur || !stillWanted || (liveHandle && !liveHandle.cancelled)) {
       result = { removed: false, reason: "failed" };
       return;
     }
@@ -6543,6 +6545,33 @@ export function sweepArchivedTeardowns(): number {
     // a trade worth making. A dirty worktree just stays stuck until the user
     // forces it from the Worktrees page.
     enqueueArchiveTeardown(task);
+    enqueued++;
+  }
+  return enqueued;
+}
+
+/** How long a card sits in Done before its worktree is detached. */
+export const DONE_TEARDOWN_AFTER_MS = 10 * 60_000;
+
+/**
+ * Done cards keep nothing in their worktree that the branch doesn't — the
+ * work is merged or abandoned — so once one has sat in Done for
+ * `DONE_TEARDOWN_AFTER_MS` with nothing running, detach its worktree exactly
+ * as archiving would (`enqueueArchiveTeardown`: sessions, terminals, then
+ * `detachWorktree`). The branch survives and the checkout re-attaches if the
+ * card is reopened; a dirty worktree is left alone. Returns the count enqueued.
+ */
+export function sweepDoneTeardowns(now = Date.now()): number {
+  let enqueued = 0;
+  const all = tasks.list();
+  for (const task of all) {
+    if (task.archivedAt != null || task.column !== "done") continue;
+    if (task.pipelineParentId || !task.worktreePath || !existsSync(task.worktreePath)) continue;
+    if (now - task.updatedAt < DONE_TEARDOWN_AFTER_MS) continue;
+    if (isTaskRunLive(task.id)) continue;
+    // A pipeline's steps share its worktree: wait until none is running.
+    if (all.some((s) => s.pipelineParentId === task.id && isTaskRunLive(s.id))) continue;
+    enqueueArchiveTeardown(task, { done: true });
     enqueued++;
   }
   return enqueued;

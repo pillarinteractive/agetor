@@ -41,7 +41,7 @@ import { stalledSince } from "./stall-registry.ts";
 import { lastActivityAt } from "./activity-clock.ts";
 import { blockedByFor, blockingFor, readDependencies, setDependencies } from "./dependencies.ts";
 import { activeTrain, mergedViaTrain, trainFor } from "./merge-train.ts";
-import { departTrainNow } from "./merge-queue.ts";
+import { departTrainNow, refreshMergeColumn } from "./merge-queue.ts";
 import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
 import {
@@ -3323,6 +3323,14 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             });
           }
           return json(digest, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Ready to Merge's refresh button: re-read its PRs and step the queue now.
+      "/merge-queue/refresh": {
+        POST: authed(async (req) => {
+          await refreshMergeColumn();
+          return json({ ok: true }, { headers: corsHeaders(req) });
         }),
       },
 

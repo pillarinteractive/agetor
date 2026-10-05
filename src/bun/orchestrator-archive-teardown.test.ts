@@ -285,6 +285,38 @@ test("sweepArchivedTeardowns enqueues teardown for a task stranded archived-with
   }
 });
 
+test("sweepDoneTeardowns detaches a Done card's worktree once it has sat there a while, keeping the branch", async () => {
+  const { createTask, pendingTeardown, sweepDoneTeardowns, DONE_TEARDOWN_AFTER_MS } = await import("./orchestrator.ts");
+  const { prepareWorkdir } = await import("./worktree.ts");
+  const { db, tasks } = await import("./db.ts");
+
+  const repo = await makeRepo();
+  const created = await createTask({ title: "done sweep", prompt: "p", agent: "claude-code", workdir: repo, isolation: "worktree" });
+  if ("error" in created) throw new Error(created.error);
+  const taskId = created.task.id;
+
+  try {
+    const prepared = await prepareWorkdir(created.task);
+    if ("error" in prepared) throw new Error(prepared.error);
+    tasks.update(taskId, { branch: prepared.branch, worktreePath: prepared.worktreePath, column: "done" });
+    const worktreePath = prepared.worktreePath!;
+    const doneAt = tasks.get(taskId)!.updatedAt;
+
+    // Just moved to Done: left alone.
+    sweepDoneTeardowns(doneAt + 1000);
+    await pendingTeardown(taskId);
+    expect(existsSync(worktreePath)).toBe(true);
+
+    sweepDoneTeardowns(doneAt + DONE_TEARDOWN_AFTER_MS + 1000);
+    await pendingTeardown(taskId);
+    expect(existsSync(worktreePath)).toBe(false);
+    const branches = Bun.spawnSync(["git", "branch", "--list", prepared.branch!], { cwd: repo }).stdout.toString();
+    expect(branches).toContain(prepared.branch!);
+  } finally {
+    db.run(`DELETE FROM tasks WHERE id = ?`, [taskId]);
+  }
+});
+
 test("FIFO ordering: pendingTeardown(b) resolving implies a's teardown (enqueued first) has already completed", async () => {
   // Documents (and relies on) the teardown queue being a per-workdir FIFO
   // chain, per enqueueTeardown's contract in orchestrator.ts. Both tasks here

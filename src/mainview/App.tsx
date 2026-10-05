@@ -1511,6 +1511,13 @@ function AppInner() {
       .then((r) => toast.success(`Merge train #${r.train.pr} is out`, { description: `${r.train.members.map((n) => `#${n}`).join(", ")} — CI runs once; it merges when green.` }))
       .catch((e) => toast.error("Couldn't send a merge train", { description: e instanceof Error ? e.message : String(e) }));
   }, []);
+  const refreshMerge = useCallback(
+    () =>
+      api
+        .refreshMergeQueue()
+        .catch((e) => toast.error("Couldn't refresh Ready to Merge", { description: e instanceof Error ? e.message : String(e) })),
+    [],
+  );
   const openIssuesPage = useCallback(() => {
     navigate({ kind: "issues" });
   }, [navigate]);
@@ -2320,6 +2327,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                             selectedTaskId={selected?.id ?? null}
                             onContextMenu={openTaskMenu}
                             onMergeTogether={c.id === "merge" ? mergeTogether : undefined}
+                            onRefresh={c.id === "merge" ? refreshMerge : undefined}
                           />
                         ))}
                       </div>
