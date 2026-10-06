@@ -41,7 +41,6 @@ import { LeaseContext } from "@/lib/leases";
 import { PrContext } from "@/lib/prs";
 import { ProgressContext } from "@/lib/progress";
 import { IssuesPage } from "@/components/issues/IssuesPage";
-import { NeedsYouBar } from "@/components/kanban/NeedsYouBar";
 import { BlockedByDialog } from "@/components/kanban/BlockedByDialog";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
@@ -2295,18 +2294,6 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                 transition={{ duration: 0.18 }}
                 className="flex min-h-0 flex-1 flex-col"
               >
-                <NeedsYouBar
-                  tasks={conductorId ? tasks.filter((t) => t.id !== conductorId) : tasks}
-                  prs={prs}
-                  leases={leases}
-                  onOpen={openTask}
-                  onRetry={(t) => {
-                    void api.retryPipeline(t.id).then(() => refresh()).catch(surfaceError);
-                  }}
-                  onOpenPr={(url) => {
-                    void api.openExternal(url).catch(surfaceError);
-                  }}
-                />
                 {onboardingVisibility.showChecklist && tasks.length > 0 && (
                   <div className="px-4 pt-3">
                     <OnboardingChecklist
