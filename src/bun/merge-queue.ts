@@ -61,7 +61,13 @@ export function nextMergeStep(
   if (mergeability?.mergeable === false || mergeability?.mergeableState === "dirty") {
     return followUps ? { kind: "resolve-conflicts" } : { kind: "needs-you", why: `PR #${pr.number} conflicts with ${pr.baseRef ?? "its base"}` };
   }
-  if ((pr.behindBy ?? 0) > 0) return { kind: "update-branch" };
+  // Bring the base in only when it helps: GitHub requires an up-to-date
+  // branch to merge ("behind"), or CI is failing and the base may already
+  // carry the fix. A green PR that's merely behind merges as it is (a merge
+  // train rebuilds on the latest base anyway) — updating restarts its CI, and
+  // with several PRs queued every merge would restart all the others.
+  if (mergeability?.mergeableState === "behind") return { kind: "update-branch" };
+  if ((pr.behindBy ?? 0) > 0 && pr.checks === "failure") return { kind: "update-branch" };
   if (pr.checks === "failure") {
     if (ownFailures(pr).length === 0) return { kind: "wait", why: `${pr.baseRef ?? "the base"} is failing the same checks` };
     return followUps ? { kind: "fix-ci" } : { kind: "needs-you", why: `PR #${pr.number} CI failing` };
@@ -150,9 +156,22 @@ async function take(task: Task, pr: TaskPrStatus | null, step: MergeStep): Promi
 }
 
 /** One pass. Exported for tests. */
-/** When each train-eligible card became ready (in memory: rebuilt within a
- *  window after a restart). */
-const readySince = new Map<string, number>();
+/** When each train-eligible card became ready. Persisted (`merge_ready_since`) so an app restart doesn't restart every
+ *  green card's wait for company. */
+const READY_SINCE_PREF = "merge_ready_since";
+const readySince = new Map<string, number>(
+  (() => {
+    try {
+      const v = JSON.parse(preferences.get(READY_SINCE_PREF) ?? "{}") as Record<string, unknown>;
+      return Object.entries(v).filter((e): e is [string, number] => typeof e[1] === "number");
+    } catch {
+      return [];
+    }
+  })(),
+);
+function saveReadySince(): void {
+  preferences.set(READY_SINCE_PREF, JSON.stringify(Object.fromEntries(readySince)));
+}
 
 /** One merge-queue action at a time: the minute tick and the user's "Merge
  *  together" button must never build two trains or merge the same PR twice. */
@@ -268,6 +287,7 @@ async function tick(now: number): Promise<void> {
   const eligibleIds = new Set(eligible.map((e) => e.t.id));
   for (const id of [...readySince.keys()]) if (!eligibleIds.has(id)) readySince.delete(id);
   for (const e of eligible) if (!readySince.has(e.t.id)) readySince.set(e.t.id, now);
+  saveReadySince();
   if (cfg.enabled && !activeTrain()) {
     const groups = new Map<string, Eval[]>();
     for (const e of eligible) {

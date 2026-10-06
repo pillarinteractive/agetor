@@ -37,7 +37,7 @@ test("plain tasks can't run fix-up steps — those need the user", () => {
   expect(nextMergeStep(plain, pr(), { mergeable: false, mergeableState: "dirty" }).kind).toBe("needs-you");
   expect(nextMergeStep(plain, pr({ unresolvedThreads: 1 }), clean).kind).toBe("needs-you");
   // …but updating the branch and merging don't need an agent.
-  expect(nextMergeStep(plain, pr({ behindBy: 1 }), clean).kind).toBe("update-branch");
+  expect(nextMergeStep(plain, pr({ behindBy: 1 }), clean).kind).toBe("merge");
   expect(nextMergeStep(plain, pr(), clean).kind).toBe("merge");
 });
 
@@ -49,4 +49,12 @@ test("closed or draft PRs need the user", () => {
 test("no PR status because the lookup failed isn't 'no PR' — it waits instead of opening another", () => {
   expect(nextMergeStep(card(), null, null, false)).toEqual({ kind: "wait", why: "checking for a PR" });
   expect(nextMergeStep(card(), null, null, true).kind).toBe("open-pr");
+});
+
+test("behind the base: merge a green PR as it is; update only when GitHub requires it or CI is failing", () => {
+  const behind = { mergeable: true, mergeableState: "behind" };
+  expect(nextMergeStep(card(), pr({ behindBy: 3 }), clean).kind).toBe("merge");
+  expect(nextMergeStep(card(), pr({ behindBy: 3, checks: "pending" }), clean).kind).toBe("wait");
+  expect(nextMergeStep(card(), pr({ behindBy: 3 }), behind).kind).toBe("update-branch");
+  expect(nextMergeStep(card(), pr({ behindBy: 3, checks: "failure", failingChecks: [{ name: "x", url: null }] as never }), clean).kind).toBe("update-branch");
 });
