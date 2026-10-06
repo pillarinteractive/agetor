@@ -93,6 +93,23 @@ import type {
   WorktreeInfo,
   WorktreeTeardownResult,
 } from "../../shared/types.ts";
+export interface AutopilotConfigDto {
+  enabled: boolean;
+  threadId: string;
+  project: string;
+  milestone: { number: number; title: string } | null;
+  maxInFlight: number;
+  pipelineId: string | null;
+}
+export interface AutopilotStateDto {
+  phase: "idle" | "running" | "auditing" | "done";
+  cards: string[];
+  held: string[];
+  audits: number;
+  lastAnswer: { at: number; kind: "next" | "audit"; text: string } | null;
+  lastError: string | null;
+  updatedAt: number;
+}
 import { TASK_EVENTS_REPLAY_META_EVENT } from "../../shared/types.ts";
 import { fetchWithRecovery } from "./net-retry.ts";
 
@@ -482,6 +499,9 @@ export const api = {
   setBlockedBy: (taskId: string, ids: string[]) =>
     j<{ blockedBy: unknown[] }>(`/tasks/${encodeURIComponent(taskId)}/blocked-by`, { method: "PUT", body: JSON.stringify({ ids }) }, { retry: false }),
   /** Send a merge train now (src/bun/merge-queue.ts `departTrainNow`). */
+  getAutopilot: () => j<{ config: AutopilotConfigDto; state: AutopilotStateDto }>("/autopilot"),
+  setAutopilot: (patch: Partial<AutopilotConfigDto> & { restart?: boolean }) =>
+    j<{ config: AutopilotConfigDto; state: AutopilotStateDto }>("/autopilot", { method: "PUT", body: JSON.stringify(patch) }, { retry: false }),
   refreshMergeQueue: () => j<{ ok: true }>("/merge-queue/refresh", { method: "POST" }, { retry: false }),
   departMergeTrain: () =>
     j<{ train: { pr: number; url: string; members: number[] } }>("/merge-train/depart", { method: "POST" }, { retry: false }),

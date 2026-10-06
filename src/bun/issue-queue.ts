@@ -75,13 +75,23 @@ export async function createTaskFromIssue(input: {
   number: number;
   pipelineId: string;
   start?: boolean;
+  /** Appended to the prompt (e.g. Autopilot's scope clarification). */
+  extraPrompt?: string;
+  /** A Done card on the issue doesn't count as "already working on it" (a
+   *  reopened issue gets a new card). */
+  allowAfterDone?: boolean;
 }): Promise<{ task: Task } | { error: string; status: 400 | 409 | 502 }> {
   const thread = await gitHost.issueThread({ dir: input.dir, number: input.number, includeComments: true });
   if (!thread.ok) return { error: thread.error, status: 502 };
-  const existing = taskForIssue(thread.item.htmlUrl, tasks.list());
+  const existing = taskForIssue(
+    thread.item.htmlUrl,
+    tasks.list().filter((t) => !input.allowAfterDone || t.column !== "done"),
+  );
   if (existing) return { error: `"${existing.title}" is already working on this issue`, status: 409 };
 
-  const prompt = `${buildIssueTaskPrompt({ ...thread, snapshotAttached: true }).prompt}\n\n${fixesLine(thread.item.number)}`;
+  const prompt =
+    `${buildIssueTaskPrompt({ ...thread, snapshotAttached: true }).prompt}\n\n${fixesLine(thread.item.number)}` +
+    (input.extraPrompt ? `\n\n${input.extraPrompt}` : "");
   const start = input.start !== false;
   const created = await createTask({
     title: issueTaskTitle(thread.item),

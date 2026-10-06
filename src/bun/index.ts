@@ -1,4 +1,5 @@
 import { writeFileSync, existsSync } from "node:fs";
+import { startAutopilot } from "./autopilot.ts";
 import { startBranchSweep } from "./branch-sweep.ts";
 import { startAwaitLoop } from "./awaits.ts";
 import { isAbsolute } from "node:path";
@@ -544,6 +545,7 @@ startMergeQueueLoop();
 startSlotScheduler();
 startAwaitLoop();
 startBranchSweep();
+startAutopilot();
 
 // Every card gets a GitHub issue (src/bun/auto-issue.ts): catch up live
 // cards that don't have one yet.

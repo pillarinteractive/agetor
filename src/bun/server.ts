@@ -44,6 +44,7 @@ import { activeTrain, mergedViaTrain, trainFor } from "./merge-train.ts";
 import { isPriority, readPriority, setPriority } from "./priority.ts";
 import { setMergeQueued } from "./merge-intent.ts";
 import { KEEP_AWAKE_PREF_KEY, KEEP_SCREEN_ON_PREF_KEY, recheckKeepAwake } from "./keep-awake.ts";
+import { AUTOPILOT_PREF, AUTOPILOT_STATE_PREF, autopilotTick, parseConfig as parseAutopilotConfig, readState as readAutopilotState } from "./autopilot.ts";
 import { departTrainNow, refreshMergeColumn } from "./merge-queue.ts";
 import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
@@ -3326,6 +3327,26 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             });
           }
           return json(digest, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Milestone Autopilot (src/bun/autopilot.ts).
+      "/autopilot": {
+        GET: authed((req) =>
+          json({ config: parseAutopilotConfig(preferences.get(AUTOPILOT_PREF)), state: readAutopilotState() }, { headers: corsHeaders(req) }),
+        ),
+        PUT: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
+          const cur = parseAutopilotConfig(preferences.get(AUTOPILOT_PREF));
+          const next = parseAutopilotConfig(JSON.stringify({ ...cur, ...body }));
+          preferences.set(AUTOPILOT_PREF, JSON.stringify(next));
+          // Starting (or changing milestone) begins a fresh run.
+          if (body.restart === true || (next.enabled && (!cur.enabled || cur.milestone?.number !== next.milestone?.number))) {
+            const s = readAutopilotState();
+            preferences.set(AUTOPILOT_STATE_PREF, JSON.stringify({ ...s, phase: "idle", held: [], lastError: null, quietUntil: 0, quietSignature: "" }));
+          }
+          if (next.enabled) void autopilotTick().catch(() => undefined);
+          return json({ config: next, state: readAutopilotState() }, { headers: corsHeaders(req) });
         }),
       },
 

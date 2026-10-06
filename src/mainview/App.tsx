@@ -27,6 +27,7 @@ import {
   X,
   Sparkles,
   Link2,
+  Rocket,
   Sun,
   SunDim,
   Zap,
@@ -41,6 +42,7 @@ import { LeaseContext } from "@/lib/leases";
 import { PrContext } from "@/lib/prs";
 import { ProgressContext } from "@/lib/progress";
 import { IssuesPage } from "@/components/issues/IssuesPage";
+import { AutopilotDialog } from "@/components/kanban/AutopilotDialog";
 import { BlockedByDialog } from "@/components/kanban/BlockedByDialog";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
@@ -1525,6 +1527,7 @@ function AppInner() {
         .catch((e) => toast.error("Couldn't refresh Ready to Merge", { description: e instanceof Error ? e.message : String(e) })),
     [],
   );
+  const [autopilotOpen, setAutopilotOpen] = useState(false);
   // Board header toggle: hold `caffeinate -d` (src/bun/keep-awake.ts).
   const [keepScreenOn, setKeepScreenOn] = useState(false);
   useEffect(() => {
@@ -2180,6 +2183,16 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
             )}
           </Button>
           <Button
+            variant={autopilotOpen ? "secondary" : "ghost"}
+            size="icon"
+            data-testid="autopilot-button"
+            onClick={() => setAutopilotOpen(true)}
+            aria-label="Milestone Autopilot"
+            title="Milestone Autopilot"
+          >
+            <Rocket className="size-4" />
+          </Button>
+          <Button
             variant={keepScreenOn ? "secondary" : "ghost"}
             size="icon"
             data-testid="keep-screen-on"
@@ -2482,6 +2495,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         </ProgressContext.Provider>
       </div>
       <BlockedByDialog task={blockedByTask} tasks={tasks} onClose={() => setBlockedByTask(null)} />
+      <AutopilotDialog open={autopilotOpen} projects={projects} tasks={tasks} onClose={() => setAutopilotOpen(false)} />
       <RunPanel
         task={selected}
         stickyUserMessages={stickyUserMessages}
