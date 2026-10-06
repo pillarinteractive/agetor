@@ -7,7 +7,6 @@ import { startLeaseWatchLoop } from "./lease-watch.ts";
 import { startKeepAwakeLoop } from "./keep-awake.ts";
 import { startPrWatchLoop } from "./pr-watch.ts";
 import { startProgressWatchLoop } from "./progress-watch.ts";
-import { startConductorLoop } from "./conductor.ts";
 import { startDependencyLoop } from "./dependencies.ts";
 import { startMergeQueueLoop } from "./merge-queue.ts";
 import { startSlotScheduler } from "./pipeline-runner.ts";
@@ -187,8 +186,6 @@ export async function runDaemon(): Promise<void> {
   startPrWatchLoop();
   // Live run progress — same as index.ts; timer is unref'd.
   startProgressWatchLoop();
-  // Conductor board updates — same as index.ts; timer is unref'd.
-  startConductorLoop();
   // Card dependencies — same as index.ts; timer is unref'd.
   startDependencyLoop();
   // Ready to Merge — same as index.ts; timer is unref'd.

@@ -13,9 +13,9 @@ test("parseConfig: defaults to off, 5 in flight, clamps to 10", () => {
 
 test("taggedJson reads the block the thread ends with", () => {
   const text = 'Thinking…\n<next-issues>[{"number": 12, "scope": "- do x"}]</next-issues>';
-  expect(taggedJson(text, "next-issues")).toEqual([{ number: 12, scope: "- do x" }]);
-  expect(taggedJson("no block", "next-issues")).toBeNull();
-  expect(taggedJson("<audit>{not json}</audit>", "audit")).toBeNull();
+  expect(taggedJson<unknown>(text, "next-issues")).toEqual([{ number: 12, scope: "- do x" }]);
+  expect(taggedJson<unknown>("no block", "next-issues")).toBeNull();
+  expect(taggedJson<unknown>("<audit>{not json}</audit>", "audit")).toBeNull();
 });
 
 test("acceptPicks keeps open, unworked, unique picks within the free slots", () => {

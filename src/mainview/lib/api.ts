@@ -492,7 +492,6 @@ export const api = {
   /** Every lease watcher's latest status (src/bun/lease-watch.ts). */
   getLeases: () => j<LeaseStatus[]>("/leases"),
   getProgress: () => j<TaskProgress[]>("/progress"),
-  /** The Conductor chat agent (src/bun/conductor.ts). */
   /** Replace the cards a card is blocked by (src/bun/dependencies.ts). */
   setPriority: (taskId: string, on: boolean) =>
     j<{ ok: true; priority: boolean }>(`/tasks/${encodeURIComponent(taskId)}/priority`, { method: "PUT", body: JSON.stringify({ on }) }, { retry: false }),
@@ -505,8 +504,6 @@ export const api = {
   refreshMergeQueue: () => j<{ ok: true }>("/merge-queue/refresh", { method: "POST" }, { retry: false }),
   departMergeTrain: () =>
     j<{ train: { pr: number; url: string; members: number[] } }>("/merge-train/depart", { method: "POST" }, { retry: false }),
-  getConductor: () => j<{ taskId: string | null }>("/conductor"),
-  startConductor: () => j<Task>("/conductor", { method: "POST" }, { retry: false }),
   /** Every watched task's pull request (src/bun/pr-watch.ts). */
   getPrs: () => j<TaskPrStatus[]>("/prs"),
   /** Orchestrator suggestions with a ready fix (src/bun/suggestions.ts). */

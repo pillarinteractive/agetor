@@ -22,7 +22,12 @@ export interface ThreadAnswer {
   ok: boolean;
   text: string;
   error?: string;
+  /** The thread is open elsewhere (Codex Desktop holds its single-writer lock). */
+  busy?: boolean;
 }
+
+export const THREAD_BUSY_MESSAGE =
+  "The thread is open in Codex Desktop, which locks it — switch to another thread there (or quit Codex) so Autopilot can use it. Retrying every 5 minutes.";
 
 /** Pull the JSON inside `<tag>…</tag>` out of an answer, or null. Pure. */
 export function taggedJson<T>(text: string, tag: string): T | null {
@@ -70,7 +75,11 @@ async function askNow(input: { threadId: string; cwd: string; prompt: string; ti
     } catch {
       // no final message written
     }
-    if (!r.ok && !text) return { ok: false, text: "", error: (r.stderr || r.stdout || "codex exited with an error").slice(-500) };
+    if (!r.ok && !text) {
+      const raw = `${r.stderr ?? ""}\n${r.stdout ?? ""}`;
+      if (/already has an active writer/i.test(raw)) return { ok: false, text: "", busy: true, error: THREAD_BUSY_MESSAGE };
+      return { ok: false, text: "", error: (r.stderr || r.stdout || "codex exited with an error").slice(-500) };
+    }
     return { ok: !!text, text, error: text ? undefined : "the thread gave no answer" };
   } finally {
     rmSync(dir, { recursive: true, force: true });

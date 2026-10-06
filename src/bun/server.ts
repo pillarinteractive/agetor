@@ -60,7 +60,6 @@ import { listLeases } from "./lease-watch.ts";
 import { listProgress } from "./progress-watch.ts";
 import { buildBoardDigest, renderBoardDigest } from "./board-digest.ts";
 import { readBlockLog, summarizeBlocks } from "./block-log.ts";
-import { conductorStatus, conductorTaskId, ensureConductor } from "./conductor.ts";
 import { listPrStatuses } from "./pr-watch.ts";
 import { createTaskFromIssue, listIssueQueue } from "./issue-queue.ts";
 import { listActivity, recordActivity } from "./activity.ts";
@@ -3306,7 +3305,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       },
 
       // The whole board in one read (src/bun/board-digest.ts); `?format=text`
-      // is what `agetor board` and the Conductor read.
+      // is what `agetor board` reads.
       // Every pipeline block so far, grouped (src/bun/block-log.ts);
       // `?days=N` limits the window (default 14).
       "/blocks": {
@@ -3319,8 +3318,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
 
       "/board/digest": {
         GET: authed((req) => {
-          const id = conductorTaskId();
-          const digest = buildBoardDigest({ exclude: new Set(id ? [id] : []) });
+          const digest = buildBoardDigest();
           if (new URL(req.url).searchParams.get("format") === "text") {
             return new Response(renderBoardDigest(digest), {
               headers: { ...corsHeaders(req), "content-type": "text/plain; charset=utf-8" },
@@ -3365,18 +3363,6 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           return "error" in r
             ? json({ error: r.error }, { status: 409, headers: corsHeaders(req) })
             : json(r, { headers: corsHeaders(req) });
-        }),
-      },
-
-      // The Conductor chat agent (src/bun/conductor.ts): GET its task id and
-      // config; POST creates and starts it the first time, then returns it.
-      "/conductor": {
-        GET: authed((req) => json(conductorStatus(), { headers: corsHeaders(req) })),
-        POST: authed(async (req) => {
-          const result = await ensureConductor();
-          return "error" in result
-            ? json({ error: result.error }, { status: 400, headers: corsHeaders(req) })
-            : json(result.task, { headers: corsHeaders(req) });
         }),
       },
 

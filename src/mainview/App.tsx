@@ -9,7 +9,6 @@ import {
   CheckCircle2,
   CircleDot,
   Copy,
-  FolderGit2,
   FolderOpen,
   Folder,
   GitBranch,
@@ -25,7 +24,6 @@ import {
   Trash2,
   Workflow,
   X,
-  Sparkles,
   Link2,
   Rocket,
   Sun,
@@ -55,7 +53,6 @@ import { visibleTopbarAgents } from "@/lib/usage";
 import { KanbanFilters } from "@/components/kanban/KanbanFilters";
 import { isMacPlatform } from "@/lib/platform";
 import { FIND_SHORTCUT_BLOCKING_LAYERS, isFindShortcut } from "@/lib/find-shortcut";
-import { NewTaskForm } from "@/components/kanban/NewTaskForm";
 import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
 import { useAgentProfiles } from "@/lib/agent-profiles";
 import { usePipelines } from "@/lib/pipelines";
@@ -66,7 +63,6 @@ import { ThemeProvider, useTheme } from "@/components/theme-provider";
 import { TmuxInstallDialog } from "@/components/tmux/TmuxInstallDialog";
 import { TmuxMissingBanner, errorIsTmuxMissing, isTmuxMissing } from "@/components/tmux/TmuxMissingBanner";
 import { UpdateBanner } from "@/components/updater/UpdateBanner";
-import { WorktreesDialog } from "@/components/worktrees/WorktreesDialog";
 import { WelcomeDialog } from "@/components/onboarding/WelcomeDialog";
 import { OnboardingChecklist } from "@/components/onboarding/OnboardingChecklist";
 import type { UpdateSnapshot } from "@/lib/api";
@@ -326,7 +322,6 @@ function AppInner() {
   const [welcomeAcknowledged, setWelcomeAcknowledged] = useState(false);
   // Nonce bumped by onboarding's "Choose a project…" / "Create your first
   // task" actions — NewTaskForm reacts to increments (expand + focus Title).
-  const [newTaskFocusNonce, setNewTaskFocusNonce] = useState(0);
   const [githubOpen, setGithubOpen] = useState(false);
   // Set by RunPanel's "Open PR" chip to open GitHubDialog pre-seeded for a
   // specific task; cleared when the dialog closes so a later plain "GitHub"
@@ -340,13 +335,10 @@ function AppInner() {
   // `githubPullDetailPrefill`) so pulls and issues share one mechanism —
   // see `GitHubItemDetailPrefill`'s doc comment in GitHubDialog.tsx.
   const [githubItemDetailPrefill, setGithubItemDetailPrefill] = useState<GitHubItemDetailPrefill | null>(null);
-  const [worktreesOpen, setWorktreesOpen] = useState(false);
   const [tmuxDialogOpen, setTmuxDialogOpen] = useState(false);
   const [updateSnapshot, setUpdateSnapshot] = useState<UpdateSnapshot | null>(null);
   const [leases, setLeases] = useState<LeaseStatus[]>([]);
   const [progress, setProgress] = useState<TaskProgress[]>([]);
-  // The Conductor chat agent's task — hidden from the columns, opened from the top bar.
-  const [conductorId, setConductorId] = useState<string | null>(null);
   const [prs, setPrs] = useState<ReadonlyMap<string, TaskPrStatus>>(new Map());
   const applyPrs = useCallback((list: TaskPrStatus[]) => setPrs(new Map(list.map((p) => [p.taskId, p]))), []);
   const [homeDir, setHomeDir] = useState<string>("");
@@ -650,7 +642,6 @@ function AppInner() {
     api.getLeases().then(setLeases).catch(() => { /* fine */ });
     api.getPrs().then(applyPrs).catch(() => { /* fine */ });
     api.getProgress().then(setProgress).catch(() => { /* fine */ });
-    api.getConductor().then((c) => setConductorId(c.taskId)).catch(() => { /* fine */ });
     // Skip poll ticks while the window is hidden — a backgrounded kanban
     // board has no reason to keep re-fetching + re-rendering every 2s/15s.
     // The intervals themselves keep running (cheap — it's just the fetch +
@@ -1404,7 +1395,6 @@ function AppInner() {
       // state itself still holds them (the run panel's `selected`-sync
       // effect and `GET /tasks/:id/pipeline` both need the full list/row).
       if (t.pipelineParentId != null) return false;
-      if (t.id === conductorId) return false;
       if (q) {
         // The card's PR number too ("334", "#334", "pr 334"), so a PR link finds its card.
         const prNum = prNumberFromUrl(t.prUrl);
@@ -1418,7 +1408,7 @@ function AppInner() {
       if (archivedView === "archived" && t.archivedAt == null) return false;
       return true;
     });
-  }, [tasks, textQuery, repoFilter, harnessFilter, typeFilter, archivedView, conductorId]);
+  }, [tasks, textQuery, repoFilter, harnessFilter, typeFilter, archivedView]);
 
   const visibleColumns = useMemo(
     () => (statusFilter.length === 0 ? COLUMNS : COLUMNS.filter((c) => statusFilter.includes(c.id))),
@@ -1549,24 +1539,6 @@ function AppInner() {
   const openIssuesPage = useCallback(() => {
     navigate({ kind: "issues" });
   }, [navigate]);
-  const conductorTask = conductorId ? (tasks.find((t) => t.id === conductorId) ?? null) : null;
-  const [conductorStarting, setConductorStarting] = useState(false);
-  // Open the Conductor's chat, creating and starting it the first time.
-  const openConductor = useCallback(() => {
-    if (conductorTask) {
-      openTask(conductorTask);
-      return;
-    }
-    setConductorStarting(true);
-    api
-      .startConductor()
-      .then((t) => {
-        setConductorId(t.id);
-        openTask(t);
-      })
-      .catch((e) => toast.error("Couldn't start the Conductor", { description: e instanceof Error ? e.message : String(e) }))
-      .finally(() => setConductorStarting(false));
-  }, [conductorTask, openTask]);
   // From the issue queue: open the card working on an issue (a pipeline
   // task opens its run view, like a board click).
   const openTaskById = useCallback((taskId: string) => {
@@ -1584,9 +1556,10 @@ function AppInner() {
     setSettingsInitialSection(undefined);
     navigate({ kind: "pipelines", pipelineId: id, editing });
   }, [navigate]);
+  // Work starts from GitHub issues: onboarding's "new task" opens the Issues page.
   const onFocusNewTask = useCallback(() => {
-    setNewTaskFocusNonce((n) => n + 1);
-  }, []);
+    navigate({ kind: "issues" });
+  }, [navigate]);
   const onOpenOnboardingTerminal = useCallback((harnessId: string) => {
     void api.openHarnessTerminal(harnessId).catch((e: unknown) => {
       const message = e instanceof Error ? e.message : String(e);
@@ -2156,33 +2129,6 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
             <GitPullRequest className="size-4" />
           </Button>
           <Button
-            variant="ghost"
-            size="icon"
-            onClick={() => setWorktreesOpen(true)}
-            aria-label="Worktrees"
-            title="Worktrees"
-          >
-            <FolderGit2 className="size-4" />
-          </Button>
-          <Button
-            variant={conductorTask && selected?.id === conductorTask.id ? "secondary" : "ghost"}
-            size="icon"
-            data-testid="conductor-button"
-            onClick={openConductor}
-            disabled={conductorStarting}
-            aria-label="Conductor"
-            title={conductorTask ? "Conductor — chat about the board" : "Start the Conductor — an agent that watches the board and suggests what to do"}
-            className="relative"
-          >
-            <Sparkles className="size-4" />
-            {conductorTask && (conductorTask.unread || conductorTask.column === "running") && (
-              <span
-                className={`absolute right-1 top-1 size-1.5 rounded-full ${conductorTask.column === "running" ? "animate-pulse bg-info" : "bg-primary"}`}
-                aria-hidden
-              />
-            )}
-          </Button>
-          <Button
             variant={autopilotOpen ? "secondary" : "ghost"}
             size="icon"
             data-testid="autopilot-button"
@@ -2235,51 +2181,6 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         </div>
       </header>
       <div className="flex min-h-0 flex-1">
-        <NewTaskForm
-          agents={agents}
-          harnesses={harnesses}
-          profiles={profiles}
-          onOpenSettingsAgents={openSettingsAgents}
-          pipelines={pipelines}
-          pipelinesLoaded={pipelinesLoaded}
-          onOpenPipelines={openPipelinesPage}
-          agentModels={agentModels}
-          harnessModels={harnessModels}
-          onRefreshModels={onRefreshModels}
-          focusNonce={newTaskFocusNonce}
-          onSubmit={async (input, { start }) => {
-            try {
-              setError(null);
-              // "Run task" creates the row in `ready` (so it's briefly visible in
-              // that column even when the agent starts immediately afterward),
-              // then asks the orchestrator to start it — which moves the card to
-              // `running`. "To backlog" just queues with no auto-start.
-              const created = await api.createTask({
-                ...input,
-                column: start ? "ready" : "backlog",
-              });
-              // The server makes the branch unique within the repo, so the
-              // pinned name can differ from what the sidebar showed (a
-              // same-name task already exists). Surface the final name rather
-              // than let the user assume the one they saw.
-              if (input.branch && created.branch && created.branch !== input.branch) {
-                toast(`Branch set to “${created.branch}” to keep it unique.`);
-              }
-              // nit8: keep the picker's per-pipeline `taskCount` fresh right
-              // away rather than waiting on Settings/the editor's own
-              // refetch triggers — fire-and-forget, same posture as every
-              // other best-effort refresh in this handler.
-              if (input.pipelineId) void refreshPipelines();
-              await refresh();
-              if (start) {
-                // Refreshes internally, so no second refresh here.
-                await startAndNotifyBranch(created.id, created.branch);
-              }
-            } catch (e) {
-              setError(e instanceof Error ? e.message : String(e));
-            }
-          }}
-        />
         <ProgressContext.Provider value={progress}>
         <main className="flex min-w-0 flex-1 flex-col">
           {/* Chrome that stays mounted regardless of `view` (D5,
@@ -2552,19 +2453,6 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         onOpenSettings={() => {
           closeGithubDialog();
           setSettingsOpen(true);
-        }}
-      />
-      <WorktreesDialog
-        open={worktreesOpen}
-        onClose={() => setWorktreesOpen(false)}
-        tasks={tasks}
-        projects={projects}
-        homeDir={homeDir}
-        onOpenTask={(t) => {
-          setWorktreesOpen(false);
-          // Routes a pipeline task to its full-page run view, everything
-          // else to the run panel — same decision the board's cards make.
-          openTask(t);
         }}
       />
       <SettingsDialog

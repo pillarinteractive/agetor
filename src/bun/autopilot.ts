@@ -28,6 +28,8 @@ export const AUTOPILOT_PREF = "autopilot";
 export const AUTOPILOT_STATE_PREF = "autopilot_state";
 const TICK_MS = 2 * 60_000;
 const QUIET_MS = 20 * 60_000;
+/** Retry sooner when the thread is just open in Codex Desktop. */
+const BUSY_MS = 5 * 60_000;
 
 export interface AutopilotConfig {
   enabled: boolean;
@@ -228,9 +230,9 @@ export async function autopilotTick(): Promise<void> {
       const a = await askThread({ threadId: cfg.threadId, cwd: cfg.project, prompt: auditPrompt(cfg.milestone.title), timeoutMs: 90 * 60_000 });
       state.audits++;
       if (!a.ok) {
-        state.lastError = `audit: ${a.error}`;
+        state.lastError = a.busy ? a.error! : `audit: ${a.error}`;
         state.phase = "running";
-        state.quietUntil = Date.now() + QUIET_MS;
+        state.quietUntil = Date.now() + (a.busy ? BUSY_MS : QUIET_MS);
         state.quietSignature = signature;
         return;
       }
@@ -249,8 +251,8 @@ export async function autopilotTick(): Promise<void> {
       prompt: nextPrompt(cfg.milestone.title, candidates, inFlight, free),
     });
     if (!answer.ok) {
-      state.lastError = `next issue: ${answer.error}`;
-      state.quietUntil = Date.now() + QUIET_MS;
+      state.lastError = answer.busy ? answer.error! : `next issue: ${answer.error}`;
+      state.quietUntil = Date.now() + (answer.busy ? BUSY_MS : QUIET_MS);
       state.quietSignature = signature;
       return;
     }

@@ -20,7 +20,6 @@ import { startLeaseWatchLoop } from "./lease-watch.ts";
 import { startKeepAwakeLoop } from "./keep-awake.ts";
 import { startPrWatchLoop } from "./pr-watch.ts";
 import { startProgressWatchLoop } from "./progress-watch.ts";
-import { startConductorLoop } from "./conductor.ts";
 import { startDependencyLoop } from "./dependencies.ts";
 import { startMergeQueueLoop } from "./merge-queue.ts";
 import { startSlotScheduler } from "./pipeline-runner.ts";
@@ -528,9 +527,6 @@ startPrWatchLoop();
 // A no-op until `progress_watchers` is configured.
 startProgressWatchLoop();
 
-// The Conductor (src/bun/conductor.ts): automatic board updates to the chat
-// agent while it's idle. A no-op until the user starts a Conductor.
-startConductorLoop();
 
 // Card dependencies (src/bun/dependencies.ts): move a card on once what
 // it was blocked by has landed.
