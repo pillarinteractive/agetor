@@ -84,7 +84,7 @@ export function nextMergeStep(
 
 const CONFLICTS_REQUEST = (base: string) =>
   `Resolve merge conflicts with ${base}\n\n` +
-  `This pull request conflicts with \`origin/${base}\` and the user has signed it off for merging. ` +
+  `This pull request conflicts with \`origin/${base}\`; resolve it so it can be reviewed and merged as it is. ` +
   `Merge \`origin/${base}\` into this branch (a merge commit — don't rebase, never push to \`${base}\`), resolve each ` +
   "conflict keeping both sides' intent, run the project's verification for what changed, commit and push the branch. " +
   'If a conflict can\'t be resolved without a product decision, hand off as blocked and say which. Otherwise hand off with "next": null.';
@@ -272,6 +272,20 @@ async function tick(now: number): Promise<void> {
       if (m && m.ok) mergeability = { mergeable: m.mergeable, mergeableState: m.mergeableState };
     }
     evals.push({ t, pr, mergeability, step: nextMergeStep(t, pr, mergeability, hasConfirmedNoPr(id)) });
+  }
+
+  // Cards waiting for your review get their conflicts resolved too, so the
+  // PR you review is the one that will merge (and its CI isn't wasted on a
+  // branch that can't). Pipeline cards only; once per PR head (take()).
+  const queued = new Set(mergeQueue());
+  for (const t of list) {
+    if (t.pipelineParentId || !t.pipelineId || t.archivedAt != null || t.column !== "review" || queued.has(t.id)) continue;
+    const pr = prStatusForTask(t.id);
+    if (pr?.state !== "open" || pr.draft) continue;
+    const m = await getGitHubPullMergeability({ dir: t.workdir, number: pr.number }).catch(() => null);
+    if (m && m.ok && (m.mergeable === false || m.mergeableState === "dirty")) {
+      await take(t, pr, { kind: "resolve-conflicts" }).catch((err: Error) => note(t, `Merge queue error: ${err.message}`, "warning"));
+    }
   }
 
   // 1. The train already out: land it when green, disband it when not.
