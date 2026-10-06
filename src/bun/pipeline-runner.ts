@@ -302,6 +302,39 @@ export async function releaseSlotWaits(): Promise<number> {
   return launched;
 }
 
+/** Turns that ended but were never settled — the run-status event was lost
+ *  (a restart or a stalled app mid-turn) — leave a step "running" forever.
+ *  A step whose task finished its turn (In Review), isn't live, has no block
+ *  and no settled outcome, and has been quiet a while, is settled now.
+ *  Pure selection; exported for tests. */
+export function unsettledSteps(list: Task[], isLive: (taskId: string) => boolean, now: number, quietMs = 5 * 60_000): { taskId: string; runId: string }[] {
+  const out: { taskId: string; runId: string }[] = [];
+  for (const parent of list) {
+    const run = parent.pipelineRun;
+    if (!run || parent.archivedAt != null) continue;
+    for (const a of run.active) {
+      const step = list.find((t) => t.id === a.taskId);
+      if (!step?.runId || step.column !== "review" || isLive(a.taskId)) continue;
+      if (run.blocked.some((b) => b.taskId === a.taskId)) continue;
+      const entry = run.history.find((h) => h.taskId === a.taskId && h.seq === a.seq);
+      if (!entry || entry.outcome != null) continue;
+      if (now - step.updatedAt < quietMs) continue;
+      out.push({ taskId: a.taskId, runId: step.runId });
+    }
+  }
+  return out;
+}
+
+export async function recoverUnsettledSteps(now = Date.now()): Promise<number> {
+  const found = unsettledSteps(tasks.list(), isTaskRunLive, now).filter((s) => !remindersInFlight.has(s.taskId));
+  for (const s of found) {
+    const parentId = tasks.get(s.taskId)?.pipelineParentId;
+    if (parentId) recordActivity(parentId, { kind: "auto", text: "A step's finished turn was never picked up — picking it up now", tone: "muted" });
+    await handleRunStatus(s.taskId, s.runId, "succeeded");
+  }
+  return found.length;
+}
+
 let slotLoop: ReturnType<typeof setInterval> | null = null;
 
 /** Start the slot scheduler. Idempotent; the timer is unref'd. */
@@ -309,6 +342,7 @@ export function startSlotScheduler(): void {
   if (slotLoop) return;
   slotLoop = setInterval(() => void releaseSlotWaits().catch(() => undefined), 10_000);
   slotLoop.unref?.();
+  setInterval(() => void recoverUnsettledSteps().catch(() => 0), 5 * 60_000).unref?.();
 }
 
 function noteSuperseded(parentId: string, steps: string[], by: string): void {
@@ -1854,6 +1888,10 @@ interface PendingReminder {
  *  again: the in-flight reminder owns this execution's next state. Cleared
  *  by `deliverHandoffReminder` once it re-acquires the lock. */
 const remindersInFlight = new Set<string>();
+/** A turn that ended while its reminder was still mid-send (a fast reply can
+ *  finish before `sendInput` returns): settled once the send completes,
+ *  instead of being dropped. */
+const deferredSettles = new Map<string, { runId: string; status: "succeeded" | "failed" | "cancelled" | "orphaned" }>();
 
 /**
  * Decide whether the single automatic handoff-format reminder for `taskId`'s
@@ -1985,6 +2023,24 @@ function attemptHandoffReminderOrBlock(input: {
  * if the execution is still the active one.
  */
 async function deliverHandoffReminder(p: PendingReminder): Promise<void> {
+  try {
+    await deliverHandoffReminderInner(p);
+  } finally {
+    // The reply to the reminder may already have finished while it was being
+    // sent — settle it now rather than leave the step running forever.
+    // Only when the step is idle again — the reply really finished. A step
+    // still working on the reminder settles through its own run-status event.
+    const deferred = deferredSettles.get(p.taskId);
+    deferredSettles.delete(p.taskId);
+    const step = tasks.get(p.taskId);
+    if (deferred && step?.column === "review" && !isTaskRunLive(p.taskId)) {
+      const entry = tasks.get(p.parentId)?.pipelineRun?.history.find((h) => h.taskId === p.taskId && h.seq === p.seq);
+      if (entry?.reminder && entry.outcome == null) void handleRunStatus(p.taskId, deferred.runId, deferred.status);
+    }
+  }
+}
+
+async function deliverHandoffReminderInner(p: PendingReminder): Promise<void> {
   let sent: Awaited<ReturnType<typeof sendInput>>;
   try {
     sent = await sendInput(p.runId, p.reminderText);
@@ -2118,7 +2174,10 @@ async function settleStepRun(
     // An automatic reminder for this very execution is mid-send outside the
     // lock — its outcome (stamp, or block) is what decides this execution's
     // next state, not a second classification of the same turn.
-    if (remindersInFlight.has(taskId)) return null;
+    if (remindersInFlight.has(taskId)) {
+      deferredSettles.set(taskId, { runId, status });
+      return null;
+    }
 
     if (status === "succeeded") {
       // One-shot handoff reminder (owner request, `docs/plans/pipelines.md`):
