@@ -125,6 +125,7 @@ import {
   setSubagentSettleHook,
 } from "./claude-subagents.ts";
 import {
+  baseBranchName,
   prepareWorkdir,
   removeWorktree,
   detachWorktree,
@@ -140,6 +141,7 @@ import {
   getAheadCount,
   isMergedIntoDefaultBranch,
 } from "./worktree.ts";
+import { setBaseBranch } from "./base-branch.ts";
 import { killTerminalsForTask } from "./terminals.ts";
 import { ensureInstalledForCwd } from "./hook-installer.ts";
 import type {
@@ -6076,6 +6078,12 @@ export async function createTask(
     updatedAt: now,
     archivedAt: null,
   });
+  // Start from the latest of the base branch when the card first runs, not
+  // the commit it pointed at now (src/bun/base-branch.ts).
+  if (!existingBranch && workdirRoot) {
+    const name = await baseBranchName(workdir, requestedRef);
+    if (name) setBaseBranch(id, name);
+  }
 
   // Write the full thread snapshot (issue body + every fetched comment) to
   // its own per-task directory and reference it, so the agent can read the

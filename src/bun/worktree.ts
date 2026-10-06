@@ -2,7 +2,8 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, statSync } from "nod
 import { rm } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import path from "node:path";
-import { dataDir, preferences } from "./db.ts";
+import { dataDir, preferences, tasks } from "./db.ts";
+import { baseBranchFor, branchNameForBase, setBaseBranch } from "./base-branch.ts";
 import { recordActivity } from "./activity.ts";
 import { MAX_DIFF_FILES, parseGitDiff } from "./git-diff.ts";
 import { LEGACY_BRANCH_PREFIX } from "../shared/types.ts";
@@ -387,6 +388,11 @@ export async function gitWritableRoots(cwd: string): Promise<string[]> {
  * relative to `dir`. Returns null if `dir` isn't a git repo or the ref doesn't
  * exist — callers turn that into a user-facing error.
  */
+/** The branch a requested base names (see src/bun/base-branch.ts). */
+export async function baseBranchName(dir: string, requested: string): Promise<string | null> {
+  return branchNameForBase(requested, (args) => git(args, dir, 5_000));
+}
+
 export async function resolveRef(dir: string, ref: string): Promise<string | null> {
   const res = await git(["rev-parse", "--verify", `${ref}^{commit}`], dir);
   if (!res.ok) return null;
@@ -824,7 +830,7 @@ export async function prepareWorkdir(
   let branch = task.branch ?? branchName(task);
   // Pinned base sha if set on the task; otherwise use HEAD at start time.
   // The sha makes the start state sticky across re-runs even when HEAD moves.
-  const base = task.baseRef ?? "HEAD";
+  let base = task.baseRef ?? "HEAD";
 
   // For a task pinned to a pre-existing branch (e.g. a PR's head branch),
   // refresh it from origin before deciding how to materialize the worktree —
@@ -839,6 +845,22 @@ export async function prepareWorkdir(
   // forcibly rewind the branch back to `base`, discarding any commits the
   // previous run made.
   const branchExists = (await git(["rev-parse", "--verify", `refs/heads/${branch}`], root, 5_000)).ok;
+
+  // A card made from a branch starts from that branch's LATEST remote commit
+  // (src/bun/base-branch.ts) — fetched now, not when the card was created.
+  const baseBranch = !branchExists && task.branchSource !== "existing" ? baseBranchFor(task.id) : null;
+  if (baseBranch) {
+    await fetchBranch(root, baseBranch);
+    const latest =
+      (await resolveRef(root, `refs/remotes/origin/${baseBranch}`)) ?? (await resolveRef(root, `refs/heads/${baseBranch}`));
+    if (latest) {
+      if (latest !== base) {
+        recordActivity(task.id, { kind: "task", text: `Starting from the latest ${baseBranch} (${latest.slice(0, 8)})`, tone: "muted" });
+      }
+      base = latest;
+      tasks.update(task.id, { baseRef: latest });
+    }
+  }
   // Prune stale worktree registrations before any `add` — git rejects adding
   // a path it still tracks as a missing-but-registered worktree without a
   // prune step first.
@@ -894,6 +916,8 @@ export async function prepareWorkdir(
       }
     }
   }
+
+  if (created.ok && baseBranch) setBaseBranch(task.id, null);
 
   if (!created.ok) {
     const detail = created.stderr || created.stdout;
