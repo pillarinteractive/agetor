@@ -1,4 +1,5 @@
 import { writeFileSync, existsSync } from "node:fs";
+import { startBranchSweep } from "./branch-sweep.ts";
 import { startAwaitLoop } from "./awaits.ts";
 import { isAbsolute } from "node:path";
 import Electrobun, { ApplicationMenu, BrowserWindow, Screen, Updater, Utils } from "electrobun/bun";
@@ -542,6 +543,7 @@ startMergeQueueLoop();
 // running ones finish.
 startSlotScheduler();
 startAwaitLoop();
+startBranchSweep();
 
 // Every card gets a GitHub issue (src/bun/auto-issue.ts): catch up live
 // cards that don't have one yet.
