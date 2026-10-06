@@ -341,6 +341,9 @@ async function land(t: Train): Promise<void> {
   const via = mergedViaTrain();
   for (const m of t.members) {
     await closeGitHubPull({ dir: t.project, number: m.pr, comment: `Merged in merge train #${t.pr} (${t.url}) as one commit on \`${t.base}\`.` });
+    // GitHub deletes a merged PR's branch, but these PRs are closed, not
+    // merged — their work is on the base now, so delete the branch here.
+    await git(["push", "--quiet", "--no-verify", "origin", "--delete", m.branch], t.project);
     via[m.taskId] = { pr: t.pr, url: t.url };
     preferences.set(VIA_PREF, JSON.stringify(via));
     const task = tasks.get(m.taskId);
