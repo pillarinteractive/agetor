@@ -12,7 +12,7 @@
  */
 import type { FollowUpAction, Task, TaskPrStatus } from "../shared/types.ts";
 import { agentProfiles, preferences, tasks } from "./db.ts";
-import { run as run_, createGitHubPull, findGitHubPullForBranch, getGitHubCompare, getGitHubPullChecks, getGitHubPullReviewThreads, createGitHubComment, getGitHubIssueThread, getGitHubRefCheckRuns, updateGitHubIssue, updateGitHubPullBranch } from "./github.ts";
+import { run as run_, createGitHubPull, gitPushWithRetry, findGitHubPullForBranch, getGitHubCompare, getGitHubPullChecks, getGitHubPullReviewThreads, createGitHubComment, getGitHubIssueThread, getGitHubRefCheckRuns, updateGitHubIssue, updateGitHubPullBranch } from "./github.ts";
 import { runPipelineFollowUp } from "./pipeline-runner.ts";
 import { parseIssueUrl } from "../shared/issue-task.ts";
 import { recordActivity, recordActivityOnce } from "./activity.ts";
@@ -208,7 +208,7 @@ export async function openPrDirectly(task: Task, checkout: string): Promise<{ ok
   const title = subject.ok ? subject.stdout.trim() : "";
   if (!title) return { ok: false, why: "no commits to open a PR for" };
   // Finish already verified this commit; the pre-push hook would re-run it.
-  const pushed = await run_(["git", "push", "--quiet", "--no-verify", "-u", "origin", `HEAD:refs/heads/${task.branch}`], checkout, 120_000);
+  const pushed = await gitPushWithRetry(["push", "--quiet", "--no-verify", "-u", "origin", `HEAD:refs/heads/${task.branch}`], checkout);
   if (!pushed.ok) return { ok: false, why: `push failed: ${(pushed.stderr || "").slice(0, 120)}` };
   const finish = [...(task.pipelineRun?.history ?? [])].reverse().find((h) => h.handoff?.summary);
   const issue = task.issueUrl ? (parseIssueUrl(task.issueUrl)?.number ?? null) : null;

@@ -26,7 +26,7 @@ import path from "node:path";
 import type { Task, TaskPrStatus } from "../shared/types.ts";
 import { dataDir, preferences, tasks } from "./db.ts";
 import { recordActivity } from "./activity.ts";
-import { closeGitHubPull, createGitHubPull, getGitHubPullChecks, getGitHubPullMergeability, mergeGitHubPull, run } from "./github.ts";
+import { closeGitHubPull, createGitHubPull, getGitHubPullChecks, getGitHubPullMergeability, gitPushWithRetry, mergeGitHubPull, run } from "./github.ts";
 import { closeIssueForTask, rollUpChecks } from "./pr-watch.ts";
 import { moveMergedTaskToDone } from "./orchestrator.ts";
 import { setMergeQueued } from "./merge-intent.ts";
@@ -237,7 +237,7 @@ export async function assembleTrain(
       // --no-verify: the repo's pre-push hook (lint, vet, tests) re-checks
       // changes each PR's CI already passed, and can fail on the machine's
       // load; the train's own CI is the check that counts.
-      const pushed = await git(["push", "--quiet", "--no-verify", "-u", "origin", branch], dir);
+      const pushed = await gitPushWithRetry(["push", "--quiet", "--no-verify", "-u", "origin", branch], dir);
       if (!pushed.ok) return { members: [], dropped: [...dropped, ...members.map((member) => ({ member, why: `push failed: ${pushed.stderr}` }))] };
     }
   } finally {

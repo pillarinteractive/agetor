@@ -5079,3 +5079,28 @@ export async function dispatchGitHubWorkflow(input: DispatchGitHubWorkflowInput)
   }
   return { ok: true, message: "Workflow dispatched." };
 }
+
+
+/** Whether a failed `git push` was GitHub's own server error (worth retrying)
+ *  rather than a real rejection (non-fast-forward, permissions, hooks). Pure. */
+export function isTransientPushError(stderr: string): boolean {
+  return /Internal Server Error|HTTP 5\d\d|returned error: 5\d\d|\b50[0234]\b|unexpected disconnect|Connection reset|timed out|early EOF/i.test(stderr);
+}
+
+/** `git <pushArgs>` with retries when GitHub answers with a server error
+ *  (it once rejected every push to a repo with "Internal Server Error" for
+ *  about an hour). Waits 30 s, 2 min, then 5 min; a real rejection returns at once. */
+export async function gitPushWithRetry(
+  pushArgs: string[],
+  cwd: string,
+  opts: { waitsMs?: number[]; timeoutMs?: number } = {},
+): Promise<CommandResult> {
+  const waits = opts.waitsMs ?? [30_000, 120_000, 300_000];
+  let r = await run(["git", ...pushArgs], cwd, opts.timeoutMs ?? 120_000, process.env);
+  for (const wait of waits) {
+    if (r.ok || !isTransientPushError(`${r.stderr ?? ""}\n${r.stdout ?? ""}`)) return r;
+    await Bun.sleep(wait);
+    r = await run(["git", ...pushArgs], cwd, opts.timeoutMs ?? 120_000, process.env);
+  }
+  return r;
+}

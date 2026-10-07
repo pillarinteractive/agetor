@@ -1585,3 +1585,11 @@ test("getGitHubIssueThread rejects a non-positive/non-integer number before any 
   expect(mock.calls).toHaveLength(0);
   mock.restore();
 });
+
+test("a GitHub server error on push is retried; a real rejection isn't", async () => {
+  const { isTransientPushError } = await import("./github.ts");
+  expect(isTransientPushError("remote: Internal Server Error\n ! [remote rejected] HEAD -> b (Internal Server Error)")).toBe(true);
+  expect(isTransientPushError("error: RPC failed; HTTP 502 curl 22")).toBe(true);
+  expect(isTransientPushError(" ! [rejected] HEAD -> b (non-fast-forward)")).toBe(false);
+  expect(isTransientPushError("ERROR: Permission to o/r.git denied")).toBe(false);
+});
