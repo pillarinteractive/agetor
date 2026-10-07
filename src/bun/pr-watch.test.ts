@@ -183,3 +183,11 @@ test("a cancelled run is not a failure — it just isn't verified yet", async ()
   expect(rollUpChecks([r("web", "completed", "cancelled"), r("lab", "completed", "failure")]).checks).toBe("failure");
   expect(rollUpChecks([r("web", "completed", "success")]).checks).toBe("success");
 });
+
+test("a PR Agetor opens itself carries Finish's summary and the issue it fixes", async () => {
+  const { directPrBody } = await import("./pr-watch.ts");
+  const body = directPrBody("- Fixed the thing\n- Verified", 381);
+  expect(body).toContain("- Fixed the thing");
+  expect(body).toContain("Fixes #381");
+  expect(directPrBody(null, null)).not.toContain("Fixes #");
+});

@@ -12,7 +12,7 @@
  */
 import type { FollowUpAction, Task, TaskPrStatus } from "../shared/types.ts";
 import { agentProfiles, preferences, tasks } from "./db.ts";
-import { run as run_, findGitHubPullForBranch, getGitHubCompare, getGitHubPullChecks, getGitHubPullReviewThreads, createGitHubComment, getGitHubIssueThread, getGitHubRefCheckRuns, updateGitHubIssue, updateGitHubPullBranch } from "./github.ts";
+import { run as run_, createGitHubPull, findGitHubPullForBranch, getGitHubCompare, getGitHubPullChecks, getGitHubPullReviewThreads, createGitHubComment, getGitHubIssueThread, getGitHubRefCheckRuns, updateGitHubIssue, updateGitHubPullBranch } from "./github.ts";
 import { runPipelineFollowUp } from "./pipeline-runner.ts";
 import { parseIssueUrl } from "../shared/issue-task.ts";
 import { recordActivity, recordActivityOnce } from "./activity.ts";
@@ -156,6 +156,15 @@ async function maybeOpenMissingPr(task: Task): Promise<void> {
   const ahead = await run_(["git", "rev-list", "--count", `${task.baseRef}..HEAD`], checkout);
   if (!ahead.ok || Number(ahead.stdout) <= 0) return;
   openPrStarted.add(key);
+  // Opening a PR is mechanical: do it here when we can, and only fall back
+  // to an agent step when something needs judgement.
+  const direct = await openPrDirectly(task, checkout);
+  if (direct.ok) {
+    recordActivity(task.id, { kind: "pr", text: `Finished without a PR — Agetor opened PR #${direct.number}`, tone: "info", url: direct.url ?? undefined });
+    if (direct.url) tasks.update(task.id, { prUrl: direct.url });
+    return;
+  }
+  recordActivity(task.id, { kind: "auto", text: `Couldn't open the PR directly (${direct.why}) — asking an agent`, tone: "muted" });
   const { startFollowUp } = await import("./pipeline-followups.ts");
   const r = await startFollowUp(task.id, { presetId: "pr" });
   recordActivity(task.id, {
@@ -163,6 +172,55 @@ async function maybeOpenMissingPr(task: Task): Promise<void> {
     text: "error" in r ? `Finished without a PR, and couldn't open one: ${r.error}` : "Finished without a PR — opening one",
     tone: "error" in r ? "warning" : "info",
   });
+}
+
+/** The base a card's PR targets: the `pr_base_branch` preference, else
+ *  `develop` when the remote has one, else the remote's default branch. */
+async function prBase(checkout: string): Promise<string> {
+  const pref = preferences.get("pr_base_branch")?.trim();
+  if (pref) return pref;
+  if ((await run_(["git", "rev-parse", "--verify", "--quiet", "refs/remotes/origin/develop"], checkout)).ok) return "develop";
+  const head = await run_(["git", "rev-parse", "--abbrev-ref", "origin/HEAD"], checkout);
+  return head.ok && head.stdout.trim().startsWith("origin/") ? head.stdout.trim().slice("origin/".length) : "main";
+}
+
+/** The PR description: Finish's summary (what was done and verified), the
+ *  issue it fixes, and a note that Agetor opened it. Pure; exported for tests. */
+export function directPrBody(summary: string | null, issueNumber: number | null): string {
+  return [
+    summary?.trim() || "Opened by Agetor once the card's pipeline finished.",
+    issueNumber ? `\nFixes #${issueNumber}` : "",
+    "\n---\nOpened by Agetor after the Finish step (no agent needed for this part).",
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+/** Push the card's branch and open its PR without an agent. Declines (so an
+ *  agent takes over) on uncommitted changes, a failed push, or a failed API
+ *  call. */
+export async function openPrDirectly(task: Task, checkout: string): Promise<{ ok: true; number: number; url: string | null } | { ok: false; why: string }> {
+  if (!task.branch) return { ok: false, why: "no branch" };
+  const dirty = await run_(["git", "status", "--porcelain"], checkout);
+  if (!dirty.ok || dirty.stdout.trim()) return { ok: false, why: "uncommitted changes" };
+  const base = await prBase(checkout);
+  const subject = await run_(["git", "log", "--no-merges", "-1", "--format=%s", `origin/${base}..HEAD`], checkout);
+  const title = subject.ok ? subject.stdout.trim() : "";
+  if (!title) return { ok: false, why: "no commits to open a PR for" };
+  // Finish already verified this commit; the pre-push hook would re-run it.
+  const pushed = await run_(["git", "push", "--quiet", "--no-verify", "-u", "origin", `HEAD:refs/heads/${task.branch}`], checkout, 120_000);
+  if (!pushed.ok) return { ok: false, why: `push failed: ${(pushed.stderr || "").slice(0, 120)}` };
+  const finish = [...(task.pipelineRun?.history ?? [])].reverse().find((h) => h.handoff?.summary);
+  const issue = task.issueUrl ? (parseIssueUrl(task.issueUrl)?.number ?? null) : null;
+  const created = await createGitHubPull({
+    dir: task.workdir,
+    title,
+    head: task.branch,
+    base,
+    body: directPrBody(finish?.handoff?.summary ?? null, issue),
+  });
+  if (!created.ok) return { ok: false, why: created.error };
+  return { ok: true, number: created.item.number, url: created.item.htmlUrl ?? null };
 }
 
 /** Cards whose branch GitHub confirmed has no PR (a successful lookup that

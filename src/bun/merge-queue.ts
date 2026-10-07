@@ -22,7 +22,7 @@ import { MERGE_TRAIN_PREF, activeTrain, advanceTrain, buildTrain, manualTrainEli
 import { preferences, tasks } from "./db.ts";
 import { recordActivity } from "./activity.ts";
 import { mergeQueue, setMergeQueued } from "./merge-intent.ts";
-import { hasConfirmedNoPr, ownFailures, prAgent, prStatusForTask, PR_FIX_CI_ACTION, PR_REVIEW_ACTION, refreshPrsNow } from "./pr-watch.ts";
+import { hasConfirmedNoPr, openPrDirectly, ownFailures, prAgent, prStatusForTask, PR_FIX_CI_ACTION, PR_REVIEW_ACTION, refreshPrsNow } from "./pr-watch.ts";
 import { getGitHubPullMergeability, mergeGitHubPull, updateGitHubPullBranch } from "./github.ts";
 import { startFollowUp } from "./pipeline-followups.ts";
 
@@ -119,6 +119,14 @@ async function take(task: Task, pr: TaskPrStatus | null, step: MergeStep): Promi
   switch (step.kind) {
     case "open-pr": {
       stepCounts.set(task.id, count + 1);
+      if (task.worktreePath) {
+        const direct = await openPrDirectly(task, task.worktreePath);
+        if (direct.ok) {
+          if (direct.url) tasks.update(task.id, { prUrl: direct.url });
+          note(task, `Opened PR #${direct.number} so it can merge`, "info");
+          return;
+        }
+      }
       const r = await startFollowUp(task.id, { presetId: "pr" });
       note(task, "error" in r ? `Couldn't open a PR: ${r.error}` : "Opening a PR so it can merge", "error" in r ? "warning" : "info");
       return;
