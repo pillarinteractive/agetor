@@ -1,4 +1,5 @@
 import { writeFileSync, existsSync } from "node:fs";
+import { startStallMonitor } from "./stall-monitor.ts";
 import { startAutopilot } from "./autopilot.ts";
 import { startBranchSweep } from "./branch-sweep.ts";
 import { startAwaitLoop } from "./awaits.ts";
@@ -542,6 +543,7 @@ startSlotScheduler();
 startAwaitLoop();
 startBranchSweep();
 startAutopilot();
+startStallMonitor();
 
 // Every card gets a GitHub issue (src/bun/auto-issue.ts): catch up live
 // cards that don't have one yet.
