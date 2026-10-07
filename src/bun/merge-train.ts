@@ -354,6 +354,7 @@ async function land(t: Train): Promise<void> {
       await closeIssueForTask(task, {
         comment: `Fixed by #${m.pr}, merged into \`${t.base}\` in merge train #${t.pr}. Closed by Agetor.`,
         activity: `fixed by PR #${m.pr}, via merge train #${t.pr}`,
+        prNumber: m.pr,
       }).catch(() => undefined);
     }
   }

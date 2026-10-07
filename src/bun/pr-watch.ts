@@ -449,14 +449,32 @@ async function closeIssueForMergedPr(task: Task, pr: TaskPrStatus): Promise<void
   await closeIssueForTask(task, {
     comment: `Fixed by #${pr.number}, merged${where}. Closed by Agetor when the PR merged — GitHub only auto-closes on merges into the default branch.`,
     activity: `fixed by PR #${pr.number}`,
+    prNumber: pr.number,
   });
 }
 
 /** Close the issue a card fixes (once), with `comment` on it. Shared by a PR
  *  merging and a merge train landing (src/bun/merge-train.ts). */
-export async function closeIssueForTask(task: Task, how: { comment: string; activity: string }): Promise<void> {
+/** Whether a PR's description says it closes issue `n` (GitHub's closing
+ *  keywords). "Refs #n" / "Part of #n" don't. Pure; exported for tests. */
+export function prClosesIssue(body: string, n: number): boolean {
+  return new RegExp(`\\b(?:fix(?:es|ed)?|close[sd]?|resolve[sd]?)\\s*:?\\s+(?:[\\w.-]+/[\\w.-]+)?#${n}\\b`, "i").test(body);
+}
+
+export async function closeIssueForTask(task: Task, how: { comment: string; activity: string; prNumber?: number }): Promise<void> {
   const number = issueNumberForTask(task);
   if (!number) return;
+  // Only when the merged PR itself says it closes the issue. A PR that lands
+  // a harness while the deployed run is still pending says "Refs #n", and
+  // the issue must stay open (#310–#315, #289 were closed early otherwise).
+  if (how.prNumber) {
+    const body = await run_(["gh", "pr", "view", String(how.prNumber), "--json", "body", "-q", ".body"], task.workdir, 30_000, process.env);
+    if (!body.ok) return; // can't tell — try again next time rather than guess
+    if (!prClosesIssue(body.stdout, number)) {
+      recordActivityOnce(task.id, { kind: "auto", text: `PR #${how.prNumber} doesn't say it fixes #${number} — leaving the issue open`, tone: "muted" });
+      return;
+    }
+  }
   const key = task.issueUrl ?? `${task.workdir}#${number}`;
   let done: string[] = [];
   try {

@@ -63,8 +63,9 @@ export async function listIssueQueue(input: {
 
 export function fixesLine(number: number): string {
   return (
-    `When this work is opened as a pull request, include "Fixes #${number}" in the PR description ` +
-    "so merging it closes the issue."
+    `When this work is opened as a pull request, include "Fixes #${number}" in the PR description so merging it closes the issue — ` +
+    `but only if the PR fully resolves it. If acceptance is still pending after it merges (a deployed or live run not done yet, ` +
+    `blocked parts, follow-ups), write "Refs #${number}" instead and say what's left; the issue then stays open.`
   );
 }
 

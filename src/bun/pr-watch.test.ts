@@ -191,3 +191,13 @@ test("a PR Agetor opens itself carries Finish's summary and the issue it fixes",
   expect(body).toContain("Fixes #381");
   expect(directPrBody(null, null)).not.toContain("Fixes #");
 });
+
+test("an issue is closed only when the PR says it fixes it", async () => {
+  const { prClosesIssue } = await import("./pr-watch.ts");
+  expect(prClosesIssue("Summary…\n\nFixes #289", 289)).toBe(true);
+  expect(prClosesIssue("closes: #12 and more", 12)).toBe(true);
+  expect(prClosesIssue("Resolves Pillar-Interactive/pillar#7", 7)).toBe(true);
+  expect(prClosesIssue("Refs #289 — deployed run still pending", 289)).toBe(false);
+  expect(prClosesIssue("Fixes #2890", 289)).toBe(false);
+  expect(prClosesIssue("Part of #289", 289)).toBe(false);
+});
