@@ -360,6 +360,41 @@ export async function recoverUnsettledSteps(now = Date.now()): Promise<number> {
   return found.length + recovered;
 }
 
+/** Pipeline step tasks whose session must not keep running: the step is no
+ *  longer active in its pipeline (it handed off, was superseded, or the run
+ *  ended) — yet its Claude REPL can wake on its own (Claude Code resumes a
+ *  turn when the usage limit resets, or after a background command
+ *  finishes) and keep editing the shared worktree next to the step that
+ *  replaced it. `sessionNames` are Agetor's live tmux sessions. Steps
+ *  created in the last minute are left alone (a launch in flight). Pure;
+ *  exported for tests. */
+export function inactiveStepSessions(list: Task[], sessionNames: Set<string>, now: number, sessionNameOf: (id: string) => string): string[] {
+  const out: string[] = [];
+  const byId = new Map(list.map((t) => [t.id, t]));
+  for (const t of list) {
+    if (!t.pipelineParentId || !sessionNames.has(sessionNameOf(t.id))) continue;
+    if (now - t.createdAt < 60_000) continue;
+    const run = byId.get(t.pipelineParentId)?.pipelineRun;
+    const active = !!run && (run.active.some((a) => a.taskId === t.id) || run.blocked.some((b) => b.taskId === t.id));
+    if (!active) out.push(t.id);
+  }
+  return out;
+}
+
+export async function reapInactiveStepSessions(now = Date.now()): Promise<number> {
+  const { sessionNameFor, dropSession } = await import("./claude-tmux.ts");
+  const ls = Bun.spawnSync(["tmux", "-L", "agetor", "ls", "-F", "#{session_name}"], { stdout: "pipe", stderr: "ignore" });
+  if (ls.exitCode !== 0) return 0;
+  const names = new Set(ls.stdout.toString().split("\n").filter(Boolean));
+  const stale = inactiveStepSessions(tasks.list(), names, now, sessionNameFor);
+  for (const id of stale) {
+    await dropSession(id).catch(() => undefined);
+    const parentId = tasks.get(id)?.pipelineParentId;
+    if (parentId) recordActivity(parentId, { kind: "auto", text: "Closed a finished step's agent session so it can't keep working in the worktree", tone: "muted" });
+  }
+  return stale.length;
+}
+
 let slotLoop: ReturnType<typeof setInterval> | null = null;
 
 /** Start the slot scheduler. Idempotent; the timer is unref'd. */
@@ -368,6 +403,7 @@ export function startSlotScheduler(): void {
   slotLoop = setInterval(() => void releaseSlotWaits().catch(() => undefined), 10_000);
   slotLoop.unref?.();
   setInterval(() => void recoverUnsettledSteps().catch(() => 0), 5 * 60_000).unref?.();
+  setInterval(() => void reapInactiveStepSessions().catch(() => 0), 60_000).unref?.();
 }
 
 function noteSuperseded(parentId: string, steps: string[], by: string): void {
