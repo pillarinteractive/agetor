@@ -6273,6 +6273,7 @@ export async function archiveTask(
   if (task.column !== "done" && !opts?.force) {
     return { error: "only tasks in Done can be archived" };
   }
+  queueMicrotask(() => notifyCardRemoved(task));
   // Defence-in-depth: column='done' should imply no live run, but column is
   // freely PATCHable (drag-to-Done on a running card is allowed today). If a
   // run is still active, refuse rather than killing tmux out from under it —
@@ -6421,6 +6422,24 @@ export async function unarchiveTask(taskId: string): Promise<{ task: Task } | { 
  * every step task is deleted first, best-effort, before the parent's own
  * teardown below.
  */
+/** Listeners told when a top-level card is deleted or archived (e.g.
+ *  Autopilot, which may now have a free slot). Column events don't cover it. */
+const cardRemovedListeners = new Set<(taskId: string) => void>();
+export function onCardRemoved(fn: (taskId: string) => void): () => void {
+  cardRemovedListeners.add(fn);
+  return () => cardRemovedListeners.delete(fn);
+}
+function notifyCardRemoved(task: Task): void {
+  if (task.pipelineParentId) return;
+  for (const fn of cardRemovedListeners) {
+    try {
+      fn(task.id);
+    } catch {
+      // a listener's failure is its own
+    }
+  }
+}
+
 export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean }): Promise<void> {
   const task = tasks.get(taskId);
   if (!task) return;
@@ -6430,6 +6449,7 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
     console.warn(`[agetor] refusing to delete pipeline step task ${taskId} directly — delete the pipeline task ${task.pipelineParentId} instead`);
     return;
   }
+  queueMicrotask(() => notifyCardRemoved(task));
   // M-R7: `cascadePipelineDelete` tombstones the parent id FIRST (so a
   // racing launch bails) — but a throw anywhere between that tombstone and
   // the `tasks.delete` at the bottom (a step delete, a teardown, the issue

@@ -23,7 +23,7 @@ import { askThread, taggedJson } from "./codex-thread.ts";
 import { createTaskFromIssue } from "./issue-queue.ts";
 import { setMergeQueued } from "./merge-intent.ts";
 import { prStatusForTask } from "./pr-watch.ts";
-import { subscribeGlobal } from "./orchestrator.ts";
+import { onCardRemoved, subscribeGlobal } from "./orchestrator.ts";
 
 export const AUTOPILOT_PREF = "autopilot";
 export const AUTOPILOT_STATE_PREF = "autopilot_state";
@@ -345,8 +345,13 @@ export function freesSlot(e: { kind: string; column?: Task["column"]; prev?: Tas
 
 export function startAutopilot(): void {
   if (loop) return;
+  const enabled = () => parseConfig(preferences.get(AUTOPILOT_PREF)).enabled;
   subscribeGlobal((e) => {
-    if (freesSlot(e as never) && parseConfig(preferences.get(AUTOPILOT_PREF)).enabled) requestAutopilotPass();
+    if (freesSlot(e as never) && enabled()) requestAutopilotPass();
+  });
+  // Deleting or archiving a card can free a slot too.
+  onCardRemoved(() => {
+    if (enabled()) requestAutopilotPass();
   });
   loop = setInterval(() => void runPass(), FALLBACK_MS);
   loop.unref?.();
