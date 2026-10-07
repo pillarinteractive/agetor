@@ -57,6 +57,7 @@ import { cancelPendingForTask, listPendingForTask } from "./interactions.ts";
 import { prepareWorkdir } from "./worktree.ts";
 import { composeLaunchPrompt, snapshotFromProfile } from "../shared/agent-profile.ts";
 import {
+  parseHandoff,
   classifyStepResponse,
   composeHandoffReminder,
   composeStepPrompt,
@@ -326,13 +327,37 @@ export function unsettledSteps(list: Task[], isLive: (taskId: string) => boolean
 }
 
 export async function recoverUnsettledSteps(now = Date.now()): Promise<number> {
+  // Steps blocked for a missing/invalid handoff whose runs DO hold a valid
+  // one (the reply landed in a sibling run): unblock and settle them.
+  let recovered = 0;
+  for (const parent of tasks.list()) {
+    const run = parent.pipelineRun;
+    if (!run || parent.archivedAt != null) continue;
+    for (const b of run.blocked) {
+      if (!b.taskId || (b.kind !== "handoff-missing" && b.kind !== "handoff-invalid")) continue;
+      const active = run.active.find((a) => a.taskId === b.taskId);
+      const step = tasks.get(b.taskId);
+      if (!active || !step?.runId || isTaskRunLive(b.taskId)) continue;
+      const since = run.history.find((h) => h.taskId === b.taskId && h.seq === active.seq)?.startedAt ?? null;
+      if (!parseHandoff(executionAssistantText(b.taskId, step.runId, since)).ok) continue;
+      await runExclusive(parent.id, async () => {
+        const fresh = tasks.get(parent.id)?.pipelineRun;
+        if (!fresh) return;
+        fresh.blocked = fresh.blocked.filter((x) => !(x.taskId === b.taskId && x.kind === b.kind));
+        persist(parent.id, fresh);
+      });
+      recordActivity(parent.id, { kind: "auto", text: "A step's valid handoff was missed (it landed in a sibling run) — picking it up now", tone: "muted" });
+      await handleRunStatus(b.taskId, step.runId, "succeeded");
+      recovered++;
+    }
+  }
   const found = unsettledSteps(tasks.list(), isTaskRunLive, now).filter((s) => !remindersInFlight.has(s.taskId));
   for (const s of found) {
     const parentId = tasks.get(s.taskId)?.pipelineParentId;
     if (parentId) recordActivity(parentId, { kind: "auto", text: "A step's finished turn was never picked up — picking it up now", tone: "muted" });
     await handleRunStatus(s.taskId, s.runId, "succeeded");
   }
-  return found.length;
+  return found.length + recovered;
 }
 
 let slotLoop: ReturnType<typeof setInterval> | null = null;
@@ -555,6 +580,24 @@ function assistantTextFrom(events: MainStreamEvent[]): string {
     .filter((e) => e.stream === "assistant")
     .map((e) => e.data)
     .join("\n");
+}
+
+/** The reply text to look for this execution's handoff in. Normally the
+ *  settling run's own text; when that has no handoff block, every run of the
+ *  step task since the execution started, oldest first — a reminder can be
+ *  delivered into a run that gets split or duplicated, and the agent's valid
+ *  handoff then sits in a sibling run (#416: the reply landed in one run, the
+ *  settle read an empty twin and blocked an approved Review). The parser
+ *  takes the LAST block, so a later reply still wins. Exported for tests. */
+export function executionAssistantText(taskId: string, runId: string, since: number | null): string {
+  const own = assistantTextFrom(mainStreamEventsForRun(runId));
+  if (own.includes("<handoff>") || since == null) return own;
+  const siblings = runs
+    .listForTask(taskId)
+    .filter((r) => r.startedAt >= since - 1_000)
+    .sort((a, b) => a.startedAt - b.startedAt);
+  if (siblings.length < 2) return own;
+  return siblings.map((r) => assistantTextFrom(mainStreamEventsForRun(r.id))).filter(Boolean).join("\n");
 }
 
 /** Best-effort "why did it fail" tail for a `step-failed` blocked message —
@@ -2187,7 +2230,7 @@ async function settleStepRun(
       // branches below) so `historyEntry.responseKind` always reflects the
       // outcome, even for a settle that never reaches the reminder logic.
       // L-R6: the run's main-stream rows are loaded ONCE here.
-      const assistantText = assistantTextFrom(mainStreamEventsForRun(runId));
+      const assistantText = executionAssistantText(taskId, runId, historyEntry?.startedAt ?? null);
       const pendingInteractions = pendingInteractionsForRun(taskId, runId);
       const classified = classifyStepResponse({ runStatus: status, assistantText, pendingInteractions });
       if (historyEntry) historyEntry.responseKind = classified.kind;
