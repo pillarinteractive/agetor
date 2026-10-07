@@ -47,3 +47,11 @@ test("a pass runs when a card stops building or reaches Done — not on other mo
 test("the next-issues prompt asks to fill every free slot", () => {
   expect(nextPrompt("m", [{ number: 1, title: "a" }], [], 4)).toContain("Pick 4 issue(s)");
 });
+
+test("run-last issues wait until they're the only ones open", async () => {
+  const { startable } = await import("./autopilot.ts");
+  const gate = { number: 561, labels: [{ name: "run-last" }] };
+  const work = { number: 400, labels: [{ name: "testing" }] };
+  expect(startable([gate, work]).map((i) => i.number)).toEqual([400]);
+  expect(startable([gate]).map((i) => i.number)).toEqual([561]);
+});

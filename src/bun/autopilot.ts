@@ -161,16 +161,28 @@ export function auditPrompt(milestone: string): string {
   ].join("\n");
 }
 
-async function milestoneIssues(cfg: AutopilotConfig): Promise<{ number: number; title: string }[] | null> {
+/** Issues labelled this start only once they're the last open issue(s) in
+ *  the milestone, e.g. a launch-candidate qualification pass. */
+export const RUN_LAST_LABEL = "run-last";
+
+/** Which open issues may start now: `run-last` ones only when nothing else
+ *  is open. Pure; exported for tests. */
+export function startable<T extends { labels?: { name: string }[] }>(open: T[]): T[] {
+  const last = (i: T) => (i.labels ?? []).some((l) => l.name === RUN_LAST_LABEL);
+  const rest = open.filter((i) => !last(i));
+  return rest.length > 0 ? rest : open;
+}
+
+async function milestoneIssues(cfg: AutopilotConfig): Promise<{ number: number; title: string; labels?: { name: string }[] }[] | null> {
   const r = await run(
-    ["gh", "issue", "list", "--milestone", cfg.milestone!.title, "--state", "open", "--limit", "300", "--json", "number,title"],
+    ["gh", "issue", "list", "--milestone", cfg.milestone!.title, "--state", "open", "--limit", "300", "--json", "number,title,labels"],
     cfg.project,
     60_000,
     process.env,
   );
   if (!r.ok) return null;
   try {
-    return JSON.parse(r.stdout || "[]") as { number: number; title: string }[];
+    return JSON.parse(r.stdout || "[]") as { number: number; title: string; labels?: { name: string }[] }[];
   } catch {
     return null;
   }
@@ -226,7 +238,7 @@ export async function autopilotTick(): Promise<void> {
     const inFlight = open.filter((i) => buildingIssues.has(i.number));
     const ownLive = mine.filter((t) => BUILDING.has(t.column)).length;
     const ownUnfinished = mine.filter(live).length;
-    const candidates = open.filter((i) => !busyIssues.has(i.number));
+    const candidates = startable(open).filter((i) => !busyIssues.has(i.number));
 
     // Back off after an ask that started nothing, until the board changes.
     const signature = `${candidates.map((i) => i.number).join(",")}|${inFlight.map((i) => i.number).join(",")}|${ownLive}`;
