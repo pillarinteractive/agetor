@@ -36,15 +36,19 @@ export function setBaseBranch(taskId: string, name: string | null): void {
 }
 
 /** The branch a requested base names, if it names one: a local or `origin/`
- *  branch (`develop`, `origin/develop`), or "HEAD" when HEAD is on a branch.
- *  A sha, tag or detached HEAD → null (pinned as given). */
+ *  branch (`develop`, `origin/develop`). "HEAD" (no base chosen) means the
+ *  repo's integration branch on the remote — `develop` when origin has one,
+ *  else origin's default branch — NOT whatever branch the user's checkout
+ *  happens to be on (a local-only branch there once became the base of every
+ *  new card). A sha or tag → null (pinned as given). */
 export async function branchNameForBase(
   requested: string,
   git: (args: string[]) => Promise<{ ok: boolean; stdout: string }>,
 ): Promise<string | null> {
   if (requested === "HEAD") {
-    const head = await git(["symbolic-ref", "--quiet", "--short", "HEAD"]);
-    return head.ok && head.stdout ? head.stdout : null;
+    if ((await git(["rev-parse", "--verify", "--quiet", "refs/remotes/origin/develop"])).ok) return "develop";
+    const def = await git(["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"]);
+    return def.ok && def.stdout.startsWith("origin/") ? def.stdout.slice("origin/".length) : null;
   }
   const name = requested.replace(/^origin\//, "");
   if (/^[0-9a-f]{7,40}$/.test(name)) return null;

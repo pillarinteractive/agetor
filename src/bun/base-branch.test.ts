@@ -20,7 +20,12 @@ test("branchNameForBase: branch names (local or origin/), HEAD's branch; not sha
   };
   expect(await branchNameForBase("develop", git)).toBe("develop");
   expect(await branchNameForBase("origin/release", git)).toBe("release");
-  expect(await branchNameForBase("HEAD", git)).toBe("develop");
+  // No base chosen: the remote's integration branch, never the checkout's own branch.
+  const onFeature = async (args: string[]) => {
+    if (args[0] === "symbolic-ref" && args.includes("HEAD")) return { ok: true, stdout: "claude/local-only" };
+    return { ok: args[args.length - 1] === "refs/remotes/origin/develop", stdout: "" };
+  };
+  expect(await branchNameForBase("HEAD", onFeature)).toBe("develop");
   expect(await branchNameForBase("0a49d119e98352d98c1b2a19184151904a83bd0b", git)).toBeNull();
   expect(await branchNameForBase("nope", git)).toBeNull();
 });
