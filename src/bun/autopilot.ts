@@ -23,10 +23,15 @@ import { askThread, taggedJson } from "./codex-thread.ts";
 import { createTaskFromIssue } from "./issue-queue.ts";
 import { setMergeQueued } from "./merge-intent.ts";
 import { prStatusForTask } from "./pr-watch.ts";
+import { subscribeGlobal } from "./orchestrator.ts";
 
 export const AUTOPILOT_PREF = "autopilot";
 export const AUTOPILOT_STATE_PREF = "autopilot_state";
-const TICK_MS = 2 * 60_000;
+/** Safety net only — passes are driven by board events (startAutopilot). */
+const FALLBACK_MS = 15 * 60_000;
+/** Columns where a card is still being built — the cards that hold a slot.
+ *  In Review / Ready to Merge / Done don't. */
+export const BUILDING = new Set<Task["column"]>(["backlog", "ready", "running", "blocked"]);
 const QUIET_MS = 20 * 60_000;
 /** Retry sooner when the thread is just open in Codex Desktop. */
 const BUSY_MS = 5 * 60_000;
@@ -138,7 +143,7 @@ export function nextPrompt(milestone: string, candidates: { number: number; titl
     "Being worked on right now (each by its own agent, on its own branch):",
     list(inFlight),
     "",
-    `Pick up to ${free} issue(s) to start now, in the order they should go. Prefer what unblocks other work; avoid starting two issues that would edit the same files at the same time; skip anything that needs a product decision from the user and say so.`,
+    `Pick ${free} issue(s) to start now, in the order they should go — fewer only when an issue truly can't start yet (it depends on unfinished work, would edit the same files as work in progress, or needs a product decision from the user); name each one you hold back and why. Prefer what unblocks other work.`,
     "For each pick, clarify its scope for the implementing agent: acceptance criteria, what is in and out of scope, risks, likely files, and how to verify. Don't change any code or GitHub state for this request.",
     "",
     'End your reply with exactly one block: <next-issues>[{"number": 123, "scope": "markdown"}]</next-issues> — an empty list if nothing should start now.',
@@ -214,16 +219,20 @@ export async function autopilotTick(): Promise<void> {
     }
     const openSet = new Set(open.map((i) => i.number));
     const busyIssues = new Set(all.filter((t) => live(t) && !t.pipelineParentId).map(issueOf).filter((n): n is number => n != null));
-    const inFlight = open.filter((i) => busyIssues.has(i.number));
-    // Autopilot's own cards still finishing (PR not merged yet) count too.
-    const ownLive = mine.filter(live).length;
+    // Slots are held by cards still being built, on milestone issues or
+    // Autopilot's own; cards waiting in review / for merge don't hold one.
+    const building = all.filter((t) => !t.pipelineParentId && t.archivedAt == null && BUILDING.has(t.column));
+    const buildingIssues = new Set(building.map(issueOf).filter((n): n is number => n != null));
+    const inFlight = open.filter((i) => buildingIssues.has(i.number));
+    const ownLive = mine.filter((t) => BUILDING.has(t.column)).length;
+    const ownUnfinished = mine.filter(live).length;
     const candidates = open.filter((i) => !busyIssues.has(i.number));
 
     // Back off after an ask that started nothing, until the board changes.
     const signature = `${candidates.map((i) => i.number).join(",")}|${inFlight.map((i) => i.number).join(",")}|${ownLive}`;
     if (Date.now() < state.quietUntil && signature === state.quietSignature) return;
 
-    if (candidates.length === 0 && ownLive === 0 && inFlight.length === 0) {
+    if (candidates.length === 0 && ownUnfinished === 0 && busyIssues.size === 0) {
       // Nothing left: audit (once per emptying), then done unless it filed more.
       state.phase = "auditing";
       writeState(state);
@@ -295,13 +304,51 @@ export async function autopilotTick(): Promise<void> {
 }
 
 let loop: ReturnType<typeof setInterval> | null = null;
+let pending = false;
+let debounce: ReturnType<typeof setTimeout> | null = null;
+
+async function runPass(): Promise<void> {
+  try {
+    await autopilotTick();
+  } catch (e) {
+    const s = readState();
+    s.lastError = (e as Error).message;
+    writeState(s);
+  }
+  // Events that arrived during a (long) thread request get one more pass.
+  if (pending) {
+    pending = false;
+    requestAutopilotPass();
+  }
+}
+
+/** Run a pass soon (coalescing bursts of events); if one is running, run
+ *  exactly one more after it. */
+export function requestAutopilotPass(delayMs = 3_000): void {
+  if (busy) {
+    pending = true;
+    return;
+  }
+  if (debounce) clearTimeout(debounce);
+  debounce = setTimeout(() => {
+    debounce = null;
+    void runPass();
+  }, delayMs);
+  debounce.unref?.();
+}
+
+/** Whether a board event can free a slot (or finish the milestone). Pure. */
+export function freesSlot(e: { kind: string; column?: Task["column"]; prev?: Task["column"] | null }): boolean {
+  if (e.kind !== "column" || !e.column) return false;
+  return e.column === "done" || (!!e.prev && BUILDING.has(e.prev) && !BUILDING.has(e.column));
+}
 
 export function startAutopilot(): void {
   if (loop) return;
-  loop = setInterval(() => void autopilotTick().catch((e: Error) => {
-    const s = readState();
-    s.lastError = e.message;
-    writeState(s);
-  }), TICK_MS);
+  subscribeGlobal((e) => {
+    if (freesSlot(e as never) && parseConfig(preferences.get(AUTOPILOT_PREF)).enabled) requestAutopilotPass();
+  });
+  loop = setInterval(() => void runPass(), FALLBACK_MS);
   loop.unref?.();
+  requestAutopilotPass(30_000);
 }

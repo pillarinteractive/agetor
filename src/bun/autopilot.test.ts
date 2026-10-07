@@ -33,3 +33,17 @@ test("prompts ask for the machine-readable block and name the milestone", () => 
   expect(p).toContain("<next-issues>");
   expect(auditPrompt("1.0 / 2")).toContain("<audit>");
 });
+
+test("a pass runs when a card stops building or reaches Done — not on other moves", async () => {
+  const { freesSlot } = await import("./autopilot.ts");
+  expect(freesSlot({ kind: "column", prev: "running", column: "review" })).toBe(true);
+  expect(freesSlot({ kind: "column", prev: "blocked", column: "merge" })).toBe(true);
+  expect(freesSlot({ kind: "column", prev: "merge", column: "done" })).toBe(true);
+  expect(freesSlot({ kind: "column", prev: "ready", column: "running" })).toBe(false);
+  expect(freesSlot({ kind: "column", prev: "review", column: "merge" })).toBe(false);
+  expect(freesSlot({ kind: "run-status" })).toBe(false);
+});
+
+test("the next-issues prompt asks to fill every free slot", () => {
+  expect(nextPrompt("m", [{ number: 1, title: "a" }], [], 4)).toContain("Pick 4 issue(s)");
+});

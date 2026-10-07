@@ -68,7 +68,8 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
   };
 
   const mine = (state?.cards ?? []).map((id) => tasks.find((t) => t.id === id)).filter((t): t is Task => !!t);
-  const inFlight = mine.filter((t) => t.column !== "done" && t.archivedAt == null);
+  // Slots are held only by cards still being built (src/bun/autopilot.ts BUILDING).
+  const inFlight = mine.filter((t) => t.archivedAt == null && ["backlog", "ready", "running", "blocked"].includes(t.column));
   const done = mine.filter((t) => t.column === "done").length;
   const ready = !!config.threadId && !!config.project && !!config.milestone;
 
@@ -162,8 +163,8 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
             </div>
           )}
           <p className="text-muted-foreground">
-            The thread picks which issues start next and clarifies each one's scope; Agetor keeps up to {config.maxInFlight} cards
-            running and signs finished PRs off for merging (billing, auth, migration and schema changes wait for you). When the
+            Whenever a card finishes building, the thread picks the next issue(s) and clarifies each one's scope; Agetor keeps
+            {" "}{config.maxInFlight} cards building and signs finished PRs off for merging (billing, auth, migration and schema changes wait for you). When the
             milestone is empty it runs a deep audit; anything it files restarts the loop. Don't type into the thread in Codex
             while Autopilot is on.
           </p>

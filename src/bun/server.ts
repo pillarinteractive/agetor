@@ -44,7 +44,7 @@ import { activeTrain, mergedViaTrain, trainFor } from "./merge-train.ts";
 import { isPriority, readPriority, setPriority } from "./priority.ts";
 import { setMergeQueued } from "./merge-intent.ts";
 import { KEEP_AWAKE_PREF_KEY, KEEP_SCREEN_ON_PREF_KEY, recheckKeepAwake } from "./keep-awake.ts";
-import { AUTOPILOT_PREF, AUTOPILOT_STATE_PREF, autopilotTick, parseConfig as parseAutopilotConfig, readState as readAutopilotState } from "./autopilot.ts";
+import { AUTOPILOT_PREF, AUTOPILOT_STATE_PREF, requestAutopilotPass, parseConfig as parseAutopilotConfig, readState as readAutopilotState } from "./autopilot.ts";
 import { departTrainNow, refreshMergeColumn } from "./merge-queue.ts";
 import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
@@ -3343,7 +3343,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             const s = readAutopilotState();
             preferences.set(AUTOPILOT_STATE_PREF, JSON.stringify({ ...s, phase: "idle", held: [], lastError: null, quietUntil: 0, quietSignature: "" }));
           }
-          if (next.enabled) void autopilotTick().catch(() => undefined);
+          if (next.enabled) requestAutopilotPass(0);
           return json({ config: next, state: readAutopilotState() }, { headers: corsHeaders(req) });
         }),
       },
