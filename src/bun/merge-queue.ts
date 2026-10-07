@@ -282,6 +282,24 @@ async function tick(now: number): Promise<void> {
     evals.push({ t, pr, mergeability, step: nextMergeStep(t, pr, mergeability, hasConfirmedNoPr(id)) });
   }
 
+  // A Fix CI step that blocked only because CI hadn't run yet (runners busy)
+  // is done once the PR's checks pass: close it out instead of leaving the
+  // card blocked (the step itself is told to wait, this is the backstop).
+  for (const e of evals) {
+    const run = e.t.pipelineRun;
+    if (e.t.column !== "blocked" || !run || e.pr?.state !== "open" || e.pr.checks !== "success") continue;
+    const names = new Map((run.snapshot?.graph.steps ?? []).map((s) => [s.id, s.name]));
+    const block = run.blocked.find((b) => b.taskId && b.kind === "step-blocked" && /^Fix CI/.test(names.get(b.stepId ?? "") ?? ""));
+    if (!block?.taskId) continue;
+    const { advancePipeline } = await import("./pipeline-runner.ts");
+    const r = await advancePipeline(e.t.id, {
+      nextStepIds: null,
+      fromTaskId: block.taskId,
+      handoff: { summary: `CI on PR #${e.pr.number} passed — nothing left to fix (the step had stopped to wait for CI runners).` },
+    });
+    note(e.t, "error" in r ? `Couldn't close out the waiting Fix CI step: ${r.error}` : `CI on PR #${e.pr.number} passed — closed out the Fix CI step that was waiting for it`, "error" in r ? "warning" : "info");
+  }
+
   // Cards waiting for your review get their conflicts resolved too, so the
   // PR you review is the one that will merge (and its CI isn't wasted on a
   // branch that can't). Pipeline cards only; once per PR head (take()).

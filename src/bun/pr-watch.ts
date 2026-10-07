@@ -601,7 +601,11 @@ export function prFollowUpInstructions(actionId: string, pr: TaskPrStatus | null
         "AGENTS.md), then run the project's scoped check (`python3 .github/scripts/verify_changed.py --if-needed` in Pillar) — " +
         "not the whole suite; CI re-runs everything when you push. " +
         "If a failure is unrelated to this branch (flaky or infrastructure), say so with evidence instead of changing code. " +
-        push,
+        push +
+        // CI that hasn't run yet (runners busy, queued) is a wait, not a block.
+        "\n\nAfter you push, or whenever CI is queued or still running, don't hand off as blocked: wait for it with " +
+        "`~/.agetor/bin/agetor-await \"CI for PR #" + pr.number + "\" -- gh pr checks " + pr.number + " --watch --interval 60` " +
+        "and end your turn. Agetor wakes you when the checks finish; then hand off on the actual result.",
     };
   }
   if (actionId === PR_REVIEW_ACTION && pr.unresolvedThreads > 0) {
