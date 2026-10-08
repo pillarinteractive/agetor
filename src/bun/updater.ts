@@ -1,6 +1,5 @@
 import { Updater } from "electrobun/bun";
-import { publishGlobalEvent } from "./orchestrator.ts";
-import type { UpdateStatus } from "../shared/types.ts";
+import type { GlobalEvent, UpdateStatus } from "../shared/types.ts";
 
 /**
  * Wraps Electrobun's `Updater` with the tiny surface our UI needs:
@@ -37,6 +36,18 @@ let snapshot: UpdaterSnapshot = {
   lastCheckedAt: null,
 };
 
+type UpdateEvent = Extract<GlobalEvent, { kind: "update" }>;
+
+// Where status changes go. The updater runs in the app process while the
+// global SSE stream lives in the core (a child process — see core-child.ts),
+// so index.ts wires this to a POST onto the core's `/host/update-event`.
+let publish: (e: UpdateEvent) => void = () => {};
+
+/** Route update status events to the core's global event stream. */
+export function setUpdateEventPublisher(fn: (e: UpdateEvent) => void): void {
+  publish = fn;
+}
+
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let inFlight: Promise<void> | null = null;
 
@@ -47,7 +58,7 @@ function setStatus(status: UpdateStatus, opts: { version?: string | null; error?
     error: opts.error !== undefined ? opts.error : (status === "error" ? snapshot.error : null),
     lastCheckedAt: status === "checking" ? snapshot.lastCheckedAt : Date.now(),
   };
-  publishGlobalEvent({
+  publish({
     kind: "update",
     status,
     version: snapshot.version,

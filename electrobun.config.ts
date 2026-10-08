@@ -44,8 +44,19 @@ export default {
     // dialog in quit-guard.ts.
     exitOnLastWindowClosed: false,
   },
+  scripts: {
+    // Bundles the core child process's entry (src/bun/core-child.ts) to
+    // out/core-child/core-child.js before every build (dev included);
+    // build.copy below ships it next to the main bundle.
+    preBuild: "scripts/build-core-child.ts",
+  },
   build: {
     copy: {
+      // The core child process's entry — the app runs the API server,
+      // orchestrator and background loops in a separate bun process with its
+      // own event loop (src/bun/core-host.ts). Lands at
+      // Contents/Resources/app/bun/core-child.js, beside index.js.
+      "out/core-child/core-child.js": "bun/core-child.js",
       "dist/index.html": "views/mainview/index.html",
       "dist/assets": "views/mainview/assets",
       // Boot splash logo. Source straight from src/mainview/public/ rather
@@ -74,7 +85,9 @@ export default {
       // docs/plans/stop-agetor-tcc-appdata-spam.md.
       "vendor/disclaim": "bin",
     },
-    watchIgnore: ["dist/**", ".agetor/**", "vendor/**"],
+    // out/** is the preBuild's own output (the core child bundle) — watching
+    // it would make every dev rebuild trigger another.
+    watchIgnore: ["dist/**", ".agetor/**", "vendor/**", "out/**"],
     mac: {
       bundleCEF: false,
       icons: "src/assets/agetor.iconset",

@@ -189,21 +189,21 @@ test("resolveThemePreference falls back to 'auto' when nothing is stored", async
   // what resolveThemePreference actually implements: anything other than
   // exactly "dark" or "light" resolves to "auto".
   preferences.set("theme", "not-a-real-theme");
-  expect(resolveThemePreference()).toBe("auto");
+  expect(resolveThemePreference((k) => preferences.get(k))).toBe("auto");
 });
 
 test("resolveThemePreference passes through 'dark' and 'light' exactly, and normalizes everything else to 'auto'", () => {
   preferences.set("theme", "dark");
-  expect(resolveThemePreference()).toBe("dark");
+  expect(resolveThemePreference((k) => preferences.get(k))).toBe("dark");
 
   preferences.set("theme", "light");
-  expect(resolveThemePreference()).toBe("light");
+  expect(resolveThemePreference((k) => preferences.get(k))).toBe("light");
 
   preferences.set("theme", "auto");
-  expect(resolveThemePreference()).toBe("auto");
+  expect(resolveThemePreference((k) => preferences.get(k))).toBe("auto");
 
   preferences.set("theme", "garbage");
-  expect(resolveThemePreference()).toBe("auto");
+  expect(resolveThemePreference((k) => preferences.get(k))).toBe("auto");
 });
 
 test("resolveThemePreference falls back to 'auto' (instead of throwing) when the DB read itself throws", () => {
@@ -219,13 +219,13 @@ test("resolveThemePreference falls back to 'auto' (instead of throwing) when the
     throw new Error("simulated: database disk image is malformed");
   };
   try {
-    expect(resolveThemePreference()).toBe("auto");
+    expect(resolveThemePreference((k) => preferences.get(k))).toBe("auto");
   } finally {
     preferences.get = realGet;
   }
   // The store itself is unaffected — restoring the stub didn't lose data.
   preferences.set("theme", "dark");
-  expect(resolveThemePreference()).toBe("dark");
+  expect(resolveThemePreference((k) => preferences.get(k))).toBe("dark");
 });
 
 test("buildWindowHash includes api, token, and theme as a hash fragment (not a query string)", () => {

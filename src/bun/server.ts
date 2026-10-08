@@ -24,11 +24,12 @@ import {
   pipelines,
   PipelineNameError,
   dataDir,
+  db,
   clampWindowByBytes,
   resolveAnchoredMinId,
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
-import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, publishGlobalEvent, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import { advancePipeline, cancelPipelineRun, isPipelineStepTask, releaseSlotWaits, retryPipelineStep, startPipelineRun } from "./pipeline-runner.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
@@ -184,7 +185,7 @@ import {
   getHarnessModelMap,
   noteHarnessStatuses,
 } from "./model-discovery.ts";
-import { getMainWindow } from "./window.ts";
+import { toggleMainWindowZoom, type ToggleZoomResult } from "./window.ts";
 import {
   answerFxPermission,
   answerTmuxPrompt,
@@ -231,8 +232,8 @@ import type {
   TaskGitStatus,
   TaskReference,
 } from "../shared/types.ts";
-import { armForceQuit, broadcastAppEvent, subscribeAppEvents } from "./quit-guard.ts";
-import { consumePendingOpenTask } from "./pending-open.ts";
+import { armForceQuit, broadcastAppEvent, consumeForceQuit, subscribeAppEvents } from "./quit-guard.ts";
+import { consumePendingOpenTask, setPendingOpenTask } from "./pending-open.ts";
 import { binaryPreviewKind, contentTypeForPreviewPath, isImagePath } from "../shared/attachments.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
 import { PIPELINE_CONTROL_CHAR_RE, handoffHeadline, isPipelineColumnRunnerOwned, validatePipelineGraph } from "../shared/pipeline.ts";
@@ -820,7 +821,10 @@ export interface ApiNative {
     canChooseDirectory: boolean;
     allowsMultipleSelection: boolean;
   }): Promise<string[]>;
-  openPath(p: string): boolean;
+  // The boolean-returning operations may also resolve asynchronously: in the
+  // packaged app the core runs in a child process and reaches these through
+  // the parent's native bridge (native-bridge.ts), so every route awaits them.
+  openPath(p: string): boolean | Promise<boolean>;
   /** Reveal `p` in the OS file manager (Finder on macOS, the only release
    *  target) with the item itself selected, rather than opening it with its
    *  default application the way `openPath` does. Backs `POST /reveal-path`
@@ -828,8 +832,8 @@ export interface ApiNative {
    *  whether the reveal command was successfully dispatched, not whether
    *  Finder actually surfaced the item — same "best-effort boolean" contract
    *  as `openPath`/`openExternal`. */
-  revealPath(p: string): boolean;
-  openExternal(url: string): boolean;
+  revealPath(p: string): boolean | Promise<boolean>;
+  openExternal(url: string): boolean | Promise<boolean>;
   showNotification(n: {
     title: string;
     body?: string;
@@ -837,7 +841,7 @@ export interface ApiNative {
     silent?: boolean;
     /** Task to deep-link to on click, e.g. via terminal-notifier's -open. */
     taskId?: string;
-  }): void;
+  }): void | Promise<void>;
   /** Raise + focus the app window. Returns `false` when there is no window to
    *  act on — never to report a failed native call, so callers can map `false`
    *  to "no window" without conflating it with a platform hiccup. Lives behind
@@ -845,10 +849,14 @@ export interface ApiNative {
    *  the display layout needs `Screen` from `electrobun/bun`, and importing
    *  that at module scope would drag Electrobun — and its transitive `three`
    *  dependency — into the headless CLI daemon, which imports this file. */
-  focusWindow(): boolean;
-  quit(): void;
+  focusWindow(): boolean | Promise<boolean>;
+  /** Toggle the main window's zoom (the title-bar double-click). Optional:
+   *  without it `/window/toggle-zoom` acts on this process's own registered
+   *  window, which only exists when the core and the window share a process. */
+  toggleZoom?(): ToggleZoomResult | Promise<ToggleZoomResult>;
+  quit(): void | Promise<void>;
   updates: {
-    snapshot(): UpdaterSnapshot;
+    snapshot(): UpdaterSnapshot | Promise<UpdaterSnapshot>;
     check(): Promise<void>;
     apply(): Promise<void>;
   };
@@ -3448,22 +3456,22 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // native double-click-to-zoom gesture never reaches AppKit — the
       // webview emulates it through here.
       "/window/toggle-zoom": {
-        POST: authed((req) => {
-          const win = getMainWindow();
-          if (!win) {
+        POST: authed(async (req) => {
+          const result = native?.toggleZoom
+            ? await native.toggleZoom()
+            : toggleMainWindowZoom();
+          if (result === "no-window") {
             return json(
               { error: "no main window" },
               { status: 503, headers: corsHeaders(req) },
             );
           }
-          if (win.isFullScreen()) {
+          if (result === "fullscreen") {
             return json(
               { ok: true, skipped: "fullscreen" },
               { headers: corsHeaders(req) },
             );
           }
-          if (win.isMaximized()) win.unmaximize();
-          else win.maximize();
           return json({ ok: true }, { headers: corsHeaders(req) });
         }),
       },
@@ -3476,15 +3484,15 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // through here.
       //
       // Native-gated rather than calling `focusWindow()` inline (the way
-      // `/window/toggle-zoom` above pokes `getMainWindow()` directly): raising
+      // `/window/toggle-zoom` above falls back to the registered window): raising
       // a window means first checking the frame against the live display
       // layout, which needs `Screen` from `electrobun/bun`. Importing that
       // here would pull Electrobun into the headless CLI daemon, which imports
       // this module — see the note on ApiNative.
       "/window/focus": {
-        POST: authed((req) => {
+        POST: authed(async (req) => {
           if (!native) return notAvailableHeadless(req);
-          if (!native.focusWindow()) {
+          if (!(await native.focusWindow())) {
             return json(
               { error: "no main window" },
               { status: 503, headers: corsHeaders(req) },
@@ -3500,20 +3508,20 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // `/updates/check` / `/updates/apply` for the manual menu item +
       // the banner's "Restart now" button.
       "/updates/status": {
-        GET: authed((req) =>
+        GET: authed(async (req) =>
           native
-            ? json(native.updates.snapshot(), { headers: corsHeaders(req) })
+            ? json(await native.updates.snapshot(), { headers: corsHeaders(req) })
             : notAvailableHeadless(req)),
       },
       "/updates/check": {
         POST: authed(async (req) => {
           if (!native) return notAvailableHeadless(req);
           await native.updates.check();
-          return json(native.updates.snapshot(), { headers: corsHeaders(req) });
+          return json(await native.updates.snapshot(), { headers: corsHeaders(req) });
         }),
       },
       "/updates/apply": {
-        POST: authed((req) => {
+        POST: authed(async (req) => {
           if (!native) return notAvailableHeadless(req);
           // Status check runs synchronously here — not inside applyUpdate —
           // so the 409 reaches the client. An earlier shape wrapped a void
@@ -3521,7 +3529,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           // synchronously, so that catch was dead code and stale-button
           // clicks silently 200'd while the actual rejection became an
           // unhandled promise inside the bun process.
-          const snap = native.updates.snapshot();
+          const snap = await native.updates.snapshot();
           if (snap.status !== "ready") {
             return json(
               { error: `no update is ready to apply (status: ${snap.status})` },
@@ -3531,7 +3539,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           // applyUpdate quits + relaunches; the HTTP response races against
           // process exit. Void on purpose — the webview drops its connection
           // when the process goes away.
-          void native.updates.apply();
+          void Promise.resolve(native.updates.apply()).catch(() => undefined);
           return json({ ok: true }, { headers: corsHeaders(req) });
         }),
       },
@@ -5412,7 +5420,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             );
           }
           if (!native) return notAvailableHeadless(req);
-          const ok = native.openPath(abs);
+          const ok = await native.openPath(abs);
           return json({ opened: ok, path: abs }, { headers: corsHeaders(req) });
         }),
       },
@@ -5455,7 +5463,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             );
           }
           if (!native) return notAvailableHeadless(req);
-          const ok = native.revealPath(abs);
+          const ok = await native.revealPath(abs);
           return json({ revealed: ok, path: abs }, { headers: corsHeaders(req) });
         }),
       },
@@ -5479,7 +5487,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             );
           }
           if (!native) return notAvailableHeadless(req);
-          const ok = native.openExternal(raw);
+          const ok = await native.openExternal(raw);
           return json({ opened: ok, url: raw }, { headers: corsHeaders(req) });
         }),
       },
@@ -6824,7 +6832,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             body.taskId.length <= 512
               ? body.taskId
               : undefined;
-          native.showNotification({
+          await native.showNotification({
             title,
             body: trunc(body.body),
             subtitle: trunc(body.subtitle),
@@ -6915,8 +6923,75 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           // reaches the webview before the renderer is torn down. (Even if
           // it doesn't, the client doesn't care — its EventSource just drops.)
           setTimeout(() => {
-            try { native.quit(); } catch { /* electrobun internals may throw on second quit; safe to swallow */ }
+            try {
+              void Promise.resolve(native.quit()).catch(() => undefined);
+            } catch { /* electrobun internals may throw on second quit; safe to swallow */ }
           }, 0);
+          return json({ ok: true }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Host → core calls. In the packaged app the window lives in the parent
+      // process and the core in a child (core-child.ts), so the bits of app
+      // lifecycle that need core state go through these: the `before-quit`
+      // gate, a deep-link open, and the self-updater's status events.
+
+      // Decide whether an app quit may proceed — the check index.ts's
+      // `before-quit` handler used to run in-process. Allowed when the
+      // webview's "Quit anyway" armed the force-quit flag or nothing is
+      // running; otherwise broadcasts the `quit_request` the
+      // QuitConfirmDialog renders and answers `allow: false`.
+      "/host/quit-check": {
+        POST: authed((req) => {
+          if (consumeForceQuit()) return json({ allow: true }, { headers: corsHeaders(req) });
+          let runningTaskIds: string[] = [];
+          try {
+            runningTaskIds = db
+              .query<{ task_id: string }, []>(`SELECT DISTINCT task_id FROM runs WHERE status = 'running'`)
+              .all()
+              .map((r) => r.task_id);
+          } catch {
+            // DB unavailable — allow the quit: a missed warning costs less
+            // than trapping the user.
+          }
+          if (runningTaskIds.length === 0) return json({ allow: true }, { headers: corsHeaders(req) });
+          broadcastAppEvent({
+            type: "quit_request",
+            runningRunCount: runningTaskIds.length,
+            runningTaskTitles: runningTaskIds
+              .map((id) => tasks.get(id)?.title ?? "")
+              .filter((t) => t.length > 0)
+              .slice(0, 10),
+            ts: Date.now(),
+          });
+          return json({ allow: false }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // A clicked `agetor://task/<id>` deep link: stash it for the next
+      // `/app/events` subscriber and broadcast it to any connected one — see
+      // pending-open.ts and index.ts's "open-url" handler.
+      "/host/open-task": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { taskId?: unknown };
+          if (typeof body.taskId !== "string" || !body.taskId) {
+            return json({ error: "taskId required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          setPendingOpenTask(body.taskId);
+          broadcastAppEvent({ type: "open_task", taskId: body.taskId, ts: Date.now() });
+          return json({ ok: true }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Self-updater status events (updater.ts runs in the app process) onto
+      // the global SSE stream the webview's update banner listens to.
+      "/host/update-event": {
+        POST: authed(async (req) => {
+          const e = (await req.json().catch(() => null)) as GlobalEvent | null;
+          if (!e || e.kind !== "update") {
+            return json({ error: "update event required" }, { status: 400, headers: corsHeaders(req) });
+          }
+          publishGlobalEvent(e);
           return json({ ok: true }, { headers: corsHeaders(req) });
         }),
       },
@@ -6931,7 +7006,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         POST: authed((req) => {
           setTimeout(() => {
             removeCoreCreds(dataDir);
-            if (native) native.quit();
+            if (native) void Promise.resolve(native.quit()).catch(() => undefined);
             else process.exit(0);
           }, 0);
           return json({ ok: true }, { headers: corsHeaders(req) });

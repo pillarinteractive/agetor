@@ -1,6 +1,10 @@
-import { preferences } from "./db.ts";
 import type { ThemePreference } from "../shared/types.ts";
 import { clampFontSizePercent, FONT_SIZE_DEFAULT } from "../shared/types.ts";
+
+/** Reads one stored preference. Injected rather than importing `db.ts` so the
+ *  app process — which no longer opens the database; the core runs in a child
+ *  process — can resolve these from the core's `GET /preferences`. */
+export type PreferenceGetter = (key: string) => string | null;
 
 /**
  * Resolve the persisted theme preference for the boot payload. Falls back to
@@ -17,10 +21,10 @@ import { clampFontSizePercent, FONT_SIZE_DEFAULT } from "../shared/types.ts";
  * ever opening, so a throw is swallowed and treated the same as "nothing
  * stored": fall back to "auto".
  */
-export function resolveThemePreference(): ThemePreference {
+export function resolveThemePreference(getPref: PreferenceGetter): ThemePreference {
   let stored: string | null;
   try {
-    stored = preferences.get("theme");
+    stored = getPref("theme");
   } catch {
     return "auto";
   }
@@ -37,10 +41,10 @@ export function resolveThemePreference(): ThemePreference {
  * value to FONT_SIZE_DEFAULT, so the try/catch only needs to guard the read
  * itself.
  */
-export function resolveFontSizePreference(): number {
+export function resolveFontSizePreference(getPref: PreferenceGetter): number {
   let stored: string | null;
   try {
-    stored = preferences.get("fontSize");
+    stored = getPref("fontSize");
   } catch {
     return FONT_SIZE_DEFAULT;
   }

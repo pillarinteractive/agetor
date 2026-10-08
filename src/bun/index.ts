@@ -1,39 +1,31 @@
-import { writeFileSync, existsSync } from "node:fs";
-import { startStallMonitor } from "./stall-monitor.ts";
-import { startAutopilot } from "./autopilot.ts";
-import { startBranchSweep } from "./branch-sweep.ts";
-import { startAwaitLoop } from "./awaits.ts";
-import { isAbsolute } from "node:path";
+import { writeFileSync, existsSync, mkdirSync } from "node:fs";
+import path, { isAbsolute } from "node:path";
 import Electrobun, { ApplicationMenu, BrowserWindow, Screen, Updater, Utils } from "electrobun/bun";
 import { rehydratePath } from "./login-path.ts";
-import { startApiServer, API_PORT, API_TOKEN, type ApiNative } from "./server.ts";
-import { db, harnesses, pidFilePath, tasks, dataDir } from "./db.ts";
-import { reconcileOrphans, rearmFxAutoResumes, sweepArchivedTeardowns, sweepDoneTeardowns, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
-import { initPipelineRunner, reconcilePipelineRuns } from "./pipeline-runner.ts";
-import { ensureDisclaimedServer } from "./tmux-resolution.ts";
-import { SESSION_REAP_SWEEP_MS, USAGE_POLL_SWEEP_MS, FONT_SIZE_DEFAULT, FONT_SIZE_BASE_PX } from "../shared/types.ts";
-import { pollAllUsage } from "./usage/poller.ts";
+import { API_TOKEN, getApiPort } from "./api-config.ts";
+import type { ApiNative } from "./server.ts";
+import { FONT_SIZE_DEFAULT, FONT_SIZE_BASE_PX } from "../shared/types.ts";
 import { resolveThemePreference, resolveFontSizePreference, buildWindowHash } from "./window-url.ts";
-import { broadcastAppEvent, consumeForceQuit } from "./quit-guard.ts";
-import { refreshAllModels, startPeriodicDiscovery } from "./model-discovery.ts";
-import { startUpdaterLoop, applyUpdate, checkForUpdate, getUpdateSnapshot } from "./updater.ts";
-import { startLeaseWatchLoop } from "./lease-watch.ts";
-import { startKeepAwakeLoop } from "./keep-awake.ts";
-import { startPrWatchLoop } from "./pr-watch.ts";
-import { startProgressWatchLoop } from "./progress-watch.ts";
-import { startDependencyLoop } from "./dependencies.ts";
-import { startMergeQueueLoop } from "./merge-queue.ts";
-import { startSlotScheduler } from "./pipeline-runner.ts";
-import { backfillIssues } from "./auto-issue.ts";
-import { getMainWindow, setMainWindow } from "./window.ts";
+import { startUpdaterLoop, applyUpdate, checkForUpdate, getUpdateSnapshot, setUpdateEventPublisher } from "./updater.ts";
+import { getMainWindow, setMainWindow, toggleMainWindowZoom } from "./window.ts";
 import { makeWindowLifecycle, type Frame } from "./window-lifecycle.ts";
 import { focusWindow } from "./window-focus.ts";
 import { repairFrame } from "./screen-frame.ts";
-import { writeCoreCreds, removeCoreCreds, readCoreCreds, probeLiveCore, waitForPortFree } from "./core-creds.ts";
+import { readCoreCreds, probeLiveCore, resolveDataDir } from "./core-creds.ts";
 import { resolveNotifier, resolveNotifierApp, buildNotifierArgs } from "./notifier.ts";
 import { buildTaskDeepLink, parseTaskDeepLink } from "./deep-link.ts";
-import { setPendingOpenTask } from "./pending-open.ts";
-import pkg from "../../package.json" with { type: "json" };
+import { startNativeBridge } from "./native-bridge.ts";
+import { resolveCoreChildEntry, superviseCore, type CoreChildBoot } from "./core-host.ts";
+
+// The app process hosts only the Electrobun side — window, menu, Dock,
+// deep links, notifications, the updater. The core (API server,
+// orchestrator, background loops) runs in a child process (core-child.ts,
+// started below) with its own event loop: in this process the
+// NSApplication host loop can leave Bun's loop un-run for minutes at a time
+// (see stall-monitor.ts), which used to stall the API and all automation.
+// Nothing here imports db.ts; core state is reached over the core's API.
+
+const API_PORT = getApiPort();
 
 /** Drop a pid file in the data dir so out-of-process tools (notably
  *  `bun run wipe:dev`) can tell whether an agetor instance is using this
@@ -48,10 +40,12 @@ import pkg from "../../package.json" with { type: "json" };
  *  double-click in Finder/Spotlight/Dock can't spawn a second process. In
  *  dev mode, dev and prod use different default ports (4318 vs 4317), so
  *  the common stale-process case can't collide. If a port is still held
- *  by something else, the try/catch around `startApiServer()` below fails
- *  loudly with a useful `lsof` hint rather than silently fighting it. */
+ *  by something else, the core child's bind (core-main.ts) fails loudly
+ *  with a useful `lsof` hint rather than silently fighting it. */
 try {
-  writeFileSync(pidFilePath, String(process.pid));
+  const dataDir = resolveDataDir();
+  mkdirSync(dataDir, { recursive: true });
+  writeFileSync(path.join(dataDir, "agetor.pid"), String(process.pid));
 } catch {
   /* non-fatal */
 }
@@ -127,130 +121,11 @@ async function getMainViewUrl(): Promise<string> {
 // When agetor is launched as a packaged .app (Finder, Spotlight, Dock),
 // launchd hands the process a minimal PATH that's missing every place users
 // actually install dev CLIs (/opt/homebrew/bin, ~/.nvm/…, ~/.npm-global/bin,
-// asdf shims, …). Source the user's login-shell PATH once at boot so
-// `Bun.which("claude")` / "codex" / "tmux" can find what's there. Has to run
-// before the API server starts handling /agents probes. Idempotent and safe
-// in dev runs — the merge dedupes.
+// asdf shims, …). Source the user's login-shell PATH once at boot — the core
+// child inherits it (and re-runs the same idempotent merge itself).
 rehydratePath();
 
-// Mark any runs that were "running" when we last shut down as orphaned, so the
-// kanban doesn't show stuck cards. Awaited (top-level await — this module is
-// ESM) so the rest of boot, in particular `startApiServer()` below, never
-// runs concurrently with reconciliation: the API must not start serving
-// `/tasks`/`/runs` while a `status='running'` row from a previous process is
-// still being reattached or flipped to `orphaned` underneath it — the same
-// "reconcile before the API starts" invariant CLAUDE.md §5 documents, and the
-// same ordering the old synchronous `reconcileOrphans` gave for free by
-// blocking this whole script until it returned. An unhandled rejection here
-// fails boot loudly, matching that old synchronous-throw behavior — no
-// swallow.
-//
-// Must run before reconcileOrphans(): reconciliation issues `has-session`
-// probes against agetor's tmux socket, and the first tmux command to touch
-// a socket auto-starts its server — un-disclaimed, if this didn't run
-// first — leaving every session that server ever hosts un-disclaimed too.
-await ensureDisclaimedServer();
-// Subscribe the pipeline runner to the global lifecycle stream BEFORE
-// reconcileOrphans() runs, so a step task's boot-time orphan→ready
-// transition (an ordinary `run-status` "orphaned" event, fired by
-// reconcileOrphans below) reaches the runner and flips its pipeline parent
-// back to ready/cancelled-with-retry instead of leaving it silently stuck
-// `running` forever (docs/plans/pipelines.md §3, T3).
-initPipelineRunner();
-await reconcileOrphans();
-
-// M16: reconcile every pipeline parent whose `pipelineRun` was left mid-flight
-// by a prior process crash/restart — placed right after `reconcileOrphans`
-// (per its own doc, and pipeline-runner.ts's module doc) so every step
-// task's own boot-time orphan→ready transition has already fired and been
-// observed by the pipeline runner's global-event subscriber (wired up by
-// `initPipelineRunner()` above) before this does its own pass over parent
-// rows directly.
-const reconciledPipelineRunCount = await reconcilePipelineRuns();
-if (reconciledPipelineRunCount > 0) {
-  console.log(`[agetor] reconciled ${reconciledPipelineRunCount} pipeline run(s)`);
-}
-
-// Re-arm in-memory auto-resume timers for every fx task still carrying a
-// pending schedule (docs/plans/fx-recovery-follow-ups.md §3 T2 item 9) — an
-// in-memory `setTimeout` handle never survives a process restart, so without
-// this a pause recorded in a prior process would sit forever with a
-// persisted `autoResume.at` nothing will ever fire. Awaited, and placed right
-// after `reconcileOrphans` so reattach/orphan resolution — which can itself
-// flip a run's status — settles first.
-const rearmedFxAutoResumeCount = await rearmFxAutoResumes();
-if (rearmedFxAutoResumeCount > 0) {
-  console.log(`[agetor] re-armed ${rearmedFxAutoResumeCount} fx auto-resume(s)`);
-}
-
-// Heal any archive/delete teardown (tmux kill, terminal shells, worktree
-// detach) that was deferred to the in-memory teardown queue but never ran
-// because agetor quit or crashed before the job fired. Fire-and-forget — it
-// only enqueues jobs onto that queue, keyed to this instance's own task ids.
-sweepArchivedTeardowns();
-
-// Done cards' worktrees: detached once they've sat in Done a while with
-// nothing running (branch kept; re-attaches on reopen). Best-effort.
-setInterval(() => {
-  try {
-    sweepDoneTeardowns();
-  } catch {
-    // background hygiene only
-  }
-}, 5 * 60_000).unref?.();
-
-// Idle-session reaper (docs/plans/reduce-cpu-and-memory.md §3.1, T4): kills
-// claude REPL tmux sessions that have sat idle (no turn in flight, nothing
-// pending, no activity) for IDLE_SESSION_REAP_MS, reclaiming their ~300–500MB
-// "node" process and per-session timers. A 30s delay before the first sweep
-// lets `reconcileOrphans` above finish reattaching live sessions first, so a
-// task that's mid-reattach isn't mistaken for idle. Errors are swallowed —
-// this is best-effort background hygiene, never something that should crash
-// the app.
-setTimeout(() => {
-  reapIdleSessions().catch((err) => {
-    console.error("[agetor] idle-session reap (post-boot) failed:", err);
-  });
-}, 30_000);
-setInterval(() => {
-  reapIdleSessions().catch((err) => {
-    console.error("[agetor] idle-session reap (interval) failed:", err);
-  });
-}, SESSION_REAP_SWEEP_MS);
-
-// Per-harness usage poller (docs/plans/harness-usage-tracker.md §7): fetches
-// quota/usage snapshots for every enabled harness on a background cadence, so
-// the topbar meters stay fresh without the webview driving the fetches. A
-// 20s post-boot delay (offset from the reaper's 30s so the two sweeps don't
-// both fire in the same tick) lets boot settle first. Errors are swallowed —
-// `pollAllUsage` already never throws, but the `.catch` matches the reaper's
-// belt-and-suspenders shape.
-setTimeout(() => {
-  pollAllUsage().catch((err) => {
-    console.error("[agetor] usage poll (post-boot) failed:", err);
-  });
-}, 20_000);
-setInterval(() => {
-  pollAllUsage().catch((err) => {
-    console.error("[agetor] usage poll sweep failed", err);
-  });
-}, USAGE_POLL_SWEEP_MS);
-
 installNativeMenu();
-
-// Best-effort: probe the agent CLIs (and every enabled fx harness's own
-// account-scoped catalog) for their model lists so the form can surface
-// anything new the user installed — or logged into — without an app update.
-// Runs in the background — we don't await it so a slow CLI never delays the
-// API/window; the webview polls GET /agent-models/harnesses' `ready` flag
-// until this sweep lands, which is what closes the boot race
-// docs/plans/fx-model-catalog-refresh.md §2 reproduced (fx=0 for the first
-// ~1s after boot). `startPeriodicDiscovery` re-runs the sweep every 15
-// minutes (`.unref()`'d — never itself keeps the app alive) so catalog
-// drift (new models, revoked account access) is eventually noticed even
-// with no triggering event.
-void refreshAllModels();
-startPeriodicDiscovery();
 
 /**
  * Posts a task notification, deep-linking it to the task when possible.
@@ -358,7 +233,8 @@ registerNotifierBundle();
 // Native-host capabilities the API server needs but that only exist inside
 // Electrobun (file dialogs, OS notifications, open-in-Finder/browser, the
 // self-updater, quit). The headless CLI daemon injects none of these — its
-// routes 501 — but the packaged app wires them up here.
+// routes 501 — but the app serves them to its core child over the native
+// bridge (native-bridge.ts).
 const native: ApiNative = {
   openFileDialog: (opts) => Utils.openFileDialog(opts),
   openPath: (p) => Utils.openPath(p),
@@ -381,6 +257,7 @@ const native: ApiNative = {
   openExternal: (url) => Utils.openExternal(url),
   showNotification: (n) => showTaskNotification(n),
   focusWindow: () => focusMainWindow(),
+  toggleZoom: () => toggleMainWindowZoom(),
   quit: () => Utils.quit(),
   updates: {
     snapshot: () => getUpdateSnapshot(),
@@ -389,165 +266,112 @@ const native: ApiNative = {
   },
 };
 
-let apiServer: ReturnType<typeof startApiServer>;
-try {
-  apiServer = startApiServer({ native });
-} catch (e) {
-  // Port busy. If our own cli-daemon owns it (the CLI started a background core
-  // while the app was closed), ask it to hand off, wait for the port to free,
-  // then bind and become the owner. Anything else — a foreign process (stale
-  // agetor, or OTLP gRPC which also defaults to 4317) or a wedged daemon that
-  // won't release — falls through to the loud message + exit so the user sees
-  // the real problem rather than a wall of CORS errors in the renderer.
-  const creds = readCoreCreds(dataDir);
-  let recovered: ReturnType<typeof startApiServer> | null = null;
-  if (creds && creds.kind === "cli-daemon" && (await probeLiveCore(creds))) {
-    console.log("[agetor] a CLI daemon owns the API port — requesting handoff…");
-    try {
-      await fetch(`http://127.0.0.1:${creds.port}/daemon/shutdown`, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${creds.token}` },
-      });
-    } catch {
-      /* the daemon drops the connection as it exits — expected */
-    }
-    if (await waitForPortFree(creds.port, 10_000)) {
-      try {
-        recovered = startApiServer({ native });
-      } catch {
-        /* fall through to the loud message below */
-      }
-    }
-  }
-  if (!recovered) {
-    const msg = (e as Error)?.message ?? String(e);
-    console.error(`[agetor] failed to bind API on 127.0.0.1:${API_PORT}: ${msg}`);
-    console.error(`[agetor] another process is holding that port. Run \`lsof -nP -iTCP:${API_PORT} -sTCP:LISTEN\` to identify it, then quit it and relaunch agetor.`);
-    process.exit(1);
-  }
-  apiServer = recovered;
+const bridge = startNativeBridge(native);
+
+/** Authenticated request to the core child's API. */
+function coreFetch(route: string, init: RequestInit & { timeoutMs?: number } = {}): Promise<Response> {
+  const { timeoutMs = 10_000, ...rest } = init;
+  return fetch(`http://127.0.0.1:${API_PORT}${route}`, {
+    ...rest,
+    headers: { authorization: `Bearer ${API_TOKEN}`, "content-type": "application/json", ...rest.headers },
+    signal: AbortSignal.timeout(timeoutMs),
+  });
 }
 
-// Publish the per-launch API port + token so the CLI (and a second app launch)
-// can discover and authenticate to this core. `kind: "app"` tells a future
-// daemon spawn that the richer surface owns the port.
-writeCoreCreds(
-  {
-    port: apiServer.port!,
-    token: API_TOKEN,
-    pid: process.pid,
-    kind: "app",
-    version: pkg.version,
-    startedAt: Date.now(),
+// Start the core child with this app's own bundled bun (`process.execPath`
+// is Contents/MacOS/bun inside the .app). It inherits this process's env —
+// including the hydrated PATH and AGETOR_DATA_DIR / AGETOR_API_PORT — and
+// reads the bridge coordinates and the API token from its stdin (see
+// CoreChildBoot). Choosing the token here (rather than letting each core
+// pick one) means a restarted core keeps the token the webview already
+// holds. stdout/stderr are inherited, so the core's output lands wherever
+// this process's does, without passing through this process's
+// (stall-prone) event loop.
+const coreEntry = resolveCoreChildEntry();
+let quitApproved = false;
+let core: ReturnType<typeof superviseCore> | null = null;
+function fatal(message: string): never {
+  console.error(`[agetor] ${message}`);
+  quitApproved = true;
+  core?.stop();
+  process.exit(1);
+}
+if (!coreEntry) fatal("core-child entry not found next to the app bundle — the build is incomplete");
+core = superviseCore({
+  spawn: () => {
+    const child = Bun.spawn([process.execPath, coreEntry!], {
+      env: process.env,
+      stdin: "pipe",
+      stdout: "inherit",
+      stderr: "inherit",
+    });
+    const boot: CoreChildBoot = { apiToken: API_TOKEN, bridgeUrl: bridge.url, bridgeToken: bridge.token };
+    child.stdin.write(JSON.stringify(boot));
+    void child.stdin.end();
+    return child;
   },
-  dataDir,
-);
+  // Healthy = this child wrote the creds file and its API answers with them.
+  isHealthy: async (pid) => {
+    const creds = readCoreCreds();
+    return creds != null && creds.pid === pid && (await probeLiveCore(creds));
+  },
+  log: (m) => console.log(`[agetor] ${m}`),
+  sleep: (ms) => Bun.sleep(ms),
+  now: () => Date.now(),
+});
+// The core does its own boot (reconcile before serving, the API bind and
+// the cli-daemon handoff) — the window waits until it's serving. A core that
+// can't boot (e.g. the API port held by a foreign process) takes the app down
+// loudly, as an in-process bind failure did.
+try {
+  await core.ready;
+} catch (err) {
+  fatal(`core failed to start: ${(err as Error)?.message ?? err}`);
+}
 
 // Warn the user before quitting when runs are still active. Electrobun's
 // `before-quit` event fires synchronously from Utils.quit() and reads
-// `responseWasSet && response.allow === false` to veto — we can't await an
-// async confirm here, so the flow is:
-//   1. Block this quit (set allow:false) and broadcast a quit_request app
-//      event over SSE.
-//   2. The webview's QuitConfirmDialog shows the modal.
-//   3. On confirm, the webview POSTs /app/force-quit which arms a one-shot
-//      flag and re-issues Utils.quit(); this handler then sees the flag
-//      via consumeForceQuit() and allows the quit through.
-// Reattached runs (claude-code sessions kept alive across restart) count
-// as running, so the user is still prompted if they try to quit while one
-// is in flight.
+// `responseWasSet && response.allow === false` to veto — we can't await
+// anything here, and the running-runs state lives in the core, so the flow
+// is:
+//   1. Veto this quit and ask the core (`POST /host/quit-check`).
+//   2. The core allows it when nothing is running or the webview's "Quit
+//      anyway" armed its force-quit flag (`POST /app/force-quit`, which
+//      then re-issues the quit through the bridge). Otherwise it broadcasts
+//      a quit_request app event and the webview's QuitConfirmDialog shows.
+//   3. On allow, re-issue Utils.quit() with `quitApproved` set; that pass
+//      goes through and takes the core child down with it.
+// An unreachable core allows the quit — a missed warning costs less than
+// trapping the user.
+let quitCheckInFlight = false;
 Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) => {
-  if (consumeForceQuit()) {
-    removeCoreCreds(dataDir);
+  if (quitApproved) {
+    core?.stop();
     event.response = { allow: true };
     return;
   }
-  let runningCount = 0;
-  let runningTaskTitles: string[] = [];
-  try {
-    const rows = db.query<{ task_id: string }, []>(
-      `SELECT DISTINCT task_id FROM runs WHERE status = 'running'`,
-    ).all();
-    runningCount = rows.length;
-    runningTaskTitles = rows
-      .map((r) => tasks.get(r.task_id)?.title ?? "")
-      .filter((t) => t.length > 0)
-      .slice(0, 10);
-  } catch {
-    // If the DB is unavailable for any reason, allow the quit — the cost
-    // of a missed warning is small; the cost of trapping the user is high.
-  }
-  if (runningCount === 0) {
-    removeCoreCreds(dataDir);
-    event.response = { allow: true };
-    return;
-  }
-  broadcastAppEvent({
-    type: "quit_request",
-    runningRunCount: runningCount,
-    runningTaskTitles,
-    ts: Date.now(),
-  });
   event.response = { allow: false };
+  if (quitCheckInFlight) return;
+  quitCheckInFlight = true;
+  void coreFetch("/host/quit-check", { method: "POST" })
+    .then(async (res) => ((await res.json()) as { allow?: boolean }).allow !== false)
+    .catch(() => true)
+    .then((allow) => {
+      quitCheckInFlight = false;
+      if (!allow) return;
+      quitApproved = true;
+      Utils.quit();
+    });
 });
 
-// Stop the fx auto-resume engine's in-memory timers on the way out (Phase 8
-// review #7) — mirrors fx-acp.ts's own `process.on("exit", reapLiveFxProcs)`
-// (see that file's doc for why `"exit"` is the right event here: it covers
-// both a normal process exit AND the `Utils.quit()` path this app's own
-// `before-quit` handler above ultimately allows through, unlike SIGINT/
-// SIGTERM which fx-acp's handlers already own separately). Unlike
-// `headless.ts`'s `shutdown()`, this app has no single synchronous teardown
-// function to hook into — the confirm-on-quit flow above just flips
-// `event.response.allow` and lets Electrobun's own quit sequence run — so a
-// bare `process.on("exit", ...)` registration is the only reliable hook.
-// `fxAutoResumeTimers` entries are `.unref()`'d already (never what keeps the
-// process alive), so this is about not racing a timer mid-teardown, not
-// about letting the process exit at all; it touches no persisted
-// `fxRecovery` row — `rearmFxAutoResumes()` re-arms from the DB on next boot.
-process.on("exit", stopFxAutoResumeTimers);
-
-// Background self-update check on launch + every 6h. Emits global events
-// that the UI subscribes to via SSE to render the "update ready" banner.
-// Defers its first probe 5s past boot so it doesn't slow window open.
+// Background self-update check on launch + every 6h. Status changes go onto
+// the core's global SSE stream, which the UI's "update ready" banner
+// listens to. Defers its first probe 5s past boot so it doesn't slow window
+// open.
+setUpdateEventPublisher((e) => {
+  void coreFetch("/host/update-event", { method: "POST", body: JSON.stringify(e) }).catch(() => undefined);
+});
 startUpdaterLoop();
-
-// Lease badges (src/bun/lease-watch.ts): probe each `lease_watchers` command
-// and publish who holds the resource. A no-op until one is configured.
-startLeaseWatchLoop();
-
-// Hold a caffeinate assertion while any agent is running so a long turn
-// isn't cut off by the Mac idling to sleep (src/bun/keep-awake.ts).
-startKeepAwakeLoop();
-
-// Follow each task's pull request (src/bun/pr-watch.ts): badge, Fix CI /
-// Address review follow-ups, and Done on merge.
-startPrWatchLoop();
-
-// Live progress of lab/E2E runs on running cards (src/bun/progress-watch.ts).
-// A no-op until `progress_watchers` is configured.
-startProgressWatchLoop();
-
-
-// Card dependencies (src/bun/dependencies.ts): move a card on once what
-// it was blocked by has landed.
-startDependencyLoop();
-
-// Ready to Merge (src/bun/merge-queue.ts): work signed-off PRs to green and
-// merge them.
-startMergeQueueLoop();
-
-// Step slots (src/bun/step-slots.ts): start queued pipeline steps as
-// running ones finish.
-startSlotScheduler();
-startAwaitLoop();
-startBranchSweep();
-startAutopilot();
-startStallMonitor();
-
-// Every card gets a GitHub issue (src/bun/auto-issue.ts): catch up live
-// cards that don't have one yet.
-void backfillIssues().catch(() => undefined);
 
 /** Lifecycle wrapper around BrowserWindow construction. Handles:
  *   - idempotency (concurrent reopen events share one in-flight build),
@@ -561,8 +385,18 @@ const windowLifecycle = makeWindowLifecycle({
   setMainWindow,
   buildWindow: async (frame: Frame) => {
     const url = await getMainViewUrl();
-    const theme = resolveThemePreference();
-    const fontSize = resolveFontSizePreference();
+    // Theme + font size live in the core's preferences store; a failed read
+    // falls back to the defaults rather than blocking the window.
+    let prefs: Record<string, string> = {};
+    try {
+      const res = await coreFetch("/preferences", { timeoutMs: 3_000 });
+      if (res.ok) prefs = (await res.json()) as Record<string, string>;
+    } catch {
+      /* defaults */
+    }
+    const getPref = (key: string) => prefs[key] ?? null;
+    const theme = resolveThemePreference(getPref);
+    const fontSize = resolveFontSizePreference(getPref);
     // The native views:// scheme handler refuses URLs that carry a fragment
     // or query — it treats the part after the scheme as a literal file path,
     // so `views://mainview/index.html#api=…` resolves to a non-existent file
@@ -730,8 +564,9 @@ Electrobun.events.on("reopen", () => {
 // Electrobun, so this is the only way a notification click gets back into
 // the app — see the design note at src/mainview/lib/api.ts:424.
 //
-// We ALWAYS stash the taskId in pending-open.ts (short-TTL) and, if a window
-// already exists, ALSO broadcast immediately and raise the window:
+// The core (`POST /host/open-task`) ALWAYS stashes the taskId in
+// pending-open.ts (short-TTL) and broadcasts it; if a window already exists
+// we also raise it:
 //   - Window exists: the webview is connected to /app/events, so the direct
 //     broadcast arrives instantly. The pending stash is belt-and-suspenders —
 //     if the broadcast happens to land while the webview is mid-reload or
@@ -760,9 +595,12 @@ Electrobun.events.on("open-url", (e: { data: { url: string } }) => {
   try {
     const taskId = parseTaskDeepLink(e.data.url);
     if (!taskId) return;
-    setPendingOpenTask(taskId);
+    // The core stashes it for the next /app/events subscriber and
+    // broadcasts it to any connected one.
+    void coreFetch("/host/open-task", { method: "POST", body: JSON.stringify({ taskId }) }).catch((err) => {
+      console.error("[agetor] failed to forward open-url to the core:", err);
+    });
     if (getMainWindow()) {
-      broadcastAppEvent({ type: "open_task", taskId, ts: Date.now() });
       focusMainWindow();
     } else {
       windowLifecycle.createMainWindow().catch((err) => {

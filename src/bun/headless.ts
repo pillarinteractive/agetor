@@ -1,30 +1,8 @@
 import pkg from "../../package.json" with { type: "json" };
-import { API_TOKEN } from "./api-config.ts";
-import { db, dataDir, subagents } from "./db.ts";
-import { reconcileOrphans, rearmFxAutoResumes, reapIdleSessions, stopFxAutoResumeTimers } from "./orchestrator.ts";
-import { initPipelineRunner, reconcilePipelineRuns } from "./pipeline-runner.ts";
-import { startLeaseWatchLoop } from "./lease-watch.ts";
-import { startKeepAwakeLoop } from "./keep-awake.ts";
-import { startPrWatchLoop } from "./pr-watch.ts";
-import { startProgressWatchLoop } from "./progress-watch.ts";
-import { startDependencyLoop } from "./dependencies.ts";
-import { startMergeQueueLoop } from "./merge-queue.ts";
-import { startSlotScheduler } from "./pipeline-runner.ts";
-import { backfillIssues } from "./auto-issue.ts";
-import { ensureDisclaimedServer } from "./tmux-resolution.ts";
-import { startApiServer, attachedClientCount } from "./server.ts";
-import { rehydratePath } from "./login-path.ts";
-import { refreshAllModels, startPeriodicDiscovery } from "./model-discovery.ts";
-import { reapLiveFxProcs } from "./fx-acp.ts";
-import {
-  writeCoreCreds,
-  removeCoreCreds,
-  readCoreCreds,
-  probeLiveCore,
-} from "./core-creds.ts";
+import { db, subagents } from "./db.ts";
+import { attachedClientCount } from "./server.ts";
+import { startCore, shutdownCore } from "./core-main.ts";
 import { daemonLog } from "./daemon-log.ts";
-import { SESSION_REAP_SWEEP_MS, USAGE_POLL_SWEEP_MS } from "../shared/types.ts";
-import { pollAllUsage } from "./usage/poller.ts";
 
 /**
  * Headless Agetor core — the same Bun server + orchestrator the desktop app
@@ -97,172 +75,23 @@ export function hasRunningWork(): boolean {
   }
 }
 
-let shuttingDown = false;
 function shutdown(reason: string, code = 0): void {
-  if (shuttingDown) return;
-  shuttingDown = true;
-  daemonLog(`shutting down (${reason})`);
-  // fx-acp.ts's own SIGINT/SIGTERM/SIGHUP handlers always reap `fx acp`
-  // children but only call `process.exit` themselves when they're the sole
-  // listener for that signal — since this module registers its own
-  // SIGINT/SIGTERM handlers below (making fx-acp's handler NOT the sole
-  // listener), fx-acp steps back and this shutdown path is what actually
-  // owns the exit sequence. That means this is also the path responsible for
-  // reaping any live fx children — do it explicitly, before the rest of
-  // teardown, rather than relying on fx-acp's handler to have done it.
-  reapLiveFxProcs();
-  // Same reasoning for the auto-resume engine's in-memory timers (Phase 8
-  // review #7): `fxAutoResumeTimers` entries are `.unref()`'d so they never
-  // block a clean exit on their own, but stopping them explicitly here keeps
-  // shutdown from racing a timer that fires mid-teardown (spawning a new fx
-  // run against a process that's already tearing everything else down). Does
-  // not touch any persisted `fxRecovery` row — `rearmFxAutoResumes()` re-arms
-  // them from the DB on the next boot.
-  stopFxAutoResumeTimers();
-  try {
-    removeCoreCreds(dataDir);
-  } catch {
-    /* best-effort */
-  }
-  process.exit(code);
+  // fx-acp.ts's own SIGINT/SIGTERM handlers step back once this module
+  // registers its own (below), so shutdownCore owns the exit sequence —
+  // including reaping live fx children and stopping auto-resume timers.
+  shutdownCore(reason, daemonLog, code);
 }
 
 export async function runDaemon(): Promise<void> {
   process.env.AGETOR_HEADLESS = "1";
   daemonLog(`cli-daemon starting — pid ${process.pid}, version ${pkg.version}`);
 
-  // Same PATH hydration + orphan reconciliation the app does at boot, so the
-  // daemon can find claude/codex/tmux and doesn't leave stale "running" cards.
-  // Awaited so `startApiServer()` below never starts serving `/tasks`/`/runs`
-  // while a `status='running'` row from a previous process is still being
-  // reattached or flipped to `orphaned` underneath it — the "reconcile
-  // before the API starts" invariant (CLAUDE.md §5), mirroring index.ts's
-  // desktop boot path. A reconcile throw propagates out of `runDaemon` and
-  // fails boot loudly, same as the old synchronous `reconcileOrphans` did —
-  // no swallow.
-  rehydratePath();
-  // Must run before reconcileOrphans(): reconciliation issues `has-session`
-  // probes against agetor's tmux socket, and the first tmux command to
-  // touch a socket auto-starts its server — un-disclaimed, if this didn't
-  // run first — leaving every session that server ever hosts un-disclaimed
-  // too.
-  await ensureDisclaimedServer();
-  // Same ordering as index.ts's desktop boot path: wire the pipeline runner
-  // to the global lifecycle stream before reconcileOrphans() so a step
-  // task's boot-time orphan→ready transition reaches it too.
-  initPipelineRunner();
-  await reconcileOrphans();
-  // M16: same ordering as index.ts's desktop boot path — reconcile every
-  // pipeline parent left mid-flight by a prior crash/restart right after
-  // reconcileOrphans() resolves every step task's own orphan→ready
-  // transition. `daemonLog`, not `console.log` — see the rearm comment below.
-  const reconciledPipelineRunCount = await reconcilePipelineRuns();
-  if (reconciledPipelineRunCount > 0) {
-    daemonLog(`reconciled ${reconciledPipelineRunCount} pipeline run(s)`);
-  }
-  // Re-arm in-memory auto-resume timers for every fx task still carrying a
-  // pending schedule — same rationale as index.ts's desktop boot path (see
-  // its comment): an in-memory `setTimeout` handle never survives a process
-  // restart. `daemonLog`, not `console.log` — this process has no console a
-  // user can see.
-  const rearmedFxAutoResumeCount = await rearmFxAutoResumes();
-  if (rearmedFxAutoResumeCount > 0) {
-    daemonLog(`re-armed ${rearmedFxAutoResumeCount} fx auto-resume(s)`);
-  }
-  // Same boot-sweep + periodic-refresh pair as index.ts's desktop boot path
-  // (see its comment for the full rationale) — the daemon needs the same
-  // model-discovery freshness the app gets, and `startPeriodicDiscovery`'s
-  // timer is `.unref()`'d internally, satisfying this file's rule that a
-  // background timer must never be what keeps the daemon alive past its own
-  // idle-shutdown path.
-  void refreshAllModels();
-  startPeriodicDiscovery();
-  // Lease badges — same as index.ts; the loop's timer is unref'd.
-  startLeaseWatchLoop();
-  // Keep the Mac awake while agents run — same as index.ts; timer is unref'd.
-  startKeepAwakeLoop();
-
-  // PR watcher — same as index.ts; timer is unref'd.
-  startPrWatchLoop();
-  // Live run progress — same as index.ts; timer is unref'd.
-  startProgressWatchLoop();
-  // Card dependencies — same as index.ts; timer is unref'd.
-  startDependencyLoop();
-  // Ready to Merge — same as index.ts; timer is unref'd.
-  startMergeQueueLoop();
-  // Step slots — same as index.ts; timer is unref'd.
-  startSlotScheduler();
-  // Every card gets a GitHub issue — same as index.ts.
-  void backfillIssues().catch(() => undefined);
-
-  // Idle-session reaper (docs/plans/reduce-cpu-and-memory.md §3.1, T4):
-  // mirrors index.ts's wiring so the headless daemon doesn't accumulate the
-  // same idle claude REPLs the desktop app now reaps. A 30s delay before the
-  // first sweep lets `reconcileOrphans` above finish reattaching live
-  // sessions first. Both timers are `.unref()`'d — like the idle-shutdown
-  // timer below, a reap timer must never be what keeps this process alive;
-  // the daemon's own idle-shutdown path (and its resulting `process.exit`)
-  // has to remain reachable regardless of these firing.
-  const reapPostBootTimer = setTimeout(() => {
-    reapIdleSessions().catch((err) => {
-      daemonLog(`idle-session reap (post-boot) failed: ${(err as Error)?.message ?? String(err)}`);
-    });
-  }, 30_000);
-  reapPostBootTimer.unref();
-  const reapIntervalTimer = setInterval(() => {
-    reapIdleSessions().catch((err) => {
-      daemonLog(`idle-session reap (interval) failed: ${(err as Error)?.message ?? String(err)}`);
-    });
-  }, SESSION_REAP_SWEEP_MS);
-  reapIntervalTimer.unref();
-
-  // Per-harness usage poller (docs/plans/harness-usage-tracker.md §7): mirrors
-  // index.ts's wiring so the headless daemon also keeps quota snapshots fresh.
-  // Both timers are `.unref()`'d — usage polling stops the moment the daemon
-  // idle-shuts, by design, since there's no attached UI left to update.
-  const usagePostBootTimer = setTimeout(() => {
-    pollAllUsage().catch((err) => {
-      daemonLog(`usage poll (post-boot) failed: ${(err as Error)?.message ?? String(err)}`);
-    });
-  }, 20_000);
-  usagePostBootTimer.unref();
-  const usageIntervalTimer = setInterval(() => {
-    pollAllUsage().catch((err) => {
-      daemonLog(`usage poll sweep failed: ${(err as Error)?.message ?? String(err)}`);
-    });
-  }, USAGE_POLL_SWEEP_MS);
-  usageIntervalTimer.unref();
-
-  let server: ReturnType<typeof startApiServer>;
-  try {
-    server = startApiServer(); // no native deps → native routes return 501
-  } catch (e) {
-    // Port busy. If a live core already owns it (the app launched, or another
-    // daemon won a startup race), exit quietly — the CLI re-discovers the
-    // winner via the creds file. Otherwise it's a real conflict.
-    const creds = readCoreCreds(dataDir);
-    if (creds && (await probeLiveCore(creds))) {
-      daemonLog("port already owned by a live core — exiting quietly");
-      process.exit(0);
-    }
-    daemonLog(`failed to bind API: ${(e as Error)?.message ?? String(e)}`);
-    process.exit(1);
-  }
-
-  writeCoreCreds(
-    {
-      // `server.port` is typed `number | undefined`, but a bound server always
-      // has a numeric port.
-      port: server.port!,
-      token: API_TOKEN,
-      pid: process.pid,
-      kind: "cli-daemon",
-      version: pkg.version,
-      startedAt: Date.now(),
-    },
-    dataDir,
-  );
-  daemonLog(`cli-daemon listening on http://127.0.0.1:${server.port}`);
+  // Same boot as the app's core (core-main.ts): PATH hydration, orphan
+  // reconciliation before the API serves, the API itself, the creds file and
+  // every background loop. A busy port held by a live core exits quietly.
+  // Every loop timer is unref'd, so the idle-shutdown path below stays
+  // reachable.
+  await startCore({ kind: "cli-daemon", log: daemonLog }); // no native → native routes 501
 
   process.on("SIGINT", () => shutdown("SIGINT"));
   process.on("SIGTERM", () => shutdown("SIGTERM"));
