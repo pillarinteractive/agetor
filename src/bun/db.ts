@@ -816,12 +816,27 @@ export const tasks = {
   // for the whole result set (two single-pass scans over their respective
   // in-memory maps) instead of once per row via `toTask`'s per-task fallback
   // — this is the hot path hit by the 2s `/tasks` poll.
-  list(): Task[] {
-    const rows = db.query<TaskRow, []>(
+  //
+  // `opts.archived` narrows which archived rows are read, in SQL, so the
+  // lean board poll never reads or JSON-parses archived history: `"all"`
+  // (the default — the server's own callers rely on archived rows being
+  // there), `"cards"` (archived rows that aren't hidden pipeline steps) or
+  // `"none"`. `opts.includeIds` keeps the named rows whatever they are.
+  list(opts?: { archived?: "all" | "cards" | "none"; includeIds?: readonly string[] }): Task[] {
+    // The id list rides one JSON parameter (`json_each`) so the SQL text —
+    // and with it bun:sqlite's cached statement — stays fixed per mode.
+    const archived = opts?.archived ?? "all";
+    const where = archived === "all"
+      ? ""
+      : `WHERE tasks.archived_at IS NULL${archived === "cards" ? " OR tasks.pipeline_parent_id IS NULL" : ""}
+            OR tasks.id IN (SELECT value FROM json_each(?))`;
+    const params = archived === "all" ? [] : [JSON.stringify(opts?.includeIds ?? [])];
+    const rows = db.query<TaskRow, string[]>(
       `${TASKS_SELECT}
+         ${where}
          GROUP BY tasks.id
          ORDER BY tasks.created_at DESC`,
-    ).all();
+    ).all(...params);
     const pending = pendingCountsByTask();
     // D11: a pipeline parent task never has interactions registered against
     // its own (hidden, agent-less) id — every interaction happens on the
@@ -837,6 +852,14 @@ export const tasks = {
     }
     const counts: TaskCounts = { pending, terminals: terminalCountsByTask() };
     return rows.map((r) => toTask(r, counts));
+  },
+  /** Archived board cards (archived rows that aren't hidden pipeline steps)
+   *  — lets the lean `/tasks` poll report how many it left out, so the
+   *  board header's "N of M tasks" total stays the same. */
+  archivedCardCount(): number {
+    return db.query<{ n: number }, []>(
+      `SELECT COUNT(*) AS n FROM tasks WHERE archived_at IS NOT NULL AND pipeline_parent_id IS NULL`,
+    ).get()?.n ?? 0;
   },
   get(id: string): Task | null {
     const row = db.query<TaskRow, [string]>(

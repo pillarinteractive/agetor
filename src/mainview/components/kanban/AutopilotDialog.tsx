@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Rocket, X } from "lucide-react";
 import { Dialog } from "@/components/ui/dialog";
@@ -51,6 +51,24 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
     return () => clearInterval(t);
   }, [open, load]);
 
+  // The board's lean task list leaves archived rows out, but an autopilot
+  // card that was finished and archived still counts toward "done" — read
+  // each such card once (archived rows are frozen; an unarchived one is back
+  // in `tasks`, which wins).
+  const [archivedCards, setArchivedCards] = useState<Record<string, Task>>({});
+  const fetchedCardIdsRef = useRef(new Set<string>());
+  useEffect(() => {
+    if (!open || !state) return;
+    const known = new Set(tasks.map((t) => t.id));
+    for (const id of state.cards) {
+      if (known.has(id) || fetchedCardIdsRef.current.has(id)) continue;
+      fetchedCardIdsRef.current.add(id);
+      void api.getTask(id)
+        .then((t) => setArchivedCards((m) => ({ ...m, [id]: t })))
+        .catch(() => { /* deleted — not counted, as before */ });
+    }
+  }, [open, state, tasks]);
+
   if (!open || !config) return null;
 
   const save = async (patch: Partial<AutopilotConfigDto> & { restart?: boolean }) => {
@@ -67,7 +85,7 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
     }
   };
 
-  const mine = (state?.cards ?? []).map((id) => tasks.find((t) => t.id === id)).filter((t): t is Task => !!t);
+  const mine = (state?.cards ?? []).map((id) => tasks.find((t) => t.id === id) ?? archivedCards[id]).filter((t): t is Task => !!t);
   // Slots are held only by cards still being built (src/bun/autopilot.ts BUILDING).
   const inFlight = mine.filter((t) => t.archivedAt == null && ["backlog", "ready", "running", "blocked"].includes(t.column));
   const done = mine.filter((t) => t.column === "done").length;

@@ -1754,6 +1754,15 @@ export interface Task {
    *  the running task, or for a running pipeline the quietest active step).
    *  Server-decorated for running cards only; drives the "quiet" warning. */
   lastActivityAt?: number | null;
+  /** Set only on a lean `GET /tasks?lean=1` row whose `prompt` was cut to a
+   *  preview (src/bun/task-list.ts). Anything that shows or uses the whole
+   *  prompt must read `GET /tasks/:id`; the server refuses to PATCH a
+   *  `prompt` sent alongside this flag. */
+  promptTruncated?: true;
+  /** Set only on a lean `GET /tasks?lean=1` row whose frozen
+   *  `agentProfile.instructions` was cut to a preview — read `GET /tasks/:id`
+   *  for the full snapshot. */
+  agentProfileTruncated?: true;
 }
 
 /** Why a worktree is flagged `stale` in {@link WorktreeInfo}. A worktree can

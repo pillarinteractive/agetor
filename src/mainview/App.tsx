@@ -506,12 +506,53 @@ function AppInner() {
   const refreshAgentsPollInFlightRef = useRef(false);
   const refreshProjectsPollInFlightRef = useRef(false);
 
+  // Lean-list bookkeeping (`api.pollTasks`, src/bun/task-list.ts): the last
+  // response's ETag, so an unchanged 2s poll is a bodiless 304 — nothing to
+  // parse or reconcile — and when the last full (200) response landed.
+  const tasksEtagRef = useRef<string | null>(null);
+  const tasksFullFetchAtRef = useRef(0);
+  /** Archived board cards the lean list left out (archived filter off) — so
+   *  the header's "N of M tasks" total still counts them. */
+  const [omittedArchivedCount, setOmittedArchivedCount] = useState(0);
+  // Read by `refresh` at call time (the archived filter and the open
+  // panel / run view decide what the lean list must carry).
+  const archivedViewRef = useRef(archivedView);
+  archivedViewRef.current = archivedView;
+
   /** Re-list tasks. Returns the fetched list so callers that need to inspect a
    *  task right after a mutation don't have to issue a second GET. `null` on
-   *  failure — the last good snapshot stays rendered and the poll retries. */
-  const refresh = useCallback(async (): Promise<Task[] | null> => {
+   *  failure — the last good snapshot stays rendered and the poll retries.
+   *
+   *  The list is LEAN (`api.pollTasks`): prompt previews, no archived rows
+   *  unless the archived filter wants them — except the open run panel's
+   *  task and the open pipeline run view's task, which always ride along so
+   *  archiving the task you're looking at doesn't make it vanish.
+   *  `conditional` (the interval/visibility poll only) sends the last ETag;
+   *  every post-mutation refresh is unconditional so an optimistic patch the
+   *  server rejected can't outlive a 304. A conditional poll still goes
+   *  unconditional once 30 s pass without a full response, as a backstop
+   *  against any other local-only drift. */
+  const refresh = useCallback(async (opts?: { conditional?: boolean }): Promise<Task[] | null> => {
     try {
-      const list = await api.listTasks();
+      const now = Date.now();
+      const conditional = opts?.conditional === true && now - tasksFullFetchAtRef.current < 30_000;
+      const include: string[] = [];
+      if (selectedIdRef.current) include.push(selectedIdRef.current);
+      const v = viewRef.current;
+      if (v.kind === "pipeline-run") include.push(v.taskId);
+      const res = await api.pollTasks({
+        archived: archivedViewRef.current !== "active",
+        include,
+        etag: conditional ? tasksEtagRef.current : null,
+      });
+      if (res.unchanged) {
+        setTasksLoaded(true);
+        return tasksRef.current;
+      }
+      tasksFullFetchAtRef.current = now; // a 200 replaces state wholesale
+      tasksEtagRef.current = res.etag;
+      setOmittedArchivedCount(res.omittedArchived);
+      const list = res.tasks;
       // `list` (unreconciled) is what callers get back for immediate reads
       // (e.g. re-checking a just-created task's branch); the reconciled,
       // identity-preserving version is what actually lands in state.
@@ -523,6 +564,17 @@ function AppInner() {
       return list;
     } catch { return null; /* keep last good snapshot; retry next tick */ }
   }, []);
+  // The archived filter decides whether the lean list carries archived
+  // cards — re-list right away when it changes instead of waiting out a
+  // tick (skipped on mount; the boot effect below does the first fetch).
+  const archivedViewMountedRef = useRef(false);
+  useEffect(() => {
+    if (!archivedViewMountedRef.current) {
+      archivedViewMountedRef.current = true;
+      return;
+    }
+    void refresh();
+  }, [archivedView, refresh]);
   const refreshAgents = useCallback(async () => {
     try {
       const payload = await api.listHarnesses();
@@ -659,7 +711,7 @@ function AppInner() {
         // flight — see `refreshPollInFlightRef`'s comment above.
         if (!refreshPollInFlightRef.current) {
           refreshPollInFlightRef.current = true;
-          void refresh().finally(() => { refreshPollInFlightRef.current = false; });
+          void refresh({ conditional: true }).finally(() => { refreshPollInFlightRef.current = false; });
         }
         // Same guard, its own ref — a slow `/projects` fetch must not stack
         // with the next 2s tick either.
@@ -682,7 +734,7 @@ function AppInner() {
       // `/tasks` request on top of one already in flight.
       if (!refreshPollInFlightRef.current) {
         refreshPollInFlightRef.current = true;
-        void refresh().finally(() => { refreshPollInFlightRef.current = false; });
+        void refresh({ conditional: true }).finally(() => { refreshPollInFlightRef.current = false; });
       }
       if (!refreshProjectsPollInFlightRef.current) {
         refreshProjectsPollInFlightRef.current = true;
@@ -1018,17 +1070,15 @@ function AppInner() {
           openTask(fresh);
           return;
         }
+        // The board's lean list leaves archived rows out, so read the one
+        // task directly; opening it puts its id in the poll's `include`, so
+        // the next tick keeps it in `tasks` (as a lean row).
         void (async () => {
           try {
-            const list = await api.listTasks();
-            setTasks(list);
-            const found = findTaskById(list, ev.taskId);
-            if (found) {
-              openTask(found);
-            }
-            // else: silently no-op — the task doesn't exist (deleted?).
+            const found = await api.getTask(ev.taskId);
+            openTask(found);
           } catch {
-            // Best-effort — no-op on fetch failure.
+            // Best-effort — no-op on fetch failure or a 404 (deleted?).
           }
         })();
         return;
@@ -1432,8 +1482,14 @@ function AppInner() {
     [harnessesLoaded, harnesses],
   );
   const onboardingSteps = useMemo(
-    () => deriveOnboardingSteps({ statuses: agents, enabledHarnessIds, projectCount: projects.length, tasks }),
-    [agents, enabledHarnessIds, projects.length, tasks],
+    () => deriveOnboardingSteps({
+      statuses: agents,
+      enabledHarnessIds,
+      projectCount: projects.length,
+      tasks,
+      archivedCount: omittedArchivedCount,
+    }),
+    [agents, enabledHarnessIds, projects.length, tasks, omittedArchivedCount],
   );
   const onboardingVisibility = useMemo(
     () => resolveOnboardingVisibility({
@@ -1444,7 +1500,8 @@ function AppInner() {
       // user whose harnesses/projects just haven't loaded yet on a slow boot.
       loaded: prefsLoaded && tasksLoaded && harnessesLoaded && projectsLoaded,
       steps: onboardingSteps,
-      taskCount: tasks.length,
+      // Archived cards the lean poll left out still count as "has tasks".
+      taskCount: tasks.length + omittedArchivedCount,
       welcomeAcknowledged,
     }),
     [
@@ -1455,6 +1512,7 @@ function AppInner() {
       projectsLoaded,
       onboardingSteps,
       tasks.length,
+      omittedArchivedCount,
       welcomeAcknowledged,
     ],
   );
@@ -1543,7 +1601,12 @@ function AppInner() {
   // task opens its run view, like a board click).
   const openTaskById = useCallback((taskId: string) => {
     const t = tasksRef.current.find((x) => x.id === taskId);
-    if (t) openTask(t);
+    if (t) {
+      openTask(t);
+      return;
+    }
+    // Not in the lean board list (archived) — read it directly.
+    void api.getTask(taskId).then(openTask).catch(() => { /* deleted — no-op */ });
   }, [openTask]);
   /** Switch Settings' "Open pipelines page"/"Edit"/"New pipeline" affordances
    *  to the matching app-level view — Settings closes itself in the same
@@ -2115,9 +2178,11 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
           <span className="text-xs text-muted-foreground">
             {/* m4: counted over `nonStepTasks`, not raw `tasks` — a hidden
                 pipeline step must not inflate the total. */}
-            {visibleTasks.length === nonStepTasks.length
-              ? `${nonStepTasks.length} tasks`
-              : `${visibleTasks.length} of ${nonStepTasks.length} tasks`}
+            {/* `omittedArchivedCount`: archived cards the lean poll left out
+                (archived filter off) still count toward the total. */}
+            {visibleTasks.length === nonStepTasks.length + omittedArchivedCount
+              ? `${nonStepTasks.length + omittedArchivedCount} tasks`
+              : `${visibleTasks.length} of ${nonStepTasks.length + omittedArchivedCount} tasks`}
           </span>
           <Button
             variant="ghost"

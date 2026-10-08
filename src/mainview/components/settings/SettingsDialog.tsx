@@ -224,16 +224,21 @@ async function describeHarnessInUse(err: unknown): Promise<string | null> {
 
   const segments: string[] = [];
   if (taskIds.length > 0) {
-    let titles: string[];
+    // Titles from the lean list with archived cards, then `GET /tasks/:id`
+    // for any it doesn't carry (archived pipeline steps). Anything that
+    // still fails falls back to its id prefix so the toast still identifies
+    // *which* tasks are blocking, even if not by name.
+    const byId = new Map<string, string>();
     try {
-      const tasks = await api.listTasks();
-      const byId = new Map(tasks.map((t) => [t.id, t.title]));
-      titles = taskIds.map((id) => byId.get(id) ?? `${id.slice(0, 8)}…`);
-    } catch {
-      // Listing tasks failed — fall back to id prefixes so the toast still
-      // identifies *which* tasks are blocking, even if not by name.
-      titles = taskIds.map((id) => `${id.slice(0, 8)}…`);
-    }
+      const res = await api.pollTasks({ archived: true });
+      if (!res.unchanged) for (const t of res.tasks) byId.set(t.id, t.title);
+    } catch { /* per-id lookups below */ }
+    const titles = await Promise.all(
+      taskIds.map((id) =>
+        byId.get(id)
+          ?? api.getTask(id).then((t) => t.title, () => `${id.slice(0, 8)}…`),
+      ),
+    );
     const noun = titles.length === 1 ? "task" : "tasks";
     segments.push(`${titles.length} ${noun}: ${titles.join(", ")}`);
   }

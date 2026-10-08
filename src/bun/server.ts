@@ -40,6 +40,7 @@ import { buildEli5Prompt, eli5TaskTitle } from "../shared/clone-eli5.ts";
 import { CLONE_PROVIDERS, isGitProvider } from "../shared/clone-input.ts";
 import { stalledSince } from "./stall-registry.ts";
 import { lastActivityAt } from "./activity-clock.ts";
+import { archivedRowsFor, isTruncatedPromptWrite, parseTaskListOptions, shapeTaskForList } from "./task-list.ts";
 import { blockedByFor, blockingFor, dependencyTick, readDependencies, setDependencies } from "./dependencies.ts";
 import { activeTrain, mergedViaTrain, trainFor } from "./merge-train.ts";
 import { isPriority, readPriority, setPriority } from "./priority.ts";
@@ -225,7 +226,6 @@ import type {
   Handoff,
   Pipeline,
   PipelineInput,
-  PipelineRunState,
   RunEvent,
   Task,
   TaskEventsReplayMeta,
@@ -236,7 +236,7 @@ import { armForceQuit, broadcastAppEvent, consumeForceQuit, subscribeAppEvents }
 import { consumePendingOpenTask, setPendingOpenTask } from "./pending-open.ts";
 import { binaryPreviewKind, contentTypeForPreviewPath, isImagePath } from "../shared/attachments.ts";
 import { AGENT_PROFILE_LIMITS, normalizeSkillName } from "../shared/agent-profile.ts";
-import { PIPELINE_CONTROL_CHAR_RE, handoffHeadline, isPipelineColumnRunnerOwned, validatePipelineGraph } from "../shared/pipeline.ts";
+import { PIPELINE_CONTROL_CHAR_RE, isPipelineColumnRunnerOwned, validatePipelineGraph } from "../shared/pipeline.ts";
 import type { AgentProfilePatch } from "./db.ts";
 
 // Re-export so existing call sites (index.ts → webview URL) keep working.
@@ -392,7 +392,9 @@ function corsHeaders(req: Request): Record<string, string> {
   return {
     "access-control-allow-origin": allowed,
     "access-control-allow-methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
-    "access-control-allow-headers": "content-type,authorization",
+    "access-control-allow-headers": "content-type,authorization,if-none-match",
+    // The lean `/tasks` poll reads its ETag and omitted-archived count.
+    "access-control-expose-headers": "etag,x-agetor-omitted-archived",
     "access-control-allow-credentials": "true",
   };
 }
@@ -680,46 +682,6 @@ function parsePipelineDescription(body: Record<string, unknown>): { value: strin
     return { error: `pipeline description must be ${PIPELINE_LIMITS.description} characters or fewer` };
   }
   return { value: body.description };
-}
-
-/**
- * The trimmed `Task.pipelineRun` variant `GET /tasks` ships (M-S3, see the
- * field's doc in `shared/types.ts`): every history handoff is cut to its
- * headline (`handoffHeadline`), partial-join arrival handoffs are nulled and
- * the frozen profile snapshots dropped,
- * since the board/TUI/`agetor ls` only read `snapshot.graph`, `status`,
- * `active`, `blocked`, history outcomes and `stepCount` — and the 2s poll
- * was otherwise shipping every handoff of every pipeline task on every
- * tick. `GET /tasks/:id` and `GET /tasks/:id/pipeline` still return the
- * full state; the server's own `tasks.list()`/`get()` reads are untouched.
- */
-function trimPipelineRunForList(run: PipelineRunState): PipelineRunState {
-  const joins: PipelineRunState["joins"] = {};
-  for (const [stepId, join] of Object.entries(run.joins)) {
-    joins[stepId] = { arrivals: join.arrivals.map((a) => ({ ...a, handoff: null })) };
-  }
-  return {
-    ...run,
-    snapshot: run.snapshot ? { ...run.snapshot, profiles: {} } : null,
-    // Keep each step's headline (status, next, first summary line) so a card
-    // can say what its run did without the full handoff on every poll.
-    history: run.history.map((h) => ({
-      ...h,
-      handoff: h.handoff
-        ? {
-            schemaVersion: 1 as const,
-            purpose: "",
-            summary: handoffHeadline(h.handoff),
-            reason: "",
-            next: h.handoff.next,
-            artifacts: [],
-            openQuestions: [],
-            ...(h.handoff.status ? { status: h.handoff.status } : {}),
-          }
-        : null,
-    })),
-    joins,
-  };
 }
 
 /**
@@ -4463,19 +4425,22 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
 
       "/tasks": {
         GET: authed((req) => {
+          // `?lean=1` (the board's 2s poll) → prompt previews, no archived
+          // rows unless `archived=1`, `include=` ids kept; no params → the
+          // legacy full list (older CLI binaries). See src/bun/task-list.ts.
+          const opts = parseTaskListOptions(new URL(req.url));
           const counts = subagents.runningCountsByTask();
-          const allTasks = tasks.list();
+          const allTasks = tasks.list({ archived: archivedRowsFor(opts), includeIds: opts.includeIds });
           const byId = new Map(allTasks.map((t) => [t.id, t]));
           const deps = readDependencies();
           const train = activeTrain();
           const via = mergedViaTrain();
           const prio = readPriority();
-          return json(
+          const body = JSON.stringify(
             allTasks.map((t) => ({
-              ...t,
               // M-S3: the list route ships the trimmed pipelineRun variant
               // (no handoffs, no profile snapshots) — see the field's doc.
-              ...(t.pipelineRun ? { pipelineRun: trimPipelineRunForList(t.pipelineRun) } : {}),
+              ...shapeTaskForList(t, opts),
               runningSubagents: counts.get(t.id) ?? 0,
               stalledSince: stalledSince(t.id),
               lastActivityAt: lastActivityAt(t, (id) => byId.get(id)),
@@ -4484,8 +4449,31 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               mergeTrain: trainFor(t.id, train, via),
               priority: isPriority(t.id, prio) || undefined,
             })),
-            { headers: corsHeaders(req) },
           );
+          if (!opts.lean) {
+            return new Response(body, { headers: { "content-type": "application/json", ...corsHeaders(req) } });
+          }
+          // Archived board cards the lean list left out, so the header's
+          // "N of M tasks" total doesn't change.
+          let omittedArchived = 0;
+          if (!opts.includeArchived) {
+            const shown = allTasks.filter((t) => t.archivedAt != null && t.pipelineParentId == null).length;
+            omittedArchived = Math.max(0, tasks.archivedCardCount() - shown);
+          }
+          // Weak ETag over the exact bytes (+ the omitted count, which rides
+          // a header): an unchanged poll answers 304 and the webview skips
+          // parsing and reconciling the list entirely.
+          const etag = `W/"${Bun.hash(body).toString(36)}-${body.length.toString(36)}-${omittedArchived}"`;
+          const headers = {
+            ...corsHeaders(req),
+            etag,
+            "cache-control": "no-cache",
+            "x-agetor-omitted-archived": String(omittedArchived),
+          };
+          if (req.headers.get("if-none-match") === etag) {
+            return new Response(null, { status: 304, headers });
+          }
+          return new Response(body, { headers: { "content-type": "application/json", ...headers } });
         }),
         POST: authed(async (req) => {
           const body = (await req.json()) as Partial<Task> & {
@@ -4596,7 +4584,16 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               { status: 400, headers: corsHeaders(req) },
             );
           }
-          const patch = filterPatch(await req.json());
+          const raw: unknown = await req.json();
+          // A lean `/tasks?lean=1` row carries only a prompt PREVIEW — never
+          // let one be written back over the full prompt (task-list.ts).
+          if (isTruncatedPromptWrite(raw, before.prompt)) {
+            return json(
+              { error: "prompt is a truncated list preview — load the full task before editing its prompt" },
+              { status: 400, headers: corsHeaders(req) },
+            );
+          }
+          const patch = filterPatch(raw);
           // A pipeline step task's `column` is managed entirely by the
           // pipeline runner (D9, docs/plans/pipelines.md) — it flips as the
           // step's own run settles, and letting a direct PATCH drag it to a

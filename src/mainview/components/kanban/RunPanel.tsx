@@ -6826,6 +6826,25 @@ function TaskDetails({
   useEffect(() => {
     if (profileDialogOpen && !profileLock) setProfileDialogOpen(false);
   }, [profileDialogOpen, profileLock]);
+  // `task` is a lean board-poll row (src/bun/task-list.ts): its prompt may be
+  // a preview (`promptTruncated`) and a step's frozen profile instructions
+  // cut (`agentProfileTruncated`). Read the full task once the user can see
+  // either — this section expanded or the agent dialog open — and again
+  // whenever the row changes while they're looking.
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const [fullTask, setFullTask] = useState<Task | null>(null);
+  const needsFullTask = task.promptTruncated === true || task.agentProfileTruncated === true;
+  useEffect(() => {
+    if (!needsFullTask || !(detailsOpen || profileDialogOpen)) return;
+    let cancelled = false;
+    void api.getTask(task.id)
+      .then((fresh) => { if (!cancelled) setFullTask(fresh); })
+      .catch(() => { /* the preview stays */ });
+    return () => { cancelled = true; };
+  }, [needsFullTask, detailsOpen, profileDialogOpen, task.id, task.updatedAt]);
+  const full = fullTask?.id === task.id ? fullTask : null;
+  const promptText = task.promptTruncated ? (full?.prompt ?? `${task.prompt}…`) : task.prompt;
+  const dialogTask = task.agentProfileTruncated && full ? { ...task, agentProfile: full.agentProfile } : task;
   const detachProfile = async () => {
     setDetaching(true);
     try {
@@ -7049,14 +7068,17 @@ function TaskDetails({
 
   return (
     <>
-      <details className="border-b border-border/60 px-3 py-2 text-xs">
+      <details
+        className="border-b border-border/60 px-3 py-2 text-xs"
+        onToggle={(e) => setDetailsOpen(e.currentTarget.open)}
+      >
         <summary className="cursor-pointer text-muted-foreground">
           <span className="text-[10px] uppercase tracking-wide">Task details</span>
         </summary>
         <div className="mt-2 space-y-2">
           <div>
             <div className="text-[10px] uppercase tracking-wide text-muted-foreground">Prompt</div>
-            <p className="max-h-48 overflow-y-auto whitespace-pre-wrap text-[11px] leading-snug">{task.prompt}</p>
+            <p className="max-h-48 overflow-y-auto whitespace-pre-wrap text-[11px] leading-snug">{promptText}</p>
           </div>
 
           {!editable && (
@@ -7341,7 +7363,7 @@ function TaskDetails({
       <AgentProfileDetailsDialog
         open={profileDialogOpen}
         onClose={() => setProfileDialogOpen(false)}
-        task={task}
+        task={dialogTask}
         display={agentProfileDisplay}
         deleted={agentProfileDisplay?.deleted ?? false}
         hasRun={hasRun}

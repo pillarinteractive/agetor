@@ -28,8 +28,13 @@ export function deriveOnboardingSteps(input: {
   enabledHarnessIds: Set<string> | null;
   projectCount: number;
   tasks: Pick<Task, "column">[];
+  /** Archived tasks the board's lean list left out of `tasks`. Archiving
+   *  needs the `done` column, so any of them means a task was created and
+   *  run. */
+  archivedCount?: number;
 }): OnboardingStep[] {
   const { statuses, enabledHarnessIds, projectCount, tasks } = input;
+  const hasArchived = (input.archivedCount ?? 0) > 0;
 
   const harnessDone = statuses.some(
     (status) =>
@@ -44,8 +49,8 @@ export function deriveOnboardingSteps(input: {
       (enabledHarnessIds === null || enabledHarnessIds.has(status.harnessId)),
   );
   const projectDone = projectCount > 0;
-  const taskDone = tasks.length > 0;
-  const runDone = tasks.some((task) => RUN_DONE_COLUMNS.has(task.column));
+  const taskDone = tasks.length > 0 || hasArchived;
+  const runDone = hasArchived || tasks.some((task) => RUN_DONE_COLUMNS.has(task.column));
 
   return [
     { id: "harness", done: harnessDone },

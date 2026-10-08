@@ -457,3 +457,16 @@ test("resolveOnboardingVisibility: all done + already dismissed ('true') -> auto
   });
   expect(result.autoDismiss).toBe(false);
 });
+
+// --- deriveOnboardingSteps: archived tasks the lean board list leaves out ---
+
+test("deriveOnboardingSteps counts archived tasks left out of the lean list as created and run", () => {
+  const input = { statuses: [], enabledHarnessIds: null, projectCount: 0, tasks: [] };
+  const done = (steps: OnboardingStep[], id: string) => steps.find((s) => s.id === id)?.done;
+  const none = deriveOnboardingSteps(input);
+  expect(done(none, "task")).toBe(false);
+  expect(done(none, "run")).toBe(false);
+  const archived = deriveOnboardingSteps({ ...input, archivedCount: 3 });
+  expect(done(archived, "task")).toBe(true);
+  expect(done(archived, "run")).toBe(true);
+});

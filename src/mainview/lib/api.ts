@@ -1418,11 +1418,52 @@ export const api = {
     if (scope.limit != null) params.set("limit", String(scope.limit));
     return j<{ files: string[]; truncated: boolean }>(`/files/index?${params.toString()}`);
   },
-  listTasks: () => j<Task[]>("/tasks"),
+  /** The board's lean task list (`GET /tasks?lean=1`, src/bun/task-list.ts):
+   *  prompts are previews (`promptTruncated`), step profile snapshots are
+   *  trimmed (`agentProfileTruncated`), and archived rows are left out
+   *  unless `archived` (archived board cards) or named in `include`. Pass
+   *  the previous response's `etag` and an unchanged list comes back as
+   *  `{ unchanged: true }` (HTTP 304) with nothing to parse. Never hand a
+   *  row from here to anything that needs the whole prompt — use `getTask`. */
+  pollTasks: async (opts: {
+    archived?: boolean;
+    include?: readonly string[];
+    etag?: string | null;
+  } = {}): Promise<
+    | { unchanged: true }
+    | { unchanged: false; tasks: Task[]; etag: string | null; omittedArchived: number }
+  > => {
+    const params = new URLSearchParams({ lean: "1" });
+    if (opts.archived) params.set("archived", "1");
+    const include = (opts.include ?? []).filter(Boolean);
+    if (include.length > 0) params.set("include", include.join(","));
+    const res = await fetchWithRecovery({ fetchImpl: fetch, base: BASE }, `/tasks?${params.toString()}`, {
+      headers: {
+        "authorization": `Bearer ${API_TOKEN}`,
+        ...(opts.etag ? { "if-none-match": opts.etag } : {}),
+      },
+    });
+    if (res.status === 304) return { unchanged: true };
+    const body = await res.json().catch(() => null);
+    if (!res.ok) {
+      const msg = (body && typeof body === "object" && "error" in body && body.error)
+        ? String(body.error)
+        : `${res.status} ${res.statusText}`;
+      throw new ApiError(msg, res.status, body);
+    }
+    return {
+      unchanged: false,
+      tasks: body as Task[],
+      etag: res.headers.get("etag"),
+      omittedArchived: Number(res.headers.get("x-agetor-omitted-archived")) || 0,
+    };
+  },
   /** Single task by id, fresh from the server (bypasses the 2s board poll's
-   *  staleness). Used to re-check a task's persisted draft right after the
-   *  panel seeds from a possibly-stale polled object — see RunPanel's
-   *  pristine-adopt seeding. 404s (task deleted) surface as ApiError. */
+   *  staleness), with the FULL prompt and profile snapshot the lean board
+   *  list leaves out. Used to re-check a task's persisted draft right after
+   *  the panel seeds from a possibly-stale polled object — see RunPanel's
+   *  pristine-adopt seeding — and to show a full prompt. 404s (task
+   *  deleted) surface as ApiError. */
   getTask: (id: string) => j<Task>(`/tasks/${id}`),
   createTask: (input: {
     title: string;
