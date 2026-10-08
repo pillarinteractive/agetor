@@ -1218,7 +1218,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           // listBranches; custom-prefixed branches (feature/…, fix/…) are only
           // recognizable via the pinned names on task rows, so pass those too.
           const managed = new Set(
-            tasks.list().map((t) => t.branch).filter((b): b is string => Boolean(b)),
+            tasks.branchRows().map((t) => t.branch),
           );
           return json(await listBranches(dir, { exclude: managed }), { headers: corsHeaders(req) });
         }),

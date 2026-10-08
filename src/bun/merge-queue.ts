@@ -217,7 +217,7 @@ export function departTrainNow(): Promise<{ train: { pr: number; url: string; me
       }
       await replaceTrain(out);
     }
-    const cards = tasks.list().filter((t) => t.column === "merge" && t.archivedAt == null && !t.pipelineParentId && t.branch);
+    const cards = tasks.listLive().filter((t) => t.column === "merge" && t.archivedAt == null && !t.pipelineParentId && t.branch);
     const ready: { task: Task; pr: TaskPrStatus }[] = [];
     const left: string[] = [];
     for (const t of cards) {
@@ -247,7 +247,7 @@ export function departTrainNow(): Promise<{ train: { pr: number; url: string; me
 }
 
 async function tick(now: number): Promise<void> {
-  const list = tasks.list();
+  const list = tasks.listLive();
   // In Ready to Merge → signed off. Withdrawing is the user's own move out
   // of the column (server.ts PATCH); a card the pipeline runner parked in In
   // Review / Blocked / Running while a follow-up step works keeps its

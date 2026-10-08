@@ -273,7 +273,7 @@ async function probe(w: ProgressWatcherConfig, task: Task, checkout: string): Pr
  *  Exported for tests. */
 export function progressWatchTick(now = Date.now()): Promise<void>[] {
   const watchers = parseProgressWatchers(preferences.get(PROGRESS_WATCHERS_PREF));
-  const list = tasks.list();
+  const list = tasks.listLive();
   const byId = new Map(list.map((t) => [t.id, t]));
   const wanted = new Set(watchers.flatMap((w) => list.map((t) => keyOf(t.id, w))));
   let removed = false;

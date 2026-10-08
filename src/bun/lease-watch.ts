@@ -170,7 +170,7 @@ async function probe(w: LeaseWatcherConfig): Promise<void> {
     const prev = statuses.get(key);
     let next: LeaseStatus;
     if (result.ok) {
-      const holder = result.held && result.checkout ? resolveHolderTask(result.checkout, tasks.list()) : null;
+      const holder = result.held && result.checkout ? resolveHolderTask(result.checkout, tasks.listLive()) : null;
       next = {
         project: w.project,
         label: w.label,
@@ -216,7 +216,7 @@ async function probe(w: LeaseWatcherConfig): Promise<void> {
 
 function queueFor(w: Pick<LeaseWatcherConfig, "project" | "label">): NonNullable<LeaseStatus["queue"]> {
   // Priority cards (src/bun/priority.ts) go to the front of the line.
-  return priorityFirst(leaseQueue(tasks.list(), w), (q) => q.task.id).map(({ task, since }) => ({ taskId: task.id, title: task.title, since }));
+  return priorityFirst(leaseQueue(tasks.listLive(), w), (q) => q.task.id).map(({ task, since }) => ({ taskId: task.id, title: task.title, since }));
 }
 
 const lastAutoRetryAt = new Map<string, number>();

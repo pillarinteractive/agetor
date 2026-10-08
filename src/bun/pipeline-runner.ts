@@ -338,7 +338,7 @@ export async function fireAutoRetry(parentId: string, at: number): Promise<boole
  *  survives one). One that came due while the core was down fires shortly. */
 export function rearmPipelineAutoRetries(now = Date.now()): number {
   let n = 0;
-  for (const t of tasks.list()) {
+  for (const t of tasks.listLive()) {
     const r = t.pipelineRun?.autoRetry;
     if (t.archivedAt != null || t.pipelineParentId || !r || r.at == null) continue;
     armAutoRetryTimer(t.id, r.at, Math.max(r.at, now + 30_000));
@@ -364,7 +364,7 @@ const slotWaitSince = new Map<string, number>();
  *  while a light one behind it goes). Exported for tests. */
 export async function releaseSlotWaits(): Promise<number> {
   const waiting: { parentId: string; stepId: string; since: number }[] = [];
-  for (const t of tasks.list()) {
+  for (const t of tasks.listLive()) {
     if (t.archivedAt != null || !t.pipelineRun) continue;
     for (const b of t.pipelineRun.blocked) {
       if (b.kind !== "slot-wait" || !b.stepId) continue;
@@ -427,7 +427,7 @@ export async function recoverUnsettledSteps(now = Date.now()): Promise<number> {
   // Steps blocked for a missing/invalid handoff whose runs DO hold a valid
   // one (the reply landed in a sibling run): unblock and settle them.
   let recovered = 0;
-  for (const parent of tasks.list()) {
+  for (const parent of tasks.listLive()) {
     const run = parent.pipelineRun;
     if (!run || parent.archivedAt != null) continue;
     for (const b of run.blocked) {
@@ -448,7 +448,7 @@ export async function recoverUnsettledSteps(now = Date.now()): Promise<number> {
       recovered++;
     }
   }
-  const found = unsettledSteps(tasks.list(), isTaskRunLive, now).filter((s) => !remindersInFlight.has(s.taskId));
+  const found = unsettledSteps(tasks.listLive(), isTaskRunLive, now).filter((s) => !remindersInFlight.has(s.taskId));
   for (const s of found) {
     const parentId = tasks.get(s.taskId)?.pipelineParentId;
     if (parentId) recordActivity(parentId, { kind: "auto", text: "A step's finished turn was never picked up — picking it up now", tone: "muted" });
@@ -478,12 +478,24 @@ export function inactiveStepSessions(list: Task[], sessionNames: Set<string>, no
   return out;
 }
 
+/** The rows `inactiveStepSessions` can act on, read without parsing the
+ *  whole table: every step row (archived or not) that has a live session,
+ *  plus those steps' parents. `inactiveStepSessions` skips every other step
+ *  (no session) and only looks a parent up by a step's `pipelineParentId`,
+ *  so it decides exactly as it would over `tasks.list()`. Exported for
+ *  tests. */
+export function stepSessionRows(sessionNames: Set<string>, sessionNameOf: (id: string) => string): Task[] {
+  const steps = tasks.stepIds().filter((s) => sessionNames.has(sessionNameOf(s.id)));
+  if (steps.length === 0) return [];
+  return tasks.listByIds([...new Set(steps.flatMap((s) => [s.id, s.parentId]))]);
+}
+
 export async function reapInactiveStepSessions(now = Date.now()): Promise<number> {
   const { sessionNameFor, dropSession } = await import("./claude-tmux.ts");
   const ls = Bun.spawnSync(["tmux", "-L", "agetor", "ls", "-F", "#{session_name}"], { stdout: "pipe", stderr: "ignore" });
   if (ls.exitCode !== 0) return 0;
   const names = new Set(ls.stdout.toString().split("\n").filter(Boolean));
-  const stale = inactiveStepSessions(tasks.list(), names, now, sessionNameFor);
+  const stale = inactiveStepSessions(stepSessionRows(names, sessionNameFor), names, now, sessionNameFor);
   for (const id of stale) {
     await dropSession(id).catch(() => undefined);
     const parentId = tasks.get(id)?.pipelineParentId;
@@ -836,7 +848,7 @@ async function refreshParentWorktree(parent: Task, run: PipelineRunState): Promi
   }
   const prepared = await prepareWorkdir(parent, {
     takenBranches: new Set(
-      tasks.list().filter((t) => t.id !== parent.id).map((t) => t.branch).filter((b): b is string => Boolean(b)),
+      tasks.branchRows().filter((t) => t.id !== parent.id).map((t) => t.branch),
     ),
   });
   if ("error" in prepared) return { error: prepared.error };
@@ -2960,7 +2972,7 @@ function markStepNeverStarted(parentId: string, taskId: string): void {
  */
 export async function reconcilePipelineRuns(): Promise<number> {
   let count = 0;
-  const parents = tasks.list().filter((t) => {
+  const parents = tasks.listLive().filter((t) => {
     if (t.pipelineId == null || t.pipelineParentId != null || t.archivedAt != null || !t.pipelineRun) return false;
     const status = t.pipelineRun.status;
     return status === "running" || status === "blocked";

@@ -93,7 +93,7 @@ export function startKeepAwakeLoop(): void {
   const check = () => {
     try {
       screen.set(keepScreenOnEnabled(preferences.get(KEEP_SCREEN_ON_PREF_KEY)));
-      keepAwake.set(keepAwakeEnabled(preferences.get(KEEP_AWAKE_PREF_KEY)) && hasRunningWork(tasks.list()));
+      keepAwake.set(keepAwakeEnabled(preferences.get(KEEP_AWAKE_PREF_KEY)) && hasRunningWork(tasks.listLive()));
     } catch {
       // A failed read just waits for the next tick.
     }

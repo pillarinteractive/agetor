@@ -485,7 +485,7 @@ export async function autopilotTick(): Promise<void> {
     // A finished milestone stays finished until the user restarts Autopilot.
     if (state.phase === "done") return;
     if (state.phase === "idle") state.phase = "running";
-    const all = tasks.list();
+    const all = tasks.listLive();
     const mine = state.cards.map((id) => all.find((t) => t.id === id)).filter((t): t is Task => !!t && t.archivedAt == null);
     state.cards = mine.map((t) => t.id);
 

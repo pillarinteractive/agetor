@@ -103,6 +103,24 @@ function alive(pid: number | null): boolean {
   }
 }
 
+/** What `listAwaits` keeps of a record between ticks: the files the helper
+ *  writes once and never changes (label, cwd, cmd and started are written
+ *  before the command starts; exit lands by an atomic rename; pid is read
+ *  until it's there). Keyed by the record's dir and checked against the
+ *  `started` file's inode + mtime, so a dir that's removed and recreated is
+ *  read afresh. Saves ~6 file reads per record per tick — hundreds of
+ *  records accumulate over the 3-day keep window. */
+interface CachedAwait {
+  stamp: string;
+  label: string;
+  cwd: string;
+  cmd: string;
+  started: number;
+  pid: number | null;
+  exit: string | null;
+}
+const awaitCache = new Map<string, CachedAwait>();
+
 export function listAwaits(root = AWAITS_DIR): AwaitRecord[] {
   let ids: string[];
   try {
@@ -111,29 +129,56 @@ export function listAwaits(root = AWAITS_DIR): AwaitRecord[] {
     return [];
   }
   const out: AwaitRecord[] = [];
+  const seen = new Set<string>();
   for (const id of ids) {
     const dir = path.join(root, id);
-    const started = Number(read(path.join(dir, "started")));
-    const cwd = read(path.join(dir, "cwd"));
-    if (!cwd || !Number.isFinite(started) || started <= 0) continue;
-    const pid = Number(read(path.join(dir, "pid"))) || null;
-    const exit = read(path.join(dir, "exit"));
+    let stamp: string;
+    try {
+      const st = statSync(path.join(dir, "started"));
+      stamp = `${st.ino}:${st.mtimeMs}:${st.size}`;
+    } catch {
+      continue; // no `started` yet (or not a record): `read` would give null → skipped
+    }
+    let c = awaitCache.get(dir);
+    if (!c || c.stamp !== stamp) {
+      const started = Number(read(path.join(dir, "started")));
+      const cwd = read(path.join(dir, "cwd"));
+      if (!cwd || !Number.isFinite(started) || started <= 0) {
+        awaitCache.delete(dir);
+        continue;
+      }
+      c = {
+        stamp,
+        label: read(path.join(dir, "label")) || "command",
+        cwd,
+        cmd: read(path.join(dir, "cmd")) ?? "",
+        started,
+        pid: null,
+        exit: null,
+      };
+      awaitCache.set(dir, c);
+    }
+    seen.add(dir);
+    if (c.pid == null) c.pid = Number(read(path.join(dir, "pid"))) || null;
+    if (!c.exit) c.exit = read(path.join(dir, "exit")); // an empty exit file is re-read until it has the code
+    const { pid, exit } = c;
     // No exit file and the process is gone: it was killed (or the machine
     // restarted) — finished, outcome unknown.
     const finished = exit != null || (pid != null && !alive(pid));
     out.push({
       id,
       dir,
-      label: read(path.join(dir, "label")) || "command",
-      cwd,
-      cmd: read(path.join(dir, "cmd")) ?? "",
-      startedAt: started * 1000,
+      label: c.label,
+      cwd: c.cwd,
+      cmd: c.cmd,
+      startedAt: c.started * 1000,
       pid,
       exitCode: exit != null && exit !== "" && Number.isFinite(Number(exit)) ? Number(exit) : null,
       finished,
       notified: existsSync(path.join(dir, "notified")),
     });
   }
+  for (const dir of awaitCache.keys()) if (path.dirname(dir) === root && !seen.has(dir)) awaitCache.delete(dir);
   return out.sort((a, b) => a.startedAt - b.startedAt);
 }
 
@@ -220,7 +265,7 @@ export function readyToWake(
 export async function awaitTick(now = Date.now()): Promise<number> {
   const all = listAwaits();
   let woke = 0;
-  for (const w of readyToWake(tasks.list(), all)) {
+  for (const w of readyToWake(tasks.listLive(), all)) {
     const step = w.parent.pipelineRun?.snapshot?.graph.steps.find((s) => s.id === w.stepId);
     if (!isPriority(w.parent.id)) {
       const slots = currentSlots();

@@ -77,7 +77,7 @@ export function currentSlots(): StepSlots {
 export function slotUse(
   isLive: (taskId: string) => boolean,
   slots: StepSlots = currentSlots(),
-  list: Task[] = tasks.list(),
+  list: Task[] = tasks.listLive(),
   quotaPaused: (taskId: string) => boolean = isQuotaPaused,
 ): SlotUse {
   let total = 0;

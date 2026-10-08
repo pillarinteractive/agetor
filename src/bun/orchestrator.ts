@@ -1499,10 +1499,9 @@ async function startTaskInner(
   // that's free of both existing refs AND those not-yet-started pins.
   const prepared = await prepareWorkdir(task, {
     takenBranches: new Set(
-      tasks.list()
+      tasks.branchRows()
         .filter((t) => t.id !== taskId)
-        .map((t) => t.branch)
-        .filter((b): b is string => Boolean(b)),
+        .map((t) => t.branch),
     ),
   });
   if ("error" in prepared) return { error: prepared.error };
@@ -5783,7 +5782,7 @@ export async function createTask(
     if (!validated.ok) {
       return { error: `invalid branch name "${existingBranch}": ${validated.reason}` };
     }
-    const collision = tasks.list().some(
+    const collision = tasks.branchRows().some(
       (t) => !t.archivedAt && t.workdir === workdir && t.branch === existingBranch,
     );
     if (collision) {
@@ -5978,7 +5977,7 @@ export async function createTask(
       if (!validateBranchName(desired).ok) desired = branchName({ id, title: input.title });
     }
     const taken = new Set(
-      tasks.list().map((t) => t.branch).filter((b): b is string => Boolean(b)),
+      tasks.branchRows().map((t) => t.branch),
     );
     plannedBranch = await ensureUniqueBranch(workdirRoot, desired, taken);
   }
@@ -6591,7 +6590,7 @@ export const DONE_TEARDOWN_AFTER_MS = 10 * 60_000;
  */
 export function sweepDoneTeardowns(now = Date.now()): number {
   let enqueued = 0;
-  const all = tasks.list();
+  const all = tasks.listLive();
   for (const task of all) {
     if (task.archivedAt != null || task.column !== "done") continue;
     if (task.pipelineParentId || !task.worktreePath || !existsSync(task.worktreePath)) continue;
@@ -6663,7 +6662,7 @@ export async function reapIdleSessions(): Promise<{ reaped: string[] }> {
   try {
     const reaped: string[] = [];
     const candidateIds = tasks
-      .list()
+      .listLive()
       .filter(
         (t) =>
           t.archivedAt == null

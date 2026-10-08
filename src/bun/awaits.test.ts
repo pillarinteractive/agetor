@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { Task } from "../shared/types.ts";
@@ -33,6 +33,35 @@ test("records: running, finished with a code, killed without one; matched to the
   expect(byId.b).toMatchObject({ finished: true, exitCode: 1 });
   expect(byId.c).toMatchObject({ finished: true, exitCode: null });
   expect(awaitsFor(wt, 1_900_000, all).map((a) => a.id).sort()).toEqual(["a", "b", "c"]);
+});
+
+test("repeat reads follow a record as it changes: pid and exit landing, notified, removal, a recreated dir", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "awaits-"));
+  const wt = mkdtempSync(path.join(tmpdir(), "wt-"));
+  record(root, "r", { cwd: wt, started: 2000 });
+  const pidFile = path.join(root, "r", "pid");
+  unlinkSync(pidFile); // the helper writes pid after started
+  const one = () => listAwaits(root).find((a) => a.id === "r");
+  expect(one()).toMatchObject({ pid: null, finished: false, exitCode: null, notified: false });
+  writeFileSync(pidFile, String(process.pid));
+  expect(one()).toMatchObject({ pid: process.pid, finished: false });
+  writeFileSync(path.join(root, "r", "exit"), "");
+  expect(one()).toMatchObject({ finished: true, exitCode: null });
+  writeFileSync(path.join(root, "r", "exit"), "3");
+  expect(one()).toMatchObject({ finished: true, exitCode: 3 });
+  writeFileSync(path.join(root, "r", "notified"), "1");
+  expect(one()).toMatchObject({ notified: true, label: "run r", cwd: wt });
+  rmSync(path.join(root, "r"), { recursive: true });
+  expect(listAwaits(root)).toEqual([]);
+  // Same id again with new contents: read afresh, not from the earlier record.
+  record(root, "r", { cwd: "/elsewhere", started: 3000 });
+  expect(one()).toMatchObject({ cwd: "/elsewhere", startedAt: 3_000_000, finished: false, exitCode: null, notified: false });
+  // A record without a valid cwd/started is skipped until it has them.
+  mkdirSync(path.join(root, "s"));
+  writeFileSync(path.join(root, "s", "started"), "4000");
+  expect(listAwaits(root).map((a) => a.id)).toEqual(["r"]);
+  writeFileSync(path.join(root, "s", "cwd"), wt);
+  expect(listAwaits(root).map((a) => a.id)).toEqual(["r", "s"]);
 });
 
 test("a parked step wakes only once every await it started has finished", () => {

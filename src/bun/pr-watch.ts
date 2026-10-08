@@ -289,7 +289,7 @@ export async function prWatchTick(opts: { column?: Task["column"] } = {}): Promi
   inFlight = true;
   let changed = false;
   try {
-    const all = tasks.list();
+    const all = tasks.listLive();
     const live = new Set(all.filter((t) => t.archivedAt == null).map((t) => t.id));
     for (const id of [...statuses.keys()]) {
       if (!live.has(id)) {

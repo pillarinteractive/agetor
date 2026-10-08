@@ -833,16 +833,23 @@ export const tasks = {
   //
   // `opts.archived` narrows which archived rows are read, in SQL, so the
   // lean board poll never reads or JSON-parses archived history: `"all"`
-  // (the default — the server's own callers rely on archived rows being
-  // there), `"cards"` (archived rows that aren't hidden pipeline steps) or
-  // `"none"`. `opts.includeIds` keeps the named rows whatever they are.
-  list(opts?: { archived?: "all" | "cards" | "none"; includeIds?: readonly string[] }): Task[] {
+  // (the default — callers that look at archived rows rely on them being
+  // there), `"cards"` (archived rows that aren't hidden pipeline steps),
+  // `"none"`, or `"live"` (every non-archived row plus every step row of a
+  // non-archived pipeline parent, archived or not — see `listLive`).
+  // `opts.includeIds` keeps the named rows whatever they are.
+  list(opts?: { archived?: "all" | "cards" | "none" | "live"; includeIds?: readonly string[] }): Task[] {
     // The id list rides one JSON parameter (`json_each`) so the SQL text —
     // and with it bun:sqlite's cached statement — stays fixed per mode.
     const archived = opts?.archived ?? "all";
+    const extra = archived === "cards"
+      ? " OR tasks.pipeline_parent_id IS NULL"
+      : archived === "live"
+        ? " OR tasks.pipeline_parent_id IN (SELECT p.id FROM tasks AS p WHERE p.archived_at IS NULL)"
+        : "";
     const where = archived === "all"
       ? ""
-      : `WHERE tasks.archived_at IS NULL${archived === "cards" ? " OR tasks.pipeline_parent_id IS NULL" : ""}
+      : `WHERE tasks.archived_at IS NULL${extra}
             OR tasks.id IN (SELECT value FROM json_each(?))`;
     const params = archived === "all" ? [] : [JSON.stringify(opts?.includeIds ?? [])];
     const rows = db.query<TaskRow, string[]>(
@@ -866,6 +873,57 @@ export const tasks = {
     }
     const counts: TaskCounts = { pending, terminals: terminalCountsByTask() };
     return rows.map((r) => toTask(r, counts));
+  },
+  /** The rows the core's background loops (progress/lease watch, slot
+   *  scheduler, keep-awake, awaits, PR watch, merge queue, sweeps) work
+   *  from: every non-archived row, plus every step row of a non-archived
+   *  pipeline parent even if that step is archived (a restart archives the
+   *  replaced run's steps while the parent stays live). Every row it leaves
+   *  out is archived and is not a step of a live parent — the rows those
+   *  loops skip anyway — so a loop that filters `archivedAt != null` and only
+   *  reaches steps through a live parent sees exactly the Task objects
+   *  `list()` would give it (pending counts included: D11 folds a step's
+   *  count into its parent, and every step of a returned parent is
+   *  returned). On a board with ~1,200 archived rows this reads ~10% of the
+   *  table and parses none of the archived prompts or run blobs. */
+  listLive(): Task[] {
+    return this.list({ archived: "live" });
+  },
+  /** Exactly the rows with these ids (any archived state), `list()`-shaped.
+   *  A parent's pending count folds in only the steps that are also in
+   *  `ids`. Used where a loop knows up front which few rows it needs. */
+  listByIds(ids: readonly string[]): Task[] {
+    if (ids.length === 0) return [];
+    const rows = db.query<TaskRow, [string]>(
+      `${TASKS_SELECT}
+         WHERE tasks.id IN (SELECT value FROM json_each(?))
+         GROUP BY tasks.id
+         ORDER BY tasks.created_at DESC`,
+    ).all(JSON.stringify(ids));
+    const pending = pendingCountsByTask();
+    for (const r of rows) {
+      if (!r.pipeline_parent_id) continue;
+      const stepCount = pending.get(r.id);
+      if (!stepCount) continue;
+      pending.set(r.pipeline_parent_id, (pending.get(r.pipeline_parent_id) ?? 0) + stepCount);
+    }
+    const counts: TaskCounts = { pending, terminals: terminalCountsByTask() };
+    return rows.map((r) => toTask(r, counts));
+  },
+  /** `{id, parentId}` of every pipeline step row, archived ones included —
+   *  two short columns, no prompt or run blob parsed. */
+  stepIds(): { id: string; parentId: string }[] {
+    return db.query<{ id: string; parentId: string }, []>(
+      `SELECT id, pipeline_parent_id AS parentId FROM tasks WHERE pipeline_parent_id IS NOT NULL`,
+    ).all();
+  },
+  /** The branch-related columns of every row with a branch, archived ones
+   *  included — for the "which branch names are taken" checks, which only
+   *  need these and used to read and parse every column of every row. */
+  branchRows(): { id: string; workdir: string; branch: string; archivedAt: number | null }[] {
+    return db.query<{ id: string; workdir: string; branch: string; archivedAt: number | null }, []>(
+      `SELECT id, workdir, branch, archived_at AS archivedAt FROM tasks WHERE branch IS NOT NULL AND branch != ''`,
+    ).all();
   },
   /** Archived board cards (archived rows that aren't hidden pipeline steps)
    *  — lets the lean `/tasks` poll report how many it left out, so the
