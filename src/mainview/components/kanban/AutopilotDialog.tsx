@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { api, ApiError, type AutopilotConfigDto, type AutopilotStateDto } from "@/lib/api";
 import type { GitHubRepoMilestone, Project, Task } from "../../../shared/types.ts";
+import { holdsAutopilotSlot, waitingOnQuota } from "../../../shared/autopilot.ts";
 
 const TITLE_ID = "autopilot-dialog-title";
 const DEFAULT_THREAD = "01a107c4-1e3c-7890-baad-752584bc2688";
@@ -86,8 +87,10 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
   };
 
   const mine = (state?.cards ?? []).map((id) => tasks.find((t) => t.id === id) ?? archivedCards[id]).filter((t): t is Task => !!t);
-  // Slots are held only by cards still being built (src/bun/autopilot.ts BUILDING).
-  const inFlight = mine.filter((t) => t.archivedAt == null && ["backlog", "ready", "running", "blocked"].includes(t.column));
+  // Slots are held only by cards that are progressing (src/shared/autopilot.ts):
+  // not blocked, not waiting on you, not waiting for a usage limit to reset.
+  const inFlight = mine.filter((t) => holdsAutopilotSlot(t));
+  const quotaWaiting = mine.filter((t) => t.archivedAt == null && waitingOnQuota(t.pipelineRun)).length;
   const done = mine.filter((t) => t.column === "done").length;
   const ready = !!config.threadId && !!config.project && !!config.milestone;
 
@@ -166,9 +169,12 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
               <div className="font-medium">{config.enabled ? PHASE[state.phase] : state.phase === "done" ? PHASE.done : "Paused"}</div>
               <div className="mt-1 text-muted-foreground">
                 {inFlight.length} card{inFlight.length === 1 ? "" : "s"} in flight · {done} done · {state.held.length} waiting for your sign-off
+                {quotaWaiting > 0 && ` · ${quotaWaiting} waiting for a usage limit to reset`}
                 {state.audits > 0 && ` · ${state.audits} audit${state.audits === 1 ? "" : "s"}`}
               </div>
-              {state.lastError && <div className="mt-1 text-warning">{state.lastError}</div>}
+              {state.lastError && (
+                <div className={`mt-1 ${(state.limitedUntil ?? 0) > Date.now() ? "text-muted-foreground" : "text-warning"}`}>{state.lastError}</div>
+              )}
               {state.lastAnswer && (
                 <details className="mt-1">
                   <summary className="cursor-pointer text-muted-foreground">

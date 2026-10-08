@@ -1365,9 +1365,14 @@ function makeFakeAgent(
     // both events would land within the same tick and there'd be nowhere
     // to insert the cancel.
     const resolveDelayMs = Number(process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS ?? 5) || 5;
+    // `AGETOR_FAKE_CLAUDE_API_ERROR_TEXT` / `_STATUS` swap in another error,
+    // e.g. claude's usage-limit 429 ("You've hit your session limit · resets
+    // 11:30pm (America/Chicago)").
+    const errorText = process.env.AGETOR_FAKE_CLAUDE_API_ERROR_TEXT ?? "API Error: 529 Overloaded. This is a server-side issue, usually temporary.";
+    const errorStatus = process.env.AGETOR_FAKE_CLAUDE_API_ERROR_STATUS ?? "529";
     after(5, () => {
-      onChunk("assistant", "API Error: 529 Overloaded. This is a server-side issue, usually temporary.");
-      onChunk("status", `${CLAUDE_API_ERROR_STATUS_PREFIX}HTTP 529 — turn aborted; blocked for manual retry`);
+      onChunk("assistant", errorText);
+      onChunk("status", `${CLAUDE_API_ERROR_STATUS_PREFIX}HTTP ${errorStatus} — turn aborted; blocked for manual retry`);
     });
     after(resolveDelayMs, () => { resolveDone(0); });
   } else if (process.env.AGETOR_FAKE_CLAUDE_SESSION_DIED === "1") {
@@ -1495,6 +1500,25 @@ function makeFakeAgent(
         onChunk("assistant", "I finished the work but forgot the handoff.");
       } else if (suffix === "invalid") {
         onChunk("assistant", `Done.\n<${HANDOFF_TAG}>\n{not json\n</${HANDOFF_TAG}>`);
+      } else if (suffix === "quota-blocked" || suffix === "blocked") {
+        // claude's usage-limit grace window (`quota-blocked`): the model is
+        // told to wrap up, hands off "blocked", and claude notes when it will
+        // continue. Plain `blocked` is a real block with no such notice.
+        if (suffix === "quota-blocked") {
+          onChunk("status", "[Usage limit reached; a short grace allowance remains, then this turn is cut off without warning.]");
+        }
+        const handoff = {
+          schemaVersion: 1,
+          purpose: "fake purpose",
+          summary: "stopped early",
+          reason: suffix === "quota-blocked" ? "Your usage limit was reached, so I stopped." : "needs a product decision",
+          next: null,
+          artifacts: [] as string[],
+          openQuestions: [] as string[],
+          status: "blocked" as const,
+        };
+        onChunk("assistant", `Stopping.\n<${HANDOFF_TAG}>\n${JSON.stringify(handoff)}\n</${HANDOFF_TAG}>`);
+        if (suffix === "quota-blocked") onChunk("status", process.env.AGETOR_FAKE_CLAUDE_QUOTA_NOTICE ?? "Usage limit reached · continuing automatically at 11:30pm · esc to cancel");
       } else {
         const next = suffix && suffix !== "done" ? suffix : null;
         const handoff = {

@@ -4,7 +4,8 @@
  * mid-response" if the machine idles to sleep, and the task blocks. While any
  * task is running, Agetor holds a `caffeinate -i -s` assertion (no idle
  * sleep; no system sleep on AC power) and releases it as soon as nothing is
- * running. `-w <pid>` ties caffeinate to this process, so a crash or quit can
+ * running — or while a card waits on an automatic retry, so an overnight
+ * usage-limit wait fires on time. `-w <pid>` ties caffeinate to this process, so a crash or quit can
  * never leave the Mac pinned awake.
  *
  * On by default; the `keepAwakeWhileRunning` preference set to "false" turns
@@ -31,9 +32,12 @@ export function keepAwakeEnabled(pref: string | null, platform: string = process
   return platform === "darwin" && pref !== "false";
 }
 
-/** Any live (non-archived) task — a pipeline step included — in Running. */
+/** Any live (non-archived) task — a pipeline step included — in Running, or
+ *  a card waiting on an automatic retry (a usage-limit reset or a transient
+ *  backoff, src/bun/pipeline-runner.ts): its timer only fires on time if the
+ *  Mac stays awake until then. */
 export function hasRunningWork(list: Task[]): boolean {
-  return list.some((t) => t.archivedAt == null && t.column === "running");
+  return list.some((t) => t.archivedAt == null && (t.column === "running" || t.pipelineRun?.autoRetry?.at != null));
 }
 
 type Spawn = (argv: string[]) => Pick<Subprocess, "kill" | "exited">;

@@ -25,6 +25,12 @@ describe("hasRunningWork", () => {
     expect(hasRunningWork([task({ column: "running", archivedAt: 1 }), task({ column: "blocked" })])).toBe(false);
     expect(hasRunningWork([])).toBe(false);
   });
+
+  test("a card waiting on an automatic retry (usage-limit reset) keeps the Mac awake", () => {
+    const waiting = (at: number | null) => task({ column: "blocked", pipelineRun: { autoRetry: { stepId: "s", kind: "quota", attempt: 1, at, reason: "" } } as never });
+    expect(hasRunningWork([waiting(Date.now() + 60_000)])).toBe(true);
+    expect(hasRunningWork([waiting(null)])).toBe(false);
+  });
 });
 
 describe("KeepAwake", () => {

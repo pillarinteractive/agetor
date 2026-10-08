@@ -724,6 +724,23 @@ export interface PipelineRunState {
    *  effectiveStepCap} in `src/shared/pipeline.ts`. Undefined/0 before the
    *  first extension. */
   capExtensions?: number;
+  /** An automatic retry of a step that failed for a reason a person can't
+   *  fix — a usage limit (`quota`: waits for the reset, never gives up) or a
+   *  transient failure (crash, overload, launch flake; a few attempts with
+   *  backoff). `at` is when the pending retry fires (persisted so a core
+   *  restart re-arms it), null once it has fired or been given up/cancelled;
+   *  `attempt` counts this step's retries of this kind. See
+   *  `scheduleAutoRetry` in src/bun/pipeline-runner.ts. */
+  autoRetry?: PipelineAutoRetry;
+}
+
+export interface PipelineAutoRetry {
+  stepId: string;
+  kind: "quota" | "transient";
+  attempt: number;
+  at: number | null;
+  /** The limit/failure line that triggered it. */
+  reason: string;
 }
 
 /** Field length/count caps enforced by both the server routes and the

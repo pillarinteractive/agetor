@@ -55,3 +55,184 @@ test("run-last issues wait until they're the only ones open", async () => {
   expect(startable([gate, work]).map((i) => i.number)).toEqual([400]);
   expect(startable([gate]).map((i) => i.number)).toEqual([561]);
 });
+
+test("a pipeline run stopping on a block frees a slot", async () => {
+  const { freesSlot } = await import("./autopilot.ts");
+  expect(freesSlot({ kind: "pipeline", status: "blocked" })).toBe(true);
+  expect(freesSlot({ kind: "pipeline", status: "running" })).toBe(false);
+  expect(freesSlot({ kind: "column", prev: "running", column: "blocked" })).toBe(true);
+});
+
+test("only progressing cards hold slots; stopped ones keep their issue busy", async () => {
+  const { slotCounts } = await import("./autopilot.ts");
+  type T = import("../shared/types.ts").Task;
+  const card = (id: string, n: number, column: string, extra: Record<string, unknown> = {}) =>
+    ({ id, issueUrl: `https://github.com/o/r/issues/${n}`, column, archivedAt: null, pipelineParentId: null, pendingInteractionCount: 0, pipelineRun: null, ...extra }) as never as T;
+  const run = (status: string, autoRetry?: unknown) => ({ status, active: [{ stepId: "build", taskId: `step-${status}`, seq: 1 }], blocked: [], history: [], joins: {}, autoRetry });
+  const all = [
+    card("a", 1, "running", { pipelineRun: run("running") }), // progressing
+    card("b", 2, "blocked", { pipelineRun: run("blocked") }), // blocked column
+    card("c", 3, "running", { pipelineRun: run("blocked") }), // run blocked, column lagging
+    card("d", 4, "running", { pipelineRun: run("running"), pendingInteractionCount: 1 }), // asks the user
+    card("e", 5, "ready"), // queued, progressing
+    card("f", 6, "review"),
+    card("g", 7, "running", { archivedAt: 1 }),
+  ];
+  const open = [1, 2, 3, 4, 5, 6, 7, 8].map((number) => ({ number, title: `#${number}` }));
+  const c = slotCounts(all, all.slice(0, 5), open);
+  expect([...c.busyIssues].sort()).toEqual([1, 2, 3, 4, 5, 6]);
+  expect(c.inFlight.map((i) => i.number)).toEqual([1, 5]);
+  expect(c.ownLive).toBe(2);
+  expect(c.ownUnfinished).toBe(5);
+  expect(c.quotaWait).toBe(false);
+
+  // Waiting for a usage-limit reset: no slot, and Autopilot holds new starts.
+  const waiting = card("h", 8, "blocked", { pipelineRun: run("blocked", { stepId: "build", kind: "quota", attempt: 1, at: Date.now() + 60_000, reason: "limit" }) });
+  const q = slotCounts([...all, waiting], [waiting], open);
+  expect(q.ownLive).toBe(0);
+  expect(q.busyIssues.has(8)).toBe(true);
+  expect(q.quotaWait).toBe(true);
+
+  // A live session paused mid-turn on claude's limit counts the same.
+  const paused = slotCounts(all, all.slice(0, 1), open, (t) => t.pipelineRun?.active[0]?.taskId === "step-running");
+  expect(paused.ownLive).toBe(0);
+  expect(paused.quotaWait).toBe(true);
+});
+
+test("a Codex usage-limit answer from the thread backs off to the reset", async () => {
+  const { threadLimit } = await import("./codex-thread.ts");
+  const now = new Date(2026, 9, 6, 22, 0).getTime();
+  const l = threadLimit("ERROR: You've hit your usage limit. Try again at 11:45 PM.", now)!;
+  expect(l.until).toBe(new Date(2026, 9, 6, 23, 50).getTime());
+  expect(threadLimit("ERROR: You've hit your usage limit. Try again later.", now)!.until).toBe(now + 30 * 60_000);
+  expect(threadLimit("thread not found", now)).toBeNull();
+});
+
+// ── Cards that end with nothing to build (#405, #407) ──────────────────────
+type TaskT = import("../shared/types.ts").Task;
+type Deps = import("./autopilot.ts").NoWorkDeps;
+
+const handoffRun = (status = "done") => ({
+  status,
+  active: [],
+  blocked: [],
+  joins: {},
+  history: [{ stepId: "u", taskId: "s", seq: 1, outcome: "succeeded", handoff: { summary: "Acceptance is owned by #410's deployed run", reason: "Nothing to build", openQuestions: ["Is the live setup done?"], next: null } }],
+});
+const noWorkCard = (id: string, n: number, extra: Record<string, unknown> = {}) =>
+  ({ id, title: `Issue #${n}`, issueUrl: `https://github.com/o/r/issues/${n}`, column: "review", archivedAt: null, pipelineParentId: null, prUrl: null, pipelineRun: handoffRun(), worktreePath: "/wt", baseRef: "abc", ...extra }) as never as TaskT;
+
+function fakeDeps(answers: (string | { ok: false; busy?: boolean; error: string })[], over: Partial<Deps> = {}) {
+  const log = { asked: [] as string[], gh: [] as string[][], started: [] as { number: number; scope: string }[], done: [] as string[], activity: [] as string[] };
+  const deps: Deps = {
+    aheadCount: async () => 0,
+    hasNoPr: () => true,
+    ask: async (prompt) => {
+      log.asked.push(prompt);
+      const a = answers.shift() ?? "no answer";
+      return typeof a === "string" ? { ok: true, text: a } : { text: "", ...a };
+    },
+    gh: async (args) => {
+      log.gh.push(args);
+      return { ok: true, stdout: args[1] === "view" ? "CLOSED" : "" };
+    },
+    startCard: async ({ number, scope }) => {
+      log.started.push({ number, scope });
+      return { task: { id: `rework-${number}` } as TaskT };
+    },
+    moveToDone: (t) => void log.done.push(t.id),
+    activity: (_id, text) => void log.activity.push(text),
+    now: () => 1_000_000,
+    ...over,
+  };
+  return { deps, log };
+}
+
+const cfg = { enabled: true, threadId: "th", project: "/repo", milestone: { number: 2, title: "M2" }, maxInFlight: 5, pipelineId: "p" };
+const freshState = async () => {
+  const { readState } = await import("./autopilot.ts");
+  return { ...readState(), noWork: {}, waits: {}, reworked: [] as number[], cards: [] as string[] };
+};
+const open = [405, 407, 410, 411].map((number) => ({ number, title: `t${number}` }));
+
+test("no-work detection: done run, no PR, no commits beyond base — nothing else", async () => {
+  const { isNoWorkCard } = await import("./autopilot.ts");
+  const deps = { aheadCount: async () => 0, hasNoPr: () => true };
+  expect(await isNoWorkCard(noWorkCard("a", 405), deps)).toBe(true);
+  expect(await isNoWorkCard(noWorkCard("a", 405), { ...deps, aheadCount: async () => 2 })).toBe(false); // has commits: pr-watch opens its PR
+  expect(await isNoWorkCard(noWorkCard("a", 405), { ...deps, aheadCount: async () => null })).toBe(false); // unknown: leave it
+  expect(await isNoWorkCard(noWorkCard("a", 405), { ...deps, hasNoPr: () => false })).toBe(false);
+  expect(await isNoWorkCard(noWorkCard("a", 405, { prUrl: "https://github.com/o/r/pull/1" }), deps)).toBe(false);
+  expect(await isNoWorkCard(noWorkCard("a", 405, { pipelineRun: handoffRun("blocked") }), deps)).toBe(false);
+  expect(await isNoWorkCard(noWorkCard("a", 405, { column: "done" }), deps)).toBe(false);
+});
+
+test("close: the card goes to Done, the thread sees the handoff, the issue is closed with its comment", async () => {
+  const { processNoWork } = await import("./autopilot.ts");
+  const state = await freshState();
+  const { deps, log } = fakeDeps(['ok <no-work>{"action":"close","comment":"Owned by #410 (PR #412) and the deployed run in #411."}</no-work>']);
+  const parked = await processNoWork(cfg, state, [noWorkCard("c1", 405)], open, deps);
+  expect(log.done).toEqual(["c1"]);
+  expect(log.asked[0]).toContain("Acceptance is owned by #410's deployed run");
+  expect(log.asked[0]).toContain("Is the live setup done?");
+  expect(log.asked[0]).toContain('"action": "rework"');
+  expect(log.gh).toEqual([["issue", "close", "405", "--comment", "Owned by #410 (PR #412) and the deployed run in #411."]]);
+  expect(state.noWork).toEqual({});
+  expect(parked.size).toBe(0);
+});
+
+test("wait: the issue isn't a candidate until every blocker closes (state, not labels)", async () => {
+  const { processNoWork } = await import("./autopilot.ts");
+  const state = await freshState();
+  const { deps, log } = fakeDeps(['<no-work>{"action":"wait","blockedBy":[410, 999]}</no-work>']);
+  // #410 is still open in the milestone: held.
+  expect([...(await processNoWork(cfg, state, [noWorkCard("c1", 407)], open, deps))]).toEqual([407]);
+  expect(state.waits).toEqual({ "407": [410, 999] });
+  expect(log.gh.some((a) => a[0] === "issue" && a[1] === "label")).toBe(false);
+  // #410 closed (gone from the open list) and #999 reports CLOSED: released.
+  const later = await processNoWork(cfg, state, [], open.filter((i) => i.number !== 410), deps);
+  expect(later.has(407)).toBe(false);
+  expect(state.waits).toEqual({});
+  expect(log.gh.at(-1)).toEqual(["issue", "view", "999", "--json", "state", "-q", ".state"]);
+});
+
+test("rework starts one new card with the scope — once per issue; a second no-work result waits", async () => {
+  const { processNoWork } = await import("./autopilot.ts");
+  const state = await freshState();
+  const rework = '<no-work>{"action":"rework","scope":"- wire the retry path"}</no-work>';
+  const { deps, log } = fakeDeps([rework, rework]);
+  await processNoWork(cfg, state, [noWorkCard("c1", 405)], open, deps);
+  expect(log.started).toEqual([{ number: 405, scope: "- wire the retry path" }]);
+  expect(state.reworked).toEqual([405]);
+  expect(state.cards).toEqual(["rework-405"]);
+
+  // The rework card also finds nothing: rework isn't offered, and a rework answer becomes a wait.
+  const parked = await processNoWork(cfg, state, [noWorkCard("rework-405", 405)], open, deps);
+  expect(log.asked[1]).toContain("rework isn't available");
+  expect(log.started.length).toBe(1);
+  expect(state.waits).toEqual({ "405": [] });
+  expect(parked.has(405)).toBe(true);
+  expect(log.activity.some((l) => l.includes("not starting another"))).toBe(true);
+});
+
+test("a malformed answer or a busy thread keeps the issue out of the candidates and asks again later", async () => {
+  const { processNoWork, parseNoWorkDecision } = await import("./autopilot.ts");
+  const state = await freshState();
+  let now = 1_000_000;
+  const { deps, log } = fakeDeps(
+    ["I think it should close.", { ok: false, busy: true, error: "busy" }, '<no-work>{"action":"close","comment":"Owned by #410."}</no-work>'],
+    { now: () => now },
+  );
+  expect((await processNoWork(cfg, state, [noWorkCard("c1", 405)], open, deps)).has(405)).toBe(true);
+  // Not re-asked before its backoff.
+  expect((await processNoWork(cfg, state, [], open, deps)).has(405)).toBe(true);
+  expect(log.asked.length).toBe(1);
+  now += 21 * 60_000;
+  expect((await processNoWork(cfg, state, [], open, deps)).has(405)).toBe(true); // busy
+  now += 6 * 60_000;
+  expect((await processNoWork(cfg, state, [], open, deps)).has(405)).toBe(false); // answered: closed
+  expect(log.asked.length).toBe(3);
+  // A close that names no owning issue/PR is malformed.
+  expect(parseNoWorkDecision('<no-work>{"action":"close","comment":"done elsewhere"}</no-work>')).toBeNull();
+  expect(parseNoWorkDecision('<no-work>{"action":"wait","blockedBy":[]}</no-work>')).toBeNull();
+});

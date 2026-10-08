@@ -341,6 +341,16 @@ test("mapJsonlEventToChunks: isApiErrorMessage without apiErrorStatus still emit
   expect(status!.data).not.toContain("HTTP");
 });
 
+test("mapJsonlEventToChunks: claude's usage-limit informational notice becomes a status row; other informational lines don't", () => {
+  // Real line (claude 2.1.292 JSONL, 2026-10-07): written as the turn stops on
+  // the usage limit; the pipeline runner reads the reset time off it.
+  const { out, onChunk } = recorder();
+  const notice = "Usage limit reached · continuing automatically at 11:30pm · esc to cancel";
+  mapJsonlEventToChunks(JSON.stringify({ type: "system", subtype: "informational", content: notice, level: "notice", uuid: "6b2c13f1-1faa-45c8-9cbf-8101609e2c92" }), onChunk);
+  mapJsonlEventToChunks(JSON.stringify({ type: "system", subtype: "informational", content: "Something else", uuid: "7b2c13f1-1faa-45c8-9cbf-8101609e2c92" }), onChunk);
+  expect(out).toEqual([{ stream: "status", data: notice }]);
+});
+
 test("mapJsonlEventToChunks: system{subtype:turn_duration} emits the duration as a status breadcrumb", () => {
   // Claude 2.1.x writes a `system{subtype:"turn_duration"}` line right
   // after the assistant end_turn. The end_turn itself already produced

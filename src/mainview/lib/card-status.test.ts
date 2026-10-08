@@ -31,6 +31,19 @@ describe("cardStatus — pipelines", () => {
     expect(status(t, { lease: { holds: [], waiting: [{ label: "lab", heldBy: "E2E", free: false, position: 1, queueLength: 1 }] } })).toMatchObject({ line: "Waiting for lab (held by E2E)", needsYou: null });
   });
 
+  test("waiting on an automatic retry (usage-limit reset, transient backoff): nothing for the user to do", () => {
+    const at = new Date(2026, 9, 6, 23, 35).getTime();
+    const time = new Date(at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    const blocked = [{ taskId: "s1", stepId: "build", kind: "step-failed" as const, message: "m" }];
+    const quota = task({ column: "blocked", pipelineRun: run({ status: "blocked", blocked, autoRetry: { stepId: "build", kind: "quota", attempt: 1, at, reason: "limit" } }) });
+    expect(status(quota)).toMatchObject({ line: `Build waiting for the usage limit to reset · retries at ${time}`, needsYou: null });
+    const flake = task({ column: "blocked", pipelineRun: run({ status: "blocked", blocked, autoRetry: { stepId: "build", kind: "transient", attempt: 2, at, reason: "529" } }) });
+    expect(status(flake)).toMatchObject({ line: `Build failed · retrying automatically at ${time} (attempt 2)`, needsYou: null });
+    // Given up: back to the ordinary blocked status.
+    const gaveUp = task({ column: "blocked", pipelineRun: run({ status: "blocked", blocked, autoRetry: { stepId: "build", kind: "transient", attempt: 5, at: null, reason: "529" } }) });
+    expect(status(gaveUp).line).not.toContain("retrying automatically");
+  });
+
   test("second in line for a busy lease says so", () => {
     const t = task({ column: "blocked", pipelineRun: run({ status: "blocked", blocked: [{ taskId: "s1", stepId: "build", kind: "step-blocked", message: "m" }] }) });
     expect(status(t, { lease: { holds: [], waiting: [{ label: "lab", heldBy: "E2E", free: false, position: 2, queueLength: 3 }] } }).line).toBe("Waiting for lab (held by E2E, 2nd of 3 in line)");

@@ -13,6 +13,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { run } from "./github.ts";
+import { classifyFailure, nextRetryAt } from "./usage-limit.ts";
 
 const CODEX = path.join(homedir(), ".agetor", "bin", "codex");
 
@@ -24,6 +25,9 @@ export interface ThreadAnswer {
   error?: string;
   /** The thread is open elsewhere (Codex Desktop holds its single-writer lock). */
   busy?: boolean;
+  /** Codex answered with a usage limit: don't ask again before this (the
+   *  parsed "try again at", else a 30-minute backoff). */
+  limitedUntil?: number;
 }
 
 export const THREAD_BUSY_MESSAGE =
@@ -38,6 +42,15 @@ export function taggedJson<T>(text: string, tag: string): T | null {
   } catch {
     return null;
   }
+}
+
+/** A usage-limit answer from `codex exec` (its stderr), and when to ask
+ *  again: the parsed reset plus a margin, else 30 minutes. Pure; exported
+ *  for tests. */
+export function threadLimit(raw: string, now: number = Date.now()): { detail: string; until: number } | null {
+  const c = classifyFailure(raw, now);
+  if (c?.kind !== "quota") return null;
+  return { detail: c.detail, until: nextRetryAt("quota", 2, c.resetAt, now)! };
 }
 
 export function askThread(input: { threadId: string; cwd: string; prompt: string; timeoutMs?: number }): Promise<ThreadAnswer> {
@@ -78,6 +91,8 @@ async function askNow(input: { threadId: string; cwd: string; prompt: string; ti
     if (!r.ok && !text) {
       const raw = `${r.stderr ?? ""}\n${r.stdout ?? ""}`;
       if (/already has an active writer/i.test(raw)) return { ok: false, text: "", busy: true, error: THREAD_BUSY_MESSAGE };
+      const limit = threadLimit(raw);
+      if (limit) return { ok: false, text: "", error: limit.detail, limitedUntil: limit.until };
       return { ok: false, text: "", error: (r.stderr || r.stdout || "codex exited with an error").slice(-500) };
     }
     return { ok: !!text, text, error: text ? undefined : "the thread gave no answer" };

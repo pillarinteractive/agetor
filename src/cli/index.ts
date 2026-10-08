@@ -26,6 +26,7 @@ import { cmdConfig } from "./commands/config.ts";
 import { cmdShell } from "./commands/shell.ts";
 import { cmdCommands } from "./commands/discovery.ts";
 import { cmdBoard, cmdSuggestions, cmdActivity, cmdFollowUps, cmdFollowUp, cmdBlocks, cmdDepends } from "./commands/board.ts";
+import { cmdKeepalive } from "./commands/keepalive.ts";
 import { helpFor } from "./usage.ts";
 
 const HELP = `agetor — drive Agetor from the terminal
@@ -56,6 +57,7 @@ Commands:
   rm <id> [--yes]     delete a task (worktree + branch)
   info                show the connected core's version
   daemon <sub>        start | stop | status of the background core
+  keepalive <sub>     on | off | status: reopen the app if it dies (never after you quit it)
   harness <sub>       list | add | edit | enable | disable | rm | shell agent harnesses
   profile <sub>       list | show | add | edit | rm reusable agent profiles
   pipeline <sub>      list | show | rm | export | import pipelines; retry [--from] |
@@ -224,6 +226,8 @@ async function main(): Promise<void> {
       return cmdBlocks(args, flags);
     case "depends":
       return cmdDepends(args, flags);
+    case "keepalive":
+      return cmdKeepalive(args, flags);
     case "info": {
       const client = await getClient(flags);
       const meta = await client.info();

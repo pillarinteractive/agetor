@@ -10,7 +10,9 @@
  * A plain (non-pipeline) task the user starts is never held, but it does
  * count toward `max`.
  */
+import type { Task } from "../shared/types.ts";
 import { preferences, tasks } from "./db.ts";
+import { isQuotaPaused } from "./usage-limit.ts";
 
 export const STEP_SLOTS_PREF = "step_slots";
 
@@ -68,11 +70,21 @@ export function currentSlots(): StepSlots {
  *  too) plus every running plain task. A step is in flight from launch —
  *  an active execution with no outcome yet and no block — or while its
  *  process is live, so two launches a moment apart can't both take the
- *  last slot while the first is still spawning. */
-export function slotUse(isLive: (taskId: string) => boolean, slots: StepSlots = currentSlots()): SlotUse {
+ *  last slot while the first is still spawning. A live step that's only
+ *  waiting — on the user (a question/permission card) or on claude's
+ *  usage-limit pause (`isQuotaPaused`) — isn't working the machine, so it
+ *  doesn't count. */
+export function slotUse(
+  isLive: (taskId: string) => boolean,
+  slots: StepSlots = currentSlots(),
+  list: Task[] = tasks.list(),
+  quotaPaused: (taskId: string) => boolean = isQuotaPaused,
+): SlotUse {
   let total = 0;
   let heavy = 0;
-  for (const t of tasks.list()) {
+  const byId = new Map(list.map((t) => [t.id, t]));
+  const waiting = (id: string) => (byId.get(id)?.pendingInteractionCount ?? 0) > 0 || quotaPaused(id);
+  for (const t of list) {
     if (t.archivedAt != null) continue;
     const run = t.pipelineRun;
     if (run) {
@@ -80,11 +92,12 @@ export function slotUse(isLive: (taskId: string) => boolean, slots: StepSlots = 
         const settled = run.history.find((h) => h.taskId === a.taskId && h.seq === a.seq)?.outcome != null;
         const blocked = run.blocked.some((b) => b.taskId === a.taskId);
         if (!isLive(a.taskId) && (settled || blocked)) continue;
+        if (waiting(a.taskId)) continue;
         total++;
         const name = run.snapshot?.graph.steps.find((s) => s.id === a.stepId)?.name ?? "";
         if (isHeavyStep(name, slots)) heavy++;
       }
-    } else if (!t.pipelineParentId && t.column === "running") {
+    } else if (!t.pipelineParentId && t.column === "running" && !waiting(t.id)) {
       total++;
     }
   }

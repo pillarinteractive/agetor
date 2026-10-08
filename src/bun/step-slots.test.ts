@@ -29,3 +29,25 @@ test("a run whose only blocks are slot waits is running, not blocked", () => {
   expect(deriveRunStatus({ ...base, blocked: [wait] })).toBe("running");
   expect(deriveRunStatus({ ...base, blocked: [wait, { taskId: "t", stepId: "b", kind: "step-blocked", message: "x" }] })).toBe("blocked");
 });
+
+test("a live step waiting on the user or on a usage-limit pause doesn't hold a step slot", async () => {
+  const { slotUse } = await import("./step-slots.ts");
+  type T = import("../shared/types.ts").Task;
+  const slots = { max: 8, heavy: { max: 2, steps: ["Finish"] } };
+  const step = (id: string, pending = 0) => ({ id, archivedAt: null, pipelineParentId: "p", column: "running", pendingInteractionCount: pending }) as never as T;
+  const run = {
+    status: "running",
+    blocked: [],
+    history: [],
+    joins: {},
+    active: [{ stepId: "build", taskId: "s1", seq: 1 }, { stepId: "finish", taskId: "s2", seq: 2 }, { stepId: "build", taskId: "s3", seq: 3 }],
+    snapshot: { graph: { steps: [{ id: "build", name: "Build" }, { id: "finish", name: "Finish" }], edges: [] } },
+  };
+  const parent = { id: "p", archivedAt: null, pipelineParentId: null, column: "running", pendingInteractionCount: 1, pipelineRun: run } as never as T;
+  const plain = (id: string, pending: number) => ({ id, archivedAt: null, pipelineParentId: null, column: "running", pendingInteractionCount: pending, pipelineRun: null }) as never as T;
+  const live = () => true;
+  // All three steps and one plain task working.
+  expect(slotUse(live, slots, [parent, step("s1"), step("s2"), step("s3"), plain("x", 0)], () => false)).toEqual({ total: 4, heavy: 1 });
+  // s2 (heavy) has a question card open, s3 is paused on the usage limit, the plain task waits on a permission.
+  expect(slotUse(live, slots, [parent, step("s1"), step("s2", 1), step("s3"), plain("x", 2)], (id) => id === "s3")).toEqual({ total: 1, heavy: 0 });
+});

@@ -12,6 +12,7 @@ import { makeWindowLifecycle, type Frame } from "./window-lifecycle.ts";
 import { focusWindow } from "./window-focus.ts";
 import { repairFrame } from "./screen-frame.ts";
 import { readCoreCreds, probeLiveCore, resolveDataDir } from "./core-creds.ts";
+import { clearDeliberateQuit, markDeliberateQuit } from "./keepalive.ts";
 import { resolveNotifier, resolveNotifierApp, buildNotifierArgs } from "./notifier.ts";
 import { buildTaskDeepLink, parseTaskDeepLink } from "./deep-link.ts";
 import { startNativeBridge } from "./native-bridge.ts";
@@ -49,6 +50,9 @@ try {
 } catch {
   /* non-fatal */
 }
+// This launch ends any deliberate quit: from here, an exit the user didn't
+// approve (a crash, a kill) is one the keepalive LaunchAgent undoes.
+clearDeliberateQuit();
 
 /**
  * Install a native macOS menu bar with standard Edit-menu roles. Without this,
@@ -346,6 +350,9 @@ try {
 let quitCheckInFlight = false;
 Electrobun.events.on("before-quit", (event: { response?: { allow: boolean } }) => {
   if (quitApproved) {
+    // The user (or install:local / the updater) quit on purpose: keepalive
+    // (src/bun/keepalive.ts) must not reopen the app until it's launched again.
+    markDeliberateQuit();
     core?.stop();
     event.response = { allow: true };
     return;

@@ -9,7 +9,7 @@ import {
   reapIdleSessions,
   stopFxAutoResumeTimers,
 } from "./orchestrator.ts";
-import { initPipelineRunner, reconcilePipelineRuns, startSlotScheduler } from "./pipeline-runner.ts";
+import { initPipelineRunner, reconcilePipelineRuns, rearmPipelineAutoRetries, startSlotScheduler, stopPipelineAutoRetryTimers } from "./pipeline-runner.ts";
 import { ensureDisclaimedServer } from "./tmux-resolution.ts";
 import { startApiServer, type ApiNative } from "./server.ts";
 import { rehydratePath } from "./login-path.ts";
@@ -68,6 +68,7 @@ export const coreDeps = {
   initPipelineRunner,
   reconcileOrphans,
   reconcilePipelineRuns,
+  rearmPipelineAutoRetries,
   rearmFxAutoResumes,
   sweepArchivedTeardowns,
   sweepDoneTeardowns,
@@ -140,6 +141,11 @@ async function boot(opts: StartCoreOptions, deps: CoreDeps): Promise<ApiServer> 
   // that every step task's own orphan→ready transition has fired.
   const reconciledPipelineRunCount = await deps.reconcilePipelineRuns();
   if (reconciledPipelineRunCount > 0) log(`reconciled ${reconciledPipelineRunCount} pipeline run(s)`);
+  // Automatic retries waiting on a usage-limit reset or a transient-failure
+  // backoff (pipeline-runner.ts `scheduleAutoRetry`) are persisted on the run;
+  // their timers aren't.
+  const rearmedAutoRetryCount = deps.rearmPipelineAutoRetries();
+  if (rearmedAutoRetryCount > 0) log(`re-armed ${rearmedAutoRetryCount} automatic step retr${rearmedAutoRetryCount === 1 ? "y" : "ies"}`);
   // Re-arm in-memory auto-resume timers for every fx task still carrying a
   // pending schedule (docs/plans/fx-recovery-follow-ups.md §3 T2 item 9) — a
   // `setTimeout` handle never survives a process restart.
@@ -309,6 +315,7 @@ export function shutdownCore(reason: string, log: (m: string) => void, code = 0)
   log(`shutting down (${reason})`);
   reapLiveFxProcs();
   stopFxAutoResumeTimers();
+  stopPipelineAutoRetryTimers();
   try {
     removeCoreCreds(dataDir);
   } catch {

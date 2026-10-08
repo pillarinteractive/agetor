@@ -38,6 +38,10 @@ mkdir -p "$DATA_DIR/bin"
 bun build "$ROOT/src/cli/index.ts" --compile --outfile "$STAGE/agetor" >/dev/null
 mv -f "$STAGE/agetor" "$DATA_DIR/bin/agetor"
 echo "installed CLI → $DATA_DIR/bin/agetor"
+# The keepalive check launchd runs once `agetor keepalive on` is set
+# (src/bun/keepalive.ts). Installing it changes nothing until then.
+install -m 755 "$ROOT/scripts/keepalive/agetor-keepalive.sh" "$DATA_DIR/bin/agetor-keepalive"
+echo "installed keepalive check → $DATA_DIR/bin/agetor-keepalive"
 
 mkdir -p "$BACKUPS"
 if [ -f "$DATA_DIR/agetor.sqlite" ]; then

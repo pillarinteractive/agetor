@@ -108,6 +108,8 @@ export interface AutopilotStateDto {
   audits: number;
   lastAnswer: { at: number; kind: "next" | "audit"; text: string } | null;
   lastError: string | null;
+  /** The thread's Codex account is at its usage limit until then. */
+  limitedUntil?: number;
   updatedAt: number;
 }
 import { TASK_EVENTS_REPLAY_META_EVENT } from "../../shared/types.ts";

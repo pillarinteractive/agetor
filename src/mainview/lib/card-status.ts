@@ -191,6 +191,17 @@ export function cardStatus(
           needsYou: null,
         };
       }
+      // An automatic retry is pending (src/bun/pipeline-runner.ts
+      // `scheduleAutoRetry`): a usage-limit reset or a transient-failure
+      // backoff. Nothing for the user to do.
+      const retry = run.autoRetry;
+      if (retry?.at != null) {
+        const at = new Date(retry.at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+        const name = stepName(run, retry.stepId);
+        return retry.kind === "quota"
+          ? { line: `${name} waiting for the usage limit to reset · retries at ${at}`, tone: "muted", needsYou: null }
+          : { line: `${name} failed · retrying automatically at ${at} (attempt ${retry.attempt})`, tone: "warning", needsYou: null };
+      }
       const freed = lease.waiting.find((w) => w.free);
       const block = run.blocked[0];
       const step = stepName(run, block?.stepId);

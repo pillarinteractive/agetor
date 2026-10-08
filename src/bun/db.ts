@@ -733,6 +733,20 @@ export const parsePipelineRunState = (raw: string | null): PipelineRunState | nu
     capExtensions: Number.isSafeInteger(rec.capExtensions) && (rec.capExtensions as number) >= 0
       ? Math.min(rec.capExtensions as number, PIPELINE_LIMITS.capExtensionsMax)
       : undefined,
+    autoRetry: sanitizeAutoRetry(rec.autoRetry),
+  };
+};
+
+const sanitizeAutoRetry = (raw: unknown): PipelineRunState["autoRetry"] => {
+  if (!isPlainObject(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.stepId !== "string" || (r.kind !== "quota" && r.kind !== "transient")) return undefined;
+  return {
+    stepId: r.stepId,
+    kind: r.kind,
+    attempt: Number.isSafeInteger(r.attempt) && (r.attempt as number) > 0 ? (r.attempt as number) : 1,
+    at: isFiniteNumber(r.at) ? r.at : null,
+    reason: typeof r.reason === "string" ? r.reason.slice(0, 500) : "",
   };
 };
 

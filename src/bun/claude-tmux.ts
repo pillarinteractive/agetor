@@ -12,6 +12,8 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { tasks } from "./db.ts";
+import { recordActivity } from "./activity.ts";
+import { CLAUDE_QUOTA_PAUSED_RE, matchClaudeResetNotice, setQuotaPaused } from "./usage-limit.ts";
 import { attachSubagentWatcher, detachWatcherFor, orphanRunningSubagents, subagentActivityWithin, type SubagentWatcherHandle } from "./claude-subagents.ts";
 import { ensureInstalledForCwd } from "./hook-installer.ts";
 import {
@@ -1386,6 +1388,15 @@ function mapParsedEventToChunks(
       // stamps `permissionMode` onto a `subtype:"turn_duration"` line
       // silently swaps the mode-change chip for the duration chip instead
       // of emitting both.
+      // Claude's usage-limit notices (`Usage limit reached · continuing
+      // automatically at 11:30pm · esc to cancel`, `Automatic continue was
+      // turned off · …`) land as `system`/`informational` lines. Surface them
+      // as status rows: the user sees why the turn stopped, and the pipeline
+      // runner reads the reset time off them (src/bun/usage-limit.ts).
+      if (evt.type === "system" && evt.subtype === "informational" && typeof evt.content === "string"
+        && /^(?:Usage limit|Automatic continue)/.test(evt.content)) {
+        onChunk("status", evt.content, uuid);
+      }
       if (evt.subtype === "turn_duration" && typeof evt.durationMs === "number") {
         // Emitted right after the assistant end_turn. The end_turn itself
         // already produced a "turn complete" status; this just adds the
@@ -6164,7 +6175,9 @@ const WORKING_CHROME_WINDOW_LINES = 16;
  *  12-line window, so they never surface a card — a mid-turn limit pause keeps
  *  the turn in flight and the pane quiet, which would otherwise arm the
  *  stuck-turn watchdog. `Usage limit has reset · press enter to continue` is
- *  deliberately NOT here — it is genuinely actionable. Note that when it
+ *  deliberately NOT here — it is genuinely actionable, and
+ *  `handleUsageLimitNotices` now presses Enter for it itself (the card below
+ *  is only the fallback if that keystroke didn't take). Note that when it
  *  renders in the hint slot above the input box it sits outside the footer
  *  arm's last-3-line window, so it reaches the user via the watchdog arm
  *  (turn still in flight, pane quiet, no working chrome) rather than
@@ -6446,6 +6459,48 @@ function normalizePaneForActivity(tail: string): string {
 /** Run a single scrape tick. Idempotent: registers at most one new
  *  TmuxPromptRequest per call, auto-cancels any pending one whose
  *  fingerprint no longer matches the pane. */
+/** Per-session bookkeeping for `handleUsageLimitNotices`'s Enter press. */
+const resetNoticeTrack = new Map<string, { streak: number; lastEnterAt: number }>();
+/** Don't press Enter for the same notice more often than this. */
+const RESET_ENTER_COOLDOWN_MS = 60_000;
+
+/**
+ * Claude's usage-limit notices on the pane (exact strings: see
+ * src/bun/usage-limit.ts):
+ *
+ * - `Usage limit reached · continuing automatically at 8am · esc to cancel`:
+ *   the turn is paused until the reset and resumes by itself — recorded
+ *   (`setQuotaPaused`) so the paused session holds no step or Autopilot slot.
+ * - `Usage limit has reset · press enter to continue`: claude's auto-continue
+ *   went stale (e.g. the Mac slept through the reset) and it waits for Enter.
+ *   Continuing is the user's standing choice — the turn was already running
+ *   and only stopped for the limit — so, like the startup consent dialogs
+ *   (`STARTUP_CONSENT_DIALOGS`), Agetor presses Enter itself: only on an
+ *   exact marker match seen on two consecutive scrapes, with claude not
+ *   working, at most once a minute, and it says so in the card's activity.
+ */
+async function handleUsageLimitNotices(state: SessionState, tailLines: string[], tail: string, now: number): Promise<void> {
+  const lines = tailLines.map((l) => l.trimEnd()).filter((l) => l.trim().length > 0).slice(-12);
+  const working = paneShowsClaudeWorking(tail);
+  setQuotaPaused(state.taskId, !working && lines.some((l) => CLAUDE_QUOTA_PAUSED_RE.test(l)));
+  const track = resetNoticeTrack.get(state.taskId) ?? { streak: 0, lastEnterAt: 0 };
+  resetNoticeTrack.set(state.taskId, track);
+  if (working || !matchClaudeResetNotice(lines)) {
+    track.streak = 0;
+    return;
+  }
+  track.streak++;
+  if (track.streak < 2 || now - track.lastEnterAt < RESET_ENTER_COOLDOWN_MS || state.drivingPrompt) return;
+  track.lastEnterAt = now;
+  track.streak = 0;
+  if (!(await tmux(["send-keys", "-t", state.sessionName, "Enter"])).ok) return;
+  bumpKeystroke(state);
+  const line = "Claude's usage limit has reset — pressed Enter so the turn continues";
+  (state.turnQueue[0]?.onChunk ?? state.lastChunk)?.("status", line);
+  const task = tasks.get(state.taskId);
+  recordActivity(task?.pipelineParentId ?? state.taskId, { kind: "auto", text: line, tone: "info" });
+}
+
 async function scrapeOnce(state: SessionState): Promise<void> {
   const now = Date.now();
   // Computed once and reused for every read below (`decideScrapeTick`'s
@@ -6495,6 +6550,8 @@ async function scrapeOnce(state: SessionState): Promise<void> {
     bumpActivity(state);
   }
   state.scrapeLastPaneText = normalizedTail;
+
+  await handleUsageLimitNotices(state, tailLines, tail, now);
 
   // Armed, token-matched lookout for claude's TUI rejecting the last-pasted
   // message as an unknown slash command. Cheap and early-guarded — only
@@ -9244,6 +9301,8 @@ function disposeSessionState(state: SessionState | undefined, orphanSubagents = 
   if (state.deathTimer) clearInterval(state.deathTimer);
   state.deathTimer = null;
   clearContinuationWatchdog(state);
+  resetNoticeTrack.delete(state.taskId);
+  setQuotaPaused(state.taskId, false);
   state.scrapeLastFingerprint = null;
   state.scrapeUnparsableStreak = 0;
   state.scrapeIdleSettleStreak = 0;
@@ -9342,6 +9401,8 @@ function rejectedAgent(_taskId: string, err: Error): SpawnedAgent {
 // dispatch logic against a real temp JSONL file without going through
 // tmux. Not part of the public surface.
 export const __forTest = {
+  /** Usage-limit notice handling (quota pause + the reset Enter press). */
+  handleUsageLimitNotices,
   /** Register a synthetic session keyed on taskId, returning the queue
    *  + offset surface for assertions. */
   installSession(taskId: string, jsonlPath: string): SessionState {

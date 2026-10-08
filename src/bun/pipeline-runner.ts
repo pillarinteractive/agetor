@@ -35,6 +35,7 @@ import { isMergeQueued } from "./merge-intent.ts";
 import { currentSlots, slotDecision, slotUse } from "./step-slots.ts";
 import { isPriority, priorityFirst } from "./priority.ts";
 import { awaitsFor } from "./awaits.ts";
+import { classifyFailure, formatRetryTime, nextRetryAt, TRANSIENT_RETRY_MAX, type FailureClass } from "./usage-limit.ts";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { agentProfiles, backlog, dataDir, harnesses, pipelines, runs, tasks } from "./db.ts";
@@ -225,36 +226,132 @@ export function supersedeBlocksBefore(run: PipelineRunState, seq: number): strin
 }
 
 /**
- * A step whose agent session crashed (run `failed`: the process died, an API
- * error ended the turn) or was orphaned (lost across a restart) didn't fail
- * its task — it never got to finish. Retry it automatically, up to
- * {@link TRANSIENT_RETRY_MAX} times per step per run, with a growing delay;
- * after that the block stays for a person. A step that hands off "blocked",
- * or a Stop the user pressed, never comes through here.
+ * Automatic retry of a step that stopped for a reason no person needs to
+ * decide on, so an unattended board keeps going overnight:
+ *
+ * - `quota` — the account hit its usage limit (src/bun/usage-limit.ts has the
+ *   exact claude/codex messages). The card waits for the limit to reset: the
+ *   retry fires at the parsed reset time plus a margin, or with a 15 → 30 →
+ *   60 minute backoff when no time was given, and never gives up.
+ * - `transient` — the session crashed or was lost, an API overload/5xx, a
+ *   launch flake ("claude session JSONL never appeared"). Up to
+ *   {@link TRANSIENT_RETRY_MAX} retries, 1 → 5 → 15 → 30 minutes apart; after
+ *   that the block stays for a person.
+ *
+ * The schedule is persisted on the run (`run.autoRetry`) and re-armed after a
+ * core restart (`rearmPipelineAutoRetries`). A step that hands off "blocked"
+ * for a real reason, a step-cap/profile-missing/merge-conflict block, or a
+ * Stop the user pressed never comes through here. Callers persist `run`.
  */
-export const TRANSIENT_RETRY_MAX = 2;
-const TRANSIENT_RETRY_DELAY_MS = 60_000;
-const transientRetries = new Map<string, number>();
+export { TRANSIENT_RETRY_MAX };
+const autoRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-function scheduleTransientRetry(parentId: string, run: PipelineRunState, stepId: string, why: string): void {
-  const key = `${parentId}:${run.startedAt ?? 0}:${stepId}`;
-  const attempt = (transientRetries.get(key) ?? 0) + 1;
+/** The last few status/stderr/assistant rows of a turn — what a usage-limit
+ *  or API error left — for `classifyFailure`. */
+function failureTextFrom(events: MainStreamEvent[], max = 12): string {
+  return events
+    .filter((e) => e.stream === "status" || e.stream === "stderr" || e.stream === "assistant")
+    .slice(-max)
+    .map((e) => e.data.slice(0, 1_000))
+    .join("\n");
+}
+
+/** Usage-limit evidence in a turn that ended normally (claude's mid-turn
+ *  grace window makes the agent stop and hand off "blocked"): only claude's
+ *  own notices (status rows), never the agent's prose. */
+function quotaNoticeFrom(events: MainStreamEvent[]): FailureClass | null {
+  const status = events.filter((e) => e.stream === "status").map((e) => e.data);
+  // The limit reset later in the same turn ("Your claude.ai usage limit has
+  // reset…", "[Earlier usage-limit notes no longer apply…]"): the block, if
+  // any, is about something else.
+  const lastQuota = status.findLastIndex((l) => classifyFailure(l)?.kind === "quota");
+  const lastReset = status.findLastIndex((l) => /usage limit has reset|usage-limit notes no longer apply/i.test(l));
+  if (lastQuota < 0 || lastReset > lastQuota) return null;
+  return classifyFailure(status.slice(Math.max(0, lastQuota - 5), lastQuota + 1).join("\n"));
+}
+
+function scheduleAutoRetry(parentId: string, run: PipelineRunState, stepId: string, failure: FailureClass | null, why: string, now = Date.now()): void {
+  const kind = failure?.kind ?? "transient";
+  const prev = run.autoRetry;
+  // Already pending for this step: a second settle of the same turn (the
+  // column and run-status events both land) mustn't count another attempt.
+  if (prev && prev.stepId === stepId && prev.kind === kind && prev.at != null) return;
+  const attempt = prev && prev.stepId === stepId && prev.kind === kind ? prev.attempt + 1 : 1;
   const stepName = run.snapshot ? stepNameById(run.snapshot.graph, stepId) : stepId;
-  if (attempt > TRANSIENT_RETRY_MAX) {
+  const reason = (failure?.detail ?? why).slice(0, 300);
+  const at = nextRetryAt(kind, attempt, failure?.resetAt ?? null, now);
+  run.autoRetry = { stepId, kind, attempt, at, reason };
+  if (at == null) {
     recordActivity(parentId, { kind: "step", text: `${stepName} ${why} again — left for you after ${TRANSIENT_RETRY_MAX} automatic retries`, tone: "danger" });
     return;
   }
-  transientRetries.set(key, attempt);
-  recordActivity(parentId, { kind: "step", text: `${stepName} ${why} — retrying automatically (${attempt} of ${TRANSIENT_RETRY_MAX})`, tone: "warning" });
-  const timer = setTimeout(() => {
-    const current = tasks.get(parentId)?.pipelineRun;
-    // Only if the run is still parked on this step (nobody retried, advanced
-    // or stopped it in the meantime).
-    if (!current || (current.status !== "blocked" && current.status !== "cancelled")) return;
-    if (!current.active.some((a) => a.stepId === stepId)) return;
-    void retryPipelineStep(parentId).catch(() => undefined);
-  }, TRANSIENT_RETRY_DELAY_MS * attempt);
-  timer.unref?.();
+  const when = formatRetryTime(at, now);
+  recordActivity(parentId, kind === "quota"
+    ? {
+      kind: "step",
+      text: `${stepName} is waiting on a usage limit (${reason}) — retrying automatically at ${when}${failure?.resetAt ? "" : ` (no reset time given; attempt ${attempt})`}`,
+      tone: "info",
+    }
+    : { kind: "step", text: `${stepName} ${why} — retrying automatically at ${when} (${attempt} of ${TRANSIENT_RETRY_MAX})`, tone: "warning" });
+  armAutoRetryTimer(parentId, at);
+}
+
+/** Arm the retry stored as `at`, firing at `fireAt` (later than `at` only on
+ *  a boot re-arm). The callback identity-checks itself and `at`. */
+function armAutoRetryTimer(parentId: string, at: number, fireAt = at): void {
+  const existing = autoRetryTimers.get(parentId);
+  if (existing) clearTimeout(existing);
+  const handle = setTimeout(() => {
+    if (autoRetryTimers.get(parentId) !== handle) return;
+    autoRetryTimers.delete(parentId);
+    void fireAutoRetry(parentId, at);
+  }, Math.max(0, fireAt - Date.now()));
+  handle.unref?.();
+  autoRetryTimers.set(parentId, handle);
+}
+
+/** Fire the retry armed for `at`, if the run is still parked on that step —
+ *  nobody retried, advanced, stopped or archived it in the meantime, and
+ *  claude didn't already continue the turn itself at the reset. Exported for
+ *  tests. */
+export async function fireAutoRetry(parentId: string, at: number): Promise<boolean> {
+  const go = await runExclusive(parentId, async () => {
+    const parent = tasks.get(parentId);
+    const run = parent?.pipelineRun;
+    const r = run?.autoRetry;
+    if (!parent || !run || !r || r.at !== at) return false;
+    run.autoRetry = { ...r, at: null };
+    persist(parentId, run);
+    if (parent.archivedAt != null || (run.status !== "blocked" && run.status !== "cancelled")) return false;
+    return run.active.some((a) => a.stepId === r.stepId && !isTaskRunLive(a.taskId));
+  }).catch(() => false);
+  if (!go) return false;
+  const result = await retryPipelineStep(parentId).catch((e: unknown) => ({ error: String(e) }));
+  if ("error" in result) {
+    recordActivity(parentId, { kind: "step", text: `The automatic retry didn't start: ${result.error}`, tone: "warning" });
+    return false;
+  }
+  return true;
+}
+
+/** Re-arm every persisted automatic retry after a core restart (a timer never
+ *  survives one). One that came due while the core was down fires shortly. */
+export function rearmPipelineAutoRetries(now = Date.now()): number {
+  let n = 0;
+  for (const t of tasks.list()) {
+    const r = t.pipelineRun?.autoRetry;
+    if (t.archivedAt != null || t.pipelineParentId || !r || r.at == null) continue;
+    armAutoRetryTimer(t.id, r.at, Math.max(r.at, now + 30_000));
+    n++;
+  }
+  return n;
+}
+
+/** Stop every in-memory retry timer (core shutdown); the schedule stays
+ *  persisted for the next boot. */
+export function stopPipelineAutoRetryTimers(): void {
+  for (const h of autoRetryTimers.values()) clearTimeout(h);
+  autoRetryTimers.clear();
 }
 
 /** When each queued step started waiting (`<parentId>:<stepId>`) — slots go
@@ -1827,7 +1924,17 @@ export async function cancelPipelineRun(parentId: string): Promise<{ task: Task 
     const run = parent.pipelineRun;
 
     const runningTargets = run.active.filter((a) => isTaskRunLive(a.taskId));
+    // Stop on a card that's only waiting for an automatic retry cancels the
+    // retry; the step stays blocked for the user.
+    if (runningTargets.length === 0 && run.autoRetry?.at != null) {
+      run.autoRetry = { ...run.autoRetry, at: null };
+      persist(parentId, run);
+      recordActivity(parentId, { kind: "step", text: "Automatic retry cancelled — left for you", tone: "muted" });
+      return { task: tasks.get(parentId)! };
+    }
     if (runningTargets.length === 0) return { error: "pipeline is not running", status: 409 as const };
+    // A Stop also cancels any automatic retry that was pending.
+    if (run.autoRetry?.at != null) run.autoRetry = { ...run.autoRetry, at: null };
 
     for (const t of runningTargets) {
       const runId = tasks.get(t.taskId)?.runId;
@@ -2270,6 +2377,8 @@ async function settleStepRun(
       const pendingInteractions = pendingInteractionsForRun(taskId, runId);
       const classified = classifyStepResponse({ runStatus: status, assistantText, pendingInteractions });
       if (historyEntry) historyEntry.responseKind = classified.kind;
+      // The step got through: its automatic-retry count starts over.
+      if (classified.kind === "handoff" && run.autoRetry?.stepId === activeEntry.stepId) delete run.autoRetry;
 
       // M-R3: the turn succeeded but the step task is HELD — background
       // subagents it spawned are still running, and the orchestrator has
@@ -2377,6 +2486,12 @@ async function settleStepRun(
           message: `step "${stepName}" reported it is blocked: ${reasonText}${oq}`,
         });
         if (historyEntry) historyEntry.handoff = handoff;
+        // Claude's usage-limit grace window told the agent to stop and say
+        // so: that's not a decision for the user — retry once the limit
+        // resets (claude may also continue the turn by itself at the reset;
+        // the retry then finds the step running and stands down).
+        const quota = quotaNoticeFrom(mainStreamEventsForRun(runId));
+        if (quota) scheduleAutoRetry(parentId, run, activeEntry.stepId, quota, "hit a usage limit");
         checkJoinIncomplete(run);
         persist(parentId, run);
         return null;
@@ -2577,19 +2692,24 @@ async function settleStepRun(
           pendingInteractions: pendingInteractionsForRun(taskId, runId),
         }).kind;
       }
-      const tail = lastStatusLineFrom(mainStreamEventsForRun(runId));
+      const events = mainStreamEventsForRun(runId);
+      const tail = lastStatusLineFrom(events);
+      const failure = classifyFailure(failureTextFrom(events));
       upsertBlocked(run, {
         taskId,
         stepId: activeEntry.stepId,
         kind: "step-failed",
-        message: tail ? `step "${stepName}" failed — ${tail}` : `step "${stepName}" failed`,
+        message: failure?.kind === "quota"
+          ? `step "${stepName}" hit a usage limit — ${failure.detail}`
+          : tail ? `step "${stepName}" failed — ${tail}` : `step "${stepName}" failed`,
       });
       if (historyEntry) {
         historyEntry.endedAt = Date.now();
         historyEntry.outcome = "failed";
       }
+      const why = failure ? `failed (${failure.detail.slice(0, 80)})` : tail ? `crashed (${tail.slice(0, 80)})` : "crashed";
+      scheduleAutoRetry(parentId, run, activeEntry.stepId, failure, why);
       persist(parentId, run);
-      scheduleTransientRetry(parentId, run, activeEntry.stepId, tail ? `crashed (${tail.slice(0, 80)})` : "crashed");
       return null;
     }
 
@@ -2651,12 +2771,12 @@ async function settleStepRun(
       // being deliberately stopped as part of the same whole-run Stop —
       // either way this settle must never add a "was stopped" block of
       // its own; `finalizeCancelled` (idempotent) is the whole story.
-      finalizeCancelled(parentId, run);
       // Orphaned (the session was lost, e.g. across a restart) isn't a Stop
       // anyone pressed.
       if (status === "orphaned" && !deliberateWholeRunStop) {
-        scheduleTransientRetry(parentId, run, activeEntry.stepId, "lost its session");
+        scheduleAutoRetry(parentId, run, activeEntry.stepId, null, "lost its session");
       }
+      finalizeCancelled(parentId, run);
     }
   } catch (err) {
     persistReconcileFailure(parentId, taskId, err);
