@@ -516,6 +516,10 @@ export const api = {
   getAutopilot: () => j<AutopilotDto>("/autopilot"),
   setAutopilot: (patch: Partial<AutopilotConfigDto> & { restart?: boolean; defaultTracker?: number | null }) =>
     j<AutopilotDto>("/autopilot", { method: "PUT", body: JSON.stringify(patch) }, { retry: false }),
+  /** The owner's answer to a roadmap step whose card finished without
+   *  closing its issue: close the issue as completed, or do the step again. */
+  resolveRoadmapStep: (issue: number, action: "close" | "redo") =>
+    j<AutopilotDto & { ok: true; message: string }>("/autopilot/roadmap/resolve", { method: "POST", body: JSON.stringify({ issue, action }) }, { retry: false }),
   refreshMergeQueue: () => j<{ ok: true }>("/merge-queue/refresh", { method: "POST" }, { retry: false }),
   departMergeTrain: () =>
     j<{ train: { pr: number; url: string; members: number[] } }>("/merge-train/depart", { method: "POST" }, { retry: false }),

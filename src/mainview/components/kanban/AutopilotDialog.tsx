@@ -236,8 +236,10 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
                     </div>
                   )}
                   {roadmap.needsUser.map((s) => (
-                    <div key={s.issue} className="mt-1 text-warning">
+                    <div key={`${s.kind ?? "stuck"}:${s.issue}`} className="mt-1 text-warning">
                       Step {s.step} · #{s.issue}: {s.reason}
+                      {/* The PR's own words, or the files holding the card: plain text. */}
+                      {s.detail && <div className="break-words text-muted-foreground">{s.kind === "held" ? `Sensitive files: ${s.detail}` : s.detail}</div>}
                     </div>
                   ))}
                   {(roadmap.blockedOutside ?? []).length > 0 && (

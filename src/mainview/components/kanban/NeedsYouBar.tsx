@@ -16,9 +16,13 @@ const COLLAPSED_COUNT = 4;
  * with its reason and the one button that settles it. Empty means nothing is
  * waiting on you. Built from the same `cardStatus` the cards' status lines use.
  *
- * Roadmap steps waiting on the user (Autopilot's roadmap mode) have no card:
- * they're listed first, each opening its issue. `roadmapOnly` shows just
- * those — cards already say what needs you on their own status line.
+ * Roadmap steps waiting on the user (Autopilot's roadmap mode) are listed
+ * first: the owner's own steps (open the issue), cards held in In Review
+ * for sign-off (open the PR or the card), and steps whose card finished
+ * while the issue stayed open — those open a panel that shows what the
+ * merged PR said, and only from there can the issue be closed as completed
+ * or the step be done again. `roadmapOnly` shows just the roadmap entries —
+ * cards already say what needs you on their own status line.
  */
 export function NeedsYouBar({
   tasks,
@@ -59,6 +63,10 @@ export function NeedsYouBar({
   // Roadmap steps waiting on the user: refetched when a card moves (a pass
   // follows) and once a minute (the owner's steps change on GitHub).
   const [roadmap, setRoadmap] = useState<RoadmapNeedsYou[]>([]);
+  // The stuck step whose resolve panel is open, and the answer being sent.
+  const [resolving, setResolving] = useState<string | null>(null);
+  const [resolveBusy, setResolveBusy] = useState<"close" | "redo" | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
   const columnsKey = useMemo(() => tasks.map((t) => `${t.id}:${t.column}`).join(","), [tasks]);
   useEffect(() => {
     let alive = true;
@@ -71,7 +79,25 @@ export function NeedsYouBar({
       clearTimeout(soon);
       clearInterval(timer);
     };
-  }, [columnsKey]);
+  }, [columnsKey, reloadKey]);
+
+  // The owner's answer to a step whose card finished with the issue still
+  // open. Reached only through the panel that shows the PR's own words.
+  const resolve = async (r: RoadmapNeedsYou, action: "close" | "redo") => {
+    setResolveBusy(action);
+    setNotice(null);
+    try {
+      const res = await api.resolveRoadmapStep(r.issue, action);
+      setNotice(res.message);
+      setRoadmap(roadmapNeedsYou(res));
+      setResolving(null);
+    } catch (e) {
+      setNotice(`Step ${r.step} (#${r.issue}): ${e instanceof ApiError ? e.message : "couldn't do that"}`);
+    } finally {
+      setResolveBusy(null);
+      setReloadKey((k) => k + 1);
+    }
+  };
 
   const apply = async (s: Suggestion) => {
     if (s.apply.kind === "open") {
@@ -126,26 +152,92 @@ export function NeedsYouBar({
       </div>
       {roadmap.length > 0 && (
         <ul className="mb-1 flex flex-col gap-1" data-testid="roadmap-needs-you">
-          {roadmap.map((r) => (
-            <li key={r.key} data-testid="roadmap-needs-you-item" className="flex items-center gap-2 text-xs">
-              <span className="min-w-0 flex-1 truncate" title={`${r.title} — ${r.reason}`}>
-                <span className="font-medium">{r.title}</span>
-                <span className="text-muted-foreground"> — {r.reason}</span>
-              </span>
-              {r.url && (
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  data-testid="roadmap-needs-you-action"
-                  onClick={() => onOpenPr(r.url!)}
-                  className="h-6 shrink-0 px-2 text-[11px]"
-                >
-                  Open issue
-                </Button>
-              )}
-            </li>
-          ))}
+          {roadmap.map((r) => {
+            const card = r.taskId ? tasks.find((t) => t.id === r.taskId) : undefined;
+            const open = resolving === r.key;
+            const small = "h-6 shrink-0 px-2 text-[11px]";
+            return (
+              <li key={r.key} data-testid="roadmap-needs-you-item" data-kind={r.kind} className="flex flex-col gap-1 text-xs">
+                <div className="flex items-center gap-2">
+                  <span className="min-w-0 flex-1 truncate" title={`${r.title} — ${r.reason}${r.detail ? `\n${r.detail}` : ""}`}>
+                    <span className="font-medium">{r.title}</span>
+                    <span className="text-muted-foreground"> — {r.reason}</span>
+                  </span>
+                  {r.kind !== "human" && r.prUrl && (
+                    <Button type="button" size="sm" variant="outline" data-testid="roadmap-needs-you-pr" onClick={() => onOpenPr(r.prUrl!)} className={small}>
+                      Open PR{r.pr != null ? ` #${r.pr}` : ""}
+                    </Button>
+                  )}
+                  {r.kind === "held" && card && (
+                    <Button type="button" size="sm" variant="outline" data-testid="roadmap-needs-you-card" onClick={() => onOpen(card)} className={small}>
+                      Open card
+                    </Button>
+                  )}
+                  {r.kind === "stuck" && (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant={open ? "secondary" : "outline"}
+                      data-testid="roadmap-needs-you-resolve"
+                      aria-expanded={open}
+                      onClick={() => setResolving(open ? null : r.key)}
+                      className={small}
+                    >
+                      Resolve…
+                    </Button>
+                  )}
+                  {r.kind === "human" && r.url && (
+                    <Button type="button" size="sm" variant="outline" data-testid="roadmap-needs-you-action" onClick={() => onOpenPr(r.url!)} className={small}>
+                      Open issue
+                    </Button>
+                  )}
+                </div>
+                {r.kind === "held" && r.detail && <p className="break-words pl-0.5 text-[11px] text-muted-foreground">Sensitive files: {r.detail}</p>}
+                {r.kind === "stuck" && open && (
+                  <div data-testid="roadmap-resolve-panel" className="rounded border border-border bg-background/60 px-2 py-1.5">
+                    <p className="text-[11px] font-medium">Why #{r.issue} is still open</p>
+                    {/* Text from the PR description: rendered as text, nothing in it is followed. */}
+                    <p data-testid="roadmap-resolve-detail" className="mt-0.5 whitespace-pre-wrap break-words text-[11px] text-muted-foreground">
+                      {r.detail ?? "The PR's description hasn't been read yet — open the PR to see what it left."}
+                    </p>
+                    <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                      <Button
+                        type="button"
+                        size="sm"
+                        data-testid="roadmap-resolve-close"
+                        disabled={resolveBusy !== null}
+                        onClick={() => void resolve(r, "close")}
+                        className={small}
+                        title={`Closes issue #${r.issue} on GitHub as completed, with a comment saying you accepted the step. The steps waiting on it start.`}
+                      >
+                        {resolveBusy === "close" ? "Closing…" : `Accept: close #${r.issue} as completed`}
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        data-testid="roadmap-resolve-redo"
+                        disabled={resolveBusy !== null}
+                        onClick={() => void resolve(r, "redo")}
+                        className={small}
+                        title="Autopilot starts a fresh card for this step, told about the earlier PR and what it left."
+                      >
+                        {resolveBusy === "redo" ? "Starting…" : "Do the step again"}
+                      </Button>
+                      {r.url && (
+                        <Button type="button" size="sm" variant="ghost" onClick={() => onOpenPr(r.url!)} className={small}>
+                          Open issue
+                        </Button>
+                      )}
+                      <Button type="button" size="sm" variant="ghost" disabled={resolveBusy !== null} onClick={() => setResolving(null)} className={small}>
+                        Cancel
+                      </Button>
+                    </div>
+                  </div>
+                )}
+              </li>
+            );
+          })}
         </ul>
       )}
       {suggestions.length > 0 && (

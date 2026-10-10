@@ -307,26 +307,69 @@ export function needsYouList(items: { task: Task; status: CardStatus }[]): { tas
     .sort((a, b) => rank(a.status) - rank(b.status) || NEEDS_YOU_ORDER[a.status.needsYou!.action] - NEEDS_YOU_ORDER[b.status.needsYou!.action] || b.task.updatedAt - a.task.updatedAt);
 }
 
-/** A Needs-you entry that has no card: a roadmap step waiting on the user
- *  (src/shared/roadmap.ts). Its one action opens the step's issue. */
+/** A Needs-you entry for a roadmap step waiting on the user
+ *  (src/shared/roadmap.ts):
+ *  human — the owner's own step, ready: open its issue.
+ *  stuck — its card finished and the issue is still open: open the PR, then
+ *          close the issue as completed or have the step done again.
+ *  held  — its card waits in In Review for sign-off: open the PR or the card.
+ *  `reason` and `detail` may quote a PR description: plain text, rendered
+ *  as text. */
 export interface RoadmapNeedsYou {
   key: string;
-  kind: "human" | "stuck";
+  kind: "human" | "stuck" | "held";
+  step: string;
+  issue: number;
   title: string;
   reason: string;
+  /** What the PR said about the issue, or the files holding the card. */
+  detail: string | null;
+  /** The step's issue. */
   url: string | null;
+  pr: number | null;
+  prUrl: string | null;
+  /** The card concerned, when there is one. */
+  taskId: string | null;
 }
 
 /** Roadmap steps waiting on the user while Autopilot runs a roadmap: steps
- *  Autopilot won't start again first, then the owner's ready `[Human]` steps. */
+ *  Autopilot won't start again and cards held for sign-off first, then the
+ *  owner's ready `[Human]` steps. */
 export function roadmapNeedsYou(
   autopilot: { config: { enabled: boolean; roadmap: { issue: number } | null; milestone?: { number: number } | null }; state: { roadmap?: RoadmapStatus | null } } | null | undefined,
 ): RoadmapNeedsYou[] {
   const status = autopilot ? currentRoadmapStatus({ roadmap: autopilot.config.roadmap, milestone: autopilot.config.milestone ?? null }, autopilot.state.roadmap) : null;
   if (!autopilot?.config.enabled || !status) return [];
   return [
-    ...status.needsUser.map((s) => ({ key: `stuck:${s.issue}`, kind: "stuck" as const, title: `Step ${s.step} · #${s.issue} ${s.title}`, reason: s.reason, url: s.url })),
-    ...status.humanReady.map((s) => ({ key: `human:${s.issue}`, kind: "human" as const, title: `Step ${s.step} · #${s.issue} ${s.title}`, reason: "ready for you — only you can do this step", url: s.url })),
+    ...status.needsUser.map((s) => {
+      const kind = s.kind === "held" ? ("held" as const) : ("stuck" as const);
+      return {
+        key: `${kind}:${s.issue}`,
+        kind,
+        step: s.step,
+        issue: s.issue,
+        title: `Step ${s.step} · #${s.issue} ${s.title}`,
+        reason: s.reason,
+        detail: s.detail ?? null,
+        url: s.url,
+        pr: s.pr ?? null,
+        prUrl: s.prUrl ?? null,
+        taskId: s.taskId ?? null,
+      };
+    }),
+    ...status.humanReady.map((s) => ({
+      key: `human:${s.issue}`,
+      kind: "human" as const,
+      step: s.step,
+      issue: s.issue,
+      title: `Step ${s.step} · #${s.issue} ${s.title}`,
+      reason: "ready for you — only you can do this step",
+      detail: null,
+      url: s.url,
+      pr: null,
+      prUrl: null,
+      taskId: null,
+    })),
   ];
 }
 

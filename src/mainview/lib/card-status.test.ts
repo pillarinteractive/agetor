@@ -182,9 +182,24 @@ describe("roadmapNeedsYou — roadmap steps with no card", () => {
 
   test("steps Autopilot won't restart first, then the ready human steps, each with its issue URL", () => {
     expect(roadmapNeedsYou(autopilot(true, { issue: 600 }))).toEqual([
-      { key: "stuck:12", kind: "stuck", title: "Step 2 · #12 Inventory the widgets", reason: "PR #77 merged but the issue is still open", url: "https://github.com/o/r/issues/12" },
-      { key: "human:11", kind: "human", title: "Step 1 · #11 [Human] Provide the sample device", reason: "ready for you — only you can do this step", url: "https://github.com/o/r/issues/11" },
+      { key: "stuck:12", kind: "stuck", step: "2", issue: 12, title: "Step 2 · #12 Inventory the widgets", reason: "PR #77 merged but the issue is still open", detail: null, url: "https://github.com/o/r/issues/12", pr: null, prUrl: null, taskId: null },
+      { key: "human:11", kind: "human", step: "1", issue: 11, title: "Step 1 · #11 [Human] Provide the sample device", reason: "ready for you — only you can do this step", detail: null, url: "https://github.com/o/r/issues/11", pr: null, prUrl: null, taskId: null },
     ]);
+  });
+
+  test("a stuck step carries its PR and what the PR said; a held card's step opens its PR and card", () => {
+    const withHeld = {
+      ...status,
+      needsUser: [
+        { step: "2", issue: 12, title: "Inventory the widgets", url: "https://github.com/o/r/issues/12", kind: "stuck" as const, reason: "PR #77 merged but the issue is still open", pr: 77, prUrl: "https://github.com/o/r/pull/77", detail: "PR #77 left it open on purpose: “Refs #12 — the export is not wired yet”", taskId: "c12" },
+        { step: "3", issue: 13, title: "Build the widget store", url: "https://github.com/o/r/issues/13", kind: "held" as const, reason: "PR #78 changes sensitive code — held in In Review for your sign-off", pr: 78, prUrl: "https://github.com/o/r/pull/78", detail: "src/lib/billing/prices.ts", taskId: "c13" },
+      ],
+      humanReady: [],
+    };
+    const out = roadmapNeedsYou({ config: { enabled: true, roadmap: { issue: 600 } }, state: { roadmap: withHeld } });
+    expect(out.map((o) => o.key)).toEqual(["stuck:12", "held:13"]);
+    expect(out[0]).toMatchObject({ kind: "stuck", pr: 77, prUrl: "https://github.com/o/r/pull/77", detail: expect.stringContaining("Refs #12"), taskId: "c12" });
+    expect(out[1]).toMatchObject({ kind: "held", pr: 78, prUrl: "https://github.com/o/r/pull/78", detail: "src/lib/billing/prices.ts", taskId: "c13" });
   });
 
   test("nothing when Autopilot is paused, in milestone mode, or the status is another roadmap's", () => {
