@@ -1043,7 +1043,7 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
       state.roadmapContinued = [...state.roadmapContinued, { ...m, stage: from.stage, at: deps.now(), by: "auto" as const }].slice(-10);
       deps.notify({
         title: "Roadmap: continued into the next milestone",
-        body: `${m.title} — ${from.steps} step${from.steps === 1 ? "" : "s"} added to the Backlog (${from.current} ${from.reason === "finished" ? "finished" : from.reason === "nothing-left" ? "had nothing left to start" : `had ${from.left} left to start`})`,
+        body: `${m.title} — ${from.steps} step${from.steps === 1 ? "" : "s"} added to the Backlog (${from.current} ${from.reason === "finished" ? "finished" : from.reason === "nothing-left" ? "had nothing left to start" : from.reason === "blocked" ? "had nothing that could start yet" : `had ${from.left} left to start`})`,
       });
       next = offerFor(list, scope);
     }

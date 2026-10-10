@@ -786,3 +786,40 @@ describe("step links (what a card waits on and blocks)", () => {
     expect(findRoadmapLinks(s.links!, "2.5")).toEqual({ entry: null, readAs: "step" });
   });
 });
+
+test("the next milestone is offered when the scope is blocked: idle slots, nothing ready, and the next one has something to start", () => {
+  const p = parseRoadmap(
+    [
+      "## Single completion order",
+      "",
+      "| Step | Task | Stage | Predecessors |",
+      "| --- | --- | --- | --- |",
+      "| 1 | #301 Gate | M01 | none |",
+      "| 2 | #302 After the gate | M01 | #301 |",
+      "| 3 | #303 Also after | M01 | #301 |",
+      "| 4 | #304 And another | M01 | #302 |",
+      "| 5 | #305 Free in the next | M02 | none |",
+      "| 6 | #306 Needs the gate | M02 | #301 |",
+      "| 7 | #307 Needs the gate too | M03 | #301 |",
+    ].join("\n"),
+  );
+  const ms = { M01: { number: 1, title: "M01 — One" }, M02: { number: 2, title: "M02 — Two" }, M03: { number: 3, title: "M03 — Three" } };
+  const st = new Map<number, RoadmapIssueState>(p.steps.map((s) => [s.issue, { state: "OPEN", stateReason: null, milestone: ms[s.milestone as keyof typeof ms] }]));
+  const views = roadmapStatus(p, st);
+  const run = (scoped: (keyof typeof ms)[], busy: number[], max = 4) => {
+    const milestones = scoped.map((k) => ms[k]);
+    const steps = new Set(milestones.flatMap((m) => [...roadmapScope(p.steps, st, m)]));
+    return roadmapContinuation({ views, states: st, milestones, steps, busy: new Set(busy), maxInFlight: max, finished: false });
+  };
+  // The gate is ready and not started: the scope can still use a slot.
+  expect(run(["M01"], [])).toMatchObject({ stage: "M02", left: 4, reason: null });
+  // The gate is running, everything else waits on it, two of three slots idle, and M02 has a step that can start.
+  const blocked = run(["M01"], [301], 3);
+  expect(blocked).toMatchObject({ stage: "M02", reason: "blocked", startable: 1, idleSlots: 2 });
+  expect(offerPending(blocked)).toBe(true);
+  expect(nextMilestoneText(blocked!).question).toContain("waiting on unfinished steps");
+  // Every slot busy: nothing to fill.
+  expect(run(["M01"], [301], 1)).toMatchObject({ reason: null });
+  // With M02 in scope too and its free step running, M03 has nothing startable: adding it wouldn't help.
+  expect(run(["M01", "M02"], [301, 305], 3)).toMatchObject({ stage: "M03", startable: 0, reason: null });
+});

@@ -551,6 +551,9 @@ nothing-to-build decision and no audit: the table decides the order.
       back when it reaches a later one — nothing left to start, then the scope finished — not on every pass.
       Declined when finished, the run is `done`; `agetor roadmap continue` still starts it later.
     - While a finished scope's offer is unanswered the run is `idle`, not `done`.
+  - **Blocked** (`reason: "blocked"`): the next milestone is also offered when slots are idle, no step in scope can
+    start to fill them (what is left waits on unfinished steps), and the next milestone has at least one step that
+    can start now. A next milestone with nothing startable isn't offered for this reason, so a chain stops there.
   - **Always continue** (`autoContinue`; the popup's button, the dialog's checkbox, `agetor roadmap start
     --auto-continue`, `agetor roadmap continue --always` / `--off`): the pass adds the next milestone by itself
     under the same condition, records it (`roadmapContinued`, shown as "continued into M02 at …" in the dialog and

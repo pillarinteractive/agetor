@@ -385,8 +385,8 @@ export function nextRoadmapMilestone(
 /** Why the next milestone is on offer now, in the order it gets more
  *  pressing: the scope can no longer fill its slots; nothing in it is left
  *  to start; every step in it is complete or declined. */
-export type RoadmapOfferReason = "nearly-done" | "nothing-left" | "finished";
-const OFFER_RANK: Record<RoadmapOfferReason, number> = { "nearly-done": 1, "nothing-left": 2, finished: 3 };
+export type RoadmapOfferReason = "blocked" | "nearly-done" | "nothing-left" | "finished";
+const OFFER_RANK: Record<RoadmapOfferReason, number> = { blocked: 0, "nearly-done": 1, "nothing-left": 2, finished: 3 };
 
 /** The owner's "not now": for which milestone, and at which stage of the
  *  offer. The offer comes back only when it reaches a later stage. */
@@ -415,6 +415,8 @@ export interface RoadmapNextMilestone {
   current: string;
   /** Agent steps in scope that haven't started and still can. */
   left: number;
+  /** Slots nothing in scope is using. */
+  idleSlots?: number;
   /** Some step in scope is complete or has started (else the scope is just
    *  small: "nearly done" would be the wrong word for it). */
   underway?: boolean;
@@ -455,10 +457,18 @@ export function roadmapContinuation(input: {
   const next = nextRoadmapMilestone(views, states, steps);
   if (!next) return null;
   const left = views.filter((v) => steps.has(v.step) && isOpenView(v) && !v.human && v.status !== "held" && !input.busy.has(v.issue) && !input.exclude?.has(v.issue)).length;
-  const reason: RoadmapOfferReason | null = input.finished ? "finished" : left === 0 ? "nothing-left" : left < input.maxInFlight ? "nearly-done" : null;
   const open = next.steps.filter(isOpenView);
   const agents = open.filter((v) => !v.human);
   const startable = agents.filter((v) => v.status === "ready").length;
+  // Blocked: slots are idle, nothing in scope can start to fill them (what
+  // is left waits on unfinished steps), and the next milestone has steps
+  // that can start now. A next milestone with nothing startable wouldn't
+  // help, so it isn't offered for this reason.
+  const inScope = views.filter((v) => steps.has(v.step) && isOpenView(v) && !v.human);
+  const inFlight = inScope.filter((v) => input.busy.has(v.issue)).length;
+  const readyLeft = inScope.filter((v) => v.status === "ready" && !input.busy.has(v.issue) && !input.exclude?.has(v.issue)).length;
+  const blocked = readyLeft === 0 && inFlight < input.maxInFlight && startable > 0;
+  const reason: RoadmapOfferReason | null = input.finished ? "finished" : left === 0 ? "nothing-left" : left < input.maxInFlight ? "nearly-done" : blocked ? "blocked" : null;
   const ids = new Set(next.steps.map((v) => v.step));
   const blockers = startable === 0 ? unfinishedAncestors(views, agents).filter((v) => !ids.has(v.step)) : [];
   const d = input.dismissal;
@@ -472,6 +482,7 @@ export function roadmapContinuation(input: {
     waitingOn: blockers.length ? `step${blockers.length === 1 ? "" : "s"} ${names(blockers, 4)}` : null,
     current: scopeLabel(input.milestones),
     left,
+    idleSlots: Math.max(0, input.maxInFlight - inFlight),
     underway: views.some((v) => steps.has(v.step) && (v.status === "complete" || (isOpenView(v) && input.busy.has(v.issue)))),
     maxInFlight: input.maxInFlight,
     reason,
@@ -491,7 +502,9 @@ export function nextMilestoneText(o: RoadmapNextMilestone): { question: string; 
       ? `${o.current} ${several ? "are" : "is"} finished. Start ${o.title} ${size}?`
       : o.reason === "nothing-left"
         ? `${o.current} ${several ? "have" : "has"} nothing left to start. Start ${o.title} ${size} as well?`
-        : o.reason === "nearly-done"
+        : o.reason === "blocked"
+          ? `${o.current} ${several ? "are" : "is"} waiting on unfinished steps: none of ${several ? "their" : "its"} ${plural(o.left, "remaining step")} can start yet and ${plural(o.idleSlots ?? 0, "slot")} ${o.idleSlots === 1 ? "is" : "are"} idle. Start ${o.title} ${size} as well?`
+          : o.reason === "nearly-done"
           ? o.underway === false
             ? `${o.current} ${several ? "have" : "has"} only ${plural(o.left, "step")} to start — fewer than the ${o.maxInFlight} that fit in flight. Start ${o.title} ${size} as well?`
             : `${o.current} ${several ? "are" : "is"} nearly done (${plural(o.left, "step")} left to start). Start ${o.title} ${size} as well?`
