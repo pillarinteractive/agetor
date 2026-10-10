@@ -13,6 +13,12 @@
  * a deep audit. Issues the audit files into the milestone restart the loop;
  * a clean audit ends it.
  *
+ * Roadmap mode (`roadmap` in the config, src/shared/roadmap.ts): the order
+ * comes from a tracker issue's numbered step table instead of a milestone
+ * and a thread. A step starts when its issue is open and every predecessor
+ * step's issue is closed as completed; the thread is never asked. See
+ * `roadmapPass`.
+ *
  * Config: `autopilot` preference. State: `autopilot_state` preference.
  */
 import type { Task } from "../shared/types.ts";
@@ -26,6 +32,17 @@ import { hasConfirmedNoPr, prStatusForTask } from "./pr-watch.ts";
 import { onCardRemoved, subscribeGlobal } from "./orchestrator.ts";
 import { holdsAutopilotSlot, PROGRESSING_COLUMNS, waitingOnQuota } from "../shared/autopilot.ts";
 import { formatRetryTime, isQuotaPaused } from "./usage-limit.ts";
+import { loadRoadmapStates, loadRoadmapTracker } from "./roadmap-fetch.ts";
+import {
+  parseRoadmap,
+  pickRoadmap,
+  roadmapFinished,
+  roadmapStatus,
+  roadmapStepPrompt,
+  summarizeRoadmap,
+  type RoadmapIssueState,
+  type RoadmapStatus,
+} from "../shared/roadmap.ts";
 
 export const AUTOPILOT_PREF = "autopilot";
 export const AUTOPILOT_STATE_PREF = "autopilot_state";
@@ -47,6 +64,9 @@ export interface AutopilotConfig {
   milestone: { number: number; title: string } | null;
   maxInFlight: number;
   pipelineId: string | null;
+  /** Roadmap mode: the tracker issue (in `project`'s repo) whose step table
+   *  gives the order. When set, `milestone` and `threadId` aren't used. */
+  roadmap: { issue: number } | null;
 }
 
 export interface AutopilotState {
@@ -73,7 +93,21 @@ export interface AutopilotState {
   waits: Record<string, number[]>;
   /** Issues that already got one rework card — never a second. */
   reworked: number[];
+  /** Roadmap mode: the status as of the last pass. */
+  roadmap: RoadmapStatus | null;
+  /** Roadmap mode: issues whose Autopilot card already finished while the
+   *  issue stayed open. Never started again by Autopilot; cleared when the
+   *  issue closes. Keyed by issue number. */
+  roadmapStuck: Record<string, RoadmapStuck>;
+  /** Roadmap mode: `[Human]` step issues already announced as ready. */
+  notifiedHuman: number[];
   updatedAt: number;
+}
+
+export interface RoadmapStuck {
+  cardId: string;
+  reason: string;
+  at: number;
 }
 
 export interface NoWorkPending {
@@ -95,6 +129,7 @@ export function parseConfig(raw: string | null | undefined): AutopilotConfig {
     // defaults
   }
   const m = o.milestone as { number?: unknown; title?: unknown } | null | undefined;
+  const r = o.roadmap as { issue?: unknown } | null | undefined;
   return {
     enabled: o.enabled === true,
     threadId: typeof o.threadId === "string" ? o.threadId : "",
@@ -102,6 +137,7 @@ export function parseConfig(raw: string | null | undefined): AutopilotConfig {
     milestone: m && typeof m.number === "number" && typeof m.title === "string" ? { number: m.number, title: m.title } : null,
     maxInFlight: typeof o.maxInFlight === "number" && o.maxInFlight >= 1 ? Math.min(10, Math.floor(o.maxInFlight)) : 5,
     pipelineId: typeof o.pipelineId === "string" && o.pipelineId ? o.pipelineId : null,
+    roadmap: typeof r?.issue === "number" && Number.isInteger(r.issue) && r.issue > 0 ? { issue: r.issue } : null,
   };
 }
 
@@ -121,10 +157,13 @@ export function readState(): AutopilotState {
       noWork: v.noWork && typeof v.noWork === "object" ? v.noWork : {},
       waits: v.waits && typeof v.waits === "object" ? v.waits : {},
       reworked: Array.isArray(v.reworked) ? v.reworked : [],
+      roadmap: v.roadmap && typeof v.roadmap === "object" ? v.roadmap : null,
+      roadmapStuck: v.roadmapStuck && typeof v.roadmapStuck === "object" ? v.roadmapStuck : {},
+      notifiedHuman: Array.isArray(v.notifiedHuman) ? v.notifiedHuman : [],
       updatedAt: v.updatedAt ?? 0,
     };
   } catch {
-    return { phase: "idle", cards: [], held: [], audits: 0, lastAnswer: null, lastError: null, quietUntil: 0, quietSignature: "", limitedUntil: 0, noWork: {}, waits: {}, reworked: [], updatedAt: 0 };
+    return { phase: "idle", cards: [], held: [], audits: 0, lastAnswer: null, lastError: null, quietUntil: 0, quietSignature: "", limitedUntil: 0, noWork: {}, waits: {}, reworked: [], roadmap: null, roadmapStuck: {}, notifiedHuman: [], updatedAt: 0 };
   }
 }
 
@@ -473,12 +512,193 @@ const NO_WORK_DEPS: NoWorkDeps = {
   now: () => Date.now(),
 };
 
+// ── Roadmap mode ─────────────────────────────────────────────────────────
+
+/** A card that just reached Done may still be having its issue closed (the
+ *  PR watcher does that when the PR merges): give it this long before
+ *  calling the issue stuck. */
+const SETTLE_MS = 3 * 60_000;
+/** GitHub changes no board event reports (the owner closing a `[Human]`
+ *  step) are picked up by polling. */
+const ROADMAP_POLL_MS = 5 * 60_000;
+
+export interface RoadmapDeps {
+  loadTracker(project: string, issue: number): Promise<{ body: string; url: string | null } | { error: string }>;
+  loadStates(project: string, numbers: number[]): Promise<Map<number, RoadmapIssueState> | { error: string }>;
+  aheadCount: NoWorkDeps["aheadCount"];
+  hasNoPr: NoWorkDeps["hasNoPr"];
+  /** The card's merged PR, if it has one. */
+  mergedPr(t: Task): number | null;
+  quotaPaused(t: Pick<Task, "pipelineRun">): boolean;
+  pipelineId(cfg: AutopilotConfig): string | null;
+  startCard(input: { dir: string; number: number; pipelineId: string; extraPrompt: string }): Promise<{ task: Task } | { error: string }>;
+  /** A native notification; false when there's no host to show it. */
+  notify(n: { title: string; body: string }): boolean;
+  activity(taskId: string, text: string, tone: "info" | "warning" | "muted"): void;
+  /** Ask for another pass in `delayMs`. */
+  recheck(delayMs: number): void;
+  now(): number;
+}
+
+/**
+ * One roadmap pass: read the tracker and every step's issue, start the
+ * ready agent steps that fit the free slots, announce newly ready `[Human]`
+ * steps, and record the status. Never asks the thread. Mutates `state`.
+ * Exported for tests.
+ */
+export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, all: Task[], mine: Task[], deps: RoadmapDeps): Promise<void> {
+  const tracker = cfg.roadmap!.issue;
+  const fail = (error: string) => {
+    state.lastError = error;
+  };
+  const doc = await deps.loadTracker(cfg.project, tracker);
+  if ("error" in doc) return fail(doc.error);
+  const parsed = parseRoadmap(doc.body);
+  if (parsed.error) {
+    // Nothing starts from a roadmap that can't be read.
+    state.roadmap = summarizeRoadmap({ issue: tracker, url: doc.url, parsed, views: [], busy: new Set(), needsUser: new Map(), now: deps.now() });
+    return fail(`roadmap #${tracker}: ${parsed.error}`);
+  }
+  const states = await deps.loadStates(cfg.project, parsed.steps.map((s) => s.issue));
+  if ("error" in states) return fail(states.error);
+  const views = roadmapStatus(parsed, states);
+  const openSteps = views.filter((v) => v.status !== "complete" && v.status !== "declined");
+  const openByIssue = new Map(openSteps.map((v) => [v.issue, v]));
+
+  // Restart guard: an Autopilot card for a step already finished, yet the
+  // step's issue is still open (the PR said "Refs", closing failed, or the
+  // run found nothing to build). Starting another card would loop, so the
+  // step waits for the user instead.
+  const settling = new Set<number>();
+  for (const t of mine) {
+    const n = issueOf(t);
+    if (n == null || !openByIssue.has(n)) continue;
+    let reason: string | null = null;
+    if (t.column === "done") {
+      if (deps.now() - t.updatedAt < SETTLE_MS) {
+        settling.add(n);
+        continue;
+      }
+      const pr = deps.mergedPr(t);
+      reason = pr != null ? `PR #${pr} merged but the issue is still open — close it or reopen the work` : "its card is Done but the issue is still open — close it or reopen the work";
+    } else if (await isNoWorkCard(t, deps)) {
+      reason = "its card found nothing to build (no commits, no PR) but the issue is still open — close it or reopen the work";
+    }
+    if (!reason) continue;
+    if (state.roadmapStuck[String(n)]?.cardId !== t.id) {
+      deps.activity(t.id, `Autopilot: step ${openByIssue.get(n)!.step} (#${n}) — ${reason}. Not starting another card for it`, "warning");
+    }
+    state.roadmapStuck[String(n)] = { cardId: t.id, reason, at: state.roadmapStuck[String(n)]?.at ?? deps.now() };
+  }
+  for (const key of Object.keys(state.roadmapStuck)) {
+    if (!openByIssue.has(Number(key))) delete state.roadmapStuck[key]; // closed since
+  }
+  if (settling.size > 0) deps.recheck(60_000);
+  const stuck = new Map(Object.entries(state.roadmapStuck).map(([k, v]) => [Number(k), v.reason]));
+
+  const open = openSteps.map((v) => ({ number: v.issue, title: v.title }));
+  const { busyIssues, inFlight, ownLive, quotaWait } = slotCounts(all, mine, open, deps.quotaPaused);
+  const free = cfg.maxInFlight - Math.max(ownLive, inFlight.length);
+  const picks = pickRoadmap(views, { busy: busyIssues, exclude: new Set([...stuck.keys(), ...settling]), free });
+
+  // A card waiting for a usage limit to reset frees its slot, but starting
+  // another now would only run into the same limit (as in milestone mode).
+  let error: string | null = null;
+  const started = new Set<number>();
+  if (picks.start.length > 0 && !quotaWait) {
+    const pipelineId = deps.pipelineId(cfg);
+    if (!pipelineId) error = "no pipeline to run issues with (set default_pipeline)";
+    else {
+      for (const v of picks.start) {
+        const r = await deps.startCard({ dir: cfg.project, number: v.issue, pipelineId, extraPrompt: roadmapStepPrompt(tracker, v, parsed.steps) });
+        if ("error" in r) {
+          error = `step ${v.step} (#${v.issue}): ${r.error}`;
+          continue;
+        }
+        started.add(v.issue);
+        state.cards.push(r.task.id);
+        deps.activity(r.task.id, `Autopilot started this as step ${v.step} of roadmap #${tracker}`, "info");
+      }
+    }
+  }
+
+  const status = summarizeRoadmap({
+    issue: tracker,
+    url: doc.url,
+    parsed,
+    views,
+    busy: new Set([...busyIssues, ...started]),
+    needsUser: stuck,
+    now: deps.now(),
+  });
+  if (!status.idleReason && quotaWait && picks.start.length > 0) status.idleReason = "Holding new starts while a card waits for a usage limit to reset";
+  state.roadmap = status;
+  state.lastError = error;
+
+  // One notification per `[Human]` step, the first time it's ready.
+  for (const h of status.humanReady) {
+    if (state.notifiedHuman.includes(h.issue)) continue;
+    if (deps.notify({ title: "Roadmap: a step needs you", body: `Step ${h.step} · #${h.issue} ${h.title}` })) state.notifiedHuman.push(h.issue);
+  }
+
+  if (roadmapFinished(parsed, views)) state.phase = "done";
+  else state.phase = status.counts.inFlight === 0 && started.size === 0 ? "idle" : "running";
+}
+
+let notifier: ((n: { title: string; body: string }) => void) | null = null;
+
+/** The host's native notifications (the API server has them; a headless
+ *  daemon doesn't). */
+export function setAutopilotNotifier(fn: ((n: { title: string; body: string }) => void) | null): void {
+  notifier = fn;
+}
+
+let recheckTimer: ReturnType<typeof setTimeout> | null = null;
+
+const ROADMAP_DEPS: RoadmapDeps = {
+  loadTracker: loadRoadmapTracker,
+  loadStates: loadRoadmapStates,
+  aheadCount: (t) => NO_WORK_DEPS.aheadCount(t),
+  hasNoPr: (t) => NO_WORK_DEPS.hasNoPr(t),
+  mergedPr: (t) => {
+    const pr = prStatusForTask(t.id);
+    return pr?.state === "merged" ? pr.number : null;
+  },
+  quotaPaused: quotaPausedCard,
+  pipelineId: (cfg) => cfg.pipelineId ?? preferences.get("default_pipeline") ?? null,
+  async startCard(input) {
+    const r = await createTaskFromIssue({ ...input, allowAfterDone: true });
+    return "error" in r ? { error: r.error } : { task: r.task };
+  },
+  notify(n) {
+    if (!notifier) return false;
+    try {
+      notifier(n);
+      return true;
+    } catch {
+      return false;
+    }
+  },
+  activity: (taskId, text, tone) => recordActivity(taskId, { kind: "auto", text, tone }),
+  recheck(delayMs) {
+    if (recheckTimer) return;
+    recheckTimer = setTimeout(() => {
+      recheckTimer = null;
+      requestAutopilotPass(0);
+    }, delayMs);
+    recheckTimer.unref?.();
+  },
+  now: () => Date.now(),
+};
+
 let busy = false;
 
 /** One pass. Exported for tests and the "run now" button. */
 export async function autopilotTick(): Promise<void> {
   const cfg = parseConfig(preferences.get(AUTOPILOT_PREF));
-  if (!cfg.enabled || !cfg.threadId || !cfg.project || !cfg.milestone || busy) return;
+  if (!cfg.enabled || !cfg.project || busy) return;
+  // Roadmap mode needs neither a milestone nor the thread.
+  if (!cfg.roadmap && (!cfg.threadId || !cfg.milestone)) return;
   busy = true;
   const state = readState();
   try {
@@ -503,6 +723,12 @@ export async function autopilotTick(): Promise<void> {
       tasks.update(t.id, { column: "merge" });
       recordActivity(t.id, { kind: "auto", text: `Autopilot: signed off PR #${pr.number} for merging`, tone: "info" });
     }
+
+    if (cfg.roadmap) {
+      await roadmapPass(cfg, state, all, mine, ROADMAP_DEPS);
+      return;
+    }
+    if (!cfg.milestone) return;
 
     const open = await milestoneIssues(cfg);
     if (!open) {
@@ -660,5 +886,8 @@ export function startAutopilot(): void {
   });
   loop = setInterval(() => void runPass(), FALLBACK_MS);
   loop.unref?.();
+  setInterval(() => {
+    if (enabled() && parseConfig(preferences.get(AUTOPILOT_PREF)).roadmap) void runPass();
+  }, ROADMAP_POLL_MS).unref?.();
   requestAutopilotPass(30_000);
 }

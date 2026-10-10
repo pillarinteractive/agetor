@@ -148,7 +148,7 @@ function fakeDeps(answers: (string | { ok: false; busy?: boolean; error: string 
   return { deps, log };
 }
 
-const cfg = { enabled: true, threadId: "th", project: "/repo", milestone: { number: 2, title: "M2" }, maxInFlight: 5, pipelineId: "p" };
+const cfg = { enabled: true, threadId: "th", project: "/repo", milestone: { number: 2, title: "M2" }, maxInFlight: 5, pipelineId: "p", roadmap: null };
 const freshState = async () => {
   const { readState } = await import("./autopilot.ts");
   return { ...readState(), noWork: {}, waits: {}, reworked: [] as number[], cards: [] as string[] };
@@ -235,4 +235,184 @@ test("a malformed answer or a busy thread keeps the issue out of the candidates 
   // A close that names no owning issue/PR is malformed.
   expect(parseNoWorkDecision('<no-work>{"action":"close","comment":"done elsewhere"}</no-work>')).toBeNull();
   expect(parseNoWorkDecision('<no-work>{"action":"wait","blockedBy":[]}</no-work>')).toBeNull();
+});
+
+// ── Roadmap mode ───────────────────────────────────────────────────────────
+type RDeps = import("./autopilot.ts").RoadmapDeps;
+type IssueState = import("../shared/roadmap.ts").RoadmapIssueState;
+
+test("parseConfig: roadmap mode needs no milestone or thread; a bad issue is no roadmap", () => {
+  expect(parseConfig(JSON.stringify({ enabled: true, project: "/repo", roadmap: { issue: 639 } }))).toMatchObject({
+    enabled: true,
+    threadId: "",
+    milestone: null,
+    roadmap: { issue: 639 },
+  });
+  expect(parseConfig(null).roadmap).toBeNull();
+  expect(parseConfig(JSON.stringify({ roadmap: { issue: "639" } })).roadmap).toBeNull();
+  expect(parseConfig(JSON.stringify({ roadmap: { issue: 0 } })).roadmap).toBeNull();
+  expect(parseConfig(JSON.stringify({ roadmap: 639 })).roadmap).toBeNull();
+});
+
+const ROADMAP_BODY = [
+  "## Numbered completion order",
+  "| Step | Task and outcome | Milestone | Predecessor steps |",
+  "| --- | --- | --- | --- |",
+  "| 1 | #11 [Human] Provide the sample device | H | none |",
+  "| 2 | #12 Inventory the widgets | M01 | none |",
+  "| 3 | #13 Build the widget store | M01 | 2 |",
+  "| 4 | #14 Wire the widget API | M02 | 2 |",
+  "| 5 | #15 Ship the widget page | M02 | 3, 4 |",
+  "| 6 | #16 Calibrate against the device | M02 | 1 |",
+].join("\n");
+const OPEN: IssueState = { state: "OPEN", stateReason: null };
+const COMPLETED: IssueState = { state: "CLOSED", stateReason: "COMPLETED" };
+const roadmapCfg = { ...cfg, threadId: "", milestone: null, maxInFlight: 2, roadmap: { issue: 600 } };
+const NOW = 10_000_000;
+const roadmapCard = (id: string, n: number, column: string, extra: Record<string, unknown> = {}) =>
+  ({ id, title: `Issue #${n}`, issueUrl: `https://github.com/o/r/issues/${n}`, column, archivedAt: null, pipelineParentId: null, pendingInteractionCount: 0, prUrl: null, pipelineRun: null, worktreePath: "/wt", baseRef: "abc", updatedAt: 0, ...extra }) as never as TaskT;
+
+function roadmapDeps(states: Record<number, IssueState>, over: Partial<RDeps> = {}) {
+  const log = { started: [] as { number: number; extraPrompt: string }[], notified: [] as string[], activity: [] as string[], rechecks: 0 };
+  const deps: RDeps = {
+    loadTracker: async () => ({ body: ROADMAP_BODY, url: "https://github.com/o/r/issues/600" }),
+    loadStates: async (_p, numbers) => new Map(numbers.map((n) => [n, { ...(states[n] ?? OPEN), url: `https://github.com/o/r/issues/${n}` }])),
+    aheadCount: async () => 0,
+    hasNoPr: () => true,
+    mergedPr: () => null,
+    quotaPaused: () => false,
+    pipelineId: () => "p",
+    startCard: async ({ number, extraPrompt }) => {
+      log.started.push({ number, extraPrompt });
+      return { task: roadmapCard(`new-${number}`, number, "ready") };
+    },
+    notify: (n) => {
+      log.notified.push(n.body);
+      return true;
+    },
+    activity: (_id, text) => void log.activity.push(text),
+    recheck: () => void log.rechecks++,
+    now: () => NOW,
+    ...over,
+  };
+  return { deps, log };
+}
+const roadmapState = async (): Promise<import("./autopilot.ts").AutopilotState> => ({ ...(await freshState()), roadmap: null, roadmapStuck: {}, notifiedHuman: [], lastError: null });
+
+test("roadmap: starts the ready agent steps in step order; the human step is announced once, never started", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  const state = await roadmapState();
+  const { deps, log } = roadmapDeps({});
+  await roadmapPass(roadmapCfg, state, [], [], deps);
+  expect(log.started.map((s) => s.number)).toEqual([12]); // #11 is human; 3–6 wait
+  expect(log.started[0]!.extraPrompt).toContain("Roadmap step 2 (M01)");
+  expect(log.started[0]!.extraPrompt).toContain("tracker issue #600");
+  expect(log.started[0]!.extraPrompt).toContain('"Fixes #12"');
+  expect(state.cards).toEqual(["new-12"]);
+  expect(state.phase).toBe("running");
+  expect(state.roadmap!.counts).toEqual({ total: 6, complete: 0, declined: 0, inFlight: 1, ready: 1, waiting: 4 });
+  expect(state.roadmap!.humanReady).toEqual([{ step: "1", issue: 11, title: "[Human] Provide the sample device", url: "https://github.com/o/r/issues/11" }]);
+  expect(log.notified).toEqual(["Step 1 · #11 [Human] Provide the sample device"]);
+
+  // The ledger keeps it to one notification.
+  await roadmapPass(roadmapCfg, state, [roadmapCard("new-12", 12, "running")], [roadmapCard("new-12", 12, "running")], deps);
+  expect(log.notified.length).toBe(1);
+  expect(log.started.length).toBe(1); // #12 has a live card
+});
+
+test("roadmap: free slots bound the starts, predecessors' issues go into the prompt", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  const state = await roadmapState();
+  const { deps, log } = roadmapDeps({ 11: COMPLETED, 12: COMPLETED, 13: COMPLETED });
+  // One slot of two is taken by someone else's card on a roadmap issue.
+  const other = roadmapCard("other", 16, "running");
+  await roadmapPass(roadmapCfg, state, [other], [], deps);
+  expect(log.started.map((s) => s.number)).toEqual([14]);
+  expect(log.started[0]!.extraPrompt).toContain("2 (#12)");
+  expect(state.roadmap!.counts).toMatchObject({ complete: 3, inFlight: 2, ready: 0, waiting: 1 });
+  expect(state.roadmap!.nextWaiting).toEqual([expect.objectContaining({ step: "5", waitingOn: ["4"] })]);
+});
+
+test("roadmap restart guard: a finished card on a still-open issue is never started again", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  const state = await roadmapState();
+  state.notifiedHuman = [11];
+  const { deps, log } = roadmapDeps({}, { mergedPr: () => 77 });
+  // The card for #12 is Done (its PR merged with "Refs #12"), the issue is open.
+  const done = roadmapCard("c12", 12, "done", { updatedAt: NOW - 10 * 60_000 });
+  await roadmapPass(roadmapCfg, state, [done], [done], deps);
+  expect(log.started).toEqual([]);
+  expect(state.roadmapStuck["12"]).toMatchObject({ cardId: "c12" });
+  expect(state.roadmap!.needsUser).toEqual([expect.objectContaining({ step: "2", issue: 12, reason: "PR #77 merged but the issue is still open — close it or reopen the work" })]);
+  expect(state.phase).toBe("idle");
+  expect(state.roadmap!.idleReason).toContain("human step 1 (#11)");
+  expect(state.roadmap!.idleReason).toContain("step 2 (#12) needs you");
+  expect(log.activity.length).toBe(1);
+
+  // Still guarded after the card is archived (gone from the board), and not logged twice.
+  await roadmapPass(roadmapCfg, state, [], [], deps);
+  expect(log.started).toEqual([]);
+  expect(log.activity.length).toBe(1);
+
+  // Once the issue closes the guard lifts and its successors start.
+  const closed = roadmapDeps({ 12: COMPLETED });
+  await roadmapPass(roadmapCfg, state, [], [], closed.deps);
+  expect(state.roadmapStuck).toEqual({});
+  expect(closed.log.started.map((s) => s.number)).toEqual([13, 14]);
+});
+
+test("roadmap restart guard: a done run with no PR and no commits waits for the user, and its card stays put", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  const state = await roadmapState();
+  const { deps, log } = roadmapDeps({});
+  const card = roadmapCard("c12", 12, "review", { pipelineRun: handoffRun() });
+  await roadmapPass(roadmapCfg, state, [card], [card], deps);
+  expect(log.started).toEqual([]);
+  expect(state.roadmapStuck["12"]!.reason).toContain("nothing to build");
+  // …and after the user moves that card to Done or archives it.
+  await roadmapPass(roadmapCfg, state, [], [], deps);
+  expect(log.started).toEqual([]);
+  expect(state.roadmap!.needsUser.map((n) => n.issue)).toEqual([12]);
+});
+
+test("roadmap: a card that just reached Done gets time for its issue to close", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  const state = await roadmapState();
+  const { deps, log } = roadmapDeps({});
+  const done = roadmapCard("c12", 12, "done", { updatedAt: NOW - 5_000 });
+  await roadmapPass(roadmapCfg, state, [done], [done], deps);
+  expect(log.started).toEqual([]);
+  expect(state.roadmapStuck).toEqual({});
+  expect(log.rechecks).toBe(1);
+});
+
+test("roadmap: done only when every step is complete or declined; an unreadable roadmap starts nothing", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  const all = { 11: COMPLETED, 12: COMPLETED, 13: COMPLETED, 14: COMPLETED, 15: COMPLETED };
+  const waiting = await roadmapState();
+  const w = roadmapDeps({ ...all, 12: { state: "CLOSED", stateReason: "NOT_PLANNED" }, 16: OPEN });
+  await roadmapPass(roadmapCfg, waiting, [], [], w.deps);
+  expect(w.log.started.map((s) => s.number)).toEqual([16]);
+  expect(waiting.phase).toBe("running");
+
+  const finished = await roadmapState();
+  await roadmapPass(roadmapCfg, finished, [], [], roadmapDeps({ ...all, 12: { state: "CLOSED", stateReason: "NOT_PLANNED" }, 16: COMPLETED }).deps);
+  expect(finished.phase).toBe("done");
+  expect(finished.roadmap!.counts).toMatchObject({ total: 6, complete: 5, declined: 1 });
+
+  const broken = await roadmapState();
+  const b = roadmapDeps({}, { loadTracker: async () => ({ body: "## Something else\n", url: null }) });
+  await roadmapPass(roadmapCfg, broken, [], [], b.deps);
+  expect(b.log.started).toEqual([]);
+  expect(broken.lastError).toContain("Numbered completion order");
+  expect(broken.roadmap!.problems[0]!.kind).toBe("missing-section");
+});
+
+test("roadmap: holds new starts while a card waits for a usage limit", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  const state = await roadmapState();
+  const { deps, log } = roadmapDeps({ 12: COMPLETED });
+  const waiting = roadmapCard("q", 13, "blocked", { pipelineRun: { status: "blocked", active: [], blocked: [], history: [], joins: {}, autoRetry: { stepId: "b", kind: "quota", attempt: 1, at: NOW + 60_000, reason: "limit" } } });
+  await roadmapPass(roadmapCfg, state, [waiting], [waiting], deps);
+  expect(log.started).toEqual([]);
 });

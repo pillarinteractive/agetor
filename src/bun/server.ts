@@ -46,7 +46,7 @@ import { activeTrain, mergedViaTrain, trainFor } from "./merge-train.ts";
 import { isPriority, readPriority, setPriority } from "./priority.ts";
 import { setMergeQueued } from "./merge-intent.ts";
 import { KEEP_AWAKE_PREF_KEY, KEEP_SCREEN_ON_PREF_KEY, recheckKeepAwake } from "./keep-awake.ts";
-import { AUTOPILOT_PREF, AUTOPILOT_STATE_PREF, requestAutopilotPass, parseConfig as parseAutopilotConfig, readState as readAutopilotState } from "./autopilot.ts";
+import { AUTOPILOT_PREF, AUTOPILOT_STATE_PREF, requestAutopilotPass, setAutopilotNotifier, parseConfig as parseAutopilotConfig, readState as readAutopilotState } from "./autopilot.ts";
 import { departTrainNow, refreshMergeColumn } from "./merge-queue.ts";
 import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
@@ -833,6 +833,8 @@ const notAvailableHeadless = (req: Request) =>
 
 export function startApiServer(deps: { native?: ApiNative } = {}) {
   const native = deps.native;
+  // Roadmap mode announces newly ready [Human] steps (src/bun/autopilot.ts).
+  setAutopilotNotifier(native ? (n) => void native.showNotification(n) : null);
   // Read the port fresh — supports tests that import server.ts after setting
   // AGETOR_API_PORT and rely on the bind to honour their override even when
   // a sibling test file imported the module first.
@@ -3308,10 +3310,24 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const cur = parseAutopilotConfig(preferences.get(AUTOPILOT_PREF));
           const next = parseAutopilotConfig(JSON.stringify({ ...cur, ...body }));
           preferences.set(AUTOPILOT_PREF, JSON.stringify(next));
-          // Starting (or changing milestone) begins a fresh run.
-          if (body.restart === true || (next.enabled && (!cur.enabled || cur.milestone?.number !== next.milestone?.number))) {
+          // Starting (or changing the milestone or the roadmap) begins a fresh
+          // run. A different roadmap also drops the old one's status, its
+          // restart guard and its announced human steps.
+          const roadmapChanged = (cur.roadmap?.issue ?? null) !== (next.roadmap?.issue ?? null) || (!!next.roadmap && cur.project !== next.project);
+          if (body.restart === true || roadmapChanged || (next.enabled && (!cur.enabled || cur.milestone?.number !== next.milestone?.number))) {
             const s = readAutopilotState();
-            preferences.set(AUTOPILOT_STATE_PREF, JSON.stringify({ ...s, phase: "idle", held: [], lastError: null, quietUntil: 0, quietSignature: "" }));
+            preferences.set(
+              AUTOPILOT_STATE_PREF,
+              JSON.stringify({
+                ...s,
+                phase: "idle",
+                held: [],
+                lastError: null,
+                quietUntil: 0,
+                quietSignature: "",
+                ...(roadmapChanged ? { roadmap: null, roadmapStuck: {}, notifiedHuman: [] } : {}),
+              }),
+            );
           }
           if (next.enabled) requestAutopilotPass(0);
           return json({ config: next, state: readAutopilotState() }, { headers: corsHeaders(req) });
