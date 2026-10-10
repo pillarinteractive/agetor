@@ -32,6 +32,10 @@ export interface RoadmapStep {
   milestone: string;
   /** Step ids, as written (an id that names no step is kept and reported). */
   predecessors: string[];
+  /** A predecessor's note from the table (`#12 (annual only)` → "annual
+   *  only"), keyed by the predecessor's step id. The predecessor is still
+   *  required; the note is shown to whoever works the step. */
+  predecessorNotes?: Record<string, string>;
 }
 
 export type RoadmapProblemKind =
@@ -146,7 +150,8 @@ export function parseRoadmap(body: string): ParsedRoadmap {
       title,
       human: /^\[human\]/i.test(title) || /^H$/i.test(milestone),
       milestone,
-      predecessors: none ? [] : preds.split(",").map((p) => p.trim()).filter(Boolean),
+      // Commas inside a parenthesised note don't separate predecessors.
+      predecessors: none ? [] : preds.split(/,(?![^()]*\))/).map((p) => p.trim()).filter(Boolean),
     };
     const first = byIssue.get(issue);
     if (first) {
@@ -166,10 +171,17 @@ export function parseRoadmap(body: string): ParsedRoadmap {
 
   // A predecessor written as an issue (`#12`) means the step for that issue.
   for (const s of steps) {
+    const notes: Record<string, string> = {};
     s.predecessors = s.predecessors.map((p) => {
-      const m = p.match(/^#(\d+)$/);
-      return (m && byIssue.get(Number(m[1]))?.step) || p;
+      // `#12 (annual only)`, `3 (if selected)`: a reference plus a note.
+      const noted = p.match(/^(#?\d+(?:\.\d+)?)\s*\((.*)\)$/);
+      const ref = noted ? noted[1]! : p;
+      const m = ref.match(/^#(\d+)$/);
+      const id = (m && byIssue.get(Number(m[1]))?.step) || ref;
+      if (noted && noted[2]!.trim()) notes[id] = noted[2]!.trim();
+      return id;
     });
+    if (Object.keys(notes).length > 0) s.predecessorNotes = notes;
   }
 
   for (const s of steps) {
@@ -356,6 +368,10 @@ export function roadmapStepPrompt(
   } = {},
 ): string {
   const label = (s: RoadmapStep) => `${s.step} (#${s.issue})`;
+  const noteLines = Object.entries(step.predecessorNotes ?? {}).map(([id, note]) => {
+    const s = all.find((x) => x.step === id);
+    return `The roadmap notes predecessor ${s ? label(s) : id} as "${displayText(note, 120)}": the issue says when it applies.`;
+  });
   const preds = step.predecessors.map((p) => all.find((s) => s.step === p)).filter((s): s is RoadmapStep => !!s);
   const pending = preds.filter((s) => opts.pending?.includes(s.step));
   const predLine =
@@ -369,6 +385,7 @@ export function roadmapStepPrompt(
     "",
     `This is step ${step.step} of the roadmap in tracker issue #${tracker}.`,
     predLine,
+    ...noteLines,
     `Later steps start only once #${step.issue} is closed, so finish the whole definition of done in this PR and say "Fixes #${step.issue}" in its description.`,
     `If part of it can't be done here, say "Refs #${step.issue}" and list what's left: the step then stays open for the owner and nothing after it starts.`,
     ...(opts.prior ? priorAttemptLines(step, opts.prior) : []),

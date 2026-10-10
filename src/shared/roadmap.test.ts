@@ -499,3 +499,24 @@ test("a step done again tells its card about the earlier PR, inside the step sec
   expect(roadmapStepPrompt(639, step3, parsed.steps, { prior: { pr: null, url: null, excerpt: null } })).toContain("An earlier card for this step finished without closing #103");
   expect(roadmapStepPrompt(639, step3, parsed.steps)).not.toContain("Earlier attempt");
 });
+
+test("a predecessor may carry a note: still required, and the note reaches the step prompt", () => {
+  const body = [
+    "## Single completion order",
+    "",
+    "| Step | Task | Stage | Predecessors |",
+    "| --- | --- | --- | --- |",
+    "| 1 | #101 First | M01 | — |",
+    "| 2 | #102 Second | M01 | — |",
+    "| 3 | #103 Third | M01 | #101, #102 (annual only, if chosen), 1 (again) |",
+  ].join("\n");
+  const r = parseRoadmap(body);
+  expect(r.problems).toEqual([]);
+  expect(r.steps[2]!.predecessors).toEqual(["1", "2", "1"]);
+  expect(r.steps[2]!.predecessorNotes).toEqual({ "2": "annual only, if chosen", "1": "again" });
+  const open = { state: "OPEN" as const, stateReason: null };
+  const done = { state: "CLOSED" as const, stateReason: "COMPLETED" };
+  const views = roadmapStatus(r, new Map<number, RoadmapIssueState>([[101, done], [102, open], [103, open]]));
+  expect(views[2]).toMatchObject({ status: "waiting", waitingOn: ["2"] });
+  expect(roadmapStepPrompt(600, r.steps[2]!, r.steps)).toContain('notes predecessor 2 (#102) as "annual only, if chosen"');
+});
