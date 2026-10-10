@@ -267,7 +267,8 @@ export function roadmapStepPrompt(tracker: number, step: RoadmapStep, all: Roadm
     "",
     `This is step ${step.step} of the roadmap in tracker issue #${tracker}.`,
     preds.length ? `Its predecessor steps are finished and already merged into the base: ${preds.join(", ")}. Build on them.` : "It has no predecessor steps.",
-    `The PR description must say "Fixes #${step.issue}" so the step closes when it merges; later steps wait on that.`,
+    `Later steps start only once #${step.issue} is closed, so finish the whole definition of done in this PR and say "Fixes #${step.issue}" in its description.`,
+    `If part of it can't be done here, say "Refs #${step.issue}" and list what's left: the step then stays open for the owner and nothing after it starts.`,
   ].join("\n");
 }
 
