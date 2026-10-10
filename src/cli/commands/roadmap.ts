@@ -4,29 +4,46 @@ import { flagValue } from "../args.ts";
 import { getClient, type Flags } from "../context.ts";
 import { c, out, printJson } from "../output.ts";
 import { matchPipelineRef } from "../../shared/pipeline.ts";
-import type { RoadmapStatus } from "../../shared/roadmap.ts";
+import { currentRoadmapStatus, type RoadmapStatus } from "../../shared/roadmap.ts";
+import type { GitHubRepoMilestone } from "../../shared/types.ts";
 
 /**
- * Autopilot's roadmap mode (src/bun/autopilot.ts, src/shared/roadmap.ts):
+ * Autopilot's tracker mode (src/bun/autopilot.ts, src/shared/roadmap.ts):
  *
  *   agetor roadmap status [--json]
- *   agetor roadmap start --project <dir> --issue <n> [--max <n>] [--pipeline <id|name>]
+ *   agetor roadmap start --project <dir> [--issue <n>] [--milestone <number|title-prefix|all>] [--max <n>] [--pipeline <id|name>]
  *   agetor roadmap pause
  *
- * Everything goes through GET/PUT /autopilot.
+ * `--issue` defaults to the default tracker (the last one saved). With
+ * `--milestone`, only the steps whose issue is in that GitHub milestone are
+ * worked, and each gets a Backlog card up front; without it (or `all`), the
+ * whole roadmap. Everything goes through GET/PUT /autopilot.
  */
-const USAGE = "usage: agetor roadmap status | start --project <dir> --issue <n> [--max <n>] [--pipeline <id|name>] | pause";
+const USAGE =
+  "usage: agetor roadmap status | start --project <dir> [--issue <n>] [--milestone <number|title-prefix|all>] [--max <n>] [--pipeline <id|name>] | pause";
 
 interface AutopilotDto {
-  config: { enabled: boolean; project: string; maxInFlight: number; pipelineId: string | null; roadmap: { issue: number } | null };
+  config: {
+    enabled: boolean;
+    project: string;
+    maxInFlight: number;
+    pipelineId: string | null;
+    roadmap: { issue: number } | null;
+    milestone?: { number: number; title: string } | null;
+  };
   state: { phase: string; lastError: string | null; roadmap?: RoadmapStatus | null };
+  defaultTracker?: number | null;
 }
 
 type Client = Pick<AgetorClient, "call" | "listPipelines" | "listProjects">;
 
+const scopeOf = (cfg: AutopilotDto["config"]) => (cfg.milestone ? `milestone "${cfg.milestone.title}" in the order of roadmap #${cfg.roadmap?.issue}` : `the whole roadmap #${cfg.roadmap?.issue}`);
+
 export interface RoadmapStartFlags {
   project?: string;
   issue?: number;
+  /** A milestone number, the start of its title (`M01`), or `all`. */
+  milestone?: string;
   max?: number;
   pipeline?: string;
 }
@@ -44,6 +61,7 @@ export function parseRoadmapStartFlags(args: string[]): RoadmapStartFlags {
     const val = () => flagValue(args, ++i, a);
     if (a === "--project") o.project = val();
     else if (a === "--issue") o.issue = positive(a, val());
+    else if (a === "--milestone") o.milestone = val();
     else if (a === "--max") o.max = positive(a, val());
     else if (a === "--pipeline") o.pipeline = val();
     else throw new Error(`unknown option '${a}'\n${USAGE}`);
@@ -51,30 +69,57 @@ export function parseRoadmapStartFlags(args: string[]): RoadmapStartFlags {
   return o;
 }
 
+/** The milestone `ref` names: its number, else the start of its title (case
+ *  doesn't matter; `M01` doesn't match `M010 …`). Pure; exported for tests. */
+export function matchMilestoneRef(milestones: Pick<GitHubRepoMilestone, "number" | "title">[], ref: string): { ok: true; milestone: { number: number; title: string } } | { ok: false; error: string } {
+  const wanted = ref.trim().replace(/^#/, "");
+  const pick = (m: Pick<GitHubRepoMilestone, "number" | "title">) => ({ ok: true as const, milestone: { number: m.number, title: m.title } });
+  if (/^\d+$/.test(wanted)) {
+    const byNumber = milestones.find((m) => m.number === Number(wanted));
+    if (byNumber) return pick(byNumber);
+  }
+  const lower = wanted.toLowerCase();
+  const byTitle = milestones.filter((m) => m.title.toLowerCase().startsWith(lower));
+  const exact = byTitle.filter((m) => m.title.toLowerCase() === lower);
+  if (exact.length === 1) return pick(exact[0]!);
+  // `M01` must not also match `M010 — …`: the title continues with a separator.
+  const whole = byTitle.filter((m) => !/[a-z0-9]/i.test(m.title.charAt(wanted.length)));
+  if (whole.length === 1) return pick(whole[0]!);
+  if (whole.length === 0 && byTitle.length === 1) return pick(byTitle[0]!);
+  if (byTitle.length > 1) return { ok: false, error: `"${ref}" matches ${byTitle.length} milestones: ${byTitle.map((m) => `"${m.title}"`).join(", ")}` };
+  return { ok: false, error: `no open milestone matches "${ref}"${milestones.length ? ` — there ${milestones.length === 1 ? "is" : "are"}: ${milestones.map((m) => `"${m.title}" (${m.number})`).join(", ")}` : ""}` };
+}
+
 /** The human-readable status. Pure; exported for tests. */
 export function roadmapStatusLines(a: AutopilotDto): string[] {
   const { config, state } = a;
-  if (!config.roadmap) return [c.dim("roadmap mode isn't set up — agetor roadmap start --project <dir> --issue <n>")];
-  const s = state.roadmap?.issue === config.roadmap.issue ? state.roadmap : null;
+  if (!config.roadmap) {
+    return [c.dim(`no tracker is set — agetor roadmap start --project <dir> ${a.defaultTracker ? `(uses the default tracker #${a.defaultTracker})` : "--issue <n>"}`)];
+  }
+  // The status of the run configured now, not of another tracker or milestone.
+  const s = currentRoadmapStatus({ roadmap: config.roadmap, milestone: config.milestone ?? null }, state.roadmap);
   const lines = [
     `${c.bold(`Roadmap #${config.roadmap.issue}`)} ${config.enabled ? (state.phase === "done" ? c.green("done") : state.phase === "idle" ? c.yellow("waiting") : c.green("running")) : c.dim("paused")}` +
       c.dim(`  ${config.project} · up to ${config.maxInFlight} in flight`),
+    config.milestone ? `  Scope: milestone "${config.milestone.title}"${s?.scope ? c.dim(` — ${s.counts.total} of the roadmap's ${s.scope.roadmapTotal} steps`) : ""}` : `  Scope: all milestones ${c.dim("(the whole roadmap)")}`,
   ];
   if (state.lastError) lines.push(c.red(`  ${state.lastError}`));
   if (!s) return state.lastError ? lines : [...lines, c.dim("  no status yet — the first pass hasn't finished")];
   const n = s.counts;
   lines.push(
-    `  ${n.complete}/${n.total} complete · ${n.inFlight} in flight · ${n.ready} ready · ${n.waiting} waiting · ${n.declined} declined` +
+    `  ${n.complete}/${n.total} complete · ${n.inFlight} in flight · ${n.ready} ready · ${n.waiting} waiting · ${n.declined} declined · ${n.backlog ?? 0} in the backlog` +
       c.dim(`  (as of ${new Date(s.fetchedAt).toLocaleTimeString()})`),
   );
   if (s.idleReason) lines.push(c.yellow(`  ${s.idleReason}`));
-  if (s.humanReady.length) {
-    lines.push("", c.bold("Yours to do ([Human] steps that are ready):"));
-    for (const h of s.humanReady) lines.push(`  ${h.step}  #${h.issue} ${h.title}${h.url ? c.dim(`  ${h.url}`) : ""}`);
-  }
-  if (s.needsUser.length) {
+  if (s.humanReady.length || s.needsUser.length) {
     lines.push("", c.bold("Needs you:"));
+    for (const h of s.humanReady) lines.push(`  ${h.step}  #${h.issue} ${h.title}${h.url ? c.dim(`  ${h.url}`) : ""}`, c.dim("      yours to do — this step is ready and only you can do it"));
     for (const u of s.needsUser) lines.push(`  ${u.step}  #${u.issue} ${u.title}`, c.yellow(`      ${u.reason}`));
+  }
+  const outside = s.blockedOutside ?? [];
+  if (outside.length) {
+    lines.push("", c.bold("Waits on other milestones (not started by this run):"));
+    for (const o of outside) lines.push(`  ${o.step}  #${o.issue} ${o.title}${c.dim(`  ${o.milestone || "no milestone"}`)}`);
   }
   if (s.nextWaiting.length) {
     lines.push("", c.bold("Next waiting steps:"));
@@ -93,7 +138,19 @@ export async function runRoadmap(client: Client, args: string[]): Promise<{ data
   if (!sub || sub === "status") {
     if (rest.length) throw new Error(USAGE);
     const a = await client.call<AutopilotDto>("GET", "/autopilot");
-    return { data: { enabled: a.config.enabled, project: a.config.project, roadmap: a.config.roadmap, phase: a.state.phase, lastError: a.state.lastError, status: a.state.roadmap ?? null }, lines: roadmapStatusLines(a) };
+    return {
+      data: {
+        enabled: a.config.enabled,
+        project: a.config.project,
+        roadmap: a.config.roadmap,
+        milestone: a.config.milestone ?? null,
+        defaultTracker: a.defaultTracker ?? null,
+        phase: a.state.phase,
+        lastError: a.state.lastError,
+        status: a.state.roadmap ?? null,
+      },
+      lines: roadmapStatusLines(a),
+    };
   }
   if (sub === "pause") {
     if (rest.length) throw new Error(USAGE);
@@ -102,10 +159,20 @@ export async function runRoadmap(client: Client, args: string[]): Promise<{ data
   }
   if (sub === "start") {
     const o = parseRoadmapStartFlags(rest);
-    if (!o.project || !o.issue) throw new Error(`'start' needs --project and --issue\n${USAGE}`);
+    if (!o.project) throw new Error(`'start' needs --project\n${USAGE}`);
     const wanted = path.resolve(o.project);
     const project = (await client.listProjects()).find((p) => p.path === wanted || p.name === o.project);
     if (!project) throw new Error(`"${o.project}" isn't a project on the board (agetor projects list)`);
+    const issue = o.issue ?? (await client.call<AutopilotDto>("GET", "/autopilot")).defaultTracker ?? null;
+    if (!issue) throw new Error(`'start' needs --issue: no default tracker is set yet (the first tracker you start becomes the default)\n${USAGE}`);
+    // No --milestone (or `all`): the whole roadmap.
+    let milestone: { number: number; title: string } | null = null;
+    if (o.milestone && o.milestone.trim().toLowerCase() !== "all") {
+      const list = await client.call<{ milestones: GitHubRepoMilestone[] }>("GET", `/github/milestones?path=${encodeURIComponent(project.path)}`);
+      const m = matchMilestoneRef((list.milestones ?? []).filter((x) => x.state === "open"), o.milestone);
+      if (!m.ok) throw new Error(m.error);
+      milestone = m.milestone;
+    }
     let pipelineId: string | undefined;
     if (o.pipeline) {
       const m = matchPipelineRef(await client.listPipelines(), o.pipeline);
@@ -115,14 +182,16 @@ export async function runRoadmap(client: Client, args: string[]): Promise<{ data
     const a = await client.call<AutopilotDto>("PUT", "/autopilot", {
       enabled: true,
       project: project.path,
-      roadmap: { issue: o.issue },
+      roadmap: { issue },
+      milestone,
       ...(o.max ? { maxInFlight: o.max } : {}),
       ...(pipelineId ? { pipelineId } : {}),
     });
     return {
       data: a,
       lines: [
-        `${c.green("✓")} Autopilot is working roadmap #${a.config.roadmap?.issue} in ${a.config.project} (up to ${a.config.maxInFlight} in flight)`,
+        `${c.green("✓")} Autopilot is working ${scopeOf(a.config)} in ${a.config.project} (up to ${a.config.maxInFlight} in flight)`,
+        ...(a.config.milestone ? [c.dim("  every open step of the milestone gets a card in the Backlog; each starts when its predecessors are complete")] : []),
         c.dim("  agetor roadmap status   shows what's ready, waiting and yours to do"),
       ],
     };

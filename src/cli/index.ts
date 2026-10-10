@@ -73,8 +73,10 @@ Commands:
   followup <id> <action> [--request <text>]  start a follow-up
   blocks [--days N]   what pipelines block on, most frequent first
   depends <id> [<dep>…|--clear]  card <id> is blocked by those cards
-  roadmap <sub>       status | start --project <dir> --issue <n> [--max <n>] [--pipeline <p>] | pause:
-                      Autopilot from a tracker issue's numbered step table
+  roadmap <sub>       status | start --project <dir> [--issue <n>] [--milestone <n|title|all>]
+                      [--max <n>] [--pipeline <p>] | pause:
+                      Autopilot in the order of a tracker issue's step table, for one
+                      milestone (a Backlog card per open step) or the whole roadmap
   help                show this help
 
 Global options:
