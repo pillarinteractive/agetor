@@ -7,7 +7,7 @@ import { Input } from "@/components/ui/input";
 import { api, ApiError, type AutopilotConfigDto, type AutopilotStateDto } from "@/lib/api";
 import type { GitHubRepoMilestone, Project, Task } from "../../../shared/types.ts";
 import { autopilotMode, holdsAutopilotSlot, waitingOnQuota } from "../../../shared/autopilot.ts";
-import { currentRoadmapStatus } from "../../../shared/roadmap.ts";
+import { currentRoadmapStatus, milestoneName, nextMilestoneText, scopeMilestones } from "../../../shared/roadmap.ts";
 
 const TITLE_ID = "autopilot-dialog-title";
 const DEFAULT_THREAD = "01a107c4-1e3c-7890-baad-752584bc2688";
@@ -98,7 +98,10 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
     setSaving(true);
     setError(null);
     try {
-      const r = await api.setAutopilot({ ...config, ...patch });
+      // While Autopilot is on, the scope and the tracker aren't this dialog's
+      // to send: a pass may have changed the scope since it was loaded (a
+      // finished milestone dropped, the next one added).
+      const r = await api.setAutopilot(config.enabled ? { maxInFlight: config.maxInFlight, autoContinue: config.autoContinue ?? false, ...patch } : { ...config, ...patch });
       setConfig({ ...r.config, threadId: r.config.threadId || DEFAULT_THREAD });
       setState(r.state);
     } catch (e) {
@@ -107,6 +110,22 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
       setSaving(false);
     }
   };
+
+  // Accept the next milestone from here: the same answer as the board's popup.
+  const continueInto = async () => {
+    setSaving(true);
+    setError(null);
+    try {
+      const r = await api.continueRoadmap("accept");
+      setConfig({ ...r.config, threadId: r.config.threadId || DEFAULT_THREAD });
+      setState(r.state);
+    } catch (e) {
+      setError(e instanceof ApiError || e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+  const scope = scopeMilestones(config);
 
   const mine = (state?.cards ?? []).map((id) => tasks.find((t) => t.id === id) ?? archivedCards[id]).filter((t): t is Task => !!t);
   // Slots are held only by cards that are progressing (src/shared/autopilot.ts):
@@ -140,7 +159,7 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
             <select
               value={config.project}
               disabled={config.enabled}
-              onChange={(e) => setConfig({ ...config, project: e.target.value, milestone: null })}
+              onChange={(e) => setConfig({ ...config, project: e.target.value, milestone: null, milestones: [] })}
               className="h-8 rounded-md border border-border bg-background px-2"
             >
               {projects.map((p) => (
@@ -158,7 +177,8 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
               disabled={config.enabled}
               onChange={(e) => {
                 const m = milestones.find((x) => x.number === Number(e.target.value));
-                setConfig({ ...config, milestone: m ? { number: m.number, title: m.title } : null });
+                const one = m ? { number: m.number, title: m.title } : null;
+                setConfig({ ...config, milestone: one, milestones: one ? [one] : [] });
               }}
               className="h-8 rounded-md border border-border bg-background px-2"
             >
@@ -173,7 +193,33 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
                 </option>
               ))}
             </select>
+            {roadmapMode && scope.length > 1 && (
+              <span className="text-muted-foreground" data-testid="autopilot-scope-list">
+                In scope: {scope.map((m) => m.title).join(" + ")} — the run continued into {scope.length === 2 ? "the second" : "the later ones"}. Choosing a
+                milestone here (while paused) sets the scope back to that one.
+              </span>
+            )}
           </label>
+          {mode === "tracker-milestone" && (
+            <label className="flex items-start gap-2">
+              <input
+                type="checkbox"
+                data-testid="autopilot-auto-continue"
+                className="mt-0.5"
+                checked={config.autoContinue ?? false}
+                disabled={saving}
+                onChange={(e) => {
+                  // Takes effect at once on a running Autopilot; with Start otherwise.
+                  if (config.enabled) void save({ autoContinue: e.target.checked });
+                  else setConfig({ ...config, autoContinue: e.target.checked });
+                }}
+              />
+              <span>
+                Always continue: when this milestone can no longer fill its slots, start the next one without asking
+                <span className="text-muted-foreground"> (off: the board asks first)</span>
+              </span>
+            </label>
+          )}
           <div className="flex gap-3">
             <label className="flex flex-1 flex-col gap-1">
               <span className="text-muted-foreground">Tracker issue (its “completion order” table gives the order)</span>
@@ -229,6 +275,27 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
                     {(roadmap.counts.backlog ?? 0) > 0 && ` · ${roadmap.counts.backlog} card${roadmap.counts.backlog === 1 ? "" : "s"} in the backlog`}
                   </div>
                   {roadmap.idleReason && <div className="mt-1 text-warning">{roadmap.idleReason}</div>}
+                  {(roadmap.continued ?? []).map((k) => (
+                    <div key={`${k.number}:${k.at}`} className="mt-1 text-muted-foreground">
+                      Continued into {k.title} at {new Date(k.at).toLocaleTimeString()} ({k.by === "auto" ? "always continue" : "you accepted"})
+                    </div>
+                  ))}
+                  {roadmap.nextMilestone && (
+                    <div className="mt-1" data-testid="autopilot-next-milestone">
+                      <div className={roadmap.nextMilestone.reason && roadmap.nextMilestone.dismissedAt == null ? "text-warning" : undefined}>
+                        {nextMilestoneText(roadmap.nextMilestone).question}
+                      </div>
+                      <div className="text-muted-foreground">
+                        {nextMilestoneText(roadmap.nextMilestone).detail}
+                        {roadmap.nextMilestone.dismissedAt != null && ` · you said not now at ${new Date(roadmap.nextMilestone.dismissedAt).toLocaleTimeString()}`}
+                      </div>
+                      {config.enabled && !config.autoContinue && (
+                        <Button size="sm" variant="outline" className="mt-1 h-6 px-2 text-[11px]" disabled={saving} data-testid="autopilot-continue" onClick={() => void continueInto()}>
+                          Start {milestoneName(roadmap.nextMilestone)} as well
+                        </Button>
+                      )}
+                    </div>
+                  )}
                   {roadmap.humanReady.length > 0 && (
                     <div className="mt-1">
                       <span className="text-muted-foreground">Yours to do: </span>
@@ -298,7 +365,8 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
             <p className="text-muted-foreground">
               Every open step whose issue is in this milestone gets a card in the Backlog. Steps of other milestones still
               gate the order but are never started by this run; cards another milestone left in the Backlog stay there,
-              untouched.
+              untouched. When fewer steps are left to start than fit in flight, the next milestone is offered: accepting adds
+              it to the scope, and what is left here keeps running.
             </p>
           )}
           {roadmapMode ? (

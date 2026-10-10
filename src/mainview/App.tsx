@@ -39,7 +39,9 @@ import { isPipelineColumnRunnerOwned } from "../shared/pipeline.ts";
 import { LeaseContext } from "@/lib/leases";
 import { PrContext } from "@/lib/prs";
 import { ProgressContext, RoadmapCardsContext } from "@/lib/progress";
-import { roadmapCardInfo } from "@/lib/card-status";
+import { roadmapCardInfo, roadmapLinkInfo } from "@/lib/card-status";
+import { BlockerLines } from "@/components/kanban/BlockerLines";
+import { NextMilestonePrompt } from "@/components/kanban/NextMilestonePrompt";
 import { autopilotLabel } from "../shared/autopilot.ts";
 import { IssuesPage } from "@/components/issues/IssuesPage";
 import { AutopilotDialog } from "@/components/kanban/AutopilotDialog";
@@ -1598,6 +1600,9 @@ function AppInner() {
     };
   }, [autopilotKey, autopilotOpen]);
   const roadmapCards = useMemo(() => roadmapCardInfo(autopilot), [autopilot]);
+  // What each roadmap step's card waits on and blocks: the lines drawn when
+  // a card is hovered (BlockerLines.tsx).
+  const roadmapLinks = useMemo(() => roadmapLinkInfo(autopilot), [autopilot]);
   // Board header toggle: hold `caffeinate -d` (src/bun/keep-awake.ts).
   const [keepScreenOn, setKeepScreenOn] = useState(false);
   useEffect(() => {
@@ -2383,6 +2388,19 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                       </LeaseContext.Provider>
                     </DndContext>
                   </div>
+                  {/* Hovering a card draws lines to what it waits on and what
+                      it blocks. A sibling of the scroller, so it stays put
+                      while the board scrolls under it; it takes no pointer
+                      events. */}
+                  <BlockerLines links={roadmapLinks} tasks={tasks} />
+                  {/* Autopilot's offer to start the milestone that follows. */}
+                  <NextMilestonePrompt
+                    autopilot={autopilot}
+                    onAnswered={(next, message) => {
+                      setAutopilot(next);
+                      toast.success(message);
+                    }}
+                  />
                   {/* Zero-task state: the full onboarding card sits above the
                       (still-visible, still-empty) column grid rather than
                       replacing it — dnd-kit's drop zones stay mounted underneath.

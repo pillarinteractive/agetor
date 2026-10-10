@@ -152,6 +152,8 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
     <Card
       ref={setNodeRef}
       style={style}
+      // Lets the board's blocker lines (BlockerLines.tsx) find this card.
+      data-task-id={task.id}
       className={cn(
         "group relative cursor-grab select-none border-border/60 border-l-4 hover:border-border transition-colors",
         type.borderClass,

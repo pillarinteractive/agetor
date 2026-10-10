@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { cardStatus, formatAge, needsYouList, roadmapCardInfo, roadmapNeedsYou } from "./card-status.ts";
+import { cardStatus, formatAge, needsYouList, roadmapCardInfo, roadmapLinkInfo, roadmapNeedsYou, roadmapOffer } from "./card-status.ts";
 import type { PipelineRunState, Task, TaskPrStatus } from "../../shared/types.ts";
 import type { TaskLeaseInfo } from "./leases.ts";
 
@@ -252,5 +252,50 @@ describe("roadmap backlog cards", () => {
     expect(roadmapNeedsYou(a({ number: 2 })).map((n) => n.key)).toEqual(["human:11"]);
     expect(roadmapNeedsYou(a({ number: 3 }))).toEqual([]);
     expect(roadmapNeedsYou(a(null))).toEqual([]);
+  });
+});
+
+
+describe("roadmap links and the next-milestone offer, from the status of the run configured now", () => {
+  const M01 = { number: 1, title: "M01 — Widget foundations" };
+  const M02 = { number: 2, title: "M02 — Widget page" };
+  const offer = { stage: "M02", number: 2, title: M02.title, steps: 3, agentSteps: 3, startable: 1, waitingOn: null, current: "M01", left: 1, maxInFlight: 2, reason: "nearly-done" as const, dismissedAt: null as number | null };
+  const roadmap = {
+    issue: 600,
+    scope: { ...M01, roadmapTotal: 6, milestones: [{ ...M01, total: 2 }] },
+    cards: [],
+    links: [
+      { step: "2", issue: 12, title: "Inventory the widgets", state: "in-flight", taskId: "c12", predecessors: [], successors: [] },
+      { step: "3", issue: 13, title: "Build the widget store", state: "backlog", taskId: "bl-13", predecessors: [], successors: [] },
+      { step: "9", issue: 19, title: "A step with no card yet", state: "open", taskId: null, predecessors: [], successors: [] },
+    ],
+    nextMilestone: offer,
+  };
+  const dto = (config: Record<string, unknown> = {}, status: Record<string, unknown> = {}) => ({
+    config: { enabled: true, roadmap: { issue: 600 }, milestone: M01, milestones: [M01], autoContinue: false, ...config },
+    state: { roadmap: { ...roadmap, ...status } as never },
+  });
+
+  test("links are keyed by card: steps without a card have no entry", () => {
+    expect([...roadmapLinkInfo(dto()).keys()]).toEqual(["c12", "bl-13"]);
+    expect(roadmapLinkInfo(dto()).get("bl-13")).toMatchObject({ step: "3", issue: 13 });
+    // Paused: the cards are still there, and so are their links.
+    expect(roadmapLinkInfo(dto({ enabled: false })).size).toBe(2);
+    // Another scope, a status from an older build, or no Autopilot at all: nothing.
+    expect(roadmapLinkInfo(dto({ milestone: M02, milestones: [M02] })).size).toBe(0);
+    expect(roadmapLinkInfo(dto({}, { links: undefined })).size).toBe(0);
+    expect(roadmapLinkInfo(null).size).toBe(0);
+  });
+
+  test("the board asks only about an offer that is due, unanswered, and not automatic", () => {
+    expect(roadmapOffer(dto())).toMatchObject({ number: 2, reason: "nearly-done" });
+    expect(roadmapOffer(dto({}, { nextMilestone: { ...offer, reason: null } }))).toBeNull(); // not due yet
+    expect(roadmapOffer(dto({}, { nextMilestone: { ...offer, dismissedAt: 5 } }))).toBeNull(); // "not now"
+    expect(roadmapOffer(dto({}, { nextMilestone: null }))).toBeNull();
+    expect(roadmapOffer(dto({ autoContinue: true }))).toBeNull(); // Autopilot takes it itself
+    expect(roadmapOffer(dto({ enabled: false }))).toBeNull(); // paused
+    // The scope changed by hand since the status was written: that offer belongs to another run.
+    expect(roadmapOffer(dto({ milestone: M01, milestones: [M01, M02] }))).toBeNull();
+    expect(roadmapOffer(null)).toBeNull();
   });
 });

@@ -6,7 +6,7 @@
  * and the board's "Needs you" bar.
  */
 import type { PipelineRunState, Task, TaskPrStatus } from "../../shared/types.ts";
-import { currentRoadmapStatus, type RoadmapCardInfo, type RoadmapStatus } from "../../shared/roadmap.ts";
+import { currentRoadmapStatus, offerPending, type RoadmapCardInfo, type RoadmapNextMilestone, type RoadmapStatus, type RoadmapStepLinks } from "../../shared/roadmap.ts";
 import { neverStarted } from "../../shared/autopilot.ts";
 import { blockReasonLine, handoffHeadline } from "../../shared/pipeline.ts";
 import type { TaskLeaseInfo } from "./leases.ts";
@@ -307,6 +307,9 @@ export function needsYouList(items: { task: Task; status: CardStatus }[]): { tas
     .sort((a, b) => rank(a.status) - rank(b.status) || NEEDS_YOU_ORDER[a.status.needsYou!.action] - NEEDS_YOU_ORDER[b.status.needsYou!.action] || b.task.updatedAt - a.task.updatedAt);
 }
 
+/** The part of Autopilot's config that says which run a status belongs to. */
+type RoadmapConfigRef = { roadmap: { issue: number } | null; milestone?: { number: number } | null; milestones?: { number: number }[] | null };
+
 /** A Needs-you entry for a roadmap step waiting on the user
  *  (src/shared/roadmap.ts):
  *  human — the owner's own step, ready: open its issue.
@@ -336,9 +339,9 @@ export interface RoadmapNeedsYou {
  *  Autopilot won't start again and cards held for sign-off first, then the
  *  owner's ready `[Human]` steps. */
 export function roadmapNeedsYou(
-  autopilot: { config: { enabled: boolean; roadmap: { issue: number } | null; milestone?: { number: number } | null }; state: { roadmap?: RoadmapStatus | null } } | null | undefined,
+  autopilot: { config: RoadmapConfigRef & { enabled: boolean }; state: { roadmap?: RoadmapStatus | null } } | null | undefined,
 ): RoadmapNeedsYou[] {
-  const status = autopilot ? currentRoadmapStatus({ roadmap: autopilot.config.roadmap, milestone: autopilot.config.milestone ?? null }, autopilot.state.roadmap) : null;
+  const status = autopilot ? currentRoadmapStatus(autopilot.config, autopilot.state.roadmap) : null;
   if (!autopilot?.config.enabled || !status) return [];
   return [
     ...status.needsUser.map((s) => {
@@ -377,8 +380,31 @@ export function roadmapNeedsYou(
  *  the cards' status lines. Shown while paused too: the cards are still
  *  there, and the line is as of the last pass. */
 export function roadmapCardInfo(
-  autopilot: { config: { roadmap: { issue: number } | null; milestone?: { number: number } | null }; state: { roadmap?: RoadmapStatus | null } } | null | undefined,
+  autopilot: { config: RoadmapConfigRef; state: { roadmap?: RoadmapStatus | null } } | null | undefined,
 ): Map<string, RoadmapCardInfo> {
-  const status = autopilot ? currentRoadmapStatus({ roadmap: autopilot.config.roadmap, milestone: autopilot.config.milestone ?? null }, autopilot.state.roadmap) : null;
+  const status = autopilot ? currentRoadmapStatus(autopilot.config, autopilot.state.roadmap) : null;
   return new Map((status?.cards ?? []).map((c) => [c.taskId, c]));
+}
+
+/** What each roadmap step's card waits on and blocks, by card id — for the
+ *  board's blocker lines (src/mainview/lib/blocker-lines.ts). Steps without
+ *  a card have no entry. */
+export function roadmapLinkInfo(
+  autopilot: { config: RoadmapConfigRef; state: { roadmap?: RoadmapStatus | null } } | null | undefined,
+): Map<string, RoadmapStepLinks> {
+  const status = autopilot ? currentRoadmapStatus(autopilot.config, autopilot.state.roadmap) : null;
+  const out = new Map<string, RoadmapStepLinks>();
+  for (const l of status?.links ?? []) if (l.taskId) out.set(l.taskId, l);
+  return out;
+}
+
+/** The next-milestone offer the board should ask about now: Autopilot is
+ *  on, the offer is due, the owner hasn't said "not now" to it, and
+ *  continuing isn't automatic. */
+export function roadmapOffer(
+  autopilot: { config: RoadmapConfigRef & { enabled: boolean; autoContinue?: boolean }; state: { roadmap?: RoadmapStatus | null } } | null | undefined,
+): RoadmapNextMilestone | null {
+  if (!autopilot?.config.enabled || autopilot.config.autoContinue) return null;
+  const next = currentRoadmapStatus(autopilot.config, autopilot.state.roadmap)?.nextMilestone;
+  return offerPending(next) ? next : null;
 }

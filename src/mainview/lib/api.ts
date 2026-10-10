@@ -98,6 +98,11 @@ export interface AutopilotConfigDto {
   threadId: string;
   project: string;
   milestone: { number: number; title: string } | null;
+  /** Tracker mode: every milestone in scope, in order (`milestone` is the
+   *  first). Absent from a core that predates scope lists. */
+  milestones?: { number: number; title: string }[];
+  /** Add the next milestone without asking when the scope runs low. */
+  autoContinue?: boolean;
   maxInFlight: number;
   pipelineId: string | null;
   /** Tracker mode: the tracker issue whose step table gives the order. The
@@ -520,6 +525,10 @@ export const api = {
    *  closing its issue: close the issue as completed, or do the step again. */
   resolveRoadmapStep: (issue: number, action: "close" | "redo") =>
     j<AutopilotDto & { ok: true; message: string }>("/autopilot/roadmap/resolve", { method: "POST", body: JSON.stringify({ issue, action }) }, { retry: false }),
+  /** The owner's answer to the next-milestone offer (src/bun/autopilot.ts
+   *  `continueRoadmap`). */
+  continueRoadmap: (action: "accept" | "always" | "dismiss") =>
+    j<AutopilotDto & { ok: true; message: string }>("/autopilot/roadmap/continue", { method: "POST", body: JSON.stringify({ action }) }, { retry: false }),
   refreshMergeQueue: () => j<{ ok: true }>("/merge-queue/refresh", { method: "POST" }, { retry: false }),
   departMergeTrain: () =>
     j<{ train: { pr: number; url: string; members: number[] } }>("/merge-train/depart", { method: "POST" }, { retry: false }),
