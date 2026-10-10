@@ -2,7 +2,7 @@ import { useContext, useEffect, useMemo, useState } from "react";
 import { ChevronDown, CircleAlert, Sparkles } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { Button } from "@/components/ui/button";
-import { cardStatus, needsYouList, type NeedsYouAction } from "@/lib/card-status";
+import { cardStatus, needsYouList, roadmapNeedsYou, type NeedsYouAction, type RoadmapNeedsYou } from "@/lib/card-status";
 import { leaseInfoForTask } from "@/lib/leases";
 import { ProgressContext } from "@/lib/progress";
 import { cn } from "@/lib/utils";
@@ -15,6 +15,10 @@ const COLLAPSED_COUNT = 4;
  * answer, a block to retry, a PR to fix or merge, a result to review — each
  * with its reason and the one button that settles it. Empty means nothing is
  * waiting on you. Built from the same `cardStatus` the cards' status lines use.
+ *
+ * Roadmap steps waiting on the user (Autopilot's roadmap mode) have no card:
+ * they're listed first, each opening its issue. `roadmapOnly` shows just
+ * those — cards already say what needs you on their own status line.
  */
 export function NeedsYouBar({
   tasks,
@@ -23,6 +27,7 @@ export function NeedsYouBar({
   onOpen,
   onRetry,
   onOpenPr,
+  roadmapOnly = false,
 }: {
   tasks: Task[];
   prs: ReadonlyMap<string, TaskPrStatus>;
@@ -30,6 +35,7 @@ export function NeedsYouBar({
   onOpen: (t: Task) => void;
   onRetry: (t: Task) => void;
   onOpenPr: (url: string) => void;
+  roadmapOnly?: boolean;
 }) {
   const [expanded, setExpanded] = useState(false);
   // Orchestrator suggestions (src/bun/suggestions.ts), refetched whenever a
@@ -43,12 +49,29 @@ export function NeedsYouBar({
     [tasks, prs, leases],
   );
   useEffect(() => {
+    if (roadmapOnly) return;
     let alive = true;
     api.getSuggestions().then((s) => alive && setSuggestions(s)).catch(() => {});
     return () => {
       alive = false;
     };
-  }, [changeKey]);
+  }, [changeKey, roadmapOnly]);
+  // Roadmap steps waiting on the user: refetched when a card moves (a pass
+  // follows) and once a minute (the owner's steps change on GitHub).
+  const [roadmap, setRoadmap] = useState<RoadmapNeedsYou[]>([]);
+  const columnsKey = useMemo(() => tasks.map((t) => `${t.id}:${t.column}`).join(","), [tasks]);
+  useEffect(() => {
+    let alive = true;
+    const load = () => void api.getAutopilot().then((a) => alive && setRoadmap(roadmapNeedsYou(a))).catch(() => {});
+    load();
+    const soon = setTimeout(load, 10_000); // after the pass the move triggers
+    const timer = setInterval(load, 60_000);
+    return () => {
+      alive = false;
+      clearTimeout(soon);
+      clearInterval(timer);
+    };
+  }, [columnsKey]);
 
   const apply = async (s: Suggestion) => {
     if (s.apply.kind === "open") {
@@ -70,6 +93,7 @@ export function NeedsYouBar({
   };
   const progress = useContext(ProgressContext);
   const items = useMemo(() => {
+    if (roadmapOnly) return [];
     const now = Date.now();
     const live = new Set(progress.filter((p) => p.active).map((p) => p.taskId));
     return needsYouList(
@@ -78,9 +102,9 @@ export function NeedsYouBar({
         status: cardStatus(task, { pr: prs.get(task.id) ?? null, lease: leaseInfoForTask(task, leases), now, progressActive: live.has(task.id) }),
       })),
     );
-  }, [tasks, prs, leases, progress]);
+  }, [tasks, prs, leases, progress, roadmapOnly]);
 
-  if (items.length === 0 && suggestions.length === 0 && !notice) return null;
+  if (items.length === 0 && suggestions.length === 0 && roadmap.length === 0 && !notice) return null;
   // A card with a suggestion shows it instead of its plain Needs-you line.
   const suggested = new Set(suggestions.map((s) => s.taskId));
   const rest = items.filter((i) => !suggested.has(i.task.id));
@@ -98,8 +122,32 @@ export function NeedsYouBar({
     <div data-testid="needs-you-bar" className="mx-4 mt-3 rounded-md border border-warning/40 bg-warning/5 px-3 py-2">
       <div className="mb-1.5 flex items-center gap-1.5 text-xs font-medium text-warning">
         <CircleAlert className="size-3.5" aria-hidden />
-        Needs you · {suggestions.length + rest.length}
+        Needs you · {suggestions.length + rest.length + roadmap.length}
       </div>
+      {roadmap.length > 0 && (
+        <ul className="mb-1 flex flex-col gap-1" data-testid="roadmap-needs-you">
+          {roadmap.map((r) => (
+            <li key={r.key} data-testid="roadmap-needs-you-item" className="flex items-center gap-2 text-xs">
+              <span className="min-w-0 flex-1 truncate" title={`${r.title} — ${r.reason}`}>
+                <span className="font-medium">{r.title}</span>
+                <span className="text-muted-foreground"> — {r.reason}</span>
+              </span>
+              {r.url && (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  data-testid="roadmap-needs-you-action"
+                  onClick={() => onOpenPr(r.url!)}
+                  className="h-6 shrink-0 px-2 text-[11px]"
+                >
+                  Open issue
+                </Button>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
       {suggestions.length > 0 && (
         <ul className="mb-1 flex flex-col gap-1" data-testid="suggestions">
           {suggestions.map((s) => (

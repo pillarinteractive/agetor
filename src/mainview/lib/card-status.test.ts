@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { cardStatus, formatAge, needsYouList } from "./card-status.ts";
+import { cardStatus, formatAge, needsYouList, roadmapNeedsYou } from "./card-status.ts";
 import type { PipelineRunState, Task, TaskPrStatus } from "../../shared/types.ts";
 import type { TaskLeaseInfo } from "./leases.ts";
 
@@ -157,5 +157,35 @@ describe("cardStatus — Ready to Merge", () => {
   test("a closed or draft PR needs the user", () => {
     expect(status(inMerge(), { pr: pr({ state: "closed" }) }).needsYou).not.toBeNull();
     expect(status(inMerge(), { pr: pr({ draft: true }) }).needsYou).not.toBeNull();
+  });
+});
+
+describe("roadmapNeedsYou — roadmap steps with no card", () => {
+  const status = {
+    issue: 600,
+    url: "https://github.com/o/r/issues/600",
+    fetchedAt: 0,
+    counts: { total: 3, complete: 0, declined: 0, inFlight: 0, ready: 1, waiting: 2 },
+    humanReady: [{ step: "1", issue: 11, title: "[Human] Provide the sample device", url: "https://github.com/o/r/issues/11" }],
+    needsUser: [{ step: "2", issue: 12, title: "Inventory the widgets", url: "https://github.com/o/r/issues/12", reason: "PR #77 merged but the issue is still open" }],
+    nextWaiting: [],
+    problems: [],
+    idleReason: null,
+  };
+  const autopilot = (enabled: boolean, roadmap: { issue: number } | null) => ({ config: { enabled, roadmap }, state: { roadmap: status } });
+
+  test("steps Autopilot won't restart first, then the ready human steps, each with its issue URL", () => {
+    expect(roadmapNeedsYou(autopilot(true, { issue: 600 }))).toEqual([
+      { key: "stuck:12", kind: "stuck", title: "Step 2 · #12 Inventory the widgets", reason: "PR #77 merged but the issue is still open", url: "https://github.com/o/r/issues/12" },
+      { key: "human:11", kind: "human", title: "Step 1 · #11 [Human] Provide the sample device", reason: "ready for you — only you can do this step", url: "https://github.com/o/r/issues/11" },
+    ]);
+  });
+
+  test("nothing when Autopilot is paused, in milestone mode, or the status is another roadmap's", () => {
+    expect(roadmapNeedsYou(autopilot(false, { issue: 600 }))).toEqual([]);
+    expect(roadmapNeedsYou(autopilot(true, null))).toEqual([]);
+    expect(roadmapNeedsYou(autopilot(true, { issue: 601 }))).toEqual([]);
+    expect(roadmapNeedsYou({ config: { enabled: true, roadmap: { issue: 600 } }, state: {} })).toEqual([]);
+    expect(roadmapNeedsYou(null)).toEqual([]);
   });
 });

@@ -17,9 +17,17 @@ const PHASE: Record<AutopilotStateDto["phase"], string> = {
   auditing: "Deep audit in progress",
   done: "Milestone done — audit came back clean",
 };
+const ROADMAP_PHASE: Record<AutopilotStateDto["phase"], string> = {
+  idle: "Waiting — nothing can start",
+  running: "Working the roadmap",
+  auditing: "Working the roadmap",
+  done: "Roadmap done — every step is complete or declined",
+};
 
 /** Milestone Autopilot (src/bun/autopilot.ts): pick a milestone and the
- *  milestone-manager Codex thread; Agetor works it to done, then audits. */
+ *  milestone-manager Codex thread; Agetor works it to done, then audits.
+ *  Or pick Roadmap and a tracker issue: its numbered step table gives the
+ *  order and no thread is involved (src/shared/roadmap.ts). */
 export function AutopilotDialog({ open, projects, tasks, onClose }: { open: boolean; projects: Project[]; tasks: Task[]; onClose: () => void }) {
   const [config, setConfig] = useState<AutopilotConfigDto | null>(null);
   const [state, setState] = useState<AutopilotStateDto | null>(null);
@@ -27,11 +35,13 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
-  const load = useCallback(() => {
+  const load = useCallback((refresh = false) => {
     void api
       .getAutopilot()
       .then((r) => {
-        setConfig({ ...r.config, threadId: r.config.threadId || DEFAULT_THREAD, project: r.config.project || projects[0]?.path || "" });
+        const next = { ...r.config, threadId: r.config.threadId || DEFAULT_THREAD, project: r.config.project || projects[0]?.path || "" };
+        // A periodic refresh mustn't undo what's being set up while paused.
+        setConfig((cur) => (refresh && cur && !cur.enabled && !r.config.enabled ? cur : next));
         setState(r.state);
       })
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
@@ -48,7 +58,7 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
   }, [open, config?.project]);
   useEffect(() => {
     if (!open) return;
-    const t = setInterval(load, 15_000);
+    const t = setInterval(() => load(true), 15_000);
     return () => clearInterval(t);
   }, [open, load]);
 
@@ -92,7 +102,11 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
   const inFlight = mine.filter((t) => holdsAutopilotSlot(t));
   const quotaWaiting = mine.filter((t) => t.archivedAt == null && waitingOnQuota(t.pipelineRun)).length;
   const done = mine.filter((t) => t.column === "done").length;
-  const ready = !!config.threadId && !!config.project && !!config.milestone;
+  const roadmapMode = !!config.roadmap;
+  const ready = !!config.project && (roadmapMode ? config.roadmap!.issue > 0 : !!config.threadId && !!config.milestone);
+  // The status of the roadmap that's configured now, not of an earlier one.
+  const roadmap = roadmapMode && state?.roadmap?.issue === config.roadmap!.issue ? state.roadmap : null;
+  const phases = roadmapMode ? ROADMAP_PHASE : PHASE;
 
   return createPortal(
     <Dialog open onClose={onClose} labelledBy={TITLE_ID} className="flex w-full max-w-xl flex-col p-0">
@@ -122,6 +136,34 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
               ))}
             </select>
           </label>
+          <div className="flex flex-col gap-1">
+            <span className="text-muted-foreground">Work from</span>
+            <div className="flex gap-1" role="group" aria-label="Work from" data-testid="autopilot-mode">
+              <Button
+                type="button"
+                size="sm"
+                variant={roadmapMode ? "outline" : "secondary"}
+                aria-pressed={!roadmapMode}
+                disabled={config.enabled}
+                onClick={() => setConfig({ ...config, roadmap: null })}
+                className="h-7 px-2 text-xs"
+              >
+                Milestone
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant={roadmapMode ? "secondary" : "outline"}
+                aria-pressed={roadmapMode}
+                disabled={config.enabled}
+                onClick={() => setConfig({ ...config, roadmap: config.roadmap ?? { issue: 0 } })}
+                className="h-7 px-2 text-xs"
+              >
+                Roadmap
+              </Button>
+            </div>
+          </div>
+          {!roadmapMode && (
           <label className="flex flex-col gap-1">
             <span className="text-muted-foreground">Milestone</span>
             <select
@@ -141,16 +183,33 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
               ))}
             </select>
           </label>
+          )}
           <div className="flex gap-3">
-            <label className="flex flex-1 flex-col gap-1">
-              <span className="text-muted-foreground">Codex thread (milestone manager)</span>
-              <Input
-                value={config.threadId}
-                disabled={config.enabled}
-                onChange={(e) => setConfig({ ...config, threadId: e.target.value.replace(/^codex:\/\/threads\//, "").trim() })}
-                className="h-8 font-mono text-[11px]"
-              />
-            </label>
+            {roadmapMode ? (
+              <label className="flex flex-1 flex-col gap-1">
+                <span className="text-muted-foreground">Tracker issue (the one with the “Numbered completion order” table)</span>
+                <Input
+                  type="number"
+                  min={1}
+                  data-testid="autopilot-roadmap-issue"
+                  value={config.roadmap!.issue || ""}
+                  disabled={config.enabled}
+                  placeholder="Issue number"
+                  onChange={(e) => setConfig({ ...config, roadmap: { issue: Math.max(0, Math.floor(Number(e.target.value)) || 0) } })}
+                  className="h-8"
+                />
+              </label>
+            ) : (
+              <label className="flex flex-1 flex-col gap-1">
+                <span className="text-muted-foreground">Codex thread (milestone manager)</span>
+                <Input
+                  value={config.threadId}
+                  disabled={config.enabled}
+                  onChange={(e) => setConfig({ ...config, threadId: e.target.value.replace(/^codex:\/\/threads\//, "").trim() })}
+                  className="h-8 font-mono text-[11px]"
+                />
+              </label>
+            )}
             <label className="flex w-24 flex-col gap-1">
               <span className="text-muted-foreground">In flight</span>
               <Input
@@ -166,7 +225,53 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
 
           {state && (
             <div className="rounded-md border border-border/60 bg-muted/30 p-2" data-testid="autopilot-status">
-              <div className="font-medium">{config.enabled ? PHASE[state.phase] : state.phase === "done" ? PHASE.done : "Paused"}</div>
+              <div className="font-medium">{config.enabled ? phases[state.phase] : state.phase === "done" ? phases.done : "Paused"}</div>
+              {roadmap && (
+                <div className="mt-1" data-testid="autopilot-roadmap-status">
+                  <div>
+                    {roadmap.counts.complete} of {roadmap.counts.total} steps complete · {roadmap.counts.inFlight} in flight · {roadmap.counts.ready} ready ·{" "}
+                    {roadmap.counts.waiting} waiting
+                    {roadmap.counts.declined > 0 && ` · ${roadmap.counts.declined} declined`}
+                  </div>
+                  {roadmap.idleReason && <div className="mt-1 text-warning">{roadmap.idleReason}</div>}
+                  {roadmap.humanReady.length > 0 && (
+                    <div className="mt-1">
+                      <span className="text-muted-foreground">Yours to do: </span>
+                      {roadmap.humanReady.map((s) => `${s.step} · #${s.issue} ${s.title}`).join("; ")}
+                    </div>
+                  )}
+                  {roadmap.needsUser.map((s) => (
+                    <div key={s.issue} className="mt-1 text-warning">
+                      Step {s.step} · #{s.issue}: {s.reason}
+                    </div>
+                  ))}
+                  {roadmap.nextWaiting.length > 0 && (
+                    <details className="mt-1">
+                      <summary className="cursor-pointer text-muted-foreground">Next waiting steps</summary>
+                      <ul className="mt-1 flex flex-col gap-0.5">
+                        {roadmap.nextWaiting.map((s) => (
+                          <li key={s.step}>
+                            {s.step} · #{s.issue} {s.title}
+                            <span className="text-muted-foreground"> — {s.reason ?? `waits on ${s.waitingOn.join(", ")}`}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </details>
+                  )}
+                  {roadmap.problems.length > 0 && (
+                    <details className="mt-1" open>
+                      <summary className="cursor-pointer text-warning">
+                        {roadmap.problems.length} roadmap problem{roadmap.problems.length === 1 ? "" : "s"}
+                      </summary>
+                      <ul className="mt-1 flex max-h-32 flex-col gap-0.5 overflow-auto">
+                        {roadmap.problems.map((p, i) => (
+                          <li key={i}>{p.message}</li>
+                        ))}
+                      </ul>
+                    </details>
+                  )}
+                </div>
+              )}
               <div className="mt-1 text-muted-foreground">
                 {inFlight.length} card{inFlight.length === 1 ? "" : "s"} in flight · {done} done · {state.held.length} waiting for your sign-off
                 {quotaWaiting > 0 && ` · ${quotaWaiting} waiting for a usage limit to reset`}
@@ -175,7 +280,7 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
               {state.lastError && (
                 <div className={`mt-1 ${(state.limitedUntil ?? 0) > Date.now() ? "text-muted-foreground" : "text-warning"}`}>{state.lastError}</div>
               )}
-              {state.lastAnswer && (
+              {!roadmapMode && state.lastAnswer && (
                 <details className="mt-1">
                   <summary className="cursor-pointer text-muted-foreground">
                     Thread's last answer ({state.lastAnswer.kind === "audit" ? "audit" : "next issues"},{" "}
@@ -186,12 +291,21 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
               )}
             </div>
           )}
+          {roadmapMode ? (
+          <p className="text-muted-foreground">
+            A step starts when its issue is open and every predecessor step's issue is closed as completed; Agetor keeps
+            {" "}{config.maxInFlight} cards building and signs finished PRs off for merging (billing, auth, migration and schema changes wait for you).
+            [Human] steps are never given to an agent — you're notified when one is ready. An issue closed as not planned is a
+            no-go: it unlocks nothing. No Codex thread is involved.
+          </p>
+          ) : (
           <p className="text-muted-foreground">
             Whenever a card finishes building, the thread picks the next issue(s) and clarifies each one's scope; Agetor keeps
             {" "}{config.maxInFlight} cards building and signs finished PRs off for merging (billing, auth, migration and schema changes wait for you). When the
             milestone is empty it runs a deep audit; anything it files restarts the loop. Don't type into the thread in Codex
             while Autopilot is on.
           </p>
+          )}
           {error && <p className="text-red-600 dark:text-red-400">{error}</p>}
         </div>
         <footer className="flex justify-end gap-2 border-t border-border/60 p-3">

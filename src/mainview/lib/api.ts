@@ -100,6 +100,8 @@ export interface AutopilotConfigDto {
   milestone: { number: number; title: string } | null;
   maxInFlight: number;
   pipelineId: string | null;
+  /** Roadmap mode: the tracker issue; milestone and thread aren't used. */
+  roadmap: { issue: number } | null;
 }
 export interface AutopilotStateDto {
   phase: "idle" | "running" | "auditing" | "done";
@@ -110,9 +112,12 @@ export interface AutopilotStateDto {
   lastError: string | null;
   /** The thread's Codex account is at its usage limit until then. */
   limitedUntil?: number;
+  /** Roadmap mode: the status as of the last pass. */
+  roadmap?: RoadmapStatus | null;
   updatedAt: number;
 }
 import { TASK_EVENTS_REPLAY_META_EVENT } from "../../shared/types.ts";
+import type { RoadmapStatus } from "../../shared/roadmap.ts";
 import { fetchWithRecovery } from "./net-retry.ts";
 
 export interface UpdateSnapshot {

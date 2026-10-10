@@ -6,6 +6,7 @@
  * and the board's "Needs you" bar.
  */
 import type { PipelineRunState, Task, TaskPrStatus } from "../../shared/types.ts";
+import type { RoadmapStatus } from "../../shared/roadmap.ts";
 import { blockReasonLine, handoffHeadline } from "../../shared/pipeline.ts";
 import type { TaskLeaseInfo } from "./leases.ts";
 import { ordinal } from "../../shared/block-reason.ts";
@@ -289,4 +290,27 @@ export function needsYouList(items: { task: Task; status: CardStatus }[]): { tas
   return items
     .filter((i) => i.status.needsYou && i.task.archivedAt == null && !i.task.pipelineParentId)
     .sort((a, b) => rank(a.status) - rank(b.status) || NEEDS_YOU_ORDER[a.status.needsYou!.action] - NEEDS_YOU_ORDER[b.status.needsYou!.action] || b.task.updatedAt - a.task.updatedAt);
+}
+
+/** A Needs-you entry that has no card: a roadmap step waiting on the user
+ *  (src/shared/roadmap.ts). Its one action opens the step's issue. */
+export interface RoadmapNeedsYou {
+  key: string;
+  kind: "human" | "stuck";
+  title: string;
+  reason: string;
+  url: string | null;
+}
+
+/** Roadmap steps waiting on the user while Autopilot runs a roadmap: steps
+ *  Autopilot won't start again first, then the owner's ready `[Human]` steps. */
+export function roadmapNeedsYou(
+  autopilot: { config: { enabled: boolean; roadmap: { issue: number } | null }; state: { roadmap?: RoadmapStatus | null } } | null | undefined,
+): RoadmapNeedsYou[] {
+  const status = autopilot?.state.roadmap;
+  if (!autopilot?.config.enabled || !autopilot.config.roadmap || !status || status.issue !== autopilot.config.roadmap.issue) return [];
+  return [
+    ...status.needsUser.map((s) => ({ key: `stuck:${s.issue}`, kind: "stuck" as const, title: `Step ${s.step} · #${s.issue} ${s.title}`, reason: s.reason, url: s.url })),
+    ...status.humanReady.map((s) => ({ key: `human:${s.issue}`, kind: "human" as const, title: `Step ${s.step} · #${s.issue} ${s.title}`, reason: "ready for you — only you can do this step", url: s.url })),
+  ];
 }
