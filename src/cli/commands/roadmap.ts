@@ -61,7 +61,7 @@ export function roadmapStatusLines(a: AutopilotDto): string[] {
       c.dim(`  ${config.project} · up to ${config.maxInFlight} in flight`),
   ];
   if (state.lastError) lines.push(c.red(`  ${state.lastError}`));
-  if (!s) return [...lines, c.dim("  no status yet — the first pass hasn't finished")];
+  if (!s) return state.lastError ? lines : [...lines, c.dim("  no status yet — the first pass hasn't finished")];
   const n = s.counts;
   lines.push(
     `  ${n.complete}/${n.total} complete · ${n.inFlight} in flight · ${n.ready} ready · ${n.waiting} waiting · ${n.declined} declined` +

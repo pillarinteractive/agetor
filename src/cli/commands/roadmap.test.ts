@@ -61,8 +61,10 @@ test("status without roadmap mode, or before the first pass, says so", () => {
   const other = { ...dto(), state: { phase: "running", lastError: "couldn't read tracker issue #601", roadmap: status } };
   other.config.roadmap = { issue: 601 };
   const text = roadmapStatusLines(other).join("\n");
-  expect(text).toContain("no status yet");
   expect(text).toContain("couldn't read tracker issue #601");
+  expect(text).not.toContain("2/6 complete"); // another roadmap's status isn't shown
+  other.state.lastError = null as never;
+  expect(roadmapStatusLines(other).join("\n")).toContain("no status yet");
 });
 
 test("start resolves the project and pipeline, then PUTs roadmap mode on", async () => {
