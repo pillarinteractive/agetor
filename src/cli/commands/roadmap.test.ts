@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import path from "node:path";
-import { matchMilestoneRef, parseRoadmapResolveArgs, parseRoadmapStartFlags, roadmapStatusLines, runRoadmap } from "./roadmap.ts";
+import { matchMilestoneRef, parseRoadmapContinueArgs, parseRoadmapResolveArgs, parseRoadmapStartFlags, roadmapStatusLines, roadmapWhyLines, runRoadmap } from "./roadmap.ts";
 import type { GitHubRepoMilestone, Pipeline, Project } from "../../shared/types.ts";
 
 const status = {
@@ -235,4 +235,166 @@ test("resolve: one issue and one of --close / --redo, sent as the owner's reques
   expect(calls).toEqual([]);
   const refusing = { ...client, call: async () => Promise.reject(new Error("#12 is already closed — nothing to resolve")) };
   await expect(runRoadmap(refusing as never, ["resolve", "12", "--redo"])).rejects.toThrow("already closed");
+});
+
+
+// ── why, and continuing into the next milestone ─────────────────────────────
+
+const M01 = { number: 1, title: "M01 — Widget foundations" };
+const M02 = { number: 2, title: "M02 — Widget page" };
+const link = (step: string, issue: number, title: string, state: string, taskId: string | null = null, milestone = "M01") => ({ step, issue, title, milestone, state, taskId });
+const scopedStatus = (over: Record<string, unknown> = {}) => ({
+  ...status,
+  scope: { ...M01, roadmapTotal: 6, milestones: [{ ...M01, total: 3 }] },
+  humanReady: [],
+  needsUser: [],
+  problems: [],
+  links: [
+    { step: "2", issue: 12, title: "Inventory the widgets", state: "in-flight", taskId: "c12", predecessors: [], successors: [link("3", 13, "Build the widget store", "backlog", "bl-13"), link("4", 14, "Wire the widget API", "outside", null, "M02")] },
+    {
+      step: "3",
+      issue: 13,
+      title: "Build the widget store",
+      state: "backlog",
+      taskId: "bl-13",
+      predecessors: [link("2", 12, "Inventory the widgets", "in-flight", "c12"), link("1", 11, "[Human] Provide the sample device", "yours", null, "H"), { ...link("7", 17, "Agree the widget names", "complete"), note: "annual only" }],
+      successors: [link("5", 15, "Ship the widget page", "outside", null, "M02")],
+      morePredecessors: 2,
+    },
+  ],
+  ...over,
+});
+const offer = (over: Record<string, unknown> = {}) => ({ stage: "M02", number: 2, title: M02.title, steps: 3, agentSteps: 3, startable: 0, waitingOn: "steps 2 (#12), 3 (#13)", current: "M01", left: 1, underway: true, maxInFlight: 3, reason: "nearly-done", dismissedAt: null, ...over });
+const scopedDto = (statusOver: Record<string, unknown> = {}, configOver: Record<string, unknown> = {}) => {
+  const a = dto({ milestone: M01, milestones: [M01], ...configOver });
+  a.state.roadmap = scopedStatus(statusOver) as never;
+  return a;
+};
+
+test("why: what a step waits on (with where each predecessor stands) and what it blocks", () => {
+  const text = roadmapWhyLines(scopedDto(), "#13").join("\n");
+  expect(text).toContain("Step 3 · #13 Build the widget store — in the backlog");
+  expect(text).toContain("Waits on:");
+  expect(text).toContain("2  #12 Inventory the widgets — in flight");
+  expect(text).toContain("1  #11 [Human] Provide the sample device — yours to do");
+  expect(text).toContain("and 2 more");
+  expect(text).toContain("Finished predecessors:");
+  expect(text).toContain("7  #17 Agree the widget names — complete (noted: annual only)");
+  expect(text).toContain("Blocks:");
+  expect(text).toContain("5  #15 Ship the widget page — open in another milestone (M02)");
+  // The same step by its step id.
+  expect(roadmapWhyLines(scopedDto(), "3")[0]).toContain("Step 3 · #13");
+
+  const running = roadmapWhyLines(scopedDto(), "2").join("\n");
+  expect(running).toContain("Step 2 · #12 Inventory the widgets — in flight");
+  expect(running).toContain("Waits on nothing — it has no predecessor steps");
+  expect(running).toContain("3  #13 Build the widget store — in the backlog");
+});
+
+test("why: a bare number is a step first; an unknown or finished step, or an older status, says so", () => {
+  // Step 2 exists and so does issue #2 (of step 9): the bare number is the step, and the output says how to name the issue.
+  const tied = scopedStatus();
+  (tied.links as { step: string; issue: number }[]).push({ ...tied.links[0]!, step: "9", issue: 2 } as never);
+  const a = scopedDto();
+  a.state.roadmap = tied as never;
+  const lines = roadmapWhyLines(a, "2").join("\n");
+  expect(lines).toContain("Step 2 · #12");
+  expect(lines).toContain("(read as step 2; for issue #2 write #2)");
+  expect(roadmapWhyLines(a, "#2")[0]).toContain("Step 9 · #2");
+
+  expect(roadmapWhyLines(scopedDto(), "#99").join("\n")).toContain("#99 isn't an open step in scope (M01)");
+  expect(roadmapWhyLines(scopedDto(), "4.5").join("\n")).toContain("step 4.5 isn't an open step in scope (M01)");
+  expect(roadmapWhyLines(scopedDto({ links: undefined }), "3").join("\n")).toContain("written by an older build");
+  expect(roadmapWhyLines(dto({ roadmap: null }), "3").join("\n")).toContain("no tracker is set");
+  // The status of another scope isn't this run's.
+  expect(roadmapWhyLines(scopedDto({}, { milestone: M02, milestones: [M02] }), "3").join("\n")).toContain("no status yet");
+});
+
+test("why reads GET /autopilot and nothing else; it needs exactly one step", async () => {
+  const { client, calls } = fakeClient(scopedDto() as never);
+  const r = await runRoadmap(client, ["why", "#13"]);
+  expect(calls).toEqual([{ method: "GET", path: "/autopilot", body: undefined }]);
+  expect(r.lines[0]).toContain("Step 3 · #13");
+  expect(r.data).toMatchObject({ ref: "#13", step: { step: "3", issue: 13 } });
+  await expect(runRoadmap(client, ["why"])).rejects.toThrow("'why' needs one step");
+  await expect(runRoadmap(client, ["why", "3", "4"])).rejects.toThrow("'why' needs one step");
+});
+
+test("status: the next milestone, why it is offered, what of it can start and the command that accepts it", () => {
+  const due = roadmapStatusLines(scopedDto({ nextMilestone: offer() })).join("\n");
+  expect(due).toContain('Scope: milestone "M01 — Widget foundations"');
+  expect(due).toContain("Next milestone:");
+  expect(due).toContain("M01 is nearly done (1 step left to start). Start M02 — Widget page (3 steps) as well?");
+  expect(due).toContain("0 can start yet — waiting on steps 2 (#12), 3 (#13)");
+  expect(due).toContain("agetor roadmap continue            start M02 as well");
+  expect(due).toContain("agetor roadmap continue --always");
+  expect(due).toContain("agetor roadmap continue --not-now");
+
+  // Not due yet: named, with the command, but nothing to dismiss.
+  const early = roadmapStatusLines(scopedDto({ nextMilestone: offer({ reason: null, left: 4 }) })).join("\n");
+  expect(early).toContain("Next: M02 — Widget page (3 steps) — offered once M01 has fewer than 3 steps left to start (4 now)");
+  expect(early).not.toContain("--not-now");
+
+  const dismissed = roadmapStatusLines(scopedDto({ nextMilestone: offer({ dismissedAt: 1_700_000_000_000 }) })).join("\n");
+  expect(dismissed).toContain("you said not now at");
+  expect(dismissed).not.toContain("--not-now");
+
+  // Several milestones in scope, continued automatically.
+  const auto = roadmapStatusLines(
+    scopedDto(
+      { scope: { ...M01, roadmapTotal: 6, milestones: [{ ...M01, total: 3 }, { ...M02, total: 3 }] }, continued: [{ ...M02, stage: "M02", at: 1_700_000_000_000, by: "auto" }], nextMilestone: null },
+      { milestones: [M01, M02], autoContinue: true },
+    ),
+  ).join("\n");
+  expect(auto).toContain('Scope: milestones "M01 — Widget foundations" + "M02 — Widget page"');
+  expect(auto).toContain("Always continue is on");
+  expect(auto).toContain("continued into M02 — Widget page at");
+  expect(auto).toContain("(always continue)");
+  expect(auto).not.toContain("Next milestone:");
+});
+
+test("continue: accepts the offer, --always also turns asking off, --not-now dismisses, --off is a config change", async () => {
+  expect(parseRoadmapContinueArgs([])).toBe("accept");
+  expect(parseRoadmapContinueArgs(["--always"])).toBe("always");
+  expect(parseRoadmapContinueArgs(["--off"])).toBe("off");
+  expect(parseRoadmapContinueArgs(["--not-now"])).toBe("dismiss");
+  expect(() => parseRoadmapContinueArgs(["--always", "--off"])).toThrow("at most one of");
+  expect(() => parseRoadmapContinueArgs(["M02"])).toThrow("at most one of");
+
+  const calls: { method: string; path: string; body?: unknown }[] = [];
+  const answered = scopedDto({}, { milestones: [M01, M02], autoContinue: true });
+  const client = {
+    ...fakeClient().client,
+    call: async <T>(method: string, p: string, body?: unknown) => {
+      calls.push({ method, path: p, body });
+      return (method === "PUT" ? { ...answered, config: { ...answered.config, ...(body as object) } } : { ...answered, ok: true, message: "M02 — Widget page is in scope with M01: 3 steps get a Backlog card (1 can start now)" }) as T;
+    },
+  };
+  const r = await runRoadmap(client, ["continue"]);
+  expect(calls).toEqual([{ method: "POST", path: "/autopilot/roadmap/continue", body: { action: "accept" } }]);
+  expect(r.lines.join("\n")).toContain("M02 — Widget page is in scope with M01");
+  expect(r.data).toMatchObject({ ok: true, action: "accept", milestones: [M01, M02], autoContinue: true });
+  calls.length = 0;
+  await runRoadmap(client, ["continue", "--always"]);
+  await runRoadmap(client, ["continue", "--not-now"]);
+  expect(calls.map((c) => c.body)).toEqual([{ action: "always" }, { action: "dismiss" }]);
+  calls.length = 0;
+  const off = await runRoadmap(client, ["continue", "--off"]);
+  expect(calls).toEqual([{ method: "PUT", path: "/autopilot", body: { autoContinue: false } }]);
+  expect(off.lines.join("\n")).toContain("Always continue is off");
+  // The server's refusal is passed on.
+  const refusing = { ...client, call: async () => Promise.reject(new Error("no milestone follows the scope")) };
+  await expect(runRoadmap(refusing as never, ["continue"])).rejects.toThrow("no milestone follows the scope");
+});
+
+test("start --auto-continue starts with always continue on; without it the flag isn't sent", async () => {
+  expect(parseRoadmapStartFlags(["--project", "/repo", "--auto-continue"])).toEqual({ project: "/repo", autoContinue: true });
+  const a = fakeClient();
+  const r = await runRoadmap(a.client, ["start", "--project", "/repo", "--issue", "600", "--milestone", "M01", "--auto-continue"]);
+  expect(a.calls.at(-1)).toMatchObject({ method: "PUT", path: "/autopilot", body: { enabled: true, roadmap: { issue: 600 }, milestone: M01, autoContinue: true } });
+  expect(r.lines.join("\n")).toContain("always continue is on");
+  const b = fakeClient();
+  const plain = await runRoadmap(b.client, ["start", "--project", "/repo", "--issue", "600", "--milestone", "M01"]);
+  expect(b.calls.at(-1)!.body).not.toHaveProperty("autoContinue");
+  expect(plain.lines.join("\n")).toContain("the next milestone is offered when this one can no longer fill its slots");
 });

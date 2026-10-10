@@ -4,16 +4,37 @@ import { flagValue } from "../args.ts";
 import { getClient, type Flags } from "../context.ts";
 import { c, out, printJson } from "../output.ts";
 import { matchPipelineRef } from "../../shared/pipeline.ts";
-import { currentRoadmapStatus, displayText, type RoadmapStatus } from "../../shared/roadmap.ts";
+import {
+  currentRoadmapStatus,
+  displayText,
+  findRoadmapLinks,
+  linkWaits,
+  milestoneName,
+  nextMilestoneText,
+  roadmapLinkStateLabel,
+  scopeLabel,
+  scopeMilestones,
+  type RoadmapLinkStep,
+  type RoadmapStatus,
+} from "../../shared/roadmap.ts";
 import type { GitHubRepoMilestone } from "../../shared/types.ts";
 
 /**
  * Autopilot's tracker mode (src/bun/autopilot.ts, src/shared/roadmap.ts):
  *
  *   agetor roadmap status [--json]
- *   agetor roadmap start --project <dir> [--issue <n>] [--milestone <number|title-prefix|all>] [--max <n>] [--pipeline <id|name>]
+ *   agetor roadmap start --project <dir> [--issue <n>] [--milestone <number|title-prefix|all>] [--max <n>] [--pipeline <id|name>] [--auto-continue]
  *   agetor roadmap pause
  *   agetor roadmap resolve <issue> --close | --redo
+ *   agetor roadmap why <issue|step>
+ *   agetor roadmap continue [--always | --off | --not-now]
+ *
+ * `why` prints what a step waits on and what it blocks (`#12` is an issue,
+ * `2.1` a step, a bare number a step when one has that id). `continue`
+ * answers the next-milestone offer `status` shows: it adds that milestone to
+ * the scope (the current one keeps running); `--always` also has Autopilot
+ * continue by itself from then on, `--off` turns that back off, `--not-now`
+ * dismisses the offer. `start --auto-continue` starts with it on.
  *
  * `resolve` answers a step whose card finished while its issue stayed open
  * (listed under "Needs you" by `status`, with what the merged PR said):
@@ -27,7 +48,7 @@ import type { GitHubRepoMilestone } from "../../shared/types.ts";
  * whole roadmap. Everything goes through GET/PUT /autopilot.
  */
 const USAGE =
-  "usage: agetor roadmap status | start --project <dir> [--issue <n>] [--milestone <number|title-prefix|all>] [--max <n>] [--pipeline <id|name>] | pause | resolve <issue> --close|--redo";
+  "usage: agetor roadmap status | start --project <dir> [--issue <n>] [--milestone <number|title-prefix|all>] [--max <n>] [--pipeline <id|name>] [--auto-continue] | pause | resolve <issue> --close|--redo | why <issue|step> | continue [--always|--off|--not-now]";
 
 interface AutopilotDto {
   config: {
@@ -37,6 +58,8 @@ interface AutopilotDto {
     pipelineId: string | null;
     roadmap: { issue: number } | null;
     milestone?: { number: number; title: string } | null;
+    milestones?: { number: number; title: string }[];
+    autoContinue?: boolean;
   };
   state: { phase: string; lastError: string | null; roadmap?: RoadmapStatus | null };
   defaultTracker?: number | null;
@@ -44,7 +67,11 @@ interface AutopilotDto {
 
 type Client = Pick<AgetorClient, "call" | "listPipelines" | "listProjects">;
 
-const scopeOf = (cfg: AutopilotDto["config"]) => (cfg.milestone ? `milestone "${cfg.milestone.title}" in the order of roadmap #${cfg.roadmap?.issue}` : `the whole roadmap #${cfg.roadmap?.issue}`);
+const scopeOf = (cfg: AutopilotDto["config"]) => {
+  const list = scopeMilestones(cfg);
+  if (list.length === 0) return `the whole roadmap #${cfg.roadmap?.issue}`;
+  return `${list.length === 1 ? `milestone "${list[0]!.title}"` : `milestones ${list.map((m) => `"${m.title}"`).join(", ")}`} in the order of roadmap #${cfg.roadmap?.issue}`;
+};
 
 export interface RoadmapStartFlags {
   project?: string;
@@ -53,6 +80,8 @@ export interface RoadmapStartFlags {
   milestone?: string;
   max?: number;
   pipeline?: string;
+  /** Continue into the next milestone without asking. */
+  autoContinue?: boolean;
 }
 
 /** Pure; exported for tests. */
@@ -71,6 +100,7 @@ export function parseRoadmapStartFlags(args: string[]): RoadmapStartFlags {
     else if (a === "--milestone") o.milestone = val();
     else if (a === "--max") o.max = positive(a, val());
     else if (a === "--pipeline") o.pipeline = val();
+    else if (a === "--auto-continue") o.autoContinue = true;
     else throw new Error(`unknown option '${a}'\n${USAGE}`);
   }
   return o;
@@ -116,6 +146,57 @@ export function parseRoadmapResolveArgs(args: string[]): { issue: number; action
   return { issue, action };
 }
 
+/** `continue [--always|--off|--not-now]`. Pure; exported for tests. */
+export function parseRoadmapContinueArgs(args: string[]): "accept" | "always" | "off" | "dismiss" {
+  if (args.length === 0) return "accept";
+  if (args.length === 1 && args[0] === "--always") return "always";
+  if (args.length === 1 && args[0] === "--off") return "off";
+  if (args.length === 1 && args[0] === "--not-now") return "dismiss";
+  throw new Error(`'continue' takes at most one of --always, --off or --not-now\n${USAGE}`);
+}
+
+const linkLine = (l: RoadmapLinkStep) => `    ${l.step}  #${l.issue} ${plain(l.title)}${c.dim(` — ${roadmapLinkStateLabel(l)}${l.note ? ` (noted: ${plain(l.note)})` : ""}`)}`;
+
+/**
+ * `why <issue|step>`: what the step waits on and what it blocks, from the
+ * last pass's status. Pure; exported for tests.
+ */
+export function roadmapWhyLines(a: AutopilotDto, ref: string): string[] {
+  const { config, state } = a;
+  if (!config.roadmap) return [c.dim("no tracker is set — agetor roadmap start --project <dir>")];
+  const s = currentRoadmapStatus(config, state.roadmap);
+  if (!s) return [c.dim("no status yet — the first pass hasn't finished")];
+  if (!s.links) return [c.dim("the status was written by an older build — it is refreshed on the next pass")];
+  const { entry, readAs } = findRoadmapLinks(s.links, ref);
+  if (!entry) {
+    return [
+      `${readAs === "issue" ? `#${ref.replace(/^#/, "")}` : `step ${plain(ref)}`} isn't an open step in scope (${s.scope ? scopeLabel(s.scope.milestones?.length ? s.scope.milestones : [s.scope]) : "the whole roadmap"})`,
+      c.dim("  it is complete, declined, in another milestone, or not in the tracker's table — agetor roadmap status lists what waits"),
+    ];
+  }
+  const waits = entry.predecessors.filter(linkWaits);
+  const finished = entry.predecessors.filter((l) => !linkWaits(l));
+  const lines = [`${c.bold(`Step ${entry.step}`)} · #${entry.issue} ${plain(entry.title)}${c.dim(` — ${roadmapLinkStateLabel({ state: entry.state, milestone: "" })}`)}`];
+  if (/^\d+$/.test(ref.trim()) && readAs === "step" && s.links.some((l) => l.issue === Number(ref))) lines.push(c.dim(`  (read as step ${ref}; for issue #${ref} write #${ref})`));
+  if (entry.predecessors.length === 0) lines.push("  Waits on nothing — it has no predecessor steps");
+  else if (waits.length === 0) lines.push(entry.state === "in-flight" ? "  Waits on nothing — it has started" : "  Waits on nothing — every predecessor is complete");
+  if (waits.length) {
+    lines.push(c.bold("  Waits on:"));
+    for (const l of waits) lines.push(linkLine(l));
+    if (entry.morePredecessors) lines.push(c.dim(`    and ${entry.morePredecessors} more`));
+  }
+  if (finished.length) {
+    lines.push(c.bold("  Finished predecessors:"));
+    for (const l of finished) lines.push(linkLine(l));
+  }
+  if (entry.successors.length) {
+    lines.push(c.bold("  Blocks:"));
+    for (const l of entry.successors) lines.push(linkLine(l));
+    if (entry.moreSuccessors) lines.push(c.dim(`    and ${entry.moreSuccessors} more`));
+  } else lines.push("  Blocks nothing that is still open");
+  return lines;
+}
+
 /** The human-readable status. Pure; exported for tests. */
 export function roadmapStatusLines(a: AutopilotDto): string[] {
   const { config, state } = a;
@@ -123,12 +204,16 @@ export function roadmapStatusLines(a: AutopilotDto): string[] {
     return [c.dim(`no tracker is set — agetor roadmap start --project <dir> ${a.defaultTracker ? `(uses the default tracker #${a.defaultTracker})` : "--issue <n>"}`)];
   }
   // The status of the run configured now, not of another tracker or milestone.
-  const s = currentRoadmapStatus({ roadmap: config.roadmap, milestone: config.milestone ?? null }, state.roadmap);
+  const s = currentRoadmapStatus(config, state.roadmap);
+  const scope = scopeMilestones(config);
   const lines = [
     `${c.bold(`Roadmap #${config.roadmap.issue}`)} ${config.enabled ? (state.phase === "done" ? c.green("done") : state.phase === "idle" ? c.yellow("waiting") : c.green("running")) : c.dim("paused")}` +
       c.dim(`  ${config.project} · up to ${config.maxInFlight} in flight`),
-    config.milestone ? `  Scope: milestone "${config.milestone.title}"${s?.scope ? c.dim(` — ${s.counts.total} of the roadmap's ${s.scope.roadmapTotal} steps`) : ""}` : `  Scope: all milestones ${c.dim("(the whole roadmap)")}`,
+    scope.length > 0
+      ? `  Scope: ${scope.length === 1 ? `milestone "${scope[0]!.title}"` : `milestones ${scope.map((m) => `"${m.title}"`).join(" + ")}`}${s?.scope ? c.dim(` — ${s.counts.total} of the roadmap's ${s.scope.roadmapTotal} steps`) : ""}`
+      : `  Scope: all milestones ${c.dim("(the whole roadmap)")}`,
   ];
+  if (scope.length > 0 && config.autoContinue) lines.push(c.dim("  Always continue is on: the next milestone is added by itself (agetor roadmap continue --off)"));
   if (state.lastError) lines.push(c.red(`  ${state.lastError}`));
   if (!s) return state.lastError ? lines : [...lines, c.dim("  no status yet — the first pass hasn't finished")];
   const n = s.counts;
@@ -137,6 +222,21 @@ export function roadmapStatusLines(a: AutopilotDto): string[] {
       c.dim(`  (as of ${new Date(s.fetchedAt).toLocaleTimeString()})`),
   );
   if (s.idleReason) lines.push(c.yellow(`  ${s.idleReason}`));
+  for (const k of s.continued ?? []) lines.push(c.dim(`  continued into ${plain(k.title)} at ${new Date(k.at).toLocaleTimeString()} (${k.by === "auto" ? "always continue" : "you accepted"})`));
+  // The milestone that follows, and the command that starts it.
+  const next = s.nextMilestone;
+  if (next) {
+    const t = nextMilestoneText(next);
+    lines.push("", c.bold("Next milestone:"));
+    lines.push(next.reason && next.dismissedAt == null ? c.yellow(`  ${plain(t.question)}`) : `  ${plain(t.question)}`);
+    lines.push(c.dim(`      ${plain(t.detail)}`));
+    if (next.dismissedAt != null) lines.push(c.dim(`      you said not now at ${new Date(next.dismissedAt).toLocaleTimeString()}`));
+    if (!config.autoContinue) {
+      lines.push(c.dim(`      agetor roadmap continue            start ${milestoneName(next)} as well (the current scope keeps running)`));
+      lines.push(c.dim("      agetor roadmap continue --always   and continue into later milestones without asking"));
+      if (next.reason && next.dismissedAt == null) lines.push(c.dim("      agetor roadmap continue --not-now  not now"));
+    }
+  }
   if (s.humanReady.length || s.needsUser.length) {
     lines.push("", c.bold("Needs you:"));
     for (const h of s.humanReady) lines.push(`  ${h.step}  #${h.issue} ${h.title}${h.url ? c.dim(`  ${h.url}`) : ""}`, c.dim("      yours to do — this step is ready and only you can do it"));
@@ -178,6 +278,8 @@ export async function runRoadmap(client: Client, args: string[]): Promise<{ data
         project: a.config.project,
         roadmap: a.config.roadmap,
         milestone: a.config.milestone ?? null,
+        milestones: scopeMilestones(a.config),
+        autoContinue: a.config.autoContinue ?? false,
         defaultTracker: a.defaultTracker ?? null,
         phase: a.state.phase,
         lastError: a.state.lastError,
@@ -195,6 +297,21 @@ export async function runRoadmap(client: Client, args: string[]): Promise<{ data
     const { issue, action } = parseRoadmapResolveArgs(rest);
     const r = await client.call<AutopilotDto & { ok: true; message: string }>("POST", "/autopilot/roadmap/resolve", { issue, action });
     return { data: { ok: true, issue, action, message: r.message }, lines: [`${c.green("✓")} ${plain(r.message)}`] };
+  }
+  if (sub === "why") {
+    if (rest.length !== 1 || rest[0]!.startsWith("--")) throw new Error(`'why' needs one step: its issue (#123) or its step id\n${USAGE}`);
+    const a = await client.call<AutopilotDto>("GET", "/autopilot");
+    const s = a.config.roadmap ? currentRoadmapStatus(a.config, a.state.roadmap) : null;
+    return { data: { ref: rest[0], step: s?.links ? findRoadmapLinks(s.links, rest[0]!).entry : null }, lines: roadmapWhyLines(a, rest[0]!) };
+  }
+  if (sub === "continue") {
+    const action = parseRoadmapContinueArgs(rest);
+    if (action === "off") {
+      const a = await client.call<AutopilotDto>("PUT", "/autopilot", { autoContinue: false });
+      return { data: a, lines: [`${c.green("✓")} Always continue is off — the next milestone is offered, not started`] };
+    }
+    const r = await client.call<AutopilotDto & { ok: true; message: string }>("POST", "/autopilot/roadmap/continue", { action });
+    return { data: { ok: true, action, message: r.message, milestones: scopeMilestones(r.config), autoContinue: r.config.autoContinue ?? false }, lines: [`${c.green("✓")} ${plain(r.message)}`] };
   }
   if (sub === "start") {
     const o = parseRoadmapStartFlags(rest);
@@ -223,6 +340,7 @@ export async function runRoadmap(client: Client, args: string[]): Promise<{ data
       project: project.path,
       roadmap: { issue },
       milestone,
+      ...(o.autoContinue ? { autoContinue: true } : {}),
       ...(o.max ? { maxInFlight: o.max } : {}),
       ...(pipelineId ? { pipelineId } : {}),
     });
@@ -231,6 +349,9 @@ export async function runRoadmap(client: Client, args: string[]): Promise<{ data
       lines: [
         `${c.green("✓")} Autopilot is working ${scopeOf(a.config)} in ${a.config.project} (up to ${a.config.maxInFlight} in flight)`,
         ...(a.config.milestone ? [c.dim("  every open step of the milestone gets a card in the Backlog; each starts when its predecessors are complete")] : []),
+        ...(a.config.milestone
+          ? [c.dim(a.config.autoContinue ? "  always continue is on: the next milestone is added when this one can no longer fill its slots" : "  the next milestone is offered when this one can no longer fill its slots (agetor roadmap continue)")]
+          : []),
         c.dim("  agetor roadmap status   shows what's ready, waiting and yours to do"),
       ],
     };
