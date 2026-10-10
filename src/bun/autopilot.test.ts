@@ -416,3 +416,30 @@ test("roadmap: holds new starts while a card waits for a usage limit", async () 
   await roadmapPass(roadmapCfg, state, [waiting], [waiting], deps);
   expect(log.started).toEqual([]);
 });
+
+test("tick: roadmap mode runs without a milestone or thread; milestone mode still needs both", async () => {
+  const { autopilotTick, readState, AUTOPILOT_PREF, AUTOPILOT_STATE_PREF } = await import("./autopilot.ts");
+  const { preferences } = await import("./db.ts");
+  const { mkdtempSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const dir = mkdtempSync(`${tmpdir()}/agetor-roadmap-`); // not a repo: the tracker read fails
+  const before = { cfg: preferences.get(AUTOPILOT_PREF), state: preferences.get(AUTOPILOT_STATE_PREF) };
+  try {
+    preferences.set(AUTOPILOT_STATE_PREF, JSON.stringify({ phase: "idle", lastError: "untouched" }));
+    // Milestone mode with no thread or milestone: the pass doesn't run.
+    preferences.set(AUTOPILOT_PREF, JSON.stringify({ enabled: true, project: dir }));
+    await autopilotTick();
+    expect(readState()).toMatchObject({ phase: "idle", lastError: "untouched" });
+    // Roadmap mode: it runs (and reports that the tracker couldn't be read).
+    preferences.set(AUTOPILOT_PREF, JSON.stringify({ enabled: true, project: dir, roadmap: { issue: 5 } }));
+    await autopilotTick();
+    const s = readState();
+    expect(s.lastError).toContain("couldn't read tracker issue #5");
+    expect(s.lastAnswer).toBeNull(); // the thread was never asked
+    expect(s.cards).toEqual([]);
+  } finally {
+    preferences.set(AUTOPILOT_PREF, before.cfg ?? "{}");
+    preferences.set(AUTOPILOT_STATE_PREF, before.state ?? "{}");
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
