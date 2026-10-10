@@ -7,8 +7,9 @@
  * scope, risks). Agetor does the rest: creates and starts a pipeline card per
  * issue (the scope goes into the card's prompt and onto the issue), keeps up
  * to `maxInFlight` cards going, signs finished cards off into Ready to Merge
- * (the merge queue lands them) — except PRs touching billing, auth,
- * migrations or the schema, which wait in In Review for the user — and, when
+ * (the merge queue lands them) — except PRs that change sensitive product
+ * code (src/shared/risky-paths.ts), which wait in In Review for the user —
+ * and, when
  * the milestone has no open issues and nothing in flight, asks the thread for
  * a deep audit. Issues the audit files into the milestone restart the loop;
  * a clean audit ends it.
@@ -24,13 +25,14 @@
  *
  * Config: `autopilot` preference. State: `autopilot_state` preference.
  */
-import type { Task } from "../shared/types.ts";
+import type { Task, TaskPrStatus } from "../shared/types.ts";
 import { preferences, tasks } from "./db.ts";
 import { recordActivity } from "./activity.ts";
 import { run } from "./github.ts";
 import { askThread, taggedJson, type ThreadAnswer } from "./codex-thread.ts";
 import { createTaskFromIssue } from "./issue-queue.ts";
 import { setMergeQueued } from "./merge-intent.ts";
+import { describeRiskyFiles, parseRiskyRules, riskyFiles, RISKY_PATHS_PREF, type RiskyRules } from "../shared/risky-paths.ts";
 import { hasConfirmedNoPr, prStatusForTask } from "./pr-watch.ts";
 import { onCardRemoved, startTask, subscribeGlobal } from "./orchestrator.ts";
 import { holdsAutopilotSlot, neverStarted, PROGRESSING_COLUMNS, waitingOnQuota } from "../shared/autopilot.ts";
@@ -39,6 +41,8 @@ import { loadRoadmapStates, loadRoadmapTracker } from "./roadmap-fetch.ts";
 import {
   parseRoadmap,
   pickRoadmap,
+  prIssueMention,
+  prIssueMentionLine,
   roadmapFinished,
   roadmapScope,
   roadmapStatus,
@@ -46,7 +50,9 @@ import {
   scopeDrift,
   summarizeRoadmap,
   withRoadmapStepPrompt,
+  type PrIssueMentionKind,
   type RoadmapIssueState,
+  type RoadmapNeedsUser,
   type RoadmapStatus,
   type RoadmapStepView,
 } from "../shared/roadmap.ts";
@@ -59,6 +65,11 @@ export const DEFAULT_TRACKER_PREF = "autopilot_default_tracker";
 /** Set once the stored config has been read by a build where `milestone`
  *  limits tracker mode (see `normalizeLegacyConfig`). */
 const CONFIG_VERSION_PREF = "autopilot_config_version";
+/** Cards of Autopilot's whose sign-off the user withdrew (dragged out of
+ *  Ready to Merge): a JSON array of card ids. Autopilot never signs such a
+ *  card off again. Its own preference, not part of the state, because it is
+ *  written from the task PATCH while a pass may hold the state. */
+export const HANDS_OFF_PREF = "autopilot_hands_off";
 /** Safety net only — passes are driven by board events (startAutopilot). */
 const FALLBACK_MS = 15 * 60_000;
 /** Columns of a card still being built (Blocked included): such a card
@@ -86,7 +97,16 @@ export interface AutopilotConfig {
 export interface AutopilotState {
   phase: "idle" | "running" | "auditing" | "done";
   cards: string[];
+  /** Cards left in In Review for the user because their PR changes
+   *  sensitive code. */
   held: string[];
+  /** Why each held card is held, and for which PR head and rules: a hold is
+   *  decided again when the head or the rules change. A card in `held`
+   *  without an entry (held by a build before this) is decided again too. */
+  holds: Record<string, CardHold>;
+  /** Cards whose PR file list couldn't be read (card id → PR number): not
+   *  signed off yet, said once, tried again every pass. */
+  unread: Record<string, number>;
   audits: number;
   lastAnswer: { at: number; kind: "next" | "audit"; text: string } | null;
   lastError: string | null;
@@ -113,6 +133,11 @@ export interface AutopilotState {
    *  issue stayed open. Never started again by Autopilot; cleared when the
    *  issue closes. Keyed by issue number. */
   roadmapStuck: Record<string, RoadmapStuck>;
+  /** Roadmap mode: steps the owner asked to be done again after a card
+   *  finished without closing the issue. The finished cards named here no
+   *  longer set off the restart guard; the next card for the step is told
+   *  about the earlier PR. Keyed by issue number; goes when the issue closes. */
+  roadmapRedo: Record<string, RoadmapRedo>;
   /** Roadmap mode: `[Human]` step issues already announced as ready. */
   notifiedHuman: number[];
   /** Tracker mode with a milestone: the cards made up front in the Backlog
@@ -124,9 +149,42 @@ export interface AutopilotState {
   updatedAt: number;
 }
 
+export interface CardHold {
+  pr: number;
+  url: string | null;
+  headSha: string | null;
+  /** `RiskyRules.signature` the hold was decided under. */
+  rules: string;
+  /** The first few sensitive files, and how many there are. */
+  files: string[];
+  count: number;
+}
+
 export interface RoadmapStuck {
   cardId: string;
   reason: string;
+  at: number;
+  step?: string;
+  /** merged — its PR merged; done — its card is Done without a merged PR;
+   *  no-work — its run ended with no commits and no PR. */
+  kind?: "merged" | "done" | "no-work";
+  pr?: number | null;
+  prUrl?: string | null;
+  /** The merged PR's description was read (once). */
+  bodyRead?: boolean;
+  mention?: PrIssueMentionKind;
+  /** The PR's words about the issue: untrusted display text. */
+  excerpt?: string | null;
+  /** `prIssueMentionLine`: the sentence shown to the owner. */
+  detail?: string | null;
+}
+
+export interface RoadmapRedo {
+  /** Finished cards the restart guard ignores from now on. */
+  cardIds: string[];
+  pr: number | null;
+  prUrl: string | null;
+  excerpt: string | null;
   at: number;
 }
 
@@ -137,8 +195,6 @@ export interface NoWorkPending {
   handoff: string;
   retryAt: number;
 }
-
-const RISKY = /(billing|stripe|checkout|subscription|auth|clerk|session|permission|migrations?\/|drizzle\/|db\/schema|schema\.ts)/i;
 
 export function parseConfig(raw: string | null | undefined): AutopilotConfig {
   let o: Record<string, unknown> = {};
@@ -168,6 +224,8 @@ export function readState(): AutopilotState {
       phase: v.phase ?? "idle",
       cards: Array.isArray(v.cards) ? v.cards : [],
       held: Array.isArray(v.held) ? v.held : [],
+      holds: v.holds && typeof v.holds === "object" ? v.holds : {},
+      unread: v.unread && typeof v.unread === "object" ? v.unread : {},
       audits: typeof v.audits === "number" ? v.audits : 0,
       lastAnswer: v.lastAnswer ?? null,
       lastError: v.lastError ?? null,
@@ -179,12 +237,13 @@ export function readState(): AutopilotState {
       reworked: Array.isArray(v.reworked) ? v.reworked : [],
       roadmap: v.roadmap && typeof v.roadmap === "object" ? v.roadmap : null,
       roadmapStuck: v.roadmapStuck && typeof v.roadmapStuck === "object" ? v.roadmapStuck : {},
+      roadmapRedo: v.roadmapRedo && typeof v.roadmapRedo === "object" ? v.roadmapRedo : {},
       notifiedHuman: Array.isArray(v.notifiedHuman) ? v.notifiedHuman : [],
       roadmapBacklog: v.roadmapBacklog && typeof v.roadmapBacklog === "object" ? v.roadmapBacklog : {},
       updatedAt: v.updatedAt ?? 0,
     };
   } catch {
-    return { phase: "idle", cards: [], held: [], audits: 0, lastAnswer: null, lastError: null, quietUntil: 0, quietSignature: "", limitedUntil: 0, noWork: {}, waits: {}, reworked: [], roadmap: null, roadmapStuck: {}, notifiedHuman: [], roadmapBacklog: {}, updatedAt: 0 };
+    return { phase: "idle", cards: [], held: [], holds: {}, unread: {}, audits: 0, lastAnswer: null, lastError: null, quietUntil: 0, quietSignature: "", limitedUntil: 0, noWork: {}, waits: {}, reworked: [], roadmap: null, roadmapStuck: {}, roadmapRedo: {}, notifiedHuman: [], roadmapBacklog: {}, updatedAt: 0 };
   }
 }
 
@@ -316,10 +375,123 @@ async function milestoneIssues(cfg: AutopilotConfig): Promise<{ number: number; 
   }
 }
 
-async function prTouchesRisky(t: Task, number: number): Promise<boolean> {
-  const r = await run(["gh", "pr", "view", String(number), "--json", "files", "-q", ".files[].path"], t.workdir, 30_000, process.env);
-  return !r.ok || (r.stdout ?? "").split("\n").some((p) => RISKY.test(p));
+// ── Sign-off ─────────────────────────────────────────────────────────────
+
+/** The cards whose sign-off the user withdrew. */
+export function readHandsOff(): string[] {
+  try {
+    const v = JSON.parse(preferences.get(HANDS_OFF_PREF) ?? "[]");
+    return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
 }
+
+/**
+ * The user dragged a card out of Ready to Merge (the task PATCH withdrew its
+ * sign-off). If it is one of Autopilot's, it is theirs from here on:
+ * Autopilot doesn't sign it off again, whatever its PR looks like later.
+ */
+export function noteSignOffWithdrawn(taskId: string): void {
+  if (!readState().cards.includes(taskId)) return;
+  const cur = readHandsOff();
+  if (!cur.includes(taskId)) preferences.set(HANDS_OFF_PREF, JSON.stringify([...cur, taskId].slice(-500)));
+}
+
+export interface SignOffDeps {
+  prStatus(taskId: string): TaskPrStatus | null;
+  /** Every file the PR changes; null when the list couldn't be read. */
+  prFiles(t: Task, pr: number): Promise<string[] | null>;
+  rules(): RiskyRules;
+  handsOff(): ReadonlySet<string>;
+  /** Move the card to Ready to Merge. */
+  signOff(t: Task): void;
+  activity(taskId: string, text: string, tone: "info" | "warning" | "muted"): void;
+}
+
+/**
+ * Sign Autopilot's finished cards off: each one in In Review with a finished
+ * run and an open PR goes to Ready to Merge — unless its PR changes
+ * sensitive code (src/shared/risky-paths.ts), which holds it in In Review
+ * for the user and says which files.
+ *
+ * - A hold is decided again when the PR's head or the rules change (and once
+ *   for a card held by an older build, which recorded neither): a hold that
+ *   no longer applies is released and the card signed off.
+ * - A file list that can't be read is not "risky": the card stays where it
+ *   is for this pass, with one note, and is looked at again on the next.
+ * - A card the user took back from Ready to Merge is never signed off again,
+ *   and one they moved out of In Review is no longer held.
+ *
+ * Mutates `state`. Exported for tests.
+ */
+export async function signOffPass(state: AutopilotState, mine: Task[], deps: SignOffDeps): Promise<void> {
+  const rules = deps.rules();
+  const handsOff = deps.handsOff();
+  const ids = new Set(mine.map((t) => t.id));
+  const release = (id: string) => {
+    state.held = state.held.filter((x) => x !== id);
+    delete state.holds[id];
+  };
+  for (const id of [...state.held, ...Object.keys(state.holds)]) if (!ids.has(id)) release(id);
+  for (const id of Object.keys(state.unread)) if (!ids.has(id)) delete state.unread[id];
+
+  for (const t of mine) {
+    const wasHeld = state.held.includes(t.id);
+    // Signed off or finished by the user: no longer waiting in In Review.
+    if (wasHeld && (t.column === "merge" || t.column === "done")) release(t.id);
+    if (t.column !== "review" || t.pipelineRun?.status !== "done" || handsOff.has(t.id)) continue;
+    const pr = deps.prStatus(t.id);
+    if (pr?.state !== "open") continue;
+    const hold = state.holds[t.id];
+    if (wasHeld && hold && hold.pr === pr.number && hold.headSha != null && hold.headSha === pr.headSha && hold.rules === rules.signature) continue;
+
+    const files = await deps.prFiles(t, pr.number);
+    if (files == null) {
+      // Unknown isn't risky. A card already held stays held until its files
+      // can be read; any other waits a pass, and says so once.
+      if (!wasHeld && state.unread[t.id] !== pr.number) {
+        state.unread[t.id] = pr.number;
+        deps.activity(t.id, `Autopilot: couldn't read which files PR #${pr.number} changes — not signed off yet, checking again on the next pass`, "muted");
+      }
+      continue;
+    }
+    delete state.unread[t.id];
+    const risky = riskyFiles(files, rules);
+    if (risky.length > 0) {
+      const next: CardHold = { pr: pr.number, url: pr.url ?? null, headSha: pr.headSha ?? null, rules: rules.signature, files: risky.slice(0, 5), count: risky.length };
+      const changed = !wasHeld || !hold || hold.count !== next.count || hold.files.join("\n") !== next.files.join("\n");
+      if (!wasHeld) state.held.push(t.id);
+      state.holds[t.id] = next;
+      if (changed) deps.activity(t.id, `Autopilot: PR #${pr.number} changes sensitive code (${describeRiskyFiles(risky)}) — left in In Review for you to sign off`, "warning");
+      continue;
+    }
+    if (wasHeld) {
+      release(t.id);
+      deps.activity(t.id, `Autopilot: PR #${pr.number} changes no sensitive code under the current rules — the hold is lifted`, "info");
+    }
+    deps.signOff(t);
+    deps.activity(t.id, `Autopilot: signed off PR #${pr.number} for merging`, "info");
+  }
+}
+
+const SIGN_OFF_DEPS: SignOffDeps = {
+  prStatus: (id) => prStatusForTask(id),
+  async prFiles(t, pr) {
+    // Every page: `gh pr view --json files` stops at 100 files.
+    const r = await run(["gh", "api", "--paginate", `repos/{owner}/{repo}/pulls/${pr}/files?per_page=100`, "-q", ".[].filename"], t.workdir, 60_000, process.env);
+    if (!r.ok) return null;
+    const files = (r.stdout ?? "").split("\n").map((p) => p.trim()).filter(Boolean);
+    return files.length > 0 ? files : null;
+  },
+  rules: () => parseRiskyRules(preferences.get(RISKY_PATHS_PREF)),
+  handsOff: () => new Set(readHandsOff()),
+  signOff(t) {
+    setMergeQueued(t.id, true);
+    tasks.update(t.id, { column: "merge" });
+  },
+  activity: (taskId, text, tone) => recordActivity(taskId, { kind: "auto", text, tone }),
+};
 
 /** A card whose live step session is paused mid-turn on a claude usage
  *  limit ("continuing automatically at …"). */
@@ -603,6 +775,10 @@ export interface RoadmapDeps {
   hasNoPr: NoWorkDeps["hasNoPr"];
   /** The card's merged PR, if it has one. */
   mergedPr(t: Task): number | null;
+  /** A PR's description; null when it couldn't be read. */
+  prBody(t: Task, pr: number): Promise<string | null>;
+  /** Cards whose sign-off the user withdrew. */
+  handsOff(): ReadonlySet<string>;
   quotaPaused(t: Pick<Task, "pipelineRun">): boolean;
   pipelineId(cfg: AutopilotConfig): string | null;
   /** Create a card for the issue and start it. */
@@ -627,6 +803,12 @@ export interface RoadmapDeps {
 }
 
 const isOpenStep = (v: RoadmapStepView) => v.status !== "complete" && v.status !== "declined";
+
+/** "a.ts, b.ts and 4 more" from a hold (which keeps the first few names). */
+function holdFilesText(hold: CardHold, max = 3): string {
+  const shown = hold.files.slice(0, max).join(", ");
+  return hold.count > max ? `${shown} and ${hold.count - max} more` : shown;
+}
 
 /**
  * One tracker pass: read the tracker and every step's issue; with a
@@ -696,31 +878,92 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
   // run found nothing to build). Starting another card would loop, so the
   // step waits for the user instead.
   const settling = new Set<number>();
+  for (const key of Object.keys(state.roadmapRedo)) {
+    if (!openByIssue.has(Number(key))) delete state.roadmapRedo[key]; // closed since
+  }
   for (const t of own) {
     const n = issueOf(t);
     if (n == null || !openByIssue.has(n)) continue;
+    // The owner asked for this step to be done again: its finished card no
+    // longer stands in the way.
+    if (state.roadmapRedo[String(n)]?.cardIds.includes(t.id)) continue;
     let reason: string | null = null;
+    let kind: RoadmapStuck["kind"] = "done";
+    let pr: number | null = null;
     if (t.column === "done") {
       if (deps.now() - t.updatedAt < SETTLE_MS) {
         settling.add(n);
         continue;
       }
-      const pr = deps.mergedPr(t);
+      pr = deps.mergedPr(t);
+      if (pr != null) kind = "merged";
       reason = pr != null ? `PR #${pr} merged but the issue is still open — close it or reopen the work` : "its card is Done but the issue is still open — close it or reopen the work";
     } else if (await isNoWorkCard(t, deps)) {
+      kind = "no-work";
       reason = "its card found nothing to build (no commits, no PR) but the issue is still open — close it or reopen the work";
     }
     if (!reason) continue;
-    if (state.roadmapStuck[String(n)]?.cardId !== t.id) {
-      deps.activity(t.id, `Autopilot: step ${openByIssue.get(n)!.step} (#${n}) — ${reason}. Not starting another card for it`, "warning");
+    const key = String(n);
+    const step = openByIssue.get(n)!.step;
+    const prev = state.roadmapStuck[key];
+    const sameCard = prev?.cardId === t.id;
+    const entry: RoadmapStuck = {
+      ...(sameCard && prev.pr === pr ? prev : {}),
+      cardId: t.id,
+      reason,
+      at: prev?.at ?? deps.now(),
+      step,
+      kind,
+      pr,
+      prUrl: pr != null ? (t.prUrl ?? null) : null,
+    };
+    // Why the issue is still open: what the merged PR said about it. Read
+    // once and kept; text from GitHub, shown and never acted on.
+    let learned = false;
+    if (pr != null && !entry.bodyRead) {
+      const body = await deps.prBody(t, pr);
+      if (body != null) {
+        const m = prIssueMention(body, n);
+        Object.assign(entry, { bodyRead: true, mention: m.kind, excerpt: m.excerpt, detail: prIssueMentionLine(pr, n, m) });
+        learned = true;
+      }
     }
-    state.roadmapStuck[String(n)] = { cardId: t.id, reason, at: state.roadmapStuck[String(n)]?.at ?? deps.now() };
+    if (!sameCard) {
+      deps.activity(t.id, `Autopilot: step ${step} (#${n}) — ${reason}${entry.detail ? `. ${entry.detail}` : ""}. Not starting another card for it`, "warning");
+    } else if (learned && entry.detail) {
+      deps.activity(t.id, `Autopilot: step ${step} (#${n}) is still open — ${entry.detail}`, "warning");
+    }
+    state.roadmapStuck[key] = entry;
   }
   for (const key of Object.keys(state.roadmapStuck)) {
     if (!openByIssue.has(Number(key))) delete state.roadmapStuck[key]; // closed since
   }
   if (settling.size > 0) deps.recheck(60_000);
-  const stuck = new Map(Object.entries(state.roadmapStuck).map(([k, v]) => [Number(k), v.reason]));
+  const stuck = new Map<number, RoadmapNeedsUser>(
+    Object.entries(state.roadmapStuck).map(([k, v]) => [Number(k), { reason: v.reason, pr: v.pr ?? null, prUrl: v.prUrl ?? null, detail: v.detail ?? null, taskId: v.cardId }]),
+  );
+
+  // Cards waiting in In Review for the owner: held because their PR changes
+  // sensitive code, or taken back from Ready to Merge. Their steps are still
+  // in flight (the issue stays busy), but nothing moves until the owner acts.
+  const handsOff = deps.handsOff();
+  const heldForUser = new Map<number, RoadmapNeedsUser>();
+  for (const t of own) {
+    const n = issueOf(t);
+    if (n == null || !openByIssue.has(n) || t.column !== "review" || t.archivedAt != null) continue;
+    const hold = state.holds[t.id];
+    if (state.held.includes(t.id)) {
+      heldForUser.set(n, {
+        reason: hold ? `PR #${hold.pr} changes sensitive code — held in In Review for your sign-off` : "its PR is held in In Review for your sign-off",
+        pr: hold?.pr ?? null,
+        prUrl: hold?.url ?? t.prUrl ?? null,
+        detail: hold ? holdFilesText(hold) : null,
+        taskId: t.id,
+      });
+    } else if (handsOff.has(t.id)) {
+      heldForUser.set(n, { reason: "you took it back from Ready to Merge — it waits in In Review for your sign-off", pr: null, prUrl: t.prUrl ?? null, detail: null, taskId: t.id });
+    }
+  }
 
   // Slots and busy issues, among this project's cards. Every unstarted
   // backlog card in the ledger is left out — also one left over from another
@@ -730,7 +973,7 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
   const { busyIssues, inFlight, ownLive, quotaWait } = slotCounts(all, own, open, deps.quotaPaused, { project: cfg.project, noSlot: exempt, notBusy: exempt });
 
   if (scope && scoped.length === 0) {
-    state.roadmap = summarizeRoadmap({ issue: tracker, url: doc.url, parsed, views, scope, busy: busyIssues, needsUser: stuck, now: deps.now() });
+    state.roadmap = summarizeRoadmap({ issue: tracker, url: doc.url, parsed, views, scope, busy: busyIssues, needsUser: stuck, held: heldForUser, now: deps.now() });
     state.phase = "idle";
     return fail(`no step of roadmap #${tracker} has its issue in milestone "${milestone!.title}" — check the issues' milestone on GitHub, or choose All milestones`);
   }
@@ -738,6 +981,11 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
   const free = cfg.maxInFlight - Math.max(ownLive, inFlight.length);
   const picks = pickRoadmap(scoped, { busy: busyIssues, exclude: new Set([...stuck.keys(), ...settling]), free });
   const pipelineId = deps.pipelineId(cfg);
+  // A step being done again tells its new card about the earlier PR.
+  const priorOf = (issue: number) => {
+    const r = state.roadmapRedo[String(issue)];
+    return r ? { pr: r.pr, url: r.prUrl, excerpt: r.excerpt } : null;
+  };
   const noPipeline = "no pipeline to run issues with (set default_pipeline)";
 
   // A card waiting for a usage limit to reset frees its slot, but starting
@@ -749,7 +997,7 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
     else {
       for (const v of picks.start) {
         if (deps.outdated()) break;
-        const stepPrompt = roadmapStepPrompt(tracker, v, parsed.steps);
+        const stepPrompt = roadmapStepPrompt(tracker, v, parsed.steps, { prior: priorOf(v.issue) });
         const card = backlog.get(v.issue);
         let id: string;
         if (card) {
@@ -773,7 +1021,7 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
         started.add(v.issue);
         state.cards.push(id);
         deps.save(state);
-        deps.activity(id, `Autopilot started this as step ${v.step} of roadmap #${tracker}`, "info");
+        deps.activity(id, `Autopilot started this as step ${v.step} of roadmap #${tracker}${state.roadmapRedo[String(v.issue)] ? " — again, at your request" : ""}`, "info");
       }
     }
   }
@@ -789,7 +1037,7 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
       // Paused, or pointed at another milestone, while the cards were being
       // made: the rest aren't this run's to make.
       if (deps.outdated()) break;
-      const r = await deps.createBacklogCard({ dir: cfg.project, number: v.issue, pipelineId: pipelineId!, extraPrompt: roadmapStepPrompt(tracker, v, parsed.steps, { pending: v.waitingOn }) });
+      const r = await deps.createBacklogCard({ dir: cfg.project, number: v.issue, pipelineId: pipelineId!, extraPrompt: roadmapStepPrompt(tracker, v, parsed.steps, { pending: v.waitingOn, prior: priorOf(v.issue) }) });
       if ("error" in r) {
         error ??= `step ${v.step} (#${v.issue}): no backlog card — ${r.error}`;
         if (++failures >= 3) break; // GitHub is probably unreachable: the next pass tries again
@@ -818,6 +1066,7 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
     busy: new Set([...busyIssues, ...started]),
     backlog: new Map([...backlog].map(([n, t]) => [n, t.id])),
     needsUser: stuck,
+    held: heldForUser,
     now: deps.now(),
   });
   if (!status.idleReason && quotaWait && picks.start.length > 0) status.idleReason = "Holding new starts while a card waits for a usage limit to reset";
@@ -848,7 +1097,134 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
   }
 
   if (roadmapFinished(parsed, scoped)) state.phase = "done";
-  else state.phase = status.counts.inFlight === 0 && started.size === 0 ? "idle" : "running";
+  // A step whose card waits in In Review for the owner is in flight, yet
+  // nothing is running because of it.
+  else state.phase = status.counts.inFlight - (status.counts.held ?? 0) === 0 && started.size === 0 ? "idle" : "running";
+}
+
+// ── Resolving a step that finished without closing its issue ─────────────
+
+export type RoadmapResolveAction = "close" | "redo";
+
+export interface ResolveDeps {
+  loadStates: RoadmapDeps["loadStates"];
+  gh(args: string[], cwd: string): Promise<{ ok: boolean; stdout: string; stderr?: string }>;
+  task(id: string): Task | null;
+  moveToDone(t: Task): void;
+  activity(taskId: string, text: string, tone: "info" | "warning" | "muted"): void;
+  now(): number;
+}
+
+/**
+ * The owner's answer to a step in `roadmapStuck` (its card finished, the
+ * issue is still open):
+ *
+ *   close — close the issue as completed, with a comment saying the owner
+ *           accepted the step from Agetor. Successors start on the next pass.
+ *   redo  — let Autopilot start a fresh card for the step; the finished card
+ *           stops setting off the restart guard and the new card is told
+ *           about the earlier PR.
+ *
+ * Only ever called for the owner's explicit request (the Needs-you button,
+ * `agetor roadmap resolve`) — never by a pass. Everything is checked again
+ * here: the entry must still be there and the issue still open. Mutates
+ * `state`; the caller saves it and asks for a pass. Exported for tests.
+ */
+export async function resolveRoadmapStep(
+  cfg: AutopilotConfig,
+  state: AutopilotState,
+  input: { issue: number; action: RoadmapResolveAction },
+  deps: ResolveDeps,
+): Promise<{ ok: true; message: string } | { error: string }> {
+  const { issue, action } = input;
+  if (!cfg.roadmap || !cfg.project) return { error: "Autopilot isn't working a roadmap" };
+  if (!Number.isInteger(issue) || issue <= 0) return { error: "which issue? give its number" };
+  if (action !== "close" && action !== "redo") return { error: `unknown action "${String(action)}" — close or redo` };
+  const key = String(issue);
+  const entry = state.roadmapStuck[key];
+  if (!entry) return { error: `#${issue} isn't a step waiting on you any more — nothing to resolve` };
+  const states = await deps.loadStates(cfg.project, [issue]);
+  if ("error" in states) return { error: `couldn't check #${issue} on GitHub: ${states.error}` };
+  const st = states.get(issue);
+  if (!st) return { error: `couldn't read the state of #${issue} on GitHub` };
+  if (st.state !== "OPEN") {
+    delete state.roadmapStuck[key];
+    return { error: `#${issue} is already closed — nothing to resolve` };
+  }
+  const step = entry.step ?? state.roadmap?.needsUser.find((u) => u.issue === issue)?.step ?? null;
+  // The last pass's status says it needs you; it doesn't any more.
+  const settled = () => {
+    delete state.roadmapStuck[key];
+    if (state.roadmap) state.roadmap = { ...state.roadmap, needsUser: state.roadmap.needsUser.filter((u) => u.issue !== issue || u.kind === "held") };
+  };
+  const stepName = step ? `step ${step}` : "this step";
+  const card = deps.task(entry.cardId);
+
+  if (action === "close") {
+    const comment =
+      `Closed by the owner from Agetor: ${stepName} of roadmap #${cfg.roadmap.issue} accepted as complete` +
+      (entry.pr != null ? `; PR #${entry.pr} merged.` : ".");
+    const r = await deps.gh(["issue", "close", String(issue), "--reason", "completed", "--comment", comment], cfg.project);
+    if (!r.ok) return { error: `couldn't close #${issue}: ${(r.stderr || r.stdout || "gh failed").trim().slice(-300)}` };
+    settled();
+    delete state.roadmapRedo[key];
+    if (card) deps.activity(card.id, `Closed #${issue} as completed at your request — ${stepName} accepted as complete`, "info");
+    return { ok: true, message: `Closed #${issue} as completed — the steps that waited on ${stepName} can start` };
+  }
+
+  // A card that found nothing to build still sits on the board and keeps the
+  // issue busy: it is finished, so it goes to Done.
+  if (card && card.archivedAt == null && card.column !== "done") {
+    if (entry.kind !== "no-work") return { error: `the card for #${issue} is still on the board — finish or archive it first` };
+    deps.moveToDone(card);
+  }
+  const before = state.roadmapRedo[key];
+  state.roadmapRedo[key] = {
+    cardIds: [...new Set([...(before?.cardIds ?? []), entry.cardId])],
+    pr: entry.pr ?? null,
+    prUrl: entry.prUrl ?? null,
+    excerpt: entry.excerpt ?? null,
+    at: deps.now(),
+  };
+  settled();
+  if (card) deps.activity(card.id, `Autopilot: ${stepName} (#${issue}) will be done again at your request — a fresh card starts when a slot is free`, "info");
+  return { ok: true, message: `Autopilot starts a fresh card for ${stepName} (#${issue}) when a slot is free` };
+}
+
+const RESOLVE_DEPS: ResolveDeps = {
+  loadStates: loadRoadmapStates,
+  gh: (args, cwd) => run(["gh", ...args], cwd, 60_000, process.env),
+  task: (id) => tasks.get(id) ?? null,
+  moveToDone: (t) => void tasks.update(t.id, { column: "done" }),
+  activity(taskId, text, tone) {
+    try {
+      recordActivity(taskId, { kind: "auto", text, tone });
+    } catch {
+      // the card is gone
+    }
+  },
+  now: () => Date.now(),
+};
+
+/**
+ * `POST /autopilot/roadmap/resolve`: apply the owner's answer between
+ * passes (a pass at work holds its own copy of the state and would write
+ * over this), save, and ask for a pass.
+ */
+export async function applyRoadmapResolve(input: { issue: number; action: RoadmapResolveAction }, deps: ResolveDeps = RESOLVE_DEPS): Promise<{ ok: true; message: string } | { error: string }> {
+  for (let i = 0; busy && i < 240; i++) await new Promise((r) => setTimeout(r, 500));
+  if (busy) return { error: "Autopilot is in the middle of a long pass — try again in a minute" };
+  busy = true;
+  try {
+    const cfg = parseConfig(preferences.get(AUTOPILOT_PREF));
+    const state = readState();
+    const r = await resolveRoadmapStep(cfg, state, input, deps);
+    writeState(state);
+    return r;
+  } finally {
+    busy = false;
+    requestAutopilotPass(0);
+  }
 }
 
 let notifier: ((n: { title: string; body: string }) => void) | null = null;
@@ -871,6 +1247,11 @@ export const ROADMAP_DEPS: RoadmapDeps = {
     const pr = prStatusForTask(t.id);
     return pr?.state === "merged" ? pr.number : null;
   },
+  async prBody(t, pr) {
+    const r = await run(["gh", "pr", "view", String(pr), "--json", "body", "-q", ".body"], t.workdir, 30_000, process.env);
+    return r.ok ? (r.stdout ?? "") : null;
+  },
+  handsOff: () => new Set(readHandsOff()),
   quotaPaused: quotaPausedCard,
   pipelineId: (cfg) => cfg.pipelineId ?? preferences.get("default_pipeline") ?? null,
   async startCard(input) {
@@ -932,20 +1313,12 @@ export async function autopilotTick(): Promise<void> {
     const mine = state.cards.map((id) => all.find((t) => t.id === id)).filter((t): t is Task => !!t && t.archivedAt == null);
     state.cards = mine.map((t) => t.id);
 
-    // Sign finished cards off: Ready to Merge, unless the PR touches risky code.
-    for (const t of mine) {
-      if (t.column !== "review" || t.pipelineRun?.status !== "done" || state.held.includes(t.id)) continue;
-      const pr = prStatusForTask(t.id);
-      if (pr?.state !== "open") continue;
-      if (await prTouchesRisky(t, pr.number)) {
-        state.held.push(t.id);
-        recordActivity(t.id, { kind: "auto", text: `Autopilot: PR #${pr.number} touches billing/auth/migrations/schema — left in In Review for you to sign off`, tone: "warning" });
-        continue;
-      }
-      setMergeQueued(t.id, true);
-      tasks.update(t.id, { column: "merge" });
-      recordActivity(t.id, { kind: "auto", text: `Autopilot: signed off PR #${pr.number} for merging`, tone: "info" });
-    }
+    // Sign finished cards off: Ready to Merge, unless the PR changes
+    // sensitive code. Forget the withdrawn sign-offs of cards that are gone.
+    const withdrawn = readHandsOff();
+    const stillThere = withdrawn.filter((id) => all.some((t) => t.id === id && t.archivedAt == null && t.column !== "done"));
+    if (stillThere.length !== withdrawn.length) preferences.set(HANDS_OFF_PREF, JSON.stringify(stillThere));
+    await signOffPass(state, mine, SIGN_OFF_DEPS);
 
     if (cfg.roadmap) {
       await roadmapPass(cfg, state, all, mine, ROADMAP_DEPS);
@@ -1107,10 +1480,12 @@ export function applyAutopilotPatch(body: Record<string, unknown>): AutopilotCon
         ...s,
         phase: "idle",
         held: [],
+        holds: {},
+        unread: {},
         lastError: null,
         quietUntil: 0,
         quietSignature: "",
-        ...(roadmapChanged ? { roadmap: null, roadmapStuck: {}, notifiedHuman: [] } : scopeChanged ? { roadmap: null } : {}),
+        ...(roadmapChanged ? { roadmap: null, roadmapStuck: {}, roadmapRedo: {}, notifiedHuman: [] } : scopeChanged ? { roadmap: null } : {}),
         // The ledger is keyed by issue number, which means another issue in
         // another project.
         ...(projectChanged ? { roadmapBacklog: {} } : {}),

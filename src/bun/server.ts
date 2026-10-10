@@ -46,7 +46,7 @@ import { activeTrain, mergedViaTrain, trainFor } from "./merge-train.ts";
 import { isPriority, readPriority, setPriority } from "./priority.ts";
 import { setMergeQueued } from "./merge-intent.ts";
 import { KEEP_AWAKE_PREF_KEY, KEEP_SCREEN_ON_PREF_KEY, recheckKeepAwake } from "./keep-awake.ts";
-import { applyAutopilotPatch, autopilotSnapshot, requestAutopilotPass, setAutopilotNotifier } from "./autopilot.ts";
+import { applyAutopilotPatch, applyRoadmapResolve, autopilotSnapshot, noteSignOffWithdrawn, requestAutopilotPass, setAutopilotNotifier } from "./autopilot.ts";
 import { departTrainNow, refreshMergeColumn } from "./merge-queue.ts";
 import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
@@ -3313,6 +3313,23 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         }),
       },
 
+      // The owner's answer to a roadmap step whose card finished without
+      // closing its issue: `close` the issue as completed, or `redo` the
+      // step. Only ever a person's explicit request — nothing calls this on
+      // its own.
+      "/autopilot/roadmap/resolve": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { issue?: unknown; action?: unknown };
+          const issue = Number(body.issue);
+          if (!Number.isInteger(issue) || issue <= 0 || (body.action !== "close" && body.action !== "redo")) {
+            return json({ error: 'expected {"issue": <number>, "action": "close" | "redo"}' }, { status: 400, headers: corsHeaders(req) });
+          }
+          const r = await applyRoadmapResolve({ issue, action: body.action });
+          if ("error" in r) return json({ error: r.error }, { status: 409, headers: corsHeaders(req) });
+          return json({ ...r, ...autopilotSnapshot() }, { headers: corsHeaders(req) });
+        }),
+      },
+
       // Ready to Merge's refresh button: re-read its PRs and step the queue now.
       "/merge-queue/refresh": {
         POST: authed(async (req) => {
@@ -4730,6 +4747,8 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             else if (patch.column === "review" || patch.column === "backlog" || patch.column === "ready") {
               if (setMergeQueued(before.id, false)) {
                 recordActivity(before.id, { kind: "task", text: "Sign-off withdrawn — moved out of Ready to Merge", tone: "muted" });
+                // One of Autopilot's cards: it doesn't sign it off again.
+                noteSignOffWithdrawn(before.id);
               }
             }
           }
