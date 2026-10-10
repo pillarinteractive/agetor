@@ -268,7 +268,8 @@ stopped pipeline) but shows in Backlog (`boardColumnOf`).
   (`merge_method` pref). Agetor opens the PR itself (`openPrDirectly`: push, then the API) and starts the Open PR
   follow-up only when that fails; the branch is updated from its base only when GitHub requires it or CI is failing.
   Each automatic step once per PR head, ≤4 fix-ups per card. A pipeline's fix-up run returns the card to Ready to
-  Merge (runner honours the intent), not In Review. Dragging back to In Review/Backlog withdraws the sign-off.
+  Merge (runner honours the intent), not In Review. Dragging back to In Review/Backlog withdraws the sign-off (for
+  one of Autopilot's cards, for good: `noteSignOffWithdrawn`).
   Merged → Done + issue closed (if the PR says `Fixes`). The column's refresh button is `POST /merge-queue/refresh`.
   Pipeline cards still in In Review get conflicts with their base resolved by the same loop.
 
@@ -399,12 +400,15 @@ which is set up (`autopilotLabel` in `src/shared/autopilot.ts`).
   Codex thread), `maxInFlight` (default 5, 1–10), `pipelineId` (else `default_pipeline`), `roadmap` `{issue}` (the
   tracker; set → tracker order, and `threadId` is unused).
 - **State** — `autopilot_state` preference: `phase` (`idle` / `running` / `auditing` / `done`), `cards` (the cards
-  Autopilot started), `held`, `lastAnswer`, `lastError`, the back-offs (`quietUntil`, `limitedUntil`), `noWork`,
-  `waits`, `reworked`, and the tracker fields. No table, no migration.
+  Autopilot started), `held` with `holds` (why, for which PR head and rules) and `unread`, `lastAnswer`, `lastError`,
+  the back-offs (`quietUntil`, `limitedUntil`), `noWork`, `waits`, `reworked`, and the tracker fields. Two more
+  preferences: `autopilot_hands_off` (cards whose sign-off you withdrew) and the optional `autopilot_risky_paths`.
+  No table, no migration; fields a build doesn't know are read as empty.
 - **API** — `GET /autopilot` → `{config, state, defaultTracker}`. `PUT /autopilot` merges the given fields into the
   config (`applyAutopilotPatch`) and runs a pass at once when enabled. Enabling, changing the milestone, the tracker
   or the project, or `"restart": true` begins a fresh run (`phase` back to `idle`; `held`, `lastError` and the
-  20-minute quiet back-off cleared). `phase: "done"` stays until then.
+  20-minute quiet back-off cleared). `phase: "done"` stays until then. `POST /autopilot/roadmap/resolve` is the
+  owner's answer to a tracker step that finished without closing its issue (next section).
 - **Which issues** (thread-driven) — Autopilot doesn't choose. It resumes the user's milestone-manager Codex thread
   (`src/bun/codex-thread.ts`: `~/.agetor/bin/codex exec resume <threadId>` in the project, one request at a time) with
   the open issues nobody is working on, what is in flight, and the number of free slots; the thread answers with a
@@ -424,10 +428,40 @@ which is set up (`autopilotLabel` in `src/shared/autopilot.ts`).
   building column (Backlog, Ready, Running, Blocked) to one that holds no slot, a pipeline run blocking, a card
   deleted or archived, and `PUT /autopilot`. Events are coalesced (3 s) and one pass runs at a time. A pass also runs
   30 s after the core starts and every 15 minutes as a fallback.
-- **Sign-off** — each pass moves Autopilot's own cards that are in In Review with a finished run and an open PR to
-  Ready to Merge (the merge queue lands them). A PR whose files match the risky pattern (`RISKY`: billing, Stripe,
-  checkout, subscription, auth, Clerk, session, permission, migrations, Drizzle, the DB schema) — or whose file list
-  can't be read — is left in In Review for the user and remembered in `held`.
+- **Sign-off** (`signOffPass`) — each pass moves Autopilot's own cards that are in In Review with a finished run and
+  an open PR to Ready to Merge (the merge queue lands them), unless the PR changes sensitive product code. Then the
+  card stays in In Review for you, is remembered in `held`, and its timeline names the files ("PR #n changes
+  sensitive code (a.ts, b.sql and 2 more)").
+  - **What is sensitive** (`src/shared/risky-paths.ts`, pure; the lists are exported constants) is decided by path
+    *segment*, never by substring:
+    1. Never: tests, fixtures, recorded data and docs — a directory named `__tests__`, `__mocks__`, `__fixtures__`,
+       `__snapshots__`, `test(s)`, `testdata`, `testing`, `fixture(s)`, `golden(s)`, `snapshots`, `mocks`, `docs`,
+       `doc`, or starting `e2e`; a file `*.test.*`, `*.spec.*`, `*.stories.*`, `*.snap`, `*.golden`, `*_test.<ext>`,
+       `test_*.py`; `*.md` / `*.mdx` / `*.rst`.
+    2. A directory named exactly `billing`, `stripe`, `checkout`, `subscription(s)`, `auth`, `authn`, `authz`,
+       `authentication`, `authorization`, `clerk`, `session(s)`, `permission(s)`, `migration(s)` or `drizzle`
+       (`RISKY_DIRS`). A Next.js route group or dynamic segment counts by its name (`(auth)/` is `auth`); a longer
+       name does not (`permission-denied/` is not `permission`).
+    3. A source file (`SOURCE_EXTENSIONS`) whose name has one of those words, or `authorize`, `rbac`, `roles`
+       (`RISKY_FILE_WORDS`), split on `-`, `_`, `.` and camelCase: `deviceAuth.ts`, `stripe.ts`,
+       `BillingNotice.tsx`, `migrationCheck.ts`. `authoritative.ts` has no such word. Data files (`.json`, `.txt`,
+       `.yaml`) are matched by their directory only.
+    4. `schema.ts`, `db/schema*`, `db/schema/**`, and the request middleware (`middleware.ts`, Next 16's `proxy.ts`).
+  - **Override**: `agetor config autopilot_risky_paths '["apps/web/src/lib/billing/**","**/*.sql"]'` — a JSON array
+    of globs (`**`, `*`, `?`; whole path, case-insensitive) that *replaces* all four rules, exclusions included. An
+    empty or malformed value means the built-in rules; nothing turns the hold off by accident.
+  - **A file list that can't be read is not "risky"** (`unread`): the card is not held and not signed off on that
+    pass, its timeline says so once, and every later pass looks again. The list is read with
+    `gh api --paginate …/pulls/n/files` (every page; `gh pr view --json files` stops at 100 files).
+  - **Holds are decided again** when the PR's head commit or the rules change — otherwise a held card costs no
+    lookup. A card in `held` with nothing in `holds` (held by a build before this one, which matched substrings and
+    also held on failed lookups) is decided again once: if the rules above don't apply, the hold is lifted and the
+    card signed off, with a timeline note; if they do, it gets a note naming the files. A failed lookup never lifts
+    a hold.
+  - **A card you moved is yours.** A held card you drag to Ready to Merge stops being held. A card of Autopilot's
+    that you drag *out* of Ready to Merge (the task PATCH withdraws the sign-off) is recorded in
+    `autopilot_hands_off` and is never signed off by Autopilot again, whatever its PR looks like later — drag it
+    back yourself. Entries go when the card is Done or archived.
 - **Nothing to build** (thread-driven) — one of its cards that finishes with no commits beyond its base and no PR
   while its issue is still open (typically after a `Refs` PR) is moved to Done and the thread is asked what to do with
   the issue: `close` (Agetor closes it with the thread's comment, which must name the owning issues/PRs), `wait` (not
@@ -488,13 +522,44 @@ nothing-to-build decision and no audit: the table decides the order.
   (the app only; the headless daemon has none) and a line in the Needs you strip at the top of the board that opens
   the issue. Closing the issue as completed releases what waits on it — picked up within 5 minutes (tracker order
   also polls GitHub, on top of the triggers above).
-- **Idle, and why**: `idleReason` names what is in the way — your steps, steps that need you, held steps, and with a
-  milestone the unfinished agent steps of *other* milestones that steps in scope wait on ("steps 2 (#12), 3 (#13) of
-  milestone M01 must finish first — run that milestone"; also `blockedOutside`).
+- **Idle, and why**: `idleReason` names what is in the way — your steps, steps that need you, steps whose card
+  waits in In Review for your sign-off, steps held by roadmap problems, and with a milestone the unfinished agent
+  steps of *other* milestones that steps in scope wait on ("steps 2 (#12), 3 (#13) of milestone M01 must finish
+  first — run that milestone"; also `blockedOutside`).
+- **Cards waiting for your sign-off need you too**: a step whose card sits in In Review because its PR changes
+  sensitive code (Sign-off, above), or because you took it back from Ready to Merge, is listed in
+  `state.roadmap.needsUser` with `kind: "held"`, the reason, the files and the PR URL — in `agetor roadmap status`,
+  in the Autopilot dialog and in the Needs you strip (**Open PR**, **Open card**). It is still in flight: its issue
+  stays busy, it is counted under `inFlight` (and `counts.held`), not under `waiting`. When nothing else is running,
+  the roadmap reads as waiting (`phase: "idle"`) and the idle reason says "step 7 (#807) waits in In Review for your
+  sign-off".
 - **No restart loops**: if a step's card finished (Done for more than 3 minutes, or a run with no commits and no PR)
   and the issue is still open, Autopilot doesn't start another and makes no backlog card for it; the step shows under
-  Needs you ("PR #n merged but the issue is still open") until you close the issue or start the work again yourself
-  from the Issues queue.
+  Needs you ("PR #n merged but the issue is still open", `kind: "stuck"`) until you resolve it.
+  - **Why it is open**: for a merged PR the guard reads the PR's description once (`prBody`, kept in
+    `roadmapStuck`) and records what it says about the issue (`prIssueMention` in `src/shared/roadmap.ts`): the
+    `Refs #n` line and what follows it up to the next heading ("PR #n left it open on purpose: “Refs #n — the
+    nightly job is not wired”"), or that the description names neither `Fixes #n` nor `Refs #n`, or that it says
+    `Fixes #n` and closing must have failed. It is shown in the Needs you entry, `agetor roadmap status`, the
+    Autopilot dialog and the card's timeline. The excerpt is text from GitHub: one line, 400 characters at most,
+    control characters, terminal escapes and HTML comments removed (`displayText`), rendered as text and never
+    interpreted.
+  - **Resolving it** — `POST /autopilot/roadmap/resolve {"issue": n, "action": "close" | "redo"}`
+    (`resolveRoadmapStep`), from the Needs you strip (**Resolve…** opens a panel that shows the PR's words first;
+    the two buttons are in that panel) or `agetor roadmap resolve <issue> --close | --redo`:
+    - `close` closes the issue as completed with the comment "Closed by the owner from Agetor: step N of roadmap
+      #T accepted as complete; PR #x merged." and clears the ledger entry; the next pass starts its successors.
+    - `redo` clears the entry and records the step in `roadmapRedo`: the finished card no longer sets off the
+      guard, and the next card for the step (a new one, or its backlog card) gets an "Earlier attempt" part in its
+      step section naming the PR and quoting what it left. A card that found nothing to build is moved to Done
+      first. If the new card also ends with the issue open, the step needs you again.
+    - Both check again when applied — the entry must still be there and the issue still open on GitHub — and
+      answer 409 with the reason otherwise; a double click closes nothing twice. They run between passes and ask
+      for a pass.
+    - **Closing is only ever your request.** No pass, no thread answer and no other loop calls it
+      (`RoadmapDeps` has no way to write to GitHub). The route and the CLI are open to anything that holds the API
+      token, as every other route is — an agent on the board that ran `agetor roadmap resolve … --close` would be
+      closing an issue in your name, so don't put that command in a pipeline's instructions.
 - **Problems** in the table (duplicate step or issue, a predecessor that names no step, a cycle, a malformed row) are
   listed in the dialog and `agetor roadmap status`; the steps they touch are held. A tracker with no usable table
   starts nothing.
@@ -508,12 +573,19 @@ nothing-to-build decision and no audit: the table decides the order.
   `agetor roadmap start --project <dir> [--issue <n>] [--milestone <number|title-prefix|all>] [--max <n>]
   [--pipeline <id|name>]` (`--issue` defaults to the default tracker; `--milestone M01` matches the milestone whose
   title starts with it; none = the whole roadmap), `agetor roadmap status [--json]` (scope, counts incl. backlog
-  cards, needs-you, what waits on other milestones), `agetor roadmap pause` (`src/cli/commands/roadmap.ts`; all go
-  through `GET/PUT /autopilot`).
-- **State**: status, the restart guard, the announced owner steps and the backlog ledger are `roadmap`,
-  `roadmapStuck`, `notifiedHuman` and `roadmapBacklog` in `autopilot_state`. A different tracker drops the first
-  three; a different milestone drops the status; a different project also empties the ledger (the cards stay).
+  cards, needs-you with each PR's stated reason and how to resolve it, what waits on other milestones),
+  `agetor roadmap pause`, `agetor roadmap resolve <issue> --close | --redo` (`src/cli/commands/roadmap.ts`; all go
+  through `GET/PUT /autopilot` and `POST /autopilot/roadmap/resolve`).
+- **State**: status, the restart guard, the steps being done again, the announced owner steps and the backlog
+  ledger are `roadmap`, `roadmapStuck`, `roadmapRedo`, `notifiedHuman` and `roadmapBacklog` in `autopilot_state`. A
+  different tracker drops the first four; a different milestone drops the status; a different project also empties
+  the ledger (the cards stay).
 - **Upgrading**: before this, a tracker made Autopilot ignore `milestone`. A config saved then with both (a
   milestone left from an earlier thread-driven run) has that milestone dropped once, on first start
   (`normalizeLegacyConfig`, marked by `autopilot_config_version`), so a run on the whole roadmap isn't silently
   narrowed; its tracker becomes the default tracker.
+- **Upgrading to segment-based sign-off**: no migration. On the first pass after installing (30 s after the core
+  starts), every card in `held` is decided again under the rules above — one that was held only because a path
+  *contained* a sensitive word, or because its file list couldn't be read, is signed off and moves to Ready to
+  Merge; and each `roadmapStuck` entry gets its PR's stated reason filled in (one `gh pr view` per entry) with a
+  timeline note. Nothing is closed and no card is started by the upgrade itself.
