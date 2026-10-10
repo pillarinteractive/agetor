@@ -385,21 +385,27 @@ So an unattended board keeps going:
 ## Milestone Autopilot (`feat/milestone-autopilot`, `feat/autopilot-events`, `feat/autopilot-run-last`)
 
 `src/bun/autopilot.ts` (the rocket button, `AutopilotDialog.tsx`) works a GitHub milestone to done: it keeps up to
-`maxInFlight` cards building, signs finished ones off for merging and audits the milestone when it empties. It has two
-modes: **milestone** (this section) and **roadmap** (next section). Both share the config, the state, slot accounting,
-card creation, sign-off and triggers described here.
+`maxInFlight` cards building and signs finished ones off for merging. One dialog, two ways to decide the order:
+
+- **Tracker order** — a milestone (the scope) and a tracker issue (the order): the next section. No milestone = the
+  whole roadmap.
+- **Thread-driven** — a milestone and no tracker: the milestone-manager Codex thread picks what starts and audits the
+  milestone when it empties. This section.
+
+Both share the config, the state, slot accounting, sign-off and triggers described here. The rocket's tooltip says
+which is set up (`autopilotLabel` in `src/shared/autopilot.ts`).
 
 - **Config** — `autopilot` preference: `enabled`, `project` (path), `milestone` `{number, title}`, `threadId` (the
-  Codex thread), `maxInFlight` (default 5, 1–10), `pipelineId` (else `default_pipeline`), `roadmap` `{issue}` (set →
-  roadmap mode; `milestone` and `threadId` are then unused).
+  Codex thread), `maxInFlight` (default 5, 1–10), `pipelineId` (else `default_pipeline`), `roadmap` `{issue}` (the
+  tracker; set → tracker order, and `threadId` is unused).
 - **State** — `autopilot_state` preference: `phase` (`idle` / `running` / `auditing` / `done`), `cards` (the cards
   Autopilot started), `held`, `lastAnswer`, `lastError`, the back-offs (`quietUntil`, `limitedUntil`), `noWork`,
-  `waits`, `reworked`, and the roadmap fields. No table, no migration.
-- **API** — `GET /autopilot` → `{config, state}`. `PUT /autopilot` merges the given fields into the config and runs a
-  pass at once when enabled. Enabling, changing the milestone or the roadmap, or `"restart": true` begins a fresh run
-  (`phase` back to `idle`; `held`, `lastError` and the 20-minute quiet back-off cleared). `phase: "done"` stays until
-  then.
-- **Which issues** (milestone mode) — Autopilot doesn't choose. It resumes the user's milestone-manager Codex thread
+  `waits`, `reworked`, and the tracker fields. No table, no migration.
+- **API** — `GET /autopilot` → `{config, state, defaultTracker}`. `PUT /autopilot` merges the given fields into the
+  config (`applyAutopilotPatch`) and runs a pass at once when enabled. Enabling, changing the milestone, the tracker
+  or the project, or `"restart": true` begins a fresh run (`phase` back to `idle`; `held`, `lastError` and the
+  20-minute quiet back-off cleared). `phase: "done"` stays until then.
+- **Which issues** (thread-driven) — Autopilot doesn't choose. It resumes the user's milestone-manager Codex thread
   (`src/bun/codex-thread.ts`: `~/.agetor/bin/codex exec resume <threadId>` in the project, one request at a time) with
   the open issues nobody is working on, what is in flight, and the number of free slots; the thread answers with a
   `<next-issues>[{"number", "scope"}]</next-issues>` block. Each accepted pick becomes a card through
@@ -411,8 +417,9 @@ card creation, sign-off and triggers described here.
 - **Slots** (`src/shared/autopilot.ts`, shared with the dialog's count) — a card holds one of the `maxInFlight` slots
   only while it is progressing: in Backlog / Ready / Running, its run not blocked, no question or permission card
   pending, not paused on a usage limit. Cards in Blocked, In Review, Ready to Merge and Done hold none. An issue with
-  any live card is never started twice. Independently, the `step_slots` preference limits how many pipeline steps run
-  at once on the machine, so cards Autopilot starts may sit queued for a step slot.
+  any live card is never started twice. The one exception is tracker order's never-started backlog cards (next
+  section), which hold no slot. Independently, the `step_slots` preference limits how many pipeline steps run at once
+  on the machine, so cards Autopilot starts may sit queued for a step slot.
 - **Triggers** — passes are event-driven (`startAutopilot`, `freesSlot`): a card reaching Done or moving from a
   building column (Backlog, Ready, Running, Blocked) to one that holds no slot, a pipeline run blocking, a card
   deleted or archived, and `PUT /autopilot`. Events are coalesced (3 s) and one pass runs at a time. A pass also runs
@@ -421,42 +428,92 @@ card creation, sign-off and triggers described here.
   Ready to Merge (the merge queue lands them). A PR whose files match the risky pattern (`RISKY`: billing, Stripe,
   checkout, subscription, auth, Clerk, session, permission, migrations, Drizzle, the DB schema) — or whose file list
   can't be read — is left in In Review for the user and remembered in `held`.
-- **Nothing to build** — one of its cards that finishes with no commits beyond its base and no PR while its issue is
-  still open (typically after a `Refs` PR) is moved to Done and the thread is asked what to do with the issue: `close` (Agetor
-  closes it with the thread's comment, which must name the owning issues/PRs), `wait` (not started again until the
-  named issues close) or `rework` (one new card with the thread's scope — once per issue).
-- **Audit** — when the milestone has no open issues, none of Autopilot's cards is unfinished and no live card on the
-  board is linked to an issue, the thread is asked for a deep audit (up to 90 minutes) and told to file what it finds
-  into the milestone. Open issues afterwards → the loop continues; none → `phase: "done"`.
+- **Nothing to build** (thread-driven) — one of its cards that finishes with no commits beyond its base and no PR
+  while its issue is still open (typically after a `Refs` PR) is moved to Done and the thread is asked what to do with
+  the issue: `close` (Agetor closes it with the thread's comment, which must name the owning issues/PRs), `wait` (not
+  started again until the named issues close) or `rework` (one new card with the thread's scope — once per issue).
+- **Audit** (thread-driven) — when the milestone has no open issues, none of Autopilot's cards is unfinished and no
+  live card on the board is linked to an issue, the thread is asked for a deep audit (up to 90 minutes) and told to
+  file what it finds into the milestone. Open issues afterwards → the loop continues; none → `phase: "done"`.
 
-## Roadmap mode (`feat/roadmap-autopilot`)
+## Roadmap mode: a tracker for the order (`feat/roadmap-autopilot`)
 
-Autopilot can work a **roadmap** instead of a milestone (`roadmapPass` in `src/bun/autopilot.ts`): a tracker issue
-whose body has a `## Numbered completion order` section with one table — `Step | Task and outcome | Milestone |
-Predecessor steps`, each task written `#123 Title`. Step ids are strings (`78.1` sits between 78 and 79), predecessors
-name steps, and a title starting `[Human]` is yours to do. No Codex thread is involved, so there is no scope
-clarification, no nothing-to-build decision and no audit: the table decides the order, and the run is done when every
-step is complete or declined.
+With a **tracker issue** set, the order comes from that issue instead of the thread (`roadmapPass` in
+`src/bun/autopilot.ts`): its body has a section whose heading contains "completion order", holding one table —
+`Step | Task and outcome | Milestone | Predecessor steps`, each task written `#123 Title`. Step ids are strings
+(`78.1` sits between 78 and 79), predecessors name steps or their issues, and a step is yours to do when its title
+starts `[Human]` or its milestone column is `H`. No Codex thread is involved, so there is no scope clarification, no
+nothing-to-build decision and no audit: the table decides the order.
 
 - **Rules** (`src/shared/roadmap.ts`, pure): a step is *complete* when its issue is closed as completed, *declined*
   when closed any other way (a no-go: unlocks nothing, never started), *ready* when open with every predecessor
-  complete. Each pass reads the tracker and every step's issue state (`src/bun/roadmap-fetch.ts`) and starts the
-  ready agent steps in step order, up to `maxInFlight`, through the same card creation, slot accounting, usage-limit
-  hold and Ready to Merge sign-off as milestone mode. The card's prompt names its step, the tracker and its
-  predecessors' issues, and repeats the `Fixes` / `Refs` rule — a step only closes (and unlocks the next) when its
-  merged PR says `Fixes #n`.
-- **Yours**: ready `[Human]` steps are never given to an agent. Each gets one native notification (the app only; the
-  headless daemon has none) and a line in the Needs you strip at the top of the board that opens the issue. Closing
-  the issue as completed releases what waits on it — picked up within 5 minutes (roadmap mode also polls GitHub, on
-  top of the triggers above).
+  complete. Each pass reads the tracker and every step's issue — state, URL and GitHub milestone in one batched GraphQL
+  query per 100 issues (`src/bun/roadmap-fetch.ts`) — and starts the ready agent steps in step order, up to
+  `maxInFlight`, with the same slot accounting, usage-limit hold and Ready to Merge sign-off as above. The card's
+  prompt names its step, the tracker and its predecessors' issues, and repeats the `Fixes` / `Refs` rule — a step only
+  closes (and unlocks the next) when its merged PR says `Fixes #n`.
+- **Scope: the milestone.** With a milestone chosen, only the steps *whose issue is in that GitHub milestone* are
+  worked (`roadmapScope`) — the issue's real milestone, not the table's milestone column, so the scope is what GitHub
+  shows. Where the two disagree the step is listed under the roadmap problems (`milestone-mismatch`); only an issue
+  whose state couldn't be read falls back to comparing the table's code with the code the milestone title starts with
+  (`M01 — …`, `X07 · …`, `H — …`). Steps outside the milestone still gate readiness; this run never starts them.
+  `phase: "done"` when every step in the milestone is complete or declined; a milestone none of the roadmap's issues
+  is in is an error, not "done". No milestone ("All milestones") works the whole roadmap, as before.
+- **Backlog cards up front** (with a milestone). Every pass makes a card in the Backlog for each open step in scope
+  that has no live card — the owner's steps too — without starting it, so a step added to the milestone later gets
+  its card as well. Making a card (`createTaskFromIssue` with `start: false`) reads the issue thread from GitHub once,
+  runs a few read-only `git rev-parse`, inserts the task row, records its base branch and writes the thread snapshot
+  under `<dataDir>/issue-threads/<id>/`. No worktree, no branch, no `worktree_setup` command, no agent session and no
+  write to GitHub happens until the card starts. The cards are remembered in `roadmapBacklog` (issue → card id),
+  saved after each one.
+  - A never-started backlog card holds **no slot** and doesn't make its issue busy (`neverStarted`; `slotCounts`'
+    `noSlot` / `notBusy`). When its step is ready and a slot is free, Autopilot **starts that card** — its step
+    section rewritten for the roadmap as it is then (`withRoadmapStepPrompt`) — instead of making another.
+  - Each card says why it waits (`roadmapCardLine`, shown through `cardStatus`): "Step 7 · waits on steps 3 (#808),
+    4 (#809)", "Step 7 · ready — waiting for a slot", "Step 5 · yours to do — open the issue". This is the status
+    line only — `card_dependencies` is not used, because `dependencyTick` would start the card on "PR merged",
+    past the slot limit and the issue-closed rule.
+  - **Owner's cards** are never started by Autopilot and take no slot. Nothing else starts them either (no
+    dependency entry, no suggestion rule, no merge-queue or auto-issue path touches an unstarted card). Starting one
+    by hand is your call: Autopilot then leaves it alone (no sign-off). An agent step's card started by hand is
+    followed like any card Autopilot started.
+  - An issue that closes (completed or not planned) before its card ever started: the card is moved to Done with an
+    activity note.
+  - **Pausing** leaves the backlog cards alone. **Switching milestone** too: the previous milestone's unstarted cards
+    stay in the Backlog, untouched and never started by the new run (they hold no slot); switching back picks them up
+    again. In thread-driven mode leftovers hold no slot either, but their issues stay busy — archive or start them
+    first if the thread should work those issues.
+- **Yours**: ready owner steps are never given to an agent. With a milestone, the ones raised are those in it plus
+  those outside it that a step in it waits on, directly or through other steps. Each gets one native notification
+  (the app only; the headless daemon has none) and a line in the Needs you strip at the top of the board that opens
+  the issue. Closing the issue as completed releases what waits on it — picked up within 5 minutes (tracker order
+  also polls GitHub, on top of the triggers above).
+- **Idle, and why**: `idleReason` names what is in the way — your steps, steps that need you, held steps, and with a
+  milestone the unfinished agent steps of *other* milestones that steps in scope wait on ("steps 2 (#12), 3 (#13) of
+  milestone M01 must finish first — run that milestone"; also `blockedOutside`).
 - **No restart loops**: if a step's card finished (Done for more than 3 minutes, or a run with no commits and no PR)
-  and the issue is still open, Autopilot doesn't start another; the step shows under Needs you ("PR #n merged but the
-  issue is still open") until you close the issue or start the work again yourself from the Issues queue.
+  and the issue is still open, Autopilot doesn't start another and makes no backlog card for it; the step shows under
+  Needs you ("PR #n merged but the issue is still open") until you close the issue or start the work again yourself
+  from the Issues queue.
 - **Problems** in the table (duplicate step or issue, a predecessor that names no step, a cycle, a malformed row) are
   listed in the dialog and `agetor roadmap status`; the steps they touch are held. A tracker with no usable table
   starts nothing.
-- **Use**: Autopilot dialog → Work from **Roadmap** → tracker issue number, or
-  `agetor roadmap start --project <dir> --issue <n> [--max <n>] [--pipeline <id|name>]`, `agetor roadmap status
-  [--json]`, `agetor roadmap pause` (`src/cli/commands/roadmap.ts`; all three go through `GET/PUT /autopilot`). Config
-  is `roadmap: {"issue": n}` in the `autopilot` preference; status, the restart guard and the announced human steps
-  are `roadmap`, `roadmapStuck` and `notifiedHuman` in `autopilot_state`, dropped when the roadmap changes.
+- **Only this project's cards count**: in tracker order, slots and busy issues are counted among cards whose project
+  is Autopilot's — issue #12 of another repository is another issue.
+- **Default tracker**: the dialog's Tracker issue field shows the configured tracker, else the
+  `autopilot_default_tracker` preference — the last tracker saved (`PUT /autopilot` with a `roadmap`), or set alone
+  with `{"defaultTracker": n}` (`null` forgets it). Clearing the field before Start turns tracker order off (the
+  thread decides); the default stays to be offered next time.
+- **Use**: Autopilot dialog → Milestone (or "All milestones") and Tracker issue, or
+  `agetor roadmap start --project <dir> [--issue <n>] [--milestone <number|title-prefix|all>] [--max <n>]
+  [--pipeline <id|name>]` (`--issue` defaults to the default tracker; `--milestone M01` matches the milestone whose
+  title starts with it; none = the whole roadmap), `agetor roadmap status [--json]` (scope, counts incl. backlog
+  cards, needs-you, what waits on other milestones), `agetor roadmap pause` (`src/cli/commands/roadmap.ts`; all go
+  through `GET/PUT /autopilot`).
+- **State**: status, the restart guard, the announced owner steps and the backlog ledger are `roadmap`,
+  `roadmapStuck`, `notifiedHuman` and `roadmapBacklog` in `autopilot_state`. A different tracker drops the first
+  three; a different milestone drops the status; a different project also empties the ledger (the cards stay).
+- **Upgrading**: before this, a tracker made Autopilot ignore `milestone`. A config saved then with both (a
+  milestone left from an earlier thread-driven run) has that milestone dropped once, on first start
+  (`normalizeLegacyConfig`, marked by `autopilot_config_version`), so a run on the whole roadmap isn't silently
+  narrowed; its tracker becomes the default tracker.
