@@ -6,7 +6,8 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { api, ApiError, type AutopilotConfigDto, type AutopilotStateDto } from "@/lib/api";
 import type { GitHubRepoMilestone, Project, Task } from "../../../shared/types.ts";
-import { holdsAutopilotSlot, waitingOnQuota } from "../../../shared/autopilot.ts";
+import { autopilotMode, holdsAutopilotSlot, waitingOnQuota } from "../../../shared/autopilot.ts";
+import { currentRoadmapStatus } from "../../../shared/roadmap.ts";
 
 const TITLE_ID = "autopilot-dialog-title";
 const DEFAULT_THREAD = "01a107c4-1e3c-7890-baad-752584bc2688";
@@ -23,11 +24,19 @@ const ROADMAP_PHASE: Record<AutopilotStateDto["phase"], string> = {
   auditing: "Working the roadmap",
   done: "Roadmap done — every step is complete or declined",
 };
+const SCOPED_PHASE: Record<AutopilotStateDto["phase"], string> = {
+  idle: "Waiting — nothing in this milestone can start",
+  running: "Working the milestone in the tracker's order",
+  auditing: "Working the milestone in the tracker's order",
+  done: "Milestone done — every step in it is complete or declined",
+};
 
-/** Milestone Autopilot (src/bun/autopilot.ts): pick a milestone and the
- *  milestone-manager Codex thread; Agetor works it to done, then audits.
- *  Or pick Roadmap and a tracker issue: its numbered step table gives the
- *  order and no thread is involved (src/shared/roadmap.ts). */
+/** Autopilot (src/bun/autopilot.ts): pick a milestone — the scope — and a
+ *  tracker issue, whose numbered step table gives the order
+ *  (src/shared/roadmap.ts): every open step of the milestone gets a card in
+ *  the Backlog, started when its predecessors are complete. No milestone =
+ *  the whole roadmap. With no tracker, the milestone-manager Codex thread
+ *  picks the order instead, and audits the milestone when it empties. */
 export function AutopilotDialog({ open, projects, tasks, onClose }: { open: boolean; projects: Project[]; tasks: Task[]; onClose: () => void }) {
   const [config, setConfig] = useState<AutopilotConfigDto | null>(null);
   const [state, setState] = useState<AutopilotStateDto | null>(null);
@@ -39,7 +48,10 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
     void api
       .getAutopilot()
       .then((r) => {
-        const next = { ...r.config, threadId: r.config.threadId || DEFAULT_THREAD, project: r.config.project || projects[0]?.path || "" };
+        // No tracker configured: offer the default one (the last one saved).
+        // Clearing the field before Start turns tracker ordering off.
+        const roadmap = r.config.roadmap ?? (!r.config.enabled && r.defaultTracker ? { issue: r.defaultTracker } : null);
+        const next = { ...r.config, roadmap, threadId: r.config.threadId || DEFAULT_THREAD, project: r.config.project || projects[0]?.path || "" };
         // A periodic refresh mustn't undo what's being set up while paused.
         setConfig((cur) => (refresh && cur && !cur.enabled && !r.config.enabled ? cur : next));
         setState(r.state);
@@ -87,7 +99,7 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
     setError(null);
     try {
       const r = await api.setAutopilot({ ...config, ...patch });
-      setConfig(r.config);
+      setConfig({ ...r.config, threadId: r.config.threadId || DEFAULT_THREAD });
       setState(r.state);
     } catch (e) {
       setError(e instanceof ApiError || e instanceof Error ? e.message : String(e));
@@ -102,11 +114,13 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
   const inFlight = mine.filter((t) => holdsAutopilotSlot(t));
   const quotaWaiting = mine.filter((t) => t.archivedAt == null && waitingOnQuota(t.pipelineRun)).length;
   const done = mine.filter((t) => t.column === "done").length;
-  const roadmapMode = !!config.roadmap;
-  const ready = !!config.project && (roadmapMode ? config.roadmap!.issue > 0 : !!config.threadId && !!config.milestone);
-  // The status of the roadmap that's configured now, not of an earlier one.
-  const roadmap = roadmapMode && state?.roadmap?.issue === config.roadmap!.issue ? state.roadmap : null;
-  const phases = roadmapMode ? ROADMAP_PHASE : PHASE;
+  const mode = autopilotMode(config);
+  const roadmapMode = mode === "tracker" || mode === "tracker-milestone";
+  const ready = !!config.project && (roadmapMode || (!!config.threadId && !!config.milestone));
+  // The status of the run that's configured now, not of another tracker's or
+  // another milestone's.
+  const roadmap = currentRoadmapStatus(config, state?.roadmap);
+  const phases = mode === "tracker-milestone" ? SCOPED_PHASE : roadmapMode ? ROADMAP_PHASE : PHASE;
 
   return createPortal(
     <Dialog open onClose={onClose} labelledBy={TITLE_ID} className="flex w-full max-w-xl flex-col p-0">
@@ -114,7 +128,7 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
         <header className="flex items-start justify-between gap-3 border-b border-border/60 p-3">
           <div id={TITLE_ID} className="flex items-center gap-2 text-sm font-semibold">
             <Rocket className="size-4 shrink-0 text-muted-foreground" />
-            Milestone Autopilot
+            Autopilot
           </div>
           <Button variant="ghost" size="icon" onClick={onClose} aria-label="Close">
             <X className="size-4" />
@@ -136,37 +150,10 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
               ))}
             </select>
           </label>
-          <div className="flex flex-col gap-1">
-            <span className="text-muted-foreground">Work from</span>
-            <div className="flex gap-1" role="group" aria-label="Work from" data-testid="autopilot-mode">
-              <Button
-                type="button"
-                size="sm"
-                variant={roadmapMode ? "outline" : "secondary"}
-                aria-pressed={!roadmapMode}
-                disabled={config.enabled}
-                onClick={() => setConfig({ ...config, roadmap: null })}
-                className="h-7 px-2 text-xs"
-              >
-                Milestone
-              </Button>
-              <Button
-                type="button"
-                size="sm"
-                variant={roadmapMode ? "secondary" : "outline"}
-                aria-pressed={roadmapMode}
-                disabled={config.enabled}
-                onClick={() => setConfig({ ...config, roadmap: config.roadmap ?? { issue: 0 } })}
-                className="h-7 px-2 text-xs"
-              >
-                Roadmap
-              </Button>
-            </div>
-          </div>
-          {!roadmapMode && (
           <label className="flex flex-col gap-1">
             <span className="text-muted-foreground">Milestone</span>
             <select
+              data-testid="autopilot-milestone"
               value={config.milestone?.number ?? ""}
               disabled={config.enabled}
               onChange={(e) => {
@@ -175,7 +162,11 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
               }}
               className="h-8 rounded-md border border-border bg-background px-2"
             >
-              <option value="">Choose a milestone…</option>
+              <option value="">{roadmapMode ? "All milestones — the whole roadmap" : "Choose a milestone…"}</option>
+              {/* The configured milestone stays listed once GitHub closes it. */}
+              {config.milestone && !milestones.some((m) => m.number === config.milestone!.number) && (
+                <option value={config.milestone.number}>{config.milestone.title}</option>
+              )}
               {milestones.map((m) => (
                 <option key={m.number} value={m.number}>
                   {m.title} — {m.openIssues} open
@@ -183,33 +174,23 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
               ))}
             </select>
           </label>
-          )}
           <div className="flex gap-3">
-            {roadmapMode ? (
-              <label className="flex flex-1 flex-col gap-1">
-                <span className="text-muted-foreground">Tracker issue (the one with the “Numbered completion order” table)</span>
-                <Input
-                  type="number"
-                  min={1}
-                  data-testid="autopilot-roadmap-issue"
-                  value={config.roadmap!.issue || ""}
-                  disabled={config.enabled}
-                  placeholder="Issue number"
-                  onChange={(e) => setConfig({ ...config, roadmap: { issue: Math.max(0, Math.floor(Number(e.target.value)) || 0) } })}
-                  className="h-8"
-                />
-              </label>
-            ) : (
-              <label className="flex flex-1 flex-col gap-1">
-                <span className="text-muted-foreground">Codex thread (milestone manager)</span>
-                <Input
-                  value={config.threadId}
-                  disabled={config.enabled}
-                  onChange={(e) => setConfig({ ...config, threadId: e.target.value.replace(/^codex:\/\/threads\//, "").trim() })}
-                  className="h-8 font-mono text-[11px]"
-                />
-              </label>
-            )}
+            <label className="flex flex-1 flex-col gap-1">
+              <span className="text-muted-foreground">Tracker issue (its “completion order” table gives the order)</span>
+              <Input
+                type="number"
+                min={1}
+                data-testid="autopilot-roadmap-issue"
+                value={config.roadmap?.issue || ""}
+                disabled={config.enabled}
+                placeholder="None — the Codex thread picks"
+                onChange={(e) => {
+                  const issue = Math.max(0, Math.floor(Number(e.target.value)) || 0);
+                  setConfig({ ...config, roadmap: issue > 0 ? { issue } : null });
+                }}
+                className="h-8"
+              />
+            </label>
             <label className="flex w-24 flex-col gap-1">
               <span className="text-muted-foreground">In flight</span>
               <Input
@@ -222,6 +203,18 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
               />
             </label>
           </div>
+          {!roadmapMode && (
+            <label className="flex flex-col gap-1">
+              <span className="text-muted-foreground">Codex thread (milestone manager) — used when there is no tracker</span>
+              <Input
+                data-testid="autopilot-thread"
+                value={config.threadId}
+                disabled={config.enabled}
+                onChange={(e) => setConfig({ ...config, threadId: e.target.value.replace(/^codex:\/\/threads\//, "").trim() })}
+                className="h-8 font-mono text-[11px]"
+              />
+            </label>
+          )}
 
           {state && (
             <div className="rounded-md border border-border/60 bg-muted/30 p-2" data-testid="autopilot-status">
@@ -229,9 +222,11 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
               {roadmap && (
                 <div className="mt-1" data-testid="autopilot-roadmap-status">
                   <div>
-                    {roadmap.counts.complete} of {roadmap.counts.total} steps complete · {roadmap.counts.inFlight} in flight · {roadmap.counts.ready} ready ·{" "}
-                    {roadmap.counts.waiting} waiting
+                    {roadmap.counts.complete} of {roadmap.counts.total} steps complete
+                    {roadmap.scope && ` (of ${roadmap.scope.roadmapTotal} in roadmap #${roadmap.issue})`} · {roadmap.counts.inFlight} in flight ·{" "}
+                    {roadmap.counts.ready} ready · {roadmap.counts.waiting} waiting
                     {roadmap.counts.declined > 0 && ` · ${roadmap.counts.declined} declined`}
+                    {(roadmap.counts.backlog ?? 0) > 0 && ` · ${roadmap.counts.backlog} card${roadmap.counts.backlog === 1 ? "" : "s"} in the backlog`}
                   </div>
                   {roadmap.idleReason && <div className="mt-1 text-warning">{roadmap.idleReason}</div>}
                   {roadmap.humanReady.length > 0 && (
@@ -245,6 +240,12 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
                       Step {s.step} · #{s.issue}: {s.reason}
                     </div>
                   ))}
+                  {(roadmap.blockedOutside ?? []).length > 0 && (
+                    <div className="mt-1" data-testid="autopilot-blocked-outside">
+                      <span className="text-muted-foreground">Waits on other milestones: </span>
+                      {(roadmap.blockedOutside ?? []).map((s) => `${s.step} · #${s.issue} (${s.milestone || "no milestone"})`).join("; ")}
+                    </div>
+                  )}
                   {roadmap.nextWaiting.length > 0 && (
                     <details className="mt-1">
                       <summary className="cursor-pointer text-muted-foreground">Next waiting steps</summary>
@@ -290,6 +291,13 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
                 </details>
               )}
             </div>
+          )}
+          {mode === "tracker-milestone" && (
+            <p className="text-muted-foreground">
+              Every open step whose issue is in this milestone gets a card in the Backlog. Steps of other milestones still
+              gate the order but are never started by this run; cards another milestone left in the Backlog stay there,
+              untouched.
+            </p>
           )}
           {roadmapMode ? (
           <p className="text-muted-foreground">

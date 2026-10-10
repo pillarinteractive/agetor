@@ -1,9 +1,18 @@
 import { createContext, useContext } from "react";
 import type { ProgressCounts, TaskProgress } from "../../shared/types.ts";
+import type { RoadmapCardInfo } from "../../shared/roadmap.ts";
 
 /** Every card's live run progress (src/bun/progress-watch.ts), provided once
  *  by App.tsx so cards and the run view read it without prop threading. */
 export const ProgressContext = createContext<TaskProgress[]>([]);
+
+/** What Autopilot's roadmap says about each never-started backlog card
+ *  (src/mainview/lib/card-status.ts `roadmapCardInfo`), by card id. */
+export const RoadmapCardsContext = createContext<Map<string, RoadmapCardInfo>>(new Map());
+
+export function useRoadmapCard(taskId: string): RoadmapCardInfo | null {
+  return useContext(RoadmapCardsContext).get(taskId) ?? null;
+}
 
 export function useTaskProgress(taskId: string): TaskProgress[] {
   return useContext(ProgressContext).filter((p) => p.taskId === taskId);

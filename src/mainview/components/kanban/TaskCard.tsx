@@ -14,7 +14,7 @@ import { useTaskLeaseInfo } from "@/lib/leases";
 import { prBadge, useTaskPr } from "@/lib/prs";
 import { cardStatus } from "@/lib/card-status";
 import { ordinal } from "../../../shared/block-reason.ts";
-import { progressFraction, progressLine, useTaskProgress } from "@/lib/progress";
+import { progressFraction, progressLine, useRoadmapCard, useTaskProgress } from "@/lib/progress";
 import { blockerColor, prNumberFromUrl, shortCardName, splitCardTitle } from "@/lib/card-names";
 
 // The theme's --destructive is a dark fill meant for buttons (30% lightness
@@ -60,7 +60,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
   // Live lab/E2E run progress in this card's checkout (src/bun/progress-watch.ts).
   const progress = useTaskProgress(task.id);
   // One plain sentence: what the card is doing, or what it's waiting on.
-  const status = cardStatus(task, { pr, lease, now: Date.now(), progressActive: progress.some((p) => p.active) });
+  const status = cardStatus(task, { pr, lease, now: Date.now(), progressActive: progress.some((p) => p.active), roadmap: useRoadmapCard(task.id) });
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: task.id,
     // Archived cards are immutable until unarchived — block drag-to-column so

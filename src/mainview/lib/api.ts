@@ -100,8 +100,16 @@ export interface AutopilotConfigDto {
   milestone: { number: number; title: string } | null;
   maxInFlight: number;
   pipelineId: string | null;
-  /** Roadmap mode: the tracker issue; milestone and thread aren't used. */
+  /** Tracker mode: the tracker issue whose step table gives the order. The
+   *  thread isn't used; `milestone` limits which steps are worked (null =
+   *  the whole roadmap). */
   roadmap: { issue: number } | null;
+}
+export interface AutopilotDto {
+  config: AutopilotConfigDto;
+  state: AutopilotStateDto;
+  /** The tracker issue offered when none is configured (the last one saved). */
+  defaultTracker?: number | null;
 }
 export interface AutopilotStateDto {
   phase: "idle" | "running" | "auditing" | "done";
@@ -505,9 +513,9 @@ export const api = {
   setBlockedBy: (taskId: string, ids: string[]) =>
     j<{ blockedBy: unknown[] }>(`/tasks/${encodeURIComponent(taskId)}/blocked-by`, { method: "PUT", body: JSON.stringify({ ids }) }, { retry: false }),
   /** Send a merge train now (src/bun/merge-queue.ts `departTrainNow`). */
-  getAutopilot: () => j<{ config: AutopilotConfigDto; state: AutopilotStateDto }>("/autopilot"),
-  setAutopilot: (patch: Partial<AutopilotConfigDto> & { restart?: boolean }) =>
-    j<{ config: AutopilotConfigDto; state: AutopilotStateDto }>("/autopilot", { method: "PUT", body: JSON.stringify(patch) }, { retry: false }),
+  getAutopilot: () => j<AutopilotDto>("/autopilot"),
+  setAutopilot: (patch: Partial<AutopilotConfigDto> & { restart?: boolean; defaultTracker?: number | null }) =>
+    j<AutopilotDto>("/autopilot", { method: "PUT", body: JSON.stringify(patch) }, { retry: false }),
   refreshMergeQueue: () => j<{ ok: true }>("/merge-queue/refresh", { method: "POST" }, { retry: false }),
   departMergeTrain: () =>
     j<{ train: { pr: number; url: string; members: number[] } }>("/merge-train/depart", { method: "POST" }, { retry: false }),

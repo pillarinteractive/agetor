@@ -38,7 +38,9 @@ import { parseIssueUrl } from "../shared/issue-task.ts";
 import { isPipelineColumnRunnerOwned } from "../shared/pipeline.ts";
 import { LeaseContext } from "@/lib/leases";
 import { PrContext } from "@/lib/prs";
-import { ProgressContext } from "@/lib/progress";
+import { ProgressContext, RoadmapCardsContext } from "@/lib/progress";
+import { roadmapCardInfo } from "@/lib/card-status";
+import { autopilotLabel } from "../shared/autopilot.ts";
 import { IssuesPage } from "@/components/issues/IssuesPage";
 import { AutopilotDialog } from "@/components/kanban/AutopilotDialog";
 import { NeedsYouBar } from "@/components/kanban/NeedsYouBar";
@@ -1577,6 +1579,25 @@ function AppInner() {
     [],
   );
   const [autopilotOpen, setAutopilotOpen] = useState(false);
+  // Autopilot's config and last status (src/bun/autopilot.ts): the rocket's
+  // tooltip says what it works from, and the roadmap's never-started backlog
+  // cards say what they wait on. Refetched when a card moves (a pass
+  // follows), when the dialog closes, and once a minute.
+  const [autopilot, setAutopilot] = useState<Awaited<ReturnType<typeof api.getAutopilot>> | null>(null);
+  const autopilotKey = useMemo(() => tasks.map((t) => `${t.id}:${t.column}`).join(","), [tasks]);
+  useEffect(() => {
+    let alive = true;
+    const load = () => void api.getAutopilot().then((a) => alive && setAutopilot(a)).catch(() => {});
+    load();
+    const soon = setTimeout(load, 10_000);
+    const timer = setInterval(load, 60_000);
+    return () => {
+      alive = false;
+      clearTimeout(soon);
+      clearInterval(timer);
+    };
+  }, [autopilotKey, autopilotOpen]);
+  const roadmapCards = useMemo(() => roadmapCardInfo(autopilot), [autopilot]);
   // Board header toggle: hold `caffeinate -d` (src/bun/keep-awake.ts).
   const [keepScreenOn, setKeepScreenOn] = useState(false);
   useEffect(() => {
@@ -2199,8 +2220,8 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
             size="icon"
             data-testid="autopilot-button"
             onClick={() => setAutopilotOpen(true)}
-            aria-label="Milestone Autopilot"
-            title="Milestone Autopilot"
+            aria-label="Autopilot"
+            title={autopilotLabel(autopilot?.config)}
           >
             <Rocket className="size-4" />
           </Button>
@@ -2248,6 +2269,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
       </header>
       <div className="flex min-h-0 flex-1">
         <ProgressContext.Provider value={progress}>
+        <RoadmapCardsContext.Provider value={roadmapCards}>
         <main className="flex min-w-0 flex-1 flex-col">
           {/* Chrome that stays mounted regardless of `view` (D5,
               docs/plans/pipelines.md): update/tmux banners and the global
@@ -2472,6 +2494,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
             )}
           </AnimatePresence>
         </main>
+        </RoadmapCardsContext.Provider>
         </ProgressContext.Provider>
       </div>
       <BlockedByDialog task={blockedByTask} tasks={tasks} onClose={() => setBlockedByTask(null)} />
