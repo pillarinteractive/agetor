@@ -74,9 +74,11 @@ Commands:
   blocks [--days N]   what pipelines block on, most frequent first
   depends <id> [<dep>…|--clear]  card <id> is blocked by those cards
   roadmap <sub>       status | start --project <dir> [--issue <n>] [--milestone <n|title|all>]
-                      [--max <n>] [--pipeline <p>] | pause:
+                      [--max <n>] [--pipeline <p>] | pause | resolve <issue> --close|--redo:
                       Autopilot in the order of a tracker issue's step table, for one
-                      milestone (a Backlog card per open step) or the whole roadmap
+                      milestone (a Backlog card per open step) or the whole roadmap.
+                      resolve answers a step whose PR merged but left its issue open:
+                      --close accepts it (closes the issue), --redo does it again
   help                show this help
 
 Global options:

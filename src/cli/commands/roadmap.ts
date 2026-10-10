@@ -4,7 +4,7 @@ import { flagValue } from "../args.ts";
 import { getClient, type Flags } from "../context.ts";
 import { c, out, printJson } from "../output.ts";
 import { matchPipelineRef } from "../../shared/pipeline.ts";
-import { currentRoadmapStatus, type RoadmapStatus } from "../../shared/roadmap.ts";
+import { currentRoadmapStatus, displayText, type RoadmapStatus } from "../../shared/roadmap.ts";
 import type { GitHubRepoMilestone } from "../../shared/types.ts";
 
 /**
@@ -13,6 +13,13 @@ import type { GitHubRepoMilestone } from "../../shared/types.ts";
  *   agetor roadmap status [--json]
  *   agetor roadmap start --project <dir> [--issue <n>] [--milestone <number|title-prefix|all>] [--max <n>] [--pipeline <id|name>]
  *   agetor roadmap pause
+ *   agetor roadmap resolve <issue> --close | --redo
+ *
+ * `resolve` answers a step whose card finished while its issue stayed open
+ * (listed under "Needs you" by `status`, with what the merged PR said):
+ * `--close` closes the issue as completed so its successors start, `--redo`
+ * has Autopilot start a fresh card for the step. It is the owner's call —
+ * nothing runs it automatically.
  *
  * `--issue` defaults to the default tracker (the last one saved). With
  * `--milestone`, only the steps whose issue is in that GitHub milestone are
@@ -20,7 +27,7 @@ import type { GitHubRepoMilestone } from "../../shared/types.ts";
  * whole roadmap. Everything goes through GET/PUT /autopilot.
  */
 const USAGE =
-  "usage: agetor roadmap status | start --project <dir> [--issue <n>] [--milestone <number|title-prefix|all>] [--max <n>] [--pipeline <id|name>] | pause";
+  "usage: agetor roadmap status | start --project <dir> [--issue <n>] [--milestone <number|title-prefix|all>] [--max <n>] [--pipeline <id|name>] | pause | resolve <issue> --close|--redo";
 
 interface AutopilotDto {
   config: {
@@ -90,6 +97,25 @@ export function matchMilestoneRef(milestones: Pick<GitHubRepoMilestone, "number"
   return { ok: false, error: `no open milestone matches "${ref}"${milestones.length ? ` — there ${milestones.length === 1 ? "is" : "are"}: ${milestones.map((m) => `"${m.title}" (${m.number})`).join(", ")}` : ""}` };
 }
 
+/** Text that came from GitHub, safe for a terminal: one line, no escapes. */
+const plain = (s: string) => displayText(s, 600);
+
+/** `resolve <issue> --close|--redo`. Pure; exported for tests. */
+export function parseRoadmapResolveArgs(args: string[]): { issue: number; action: "close" | "redo" } {
+  let issue: number | null = null;
+  let action: "close" | "redo" | null = null;
+  for (const a of args) {
+    if (a === "--close" || a === "--redo") {
+      if (action) throw new Error(`'resolve' takes one of --close or --redo\n${USAGE}`);
+      action = a === "--close" ? "close" : "redo";
+    } else if (/^#?\d+$/.test(a) && issue == null) issue = Number(a.replace(/^#/, ""));
+    else throw new Error(`unknown argument '${a}'\n${USAGE}`);
+  }
+  if (!issue) throw new Error(`'resolve' needs the step's issue number\n${USAGE}`);
+  if (!action) throw new Error(`'resolve' needs --close (accept the step, close the issue) or --redo (do the step again)\n${USAGE}`);
+  return { issue, action };
+}
+
 /** The human-readable status. Pure; exported for tests. */
 export function roadmapStatusLines(a: AutopilotDto): string[] {
   const { config, state } = a;
@@ -107,14 +133,22 @@ export function roadmapStatusLines(a: AutopilotDto): string[] {
   if (!s) return state.lastError ? lines : [...lines, c.dim("  no status yet — the first pass hasn't finished")];
   const n = s.counts;
   lines.push(
-    `  ${n.complete}/${n.total} complete · ${n.inFlight} in flight · ${n.ready} ready · ${n.waiting} waiting · ${n.declined} declined · ${n.backlog ?? 0} in the backlog` +
+    `  ${n.complete}/${n.total} complete · ${n.inFlight} in flight${n.held ? ` (${n.held} held for your sign-off)` : ""} · ${n.ready} ready · ${n.waiting} waiting · ${n.declined} declined · ${n.backlog ?? 0} in the backlog` +
       c.dim(`  (as of ${new Date(s.fetchedAt).toLocaleTimeString()})`),
   );
   if (s.idleReason) lines.push(c.yellow(`  ${s.idleReason}`));
   if (s.humanReady.length || s.needsUser.length) {
     lines.push("", c.bold("Needs you:"));
     for (const h of s.humanReady) lines.push(`  ${h.step}  #${h.issue} ${h.title}${h.url ? c.dim(`  ${h.url}`) : ""}`, c.dim("      yours to do — this step is ready and only you can do it"));
-    for (const u of s.needsUser) lines.push(`  ${u.step}  #${u.issue} ${u.title}`, c.yellow(`      ${u.reason}`));
+    for (const u of s.needsUser) {
+      lines.push(`  ${u.step}  #${u.issue} ${u.title}`, c.yellow(`      ${plain(u.reason)}`));
+      // What the PR said (or the files holding the card): text from GitHub,
+      // printed with control characters removed.
+      if (u.detail) lines.push(c.dim(`      ${u.kind === "held" ? "sensitive files: " : ""}${plain(u.detail)}`));
+      if (u.prUrl) lines.push(c.dim(`      ${plain(u.prUrl)}`));
+      if (u.kind === "held") lines.push(c.dim("      review the PR, then move its card to Ready to Merge"));
+      else lines.push(c.dim(`      agetor roadmap resolve ${u.issue} --close   accept the step: close the issue as completed`), c.dim(`      agetor roadmap resolve ${u.issue} --redo    have the step done again`));
+    }
   }
   const outside = s.blockedOutside ?? [];
   if (outside.length) {
@@ -156,6 +190,11 @@ export async function runRoadmap(client: Client, args: string[]): Promise<{ data
     if (rest.length) throw new Error(USAGE);
     const a = await client.call<AutopilotDto>("PUT", "/autopilot", { enabled: false });
     return { data: a, lines: [`${c.green("✓")} Autopilot paused — cards already running carry on`] };
+  }
+  if (sub === "resolve") {
+    const { issue, action } = parseRoadmapResolveArgs(rest);
+    const r = await client.call<AutopilotDto & { ok: true; message: string }>("POST", "/autopilot/roadmap/resolve", { issue, action });
+    return { data: { ok: true, issue, action, message: r.message }, lines: [`${c.green("✓")} ${plain(r.message)}`] };
   }
   if (sub === "start") {
     const o = parseRoadmapStartFlags(rest);

@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import path from "node:path";
-import { matchMilestoneRef, parseRoadmapStartFlags, roadmapStatusLines, runRoadmap } from "./roadmap.ts";
+import { matchMilestoneRef, parseRoadmapResolveArgs, parseRoadmapStartFlags, roadmapStatusLines, runRoadmap } from "./roadmap.ts";
 import type { GitHubRepoMilestone, Pipeline, Project } from "../../shared/types.ts";
 
 const status = {
@@ -171,4 +171,68 @@ test("status with a milestone: the scope, its counts, what needs you and what wa
   const staleText = roadmapStatusLines(stale).join("\n");
   expect(staleText).toContain("no status yet");
   expect(staleText).not.toContain("2/6 complete");
+});
+
+test("status: a merged-but-open step shows what its PR said and how to resolve it; a held card shows its PR and files", () => {
+  const a = dto();
+  a.state.roadmap = {
+    ...status,
+    counts: { ...status.counts, inFlight: 2, held: 1 },
+    idleReason: "Nothing can start: step 3 (#13) waits in In Review for your sign-off; step 2 (#12) needs you",
+    needsUser: [
+      { step: "2", issue: 12, title: "Inventory the widgets", url: null, kind: "stuck", reason: "PR #77 merged but the issue is still open — close it or reopen the work", pr: 77, prUrl: "https://github.com/o/r/pull/77", detail: "PR #77 left it open on purpose: “Refs #12 — the nightly job is not wired”", taskId: "c12" },
+      { step: "3", issue: 13, title: "Build the widget store", url: null, kind: "held", reason: "PR #82 changes sensitive code — held in In Review for your sign-off", pr: 82, prUrl: "https://github.com/o/r/pull/82", detail: "apps/web/src/lib/billing/prices.ts", taskId: "c13" },
+    ],
+  } as never;
+  const text = roadmapStatusLines(a).join("\n");
+  expect(text).toContain("2 in flight (1 held for your sign-off)");
+  expect(text).toContain("waits in In Review for your sign-off");
+  expect(text).toContain("PR #77 left it open on purpose: “Refs #12 — the nightly job is not wired”");
+  expect(text).toContain("https://github.com/o/r/pull/77");
+  expect(text).toContain("agetor roadmap resolve 12 --close");
+  expect(text).toContain("agetor roadmap resolve 12 --redo");
+  expect(text).toContain("PR #82 changes sensitive code — held in In Review for your sign-off");
+  expect(text).toContain("sensitive files: apps/web/src/lib/billing/prices.ts");
+  expect(text).toContain("https://github.com/o/r/pull/82");
+  expect(text).not.toContain("agetor roadmap resolve 13");
+});
+
+test("status prints text from a PR without its control characters or escapes", () => {
+  const a = dto();
+  a.state.roadmap = { ...status, needsUser: [{ step: "2", issue: 12, title: "Inventory the widgets", url: null, kind: "stuck", reason: "PR #77 merged", detail: "says \u001b[2J\u001b[31mcleared\u0007\nsecond line" }] } as never;
+  const lines = roadmapStatusLines(a);
+  const line = lines.find((l) => l.includes("cleared"))!;
+  expect(line).toContain("says cleared second line");
+  expect(line).not.toContain("\u001b[2J");
+  expect(line).not.toContain("\u0007");
+  expect(lines.some((l) => l.includes("\n"))).toBe(false);
+});
+
+test("resolve: one issue and one of --close / --redo, sent as the owner's request", async () => {
+  expect(parseRoadmapResolveArgs(["12", "--close"])).toEqual({ issue: 12, action: "close" });
+  expect(parseRoadmapResolveArgs(["--redo", "#12"])).toEqual({ issue: 12, action: "redo" });
+  expect(() => parseRoadmapResolveArgs(["12"])).toThrow("needs --close");
+  expect(() => parseRoadmapResolveArgs(["--close"])).toThrow("needs the step's issue number");
+  expect(() => parseRoadmapResolveArgs(["12", "--close", "--redo"])).toThrow("one of --close or --redo");
+  expect(() => parseRoadmapResolveArgs(["12", "13", "--close"])).toThrow("unknown argument");
+  expect(() => parseRoadmapResolveArgs(["12", "--yes"])).toThrow("unknown argument");
+
+  const calls: { method: string; path: string; body?: unknown }[] = [];
+  const client = {
+    ...fakeClient().client,
+    call: async <T>(method: string, p: string, body?: unknown) => {
+      calls.push({ method, path: p, body });
+      return { ...dto(), ok: true, message: "Closed #12 as completed — the steps that waited on step 2 can start" } as T;
+    },
+  };
+  const r = await runRoadmap(client, ["resolve", "12", "--close"]);
+  expect(calls).toEqual([{ method: "POST", path: "/autopilot/roadmap/resolve", body: { issue: 12, action: "close" } }]);
+  expect(r.lines.join("\n")).toContain("Closed #12 as completed");
+  expect(r.data).toEqual({ ok: true, issue: 12, action: "close", message: "Closed #12 as completed — the steps that waited on step 2 can start" });
+  // Nothing is sent when the request is incomplete; the server's refusal is passed on.
+  calls.length = 0;
+  await expect(runRoadmap(client, ["resolve", "12"])).rejects.toThrow("needs --close");
+  expect(calls).toEqual([]);
+  const refusing = { ...client, call: async () => Promise.reject(new Error("#12 is already closed — nothing to resolve")) };
+  await expect(runRoadmap(refusing as never, ["resolve", "12", "--redo"])).rejects.toThrow("already closed");
 });
