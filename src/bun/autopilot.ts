@@ -13,11 +13,14 @@
  * a deep audit. Issues the audit files into the milestone restart the loop;
  * a clean audit ends it.
  *
- * Roadmap mode (`roadmap` in the config, src/shared/roadmap.ts): the order
- * comes from a tracker issue's numbered step table instead of a milestone
- * and a thread. A step starts when its issue is open and every predecessor
- * step's issue is closed as completed; the thread is never asked. See
- * `roadmapPass`.
+ * Tracker mode (`roadmap` in the config, src/shared/roadmap.ts): the order
+ * comes from a tracker issue's numbered step table instead of the thread. A
+ * step starts when its issue is open and every predecessor step's issue is
+ * closed as completed; the thread is never asked. With a `milestone` too,
+ * only the steps whose issue is in that GitHub milestone are worked, and
+ * each of them gets a card in the Backlog up front, started when its step
+ * is ready and a slot is free. Without one, the whole roadmap is worked.
+ * See `roadmapPass`.
  *
  * Config: `autopilot` preference. State: `autopilot_state` preference.
  */
@@ -29,23 +32,33 @@ import { askThread, taggedJson, type ThreadAnswer } from "./codex-thread.ts";
 import { createTaskFromIssue } from "./issue-queue.ts";
 import { setMergeQueued } from "./merge-intent.ts";
 import { hasConfirmedNoPr, prStatusForTask } from "./pr-watch.ts";
-import { onCardRemoved, subscribeGlobal } from "./orchestrator.ts";
-import { holdsAutopilotSlot, PROGRESSING_COLUMNS, waitingOnQuota } from "../shared/autopilot.ts";
+import { onCardRemoved, startTask, subscribeGlobal } from "./orchestrator.ts";
+import { holdsAutopilotSlot, neverStarted, PROGRESSING_COLUMNS, waitingOnQuota } from "../shared/autopilot.ts";
 import { formatRetryTime, isQuotaPaused } from "./usage-limit.ts";
 import { loadRoadmapStates, loadRoadmapTracker } from "./roadmap-fetch.ts";
 import {
   parseRoadmap,
   pickRoadmap,
   roadmapFinished,
+  roadmapScope,
   roadmapStatus,
   roadmapStepPrompt,
+  scopeDrift,
   summarizeRoadmap,
+  withRoadmapStepPrompt,
   type RoadmapIssueState,
   type RoadmapStatus,
+  type RoadmapStepView,
 } from "../shared/roadmap.ts";
 
 export const AUTOPILOT_PREF = "autopilot";
 export const AUTOPILOT_STATE_PREF = "autopilot_state";
+/** The tracker issue the dialog and `agetor roadmap start` offer when none
+ *  is configured: the last one saved. */
+export const DEFAULT_TRACKER_PREF = "autopilot_default_tracker";
+/** Set once the stored config has been read by a build where `milestone`
+ *  limits tracker mode (see `normalizeLegacyConfig`). */
+const CONFIG_VERSION_PREF = "autopilot_config_version";
 /** Safety net only — passes are driven by board events (startAutopilot). */
 const FALLBACK_MS = 15 * 60_000;
 /** Columns of a card still being built (Blocked included): such a card
@@ -64,8 +77,9 @@ export interface AutopilotConfig {
   milestone: { number: number; title: string } | null;
   maxInFlight: number;
   pipelineId: string | null;
-  /** Roadmap mode: the tracker issue (in `project`'s repo) whose step table
-   *  gives the order. When set, `milestone` and `threadId` aren't used. */
+  /** Tracker mode: the tracker issue (in `project`'s repo) whose step table
+   *  gives the order. When set, `threadId` isn't used and `milestone` limits
+   *  which steps are worked (null = the whole roadmap). */
   roadmap: { issue: number } | null;
 }
 
@@ -101,6 +115,12 @@ export interface AutopilotState {
   roadmapStuck: Record<string, RoadmapStuck>;
   /** Roadmap mode: `[Human]` step issues already announced as ready. */
   notifiedHuman: number[];
+  /** Tracker mode with a milestone: the cards made up front in the Backlog
+   *  and not started yet — issue number → card id. Such a card holds no slot
+   *  and doesn't make its issue busy. An entry goes when its card starts, is
+   *  closed, archived or deleted. Kept across milestone changes, so cards
+   *  left over from another milestone stay known (and untouched). */
+  roadmapBacklog: Record<string, string>;
   updatedAt: number;
 }
 
@@ -160,10 +180,11 @@ export function readState(): AutopilotState {
       roadmap: v.roadmap && typeof v.roadmap === "object" ? v.roadmap : null,
       roadmapStuck: v.roadmapStuck && typeof v.roadmapStuck === "object" ? v.roadmapStuck : {},
       notifiedHuman: Array.isArray(v.notifiedHuman) ? v.notifiedHuman : [],
+      roadmapBacklog: v.roadmapBacklog && typeof v.roadmapBacklog === "object" ? v.roadmapBacklog : {},
       updatedAt: v.updatedAt ?? 0,
     };
   } catch {
-    return { phase: "idle", cards: [], held: [], audits: 0, lastAnswer: null, lastError: null, quietUntil: 0, quietSignature: "", limitedUntil: 0, noWork: {}, waits: {}, reworked: [], roadmap: null, roadmapStuck: {}, notifiedHuman: [], updatedAt: 0 };
+    return { phase: "idle", cards: [], held: [], audits: 0, lastAnswer: null, lastError: null, quietUntil: 0, quietSignature: "", limitedUntil: 0, noWork: {}, waits: {}, reworked: [], roadmap: null, roadmapStuck: {}, notifiedHuman: [], roadmapBacklog: {}, updatedAt: 0 };
   }
 }
 
@@ -171,10 +192,49 @@ function writeState(s: AutopilotState): void {
   preferences.set(AUTOPILOT_STATE_PREF, JSON.stringify({ ...s, updatedAt: Date.now() }));
 }
 
+/** Bumped whenever `PUT /autopilot` begins a fresh run (and resets the
+ *  state). A pass that started before then is working an older run. */
+let runEpoch = 0;
+/** The epoch and project of the pass at work. */
+let passRun: { epoch: number; project: string } | null = null;
+
+/** The run was changed, or paused, while this pass was at work: it should
+ *  stop making and starting cards. */
+function passOutdated(): boolean {
+  if (!passRun) return false;
+  return passRun.epoch !== runEpoch || !parseConfig(preferences.get(AUTOPILOT_PREF)).enabled;
+}
+
+/**
+ * Save a pass's state. If a fresh run began meanwhile, its reset state
+ * stands (phase, status, errors) and only what the pass did to cards is
+ * carried over — a pass that outlived its run must not mark the new one
+ * "done" or bring the old status back.
+ */
+function savePassState(state: AutopilotState): void {
+  if (!passRun || passRun.epoch === runEpoch) return writeState(state);
+  const fresh = readState();
+  const sameProject = parseConfig(preferences.get(AUTOPILOT_PREF)).project === passRun.project;
+  writeState({ ...fresh, cards: state.cards, roadmapBacklog: sameProject ? state.roadmapBacklog : fresh.roadmapBacklog });
+}
+
 /** Issue number from a card's issue URL. */
 function issueOf(t: Task): number | null {
   const m = t.issueUrl?.match(/\/issues\/(\d+)/);
   return m ? Number(m[1]) : null;
+}
+
+const trimDir = (p: string) => (p.length > 1 ? p.replace(/\/+$/, "") : p);
+const sameDir = (a: string | null | undefined, b: string) => !!a && trimDir(a) === trimDir(b);
+
+/** The never-started backlog cards Autopilot made in tracker mode, by issue. */
+function unstartedBacklog(state: AutopilotState, all: Task[]): Map<number, Task> {
+  const out = new Map<number, Task>();
+  for (const [key, id] of Object.entries(state.roadmapBacklog)) {
+    const t = all.find((x) => x.id === id);
+    if (t && neverStarted(t)) out.set(Number(key), t);
+  }
+  return out;
 }
 
 /** Live = not archived and not Done. */
@@ -288,10 +348,20 @@ export function slotCounts<T extends { number: number; title: string }>(
   mine: Task[],
   open: T[],
   quotaPaused: (t: Pick<Task, "pipelineRun">) => boolean = () => false,
+  opts: {
+    /** Count only cards of this project: issue numbers mean nothing across
+     *  repositories. */
+    project?: string;
+    /** Cards that hold no slot whatever their column (the never-started
+     *  backlog cards of tracker mode). */
+    noSlot?: ReadonlySet<string>;
+    /** Cards that don't make their issue busy either. */
+    notBusy?: ReadonlySet<string>;
+  } = {},
 ): SlotCounts {
-  const cards = all.filter((t) => !t.pipelineParentId && t.archivedAt == null);
-  const busyIssues = new Set(cards.filter(live).map(issueOf).filter((n): n is number => n != null));
-  const holding = cards.filter((t) => holdsAutopilotSlot(t, quotaPaused));
+  const cards = all.filter((t) => !t.pipelineParentId && t.archivedAt == null && (!opts.project || sameDir(t.workdir, opts.project)));
+  const busyIssues = new Set(cards.filter((t) => live(t) && !opts.notBusy?.has(t.id)).map(issueOf).filter((n): n is number => n != null));
+  const holding = cards.filter((t) => !opts.noSlot?.has(t.id) && holdsAutopilotSlot(t, quotaPaused));
   const holdingIssues = new Set(holding.map(issueOf).filter((n): n is number => n != null));
   return {
     busyIssues,
@@ -522,6 +592,10 @@ const SETTLE_MS = 3 * 60_000;
  *  step) are picked up by polling. */
 const ROADMAP_POLL_MS = 5 * 60_000;
 
+/** How many backlog cards one pass makes at most (each reads its issue
+ *  thread from GitHub); the next pass makes the rest. */
+const BACKLOG_PER_PASS = 60;
+
 export interface RoadmapDeps {
   loadTracker(project: string, issue: number): Promise<{ body: string; url: string | null } | { error: string }>;
   loadStates(project: string, numbers: number[]): Promise<Map<number, RoadmapIssueState> | { error: string }>;
@@ -531,7 +605,19 @@ export interface RoadmapDeps {
   mergedPr(t: Task): number | null;
   quotaPaused(t: Pick<Task, "pipelineRun">): boolean;
   pipelineId(cfg: AutopilotConfig): string | null;
+  /** Create a card for the issue and start it. */
   startCard(input: { dir: string; number: number; pipelineId: string; extraPrompt: string }): Promise<{ task: Task } | { error: string }>;
+  /** Create a card for the issue in the Backlog, not started. */
+  createBacklogCard(input: { dir: string; number: number; pipelineId: string; extraPrompt: string }): Promise<{ task: Task } | { error: string }>;
+  /** Start a backlog card made earlier, with its step section rewritten. */
+  startExisting(input: { task: Task; stepPrompt: string }): Promise<{ ok: true } | { error: string }>;
+  moveToDone(t: Task): void;
+  /** Persist the state mid-pass (after each card made or started, so a core
+   *  that stops half way still knows its cards). */
+  save(state: AutopilotState): void;
+  /** The run was changed or paused while this pass was at work: make and
+   *  start nothing more. */
+  outdated(): boolean;
   /** A native notification; false when there's no host to show it. */
   notify(n: { title: string; body: string }): boolean;
   activity(taskId: string, text: string, tone: "info" | "warning" | "muted"): void;
@@ -540,14 +626,19 @@ export interface RoadmapDeps {
   now(): number;
 }
 
+const isOpenStep = (v: RoadmapStepView) => v.status !== "complete" && v.status !== "declined";
+
 /**
- * One roadmap pass: read the tracker and every step's issue, start the
- * ready agent steps that fit the free slots, announce newly ready `[Human]`
- * steps, and record the status. Never asks the thread. Mutates `state`.
- * Exported for tests.
+ * One tracker pass: read the tracker and every step's issue; with a
+ * milestone, keep to the steps whose issue is in it and make a Backlog card
+ * for each open one that has none; start the ready agent steps that fit the
+ * free slots (the step's backlog card when it has one, else a new card);
+ * announce newly ready `[Human]` steps; record the status. Never asks the
+ * thread. Mutates `state`. Exported for tests.
  */
 export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, all: Task[], mine: Task[], deps: RoadmapDeps): Promise<void> {
   const tracker = cfg.roadmap!.issue;
+  const milestone = cfg.milestone;
   const fail = (error: string) => {
     state.lastError = error;
   };
@@ -562,15 +653,50 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
   const states = await deps.loadStates(cfg.project, parsed.steps.map((s) => s.issue));
   if ("error" in states) return fail(states.error);
   const views = roadmapStatus(parsed, states);
-  const openSteps = views.filter((v) => v.status !== "complete" && v.status !== "declined");
+  // The scope: steps whose issue is in the chosen GitHub milestone. Steps
+  // outside it still gate readiness; this run just never starts them.
+  const scope = milestone ? { milestone, steps: roadmapScope(parsed.steps, states, milestone) } : null;
+  const scoped = scope ? views.filter((v) => scope.steps.has(v.step)) : views;
+  const viewByIssue = new Map(views.map((v) => [v.issue, v]));
+  const openSteps = views.filter(isOpenStep);
   const openByIssue = new Map(openSteps.map((v) => [v.issue, v]));
+
+  // The backlog ledger: cards made up front that haven't started. One that a
+  // person started is an ordinary card from then on (an agent step's is
+  // followed like any card Autopilot started; the owner's is theirs alone).
+  // One whose issue closed before it started is closed too.
+  const own = [...mine];
+  const closedNow = new Set<string>();
+  const backlog = new Map<number, Task>();
+  for (const [key, id] of Object.entries(state.roadmapBacklog)) {
+    const n = Number(key);
+    const t = all.find((x) => x.id === id);
+    const v = viewByIssue.get(n);
+    if (!t || t.archivedAt != null || t.column === "done") {
+      delete state.roadmapBacklog[key];
+    } else if (!neverStarted(t)) {
+      delete state.roadmapBacklog[key];
+      if (v && !v.human && !state.cards.includes(id)) {
+        state.cards.push(id);
+        own.push(t);
+        deps.activity(id, `Autopilot: step ${v.step} was started by hand — following it from here`, "muted");
+      }
+    } else if (v && !isOpenStep(v)) {
+      deps.moveToDone(t);
+      deps.activity(id, `Autopilot: #${n} was closed (${v.status === "complete" ? "completed" : "not planned"}) before this card started — moved it to Done`, "info");
+      closedNow.add(id);
+      delete state.roadmapBacklog[key];
+    } else {
+      backlog.set(n, t);
+    }
+  }
 
   // Restart guard: an Autopilot card for a step already finished, yet the
   // step's issue is still open (the PR said "Refs", closing failed, or the
   // run found nothing to build). Starting another card would loop, so the
   // step waits for the user instead.
   const settling = new Set<number>();
-  for (const t of mine) {
+  for (const t of own) {
     const n = issueOf(t);
     if (n == null || !openByIssue.has(n)) continue;
     let reason: string | null = null;
@@ -596,30 +722,91 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
   if (settling.size > 0) deps.recheck(60_000);
   const stuck = new Map(Object.entries(state.roadmapStuck).map(([k, v]) => [Number(k), v.reason]));
 
+  // Slots and busy issues, among this project's cards. Every unstarted
+  // backlog card in the ledger is left out — also one left over from another
+  // milestone — and so is one just closed above.
+  const exempt = new Set([...unstartedBacklog(state, all).values()].map((t) => t.id).concat([...closedNow]));
   const open = openSteps.map((v) => ({ number: v.issue, title: v.title }));
-  const { busyIssues, inFlight, ownLive, quotaWait } = slotCounts(all, mine, open, deps.quotaPaused);
+  const { busyIssues, inFlight, ownLive, quotaWait } = slotCounts(all, own, open, deps.quotaPaused, { project: cfg.project, noSlot: exempt, notBusy: exempt });
+
+  if (scope && scoped.length === 0) {
+    state.roadmap = summarizeRoadmap({ issue: tracker, url: doc.url, parsed, views, scope, busy: busyIssues, needsUser: stuck, now: deps.now() });
+    state.phase = "idle";
+    return fail(`no step of roadmap #${tracker} has its issue in milestone "${milestone!.title}" — check the issues' milestone on GitHub, or choose All milestones`);
+  }
+
   const free = cfg.maxInFlight - Math.max(ownLive, inFlight.length);
-  const picks = pickRoadmap(views, { busy: busyIssues, exclude: new Set([...stuck.keys(), ...settling]), free });
+  const picks = pickRoadmap(scoped, { busy: busyIssues, exclude: new Set([...stuck.keys(), ...settling]), free });
+  const pipelineId = deps.pipelineId(cfg);
+  const noPipeline = "no pipeline to run issues with (set default_pipeline)";
 
   // A card waiting for a usage limit to reset frees its slot, but starting
   // another now would only run into the same limit (as in milestone mode).
   let error: string | null = null;
   const started = new Set<number>();
   if (picks.start.length > 0 && !quotaWait) {
-    const pipelineId = deps.pipelineId(cfg);
-    if (!pipelineId) error = "no pipeline to run issues with (set default_pipeline)";
+    if (!pipelineId) error = noPipeline;
     else {
       for (const v of picks.start) {
-        const r = await deps.startCard({ dir: cfg.project, number: v.issue, pipelineId, extraPrompt: roadmapStepPrompt(tracker, v, parsed.steps) });
-        if ("error" in r) {
-          error = `step ${v.step} (#${v.issue}): ${r.error}`;
-          continue;
+        if (deps.outdated()) break;
+        const stepPrompt = roadmapStepPrompt(tracker, v, parsed.steps);
+        const card = backlog.get(v.issue);
+        let id: string;
+        if (card) {
+          const r = await deps.startExisting({ task: card, stepPrompt });
+          if ("error" in r) {
+            // Still in the backlog, still in the ledger: the next pass tries again.
+            error = `step ${v.step} (#${v.issue}): ${r.error}`;
+            continue;
+          }
+          id = card.id;
+          backlog.delete(v.issue);
+          delete state.roadmapBacklog[String(v.issue)];
+        } else {
+          const r = await deps.startCard({ dir: cfg.project, number: v.issue, pipelineId, extraPrompt: stepPrompt });
+          if ("error" in r) {
+            error = `step ${v.step} (#${v.issue}): ${r.error}`;
+            continue;
+          }
+          id = r.task.id;
         }
         started.add(v.issue);
-        state.cards.push(r.task.id);
-        deps.activity(r.task.id, `Autopilot started this as step ${v.step} of roadmap #${tracker}`, "info");
+        state.cards.push(id);
+        deps.save(state);
+        deps.activity(id, `Autopilot started this as step ${v.step} of roadmap #${tracker}`, "info");
       }
     }
+  }
+
+  // Backlog cards up front: with a milestone, every open step in it that has
+  // no live card gets one, not started — the owner's steps too. Idempotent:
+  // a step added to the milestone later gets its card on the next pass.
+  if (scope) {
+    const missing = scoped.filter((v) => isOpenStep(v) && !busyIssues.has(v.issue) && !started.has(v.issue) && !backlog.has(v.issue) && !stuck.has(v.issue) && !settling.has(v.issue));
+    if (missing.length > 0 && !pipelineId) error ??= noPipeline;
+    let failures = 0;
+    for (const v of pipelineId ? missing.slice(0, BACKLOG_PER_PASS) : []) {
+      // Paused, or pointed at another milestone, while the cards were being
+      // made: the rest aren't this run's to make.
+      if (deps.outdated()) break;
+      const r = await deps.createBacklogCard({ dir: cfg.project, number: v.issue, pipelineId: pipelineId!, extraPrompt: roadmapStepPrompt(tracker, v, parsed.steps, { pending: v.waitingOn }) });
+      if ("error" in r) {
+        error ??= `step ${v.step} (#${v.issue}): no backlog card — ${r.error}`;
+        if (++failures >= 3) break; // GitHub is probably unreachable: the next pass tries again
+        continue;
+      }
+      state.roadmapBacklog[String(v.issue)] = r.task.id;
+      backlog.set(v.issue, r.task);
+      deps.save(state);
+      deps.activity(
+        r.task.id,
+        v.human
+          ? `Autopilot added this to the backlog: step ${v.step} of roadmap #${tracker} is yours to do — Autopilot never starts it`
+          : `Autopilot added this to the backlog as step ${v.step} of roadmap #${tracker} — it starts when its predecessor steps are complete and a slot is free`,
+        "muted",
+      );
+    }
+    if (missing.length > BACKLOG_PER_PASS) deps.recheck(5_000);
   }
 
   const status = summarizeRoadmap({
@@ -627,11 +814,30 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
     url: doc.url,
     parsed,
     views,
+    scope,
     busy: new Set([...busyIssues, ...started]),
+    backlog: new Map([...backlog].map(([n, t]) => [n, t.id])),
     needsUser: stuck,
     now: deps.now(),
   });
   if (!status.idleReason && quotaWait && picks.start.length > 0) status.idleReason = "Holding new starts while a card waits for a usage limit to reset";
+  // The table's milestone column and GitHub disagreeing is worth knowing: a
+  // step the table puts in this milestone isn't worked unless its issue is.
+  if (scope) {
+    for (const s of scopeDrift(parsed.steps, states, scope.milestone)) {
+      const inIt = scope.steps.has(s.step);
+      status.problems = [
+        ...status.problems,
+        {
+          kind: "milestone-mismatch",
+          step: s.step,
+          message: inIt
+            ? `step ${s.step} (#${s.issue}) is in this milestone on GitHub, but the table says ${s.milestone || "none"} — it is worked`
+            : `step ${s.step} (#${s.issue}): the table says ${s.milestone}, but its issue isn't in this milestone on GitHub — it is not worked`,
+        },
+      ];
+    }
+  }
   state.roadmap = status;
   state.lastError = error;
 
@@ -641,7 +847,7 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
     if (deps.notify({ title: "Roadmap: a step needs you", body: `Step ${h.step} · #${h.issue} ${h.title}` })) state.notifiedHuman.push(h.issue);
   }
 
-  if (roadmapFinished(parsed, views)) state.phase = "done";
+  if (roadmapFinished(parsed, scoped)) state.phase = "done";
   else state.phase = status.counts.inFlight === 0 && started.size === 0 ? "idle" : "running";
 }
 
@@ -655,7 +861,8 @@ export function setAutopilotNotifier(fn: ((n: { title: string; body: string }) =
 
 let recheckTimer: ReturnType<typeof setTimeout> | null = null;
 
-const ROADMAP_DEPS: RoadmapDeps = {
+/** Exported for tests, which swap the GitHub reads. */
+export const ROADMAP_DEPS: RoadmapDeps = {
   loadTracker: loadRoadmapTracker,
   loadStates: loadRoadmapStates,
   aheadCount: (t) => NO_WORK_DEPS.aheadCount(t),
@@ -670,6 +877,21 @@ const ROADMAP_DEPS: RoadmapDeps = {
     const r = await createTaskFromIssue({ ...input, allowAfterDone: true });
     return "error" in r ? { error: r.error } : { task: r.task };
   },
+  async createBacklogCard(input) {
+    const r = await createTaskFromIssue({ ...input, start: false, allowAfterDone: true });
+    return "error" in r ? { error: r.error } : { task: r.task };
+  },
+  async startExisting({ task, stepPrompt }) {
+    // The step section was written when the card was made; say what holds now.
+    const fresh = tasks.get(task.id);
+    if (!fresh || fresh.archivedAt != null) return { error: "its backlog card is gone" };
+    tasks.update(task.id, { prompt: withRoadmapStepPrompt(fresh.prompt, stepPrompt) });
+    const r = await startTask(task.id);
+    return "error" in r ? { error: `its backlog card didn't start: ${r.error}` } : { ok: true };
+  },
+  moveToDone: (t) => void tasks.update(t.id, { column: "done" }),
+  save: (state) => savePassState(state),
+  outdated: () => passOutdated(),
   notify(n) {
     if (!notifier) return false;
     try {
@@ -697,9 +919,10 @@ let busy = false;
 export async function autopilotTick(): Promise<void> {
   const cfg = parseConfig(preferences.get(AUTOPILOT_PREF));
   if (!cfg.enabled || !cfg.project || busy) return;
-  // Roadmap mode needs neither a milestone nor the thread.
+  // Tracker mode needs neither a milestone nor the thread.
   if (!cfg.roadmap && (!cfg.threadId || !cfg.milestone)) return;
   busy = true;
+  passRun = { epoch: runEpoch, project: cfg.project };
   const state = readState();
   try {
     // A finished milestone stays finished until the user restarts Autopilot.
@@ -740,7 +963,10 @@ export async function autopilotTick(): Promise<void> {
     // decide about their issues; issues still deciding or waiting on others
     // aren't candidates.
     const parked = await processNoWork(cfg, state, mine, open, NO_WORK_DEPS);
-    const { busyIssues, inFlight, ownLive, ownUnfinished, quotaWait } = slotCounts(all, mine, open, quotaPausedCard);
+    // Backlog cards a tracker run left unstarted hold no slot here either
+    // (their issues stay busy: the thread isn't offered them).
+    const leftover = new Set([...unstartedBacklog(state, all).values()].map((t) => t.id));
+    const { busyIssues, inFlight, ownLive, ownUnfinished, quotaWait } = slotCounts(all, mine, open, quotaPausedCard, { noSlot: leftover });
     const candidates = startable(open).filter((i) => !busyIssues.has(i.number) && !parked.has(i.number));
 
     // Back off after an ask that started nothing, until the board changes.
@@ -826,9 +1052,95 @@ export async function autopilotTick(): Promise<void> {
       state.lastError = null;
     }
   } finally {
-    writeState(state);
+    savePassState(state);
+    passRun = null;
     busy = false;
   }
+}
+
+// ── Config (GET/PUT /autopilot) ──────────────────────────────────────────
+
+/** The tracker issue offered when none is configured. */
+export function readDefaultTracker(): number | null {
+  const n = Number(preferences.get(DEFAULT_TRACKER_PREF));
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
+export function autopilotSnapshot(): { config: AutopilotConfig; state: AutopilotState; defaultTracker: number | null } {
+  normalizeLegacyConfig();
+  return { config: parseConfig(preferences.get(AUTOPILOT_PREF)), state: readState(), defaultTracker: readDefaultTracker() };
+}
+
+/**
+ * Merge `body` into the config. Enabling, changing the milestone, the
+ * tracker or the project, or `restart: true` begins a fresh run. A tracker
+ * that is set is remembered as the default; `defaultTracker` (a number, or
+ * null to forget it) sets the default alone. Doesn't run a pass.
+ */
+export function applyAutopilotPatch(body: Record<string, unknown>): AutopilotConfig {
+  normalizeLegacyConfig();
+  preferences.set(CONFIG_VERSION_PREF, "2"); // what is saved from here on is saved by this build
+  const cur = parseConfig(preferences.get(AUTOPILOT_PREF));
+  const next = parseConfig(JSON.stringify({ ...cur, ...body }));
+  preferences.set(AUTOPILOT_PREF, JSON.stringify(next));
+  if (typeof body.defaultTracker === "number" && Number.isInteger(body.defaultTracker) && body.defaultTracker > 0) {
+    preferences.set(DEFAULT_TRACKER_PREF, String(body.defaultTracker));
+  } else if (body.defaultTracker === null) {
+    preferences.set(DEFAULT_TRACKER_PREF, "");
+  }
+  if (next.roadmap && "roadmap" in body) preferences.set(DEFAULT_TRACKER_PREF, String(next.roadmap.issue));
+
+  // A different tracker (or project) drops the old one's status, its restart
+  // guard and its announced human steps; a different milestone under the
+  // same tracker drops the status only (it counts the old scope). Backlog
+  // cards already made are never touched here — they stay where they are.
+  const projectChanged = cur.project !== next.project;
+  const milestoneChanged = (cur.milestone?.number ?? null) !== (next.milestone?.number ?? null);
+  const roadmapChanged = (cur.roadmap?.issue ?? null) !== (next.roadmap?.issue ?? null) || (!!next.roadmap && projectChanged);
+  const scopeChanged = !!next.roadmap && milestoneChanged;
+  if (body.restart === true || roadmapChanged || scopeChanged || (next.enabled && (!cur.enabled || milestoneChanged))) {
+    runEpoch++;
+    const s = readState();
+    preferences.set(
+      AUTOPILOT_STATE_PREF,
+      JSON.stringify({
+        ...s,
+        phase: "idle",
+        held: [],
+        lastError: null,
+        quietUntil: 0,
+        quietSignature: "",
+        ...(roadmapChanged ? { roadmap: null, roadmapStuck: {}, notifiedHuman: [] } : scopeChanged ? { roadmap: null } : {}),
+        // The ledger is keyed by issue number, which means another issue in
+        // another project.
+        ...(projectChanged ? { roadmapBacklog: {} } : {}),
+      }),
+    );
+  }
+  return next;
+}
+
+/**
+ * Once, on the first start of a build where `milestone` limits tracker mode:
+ * a config saved before that could hold a tracker AND a milestone left over
+ * from an earlier thread-driven run, which was ignored then. Reading it as a
+ * scope now would quietly narrow a run that works the whole roadmap, so the
+ * leftover milestone is dropped. The tracker in use also becomes the default
+ * tracker when there is none. Runs when the core starts and before the
+ * config is read or changed through the API; a board that never had
+ * Autopilot set up has nothing to decide (the first save marks it).
+ * Exported for tests.
+ */
+export function normalizeLegacyConfig(): void {
+  if (preferences.get(CONFIG_VERSION_PREF) === "2") return;
+  const raw = preferences.get(AUTOPILOT_PREF);
+  if (!raw) return;
+  const cfg = parseConfig(raw);
+  if (cfg.roadmap) {
+    if (cfg.milestone) preferences.set(AUTOPILOT_PREF, JSON.stringify({ ...cfg, milestone: null }));
+    if (readDefaultTracker() == null) preferences.set(DEFAULT_TRACKER_PREF, String(cfg.roadmap.issue));
+  }
+  preferences.set(CONFIG_VERSION_PREF, "2");
 }
 
 let loop: ReturnType<typeof setInterval> | null = null;
@@ -876,6 +1188,7 @@ export function freesSlot(e: { kind: string; column?: Task["column"]; prev?: Tas
 
 export function startAutopilot(): void {
   if (loop) return;
+  normalizeLegacyConfig();
   const enabled = () => parseConfig(preferences.get(AUTOPILOT_PREF)).enabled;
   subscribeGlobal((e) => {
     if (freesSlot(e as never) && enabled()) requestAutopilotPass();

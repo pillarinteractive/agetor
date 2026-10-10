@@ -30,3 +30,39 @@ export function holdsAutopilotSlot(
   if ((t.pendingInteractionCount ?? 0) > 0) return false;
   return !quotaPaused?.(t);
 }
+
+/**
+ * A card nothing has run yet: in Backlog (or Ready), with no run and an idle
+ * pipeline. Tracker mode makes such a card for every open step of the
+ * milestone up front; until it starts it holds no slot and its issue isn't
+ * being worked.
+ */
+export function neverStarted(t: Pick<Task, "column" | "archivedAt" | "pipelineRun"> & { runId?: string | null }): boolean {
+  if (t.archivedAt != null || (t.column !== "backlog" && t.column !== "ready") || t.runId) return false;
+  const run = t.pipelineRun;
+  return !run || (run.status === "idle" && run.history.length === 0 && run.active.length === 0);
+}
+
+export type AutopilotMode = "tracker-milestone" | "tracker" | "milestone" | "none";
+
+/** What Autopilot works from: a tracker's order (within a milestone, or the
+ *  whole roadmap), or a milestone driven by the Codex thread. */
+export function autopilotMode(c: { roadmap: { issue: number } | null; milestone: { title: string } | null }): AutopilotMode {
+  if (c.roadmap && c.roadmap.issue > 0) return c.milestone ? "tracker-milestone" : "tracker";
+  return c.milestone ? "milestone" : "none";
+}
+
+/** The rocket button's tooltip. */
+export function autopilotLabel(c: { enabled: boolean; roadmap: { issue: number } | null; milestone: { title: string } | null } | null | undefined): string {
+  if (!c) return "Autopilot";
+  const mode = autopilotMode(c);
+  const what =
+    mode === "tracker-milestone"
+      ? `Autopilot — milestone "${c.milestone!.title}", in the order of tracker #${c.roadmap!.issue}`
+      : mode === "tracker"
+        ? `Autopilot — the whole roadmap of tracker #${c.roadmap!.issue}`
+        : mode === "milestone"
+          ? `Milestone Autopilot — "${c.milestone!.title}", driven by the Codex thread`
+          : "Autopilot — not set up";
+  return mode === "none" ? what : `${what}${c.enabled ? "" : " (paused)"}`;
+}

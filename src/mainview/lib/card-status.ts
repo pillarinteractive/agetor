@@ -6,7 +6,8 @@
  * and the board's "Needs you" bar.
  */
 import type { PipelineRunState, Task, TaskPrStatus } from "../../shared/types.ts";
-import type { RoadmapStatus } from "../../shared/roadmap.ts";
+import { currentRoadmapStatus, type RoadmapCardInfo, type RoadmapStatus } from "../../shared/roadmap.ts";
+import { neverStarted } from "../../shared/autopilot.ts";
 import { blockReasonLine, handoffHeadline } from "../../shared/pipeline.ts";
 import type { TaskLeaseInfo } from "./leases.ts";
 import { ordinal } from "../../shared/block-reason.ts";
@@ -111,7 +112,15 @@ function mergeStatus(pr: TaskPrStatus | null): CardStatus {
 
 export function cardStatus(
   task: Task,
-  ctx: { pr: TaskPrStatus | null; lease: TaskLeaseInfo; now: number; progressActive?: boolean },
+  ctx: {
+    pr: TaskPrStatus | null;
+    lease: TaskLeaseInfo;
+    now: number;
+    progressActive?: boolean;
+    /** What Autopilot's roadmap says about this card while it waits in the
+     *  backlog, never started (src/shared/roadmap.ts `roadmapCardLine`). */
+    roadmap?: RoadmapCardInfo | null;
+  },
 ): CardStatus {
   const { pr, lease, now } = ctx;
   const asked = (task.pendingInteractionCount ?? 0) > 0;
@@ -144,7 +153,13 @@ export function cardStatus(
   // merge it (src/bun/merge-queue.ts). Say which part it's on.
   if (task.column === "merge") return mergeStatus(pr);
 
-  const run = task.pipelineRun ?? null;
+  // A roadmap step's card waiting in the backlog: its step and what it waits
+  // on. The owner's ready steps are in the Needs you strip already (by
+  // step, with the issue link), so the card doesn't ask twice.
+  if (ctx.roadmap && neverStarted(task)) return { line: ctx.roadmap.line, tone: ctx.roadmap.tone, needsYou: null };
+
+  // A pipeline card nothing has run yet has no run to describe.
+  const run = task.pipelineRun && !(task.pipelineRun.status === "idle" && task.pipelineRun.history.length === 0) ? task.pipelineRun : null;
   if (run) {
     if (run.status === "running") {
       const quiet = quietFor(task, ctx);
@@ -305,12 +320,22 @@ export interface RoadmapNeedsYou {
 /** Roadmap steps waiting on the user while Autopilot runs a roadmap: steps
  *  Autopilot won't start again first, then the owner's ready `[Human]` steps. */
 export function roadmapNeedsYou(
-  autopilot: { config: { enabled: boolean; roadmap: { issue: number } | null }; state: { roadmap?: RoadmapStatus | null } } | null | undefined,
+  autopilot: { config: { enabled: boolean; roadmap: { issue: number } | null; milestone?: { number: number } | null }; state: { roadmap?: RoadmapStatus | null } } | null | undefined,
 ): RoadmapNeedsYou[] {
-  const status = autopilot?.state.roadmap;
-  if (!autopilot?.config.enabled || !autopilot.config.roadmap || !status || status.issue !== autopilot.config.roadmap.issue) return [];
+  const status = autopilot ? currentRoadmapStatus({ roadmap: autopilot.config.roadmap, milestone: autopilot.config.milestone ?? null }, autopilot.state.roadmap) : null;
+  if (!autopilot?.config.enabled || !status) return [];
   return [
     ...status.needsUser.map((s) => ({ key: `stuck:${s.issue}`, kind: "stuck" as const, title: `Step ${s.step} · #${s.issue} ${s.title}`, reason: s.reason, url: s.url })),
     ...status.humanReady.map((s) => ({ key: `human:${s.issue}`, kind: "human" as const, title: `Step ${s.step} · #${s.issue} ${s.title}`, reason: "ready for you — only you can do this step", url: s.url })),
   ];
+}
+
+/** The roadmap's word on each never-started backlog card, by card id — for
+ *  the cards' status lines. Shown while paused too: the cards are still
+ *  there, and the line is as of the last pass. */
+export function roadmapCardInfo(
+  autopilot: { config: { roadmap: { issue: number } | null; milestone?: { number: number } | null }; state: { roadmap?: RoadmapStatus | null } } | null | undefined,
+): Map<string, RoadmapCardInfo> {
+  const status = autopilot ? currentRoadmapStatus({ roadmap: autopilot.config.roadmap, milestone: autopilot.config.milestone ?? null }, autopilot.state.roadmap) : null;
+  return new Map((status?.cards ?? []).map((c) => [c.taskId, c]));
 }

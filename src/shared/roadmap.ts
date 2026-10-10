@@ -42,7 +42,10 @@ export type RoadmapProblemKind =
   | "duplicate-step"
   | "duplicate-issue"
   | "unknown-predecessor"
-  | "cycle";
+  | "cycle"
+  /** Not from the table alone: a step's milestone column and its issue's
+   *  GitHub milestone disagree (reported when a milestone limits the run). */
+  | "milestone-mismatch";
 
 export interface RoadmapProblem {
   kind: RoadmapProblemKind;
@@ -210,6 +213,9 @@ export interface RoadmapIssueState {
   /** COMPLETED | NOT_PLANNED | DUPLICATE | REOPENED | null */
   stateReason: string | null;
   url?: string | null;
+  /** The issue's GitHub milestone; null when it has none, undefined when the
+   *  reader didn't ask. */
+  milestone?: { number: number; title: string } | null;
 }
 
 /**
@@ -251,6 +257,68 @@ export function roadmapStatus(parsed: ParsedRoadmap, states: ReadonlyMap<number,
   });
 }
 
+// ── Milestone scope ───────────────────────────────────────────────────────
+
+/** A GitHub milestone limiting which steps Autopilot works. */
+export interface RoadmapMilestone {
+  number: number;
+  title: string;
+}
+
+/** The code a milestone title starts with: `M01 — Inventory` → `M01`,
+ *  `X07 · Apple TV` → `X07`, `H — Human decisions` → `H`. Null when the
+ *  title doesn't start with one. */
+export function milestoneCode(title: string): string | null {
+  const m = title.trim().match(/^([A-Za-z]{1,4}\d{0,4})(?=$|[\s—–·:.\-])/);
+  return m ? m[1]!.toUpperCase() : null;
+}
+
+/**
+ * The steps in a milestone's scope: those whose issue is in that GitHub
+ * milestone — what the user sees on GitHub, whatever the table's milestone
+ * column says. Only when an issue's milestone wasn't read (its state is
+ * unknown) does the table's code decide, compared with the code the
+ * milestone's title starts with.
+ */
+export function roadmapScope(steps: RoadmapStep[], states: ReadonlyMap<number, RoadmapIssueState>, milestone: RoadmapMilestone): Set<string> {
+  const code = milestoneCode(milestone.title);
+  const out = new Set<string>();
+  for (const s of steps) {
+    const m = states.get(s.issue)?.milestone;
+    if (m !== undefined ? m?.number === milestone.number : code != null && s.milestone.trim().toUpperCase() === code) out.add(s.step);
+  }
+  return out;
+}
+
+/** Steps whose table milestone code and GitHub milestone disagree about
+ *  being in `milestone` (the GitHub milestone wins; this is only reported). */
+export function scopeDrift(steps: RoadmapStep[], states: ReadonlyMap<number, RoadmapIssueState>, milestone: RoadmapMilestone): RoadmapStep[] {
+  const code = milestoneCode(milestone.title);
+  if (!code) return [];
+  return steps.filter((s) => {
+    const m = states.get(s.issue)?.milestone;
+    return m !== undefined && (m?.number === milestone.number) !== (s.milestone.trim().toUpperCase() === code);
+  });
+}
+
+/**
+ * What stands between a set of steps and being startable: every step that
+ * isn't complete among their predecessors, followed transitively.
+ */
+export function unfinishedAncestors(views: RoadmapStepView[], of: RoadmapStepView[]): RoadmapStepView[] {
+  const byStep = new Map(views.map((v) => [v.step, v]));
+  const seen = new Set<string>();
+  const stack = of.flatMap((v) => v.waitingOn);
+  while (stack.length) {
+    const id = stack.pop()!;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const v = byStep.get(id);
+    if (v && v.status !== "complete") stack.push(...v.waitingOn);
+  }
+  return views.filter((v) => seen.has(v.step) && v.status !== "complete");
+}
+
 /**
  * What may start now: ready agent steps, in step order, whose issue has no
  * live card (`busy`) and isn't set aside (`exclude`), up to `free` of them.
@@ -268,20 +336,40 @@ export function pickRoadmap(
   };
 }
 
-/** What a started card is told about its step. */
-export function roadmapStepPrompt(tracker: number, step: RoadmapStep, all: RoadmapStep[]): string {
-  const preds = step.predecessors
-    .map((p) => all.find((s) => s.step === p))
-    .filter((s): s is RoadmapStep => !!s)
-    .map((s) => `${s.step} (#${s.issue})`);
+const STEP_PROMPT_HEADING = "## Roadmap step ";
+
+/**
+ * What a card is told about its step. `pending` names the predecessor steps
+ * that weren't complete when this was written — for a backlog card made
+ * before its step is ready; Autopilot rewrites the section when it starts
+ * the card, by which time there are none.
+ */
+export function roadmapStepPrompt(tracker: number, step: RoadmapStep, all: RoadmapStep[], opts: { pending?: readonly string[] } = {}): string {
+  const label = (s: RoadmapStep) => `${s.step} (#${s.issue})`;
+  const preds = step.predecessors.map((p) => all.find((s) => s.step === p)).filter((s): s is RoadmapStep => !!s);
+  const pending = preds.filter((s) => opts.pending?.includes(s.step));
+  const predLine =
+    preds.length === 0
+      ? "It has no predecessor steps."
+      : pending.length === 0
+        ? `Its predecessor steps are finished and already merged into the base: ${preds.map(label).join(", ")}. Build on them.`
+        : `Its predecessor steps are ${preds.map(label).join(", ")}. When this card was created, ${pending.map(label).join(", ")} ${pending.length === 1 ? "was" : "were"} not finished: before building on them, check that their issues are closed and their work is merged into the base.`;
   return [
-    `## Roadmap step ${step.step} (${step.milestone})`,
+    `${STEP_PROMPT_HEADING}${step.step} (${step.milestone})`,
     "",
     `This is step ${step.step} of the roadmap in tracker issue #${tracker}.`,
-    preds.length ? `Its predecessor steps are finished and already merged into the base: ${preds.join(", ")}. Build on them.` : "It has no predecessor steps.",
+    predLine,
     `Later steps start only once #${step.issue} is closed, so finish the whole definition of done in this PR and say "Fixes #${step.issue}" in its description.`,
     `If part of it can't be done here, say "Refs #${step.issue}" and list what's left: the step then stays open for the owner and nothing after it starts.`,
   ].join("\n");
+}
+
+/** A card prompt with its roadmap step section replaced by `section`
+ *  (appended when it has none). The section is always the prompt's last. */
+export function withRoadmapStepPrompt(prompt: string, section: string): string {
+  const at = prompt.lastIndexOf(`\n${STEP_PROMPT_HEADING}`);
+  const head = (at >= 0 ? prompt.slice(0, at) : prompt).trimEnd();
+  return `${head}\n\n${section}`;
 }
 
 // ── Summary (API, board, CLI) ─────────────────────────────────────────────
@@ -293,29 +381,54 @@ export interface RoadmapStepRef {
   url: string | null;
 }
 
+/** What a never-started backlog card says about its step (the card's status
+ *  line on the board). */
+export interface RoadmapCardInfo {
+  taskId: string;
+  step: string;
+  issue: number;
+  /** The owner's step: Autopilot never starts this card. */
+  human: boolean;
+  line: string;
+  tone: "muted" | "info" | "warning";
+}
+
 export interface RoadmapStatus {
   /** The tracker issue. */
   issue: number;
   url: string | null;
   fetchedAt: number;
-  /** Every step is in exactly one of complete / declined / inFlight / ready / waiting. */
+  /** The milestone that limits which steps are worked; null = the whole
+   *  roadmap. Everything below counts the steps in scope only. */
+  scope: (RoadmapMilestone & { roadmapTotal: number }) | null;
+  /** Every step in scope is in exactly one of complete / declined / inFlight
+   *  / ready / waiting. `backlog` overlaps ready and waiting. */
   counts: {
     total: number;
     complete: number;
     declined: number;
-    /** Open steps with a live card. */
+    /** Open steps with a live card that has started. */
     inFlight: number;
-    /** Ready, no live card (the owner's `[Human]` steps included). */
+    /** Ready, not started (the owner's `[Human]` steps included). */
     ready: number;
     /** Everything else: waiting on predecessors, held, or needing the user. */
     waiting: number;
+    /** Open steps whose card sits in the backlog, never started. */
+    backlog: number;
   };
-  /** Ready `[Human]` steps: only the owner can do them. */
+  /** Ready owner steps: only the owner can do them. With a scope: the ones
+   *  in it, and the ones outside it that a step in it waits on. */
   humanReady: RoadmapStepRef[];
   /** Steps Autopilot won't start again by itself. */
   needsUser: (RoadmapStepRef & { reason: string })[];
+  /** With a scope: unfinished agent steps of other milestones that steps in
+   *  scope wait on (directly or through other steps). This run never starts
+   *  them. */
+  blockedOutside: (RoadmapStepRef & { milestone: string })[];
   /** The first few steps that can't start yet, and why. */
   nextWaiting: (RoadmapStepRef & { waitingOn: string[]; reason: string | null })[];
+  /** The never-started backlog cards of open steps. */
+  cards: RoadmapCardInfo[];
   problems: RoadmapProblem[];
   /** Why nothing is running, when nothing is. */
   idleReason: string | null;
@@ -325,37 +438,71 @@ const ref = (v: RoadmapStepView): RoadmapStepRef => ({ step: v.step, issue: v.is
 const names = (xs: { step: string; issue: number }[], max = 6) =>
   xs.slice(0, max).map((x) => `${x.step} (#${x.issue})`).join(", ") + (xs.length > max ? ` and ${xs.length - max} more` : "");
 
+/** A never-started backlog card's status line: its step, and what it waits
+ *  on. Pure. */
+export function roadmapCardLine(v: RoadmapStepView, all: RoadmapStepView[]): { line: string; tone: RoadmapCardInfo["tone"] } {
+  const waits = v.waitingOn.map((p) => all.find((s) => s.step === p)).filter((s): s is RoadmapStepView => !!s);
+  const on = `step${waits.length === 1 ? "" : "s"} ${names(waits, 4)}`;
+  const head = `Step ${v.step}`;
+  if (v.status === "held") return { line: `${head} · held — ${v.reason ?? "a roadmap problem"}`, tone: "warning" };
+  if (v.human) {
+    return waits.length === 0
+      ? { line: `${head} · yours to do — open the issue`, tone: "warning" }
+      : { line: `${head} · yours to do, after ${on}`, tone: "muted" };
+  }
+  if (waits.length === 0) return { line: `${head} · ready — waiting for a slot`, tone: "info" };
+  return { line: `${head} · waits on ${on}`, tone: "muted" };
+}
+
 export function summarizeRoadmap(input: {
   issue: number;
   url: string | null;
   parsed: ParsedRoadmap;
+  /** Every step of the roadmap. */
   views: RoadmapStepView[];
-  /** Issues with a live card. */
+  /** The milestone and its steps, when one limits the run. */
+  scope?: { milestone: RoadmapMilestone; steps: ReadonlySet<string> } | null;
+  /** Issues with a live card that has started. */
   busy: ReadonlySet<number>;
+  /** Issues whose card is in the backlog, never started: issue → card id. */
+  backlog?: ReadonlyMap<number, string>;
   /** Issues Autopilot won't start again: issue → why. */
   needsUser: ReadonlyMap<number, string>;
   now: number;
   nextWaiting?: number;
 }): RoadmapStatus {
-  const { views, busy, needsUser } = input;
+  const { busy, needsUser, scope } = input;
+  const views = scope ? input.views.filter((v) => scope.steps.has(v.step)) : input.views;
   const open = views.filter((v) => v.status !== "complete" && v.status !== "declined");
   const inFlight = open.filter((v) => busy.has(v.issue));
   const idle = open.filter((v) => !busy.has(v.issue));
   const stuck = idle.filter((v) => needsUser.has(v.issue));
   const ready = idle.filter((v) => v.status === "ready" && !needsUser.has(v.issue));
   const waiting = idle.filter((v) => v.status !== "ready" && !needsUser.has(v.issue));
-  const humanReady = ready.filter((v) => v.human);
   const complete = views.filter((v) => v.status === "complete").length;
   const declined = views.filter((v) => v.status === "declined");
+  const carded = idle.filter((v) => input.backlog?.has(v.issue));
+
+  // What the steps in scope wait on outside it: the owner's ready steps need
+  // the owner; agent steps need their own milestone to be run.
+  const ancestors = scope ? unfinishedAncestors(input.views, open).filter((v) => !scope.steps.has(v.step)) : [];
+  const humanReady = [...ready.filter((v) => v.human), ...ancestors.filter((v) => v.human && v.status === "ready")].sort((a, b) => compareStepIds(a.step, b.step));
+  const outside = ancestors.filter((v) => !v.human && v.status !== "declined");
 
   let idleReason: string | null = null;
   if (open.length > 0 && inFlight.length === 0 && ready.every((v) => v.human)) {
     const parts: string[] = [];
     if (humanReady.length) parts.push(`waiting on you to do ${humanReady.length === 1 ? "human step" : "human steps"} ${names(humanReady)}`);
     if (stuck.length) parts.push(`${stuck.length === 1 ? "step" : "steps"} ${names(stuck)} ${stuck.length === 1 ? "needs" : "need"} you`);
+    if (outside.length) {
+      const codes = [...new Set(outside.map((v) => v.milestone).filter(Boolean))];
+      parts.push(
+        `${outside.length === 1 ? "step" : "steps"} ${names(outside)} of ${codes.length === 1 ? `milestone ${codes[0]}` : `other milestones (${codes.join(", ")})`} must finish first — run ${codes.length === 1 ? "that milestone" : "those milestones"}`,
+      );
+    }
     const heldSteps = waiting.filter((v) => v.status === "held");
     if (heldSteps.length) parts.push(`held by roadmap problems: ${names(heldSteps)}`);
-    const declinedIds = new Set(declined.map((v) => v.step));
+    const declinedIds = new Set(input.views.filter((v) => v.status === "declined").map((v) => v.step));
     const behindDeclined = waiting.filter((v) => v.waitingOn.some((p) => declinedIds.has(p)));
     if (behindDeclined.length) parts.push(`${names(behindDeclined)} wait on a declined step`);
     idleReason = parts.length ? `Nothing can start: ${parts.join("; ")}` : "Nothing can start: every open step waits on an unfinished predecessor";
@@ -365,18 +512,32 @@ export function summarizeRoadmap(input: {
     issue: input.issue,
     url: input.url,
     fetchedAt: input.now,
-    counts: { total: views.length, complete, declined: declined.length, inFlight: inFlight.length, ready: ready.length, waiting: waiting.length + stuck.length },
+    scope: scope ? { number: scope.milestone.number, title: scope.milestone.title, roadmapTotal: input.views.length } : null,
+    counts: { total: views.length, complete, declined: declined.length, inFlight: inFlight.length, ready: ready.length, waiting: waiting.length + stuck.length, backlog: carded.length },
     humanReady: humanReady.map(ref),
     needsUser: stuck.map((v) => ({ ...ref(v), reason: needsUser.get(v.issue)! })),
+    blockedOutside: outside.map((v) => ({ ...ref(v), milestone: v.milestone })),
     nextWaiting: waiting.slice(0, input.nextWaiting ?? 8).map((v) => ({ ...ref(v), waitingOn: v.waitingOn, reason: v.reason })),
+    cards: carded.map((v) => ({ taskId: input.backlog!.get(v.issue)!, step: v.step, issue: v.issue, human: v.human, ...roadmapCardLine(v, input.views) })),
     problems: input.parsed.problems,
     idleReason,
   };
 }
 
-/** Every step is complete or declined (and no row was dropped on the way). */
+/** Every step is complete or declined (and no row was dropped on the way).
+ *  `views` are the steps in scope. */
 export function roadmapFinished(parsed: ParsedRoadmap, views: RoadmapStepView[]): boolean {
   if (parsed.error || views.length === 0) return false;
   if (parsed.problems.some((p) => p.kind === "malformed-row" || p.kind === "duplicate-step")) return false;
   return views.every((v) => v.status === "complete" || v.status === "declined");
+}
+
+/** The status that belongs to the run configured now — not to another
+ *  tracker's or another milestone's. */
+export function currentRoadmapStatus(
+  config: { roadmap: { issue: number } | null; milestone: { number: number } | null },
+  status: RoadmapStatus | null | undefined,
+): RoadmapStatus | null {
+  if (!config.roadmap || !status || status.issue !== config.roadmap.issue) return null;
+  return (status.scope?.number ?? null) === (config.milestone?.number ?? null) ? status : null;
 }

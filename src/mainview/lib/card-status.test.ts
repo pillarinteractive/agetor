@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { cardStatus, formatAge, needsYouList, roadmapNeedsYou } from "./card-status.ts";
+import { cardStatus, formatAge, needsYouList, roadmapCardInfo, roadmapNeedsYou } from "./card-status.ts";
 import type { PipelineRunState, Task, TaskPrStatus } from "../../shared/types.ts";
 import type { TaskLeaseInfo } from "./leases.ts";
 
@@ -165,7 +165,13 @@ describe("roadmapNeedsYou — roadmap steps with no card", () => {
     issue: 600,
     url: "https://github.com/o/r/issues/600",
     fetchedAt: 0,
-    counts: { total: 3, complete: 0, declined: 0, inFlight: 0, ready: 1, waiting: 2 },
+    scope: null as { number: number; title: string; roadmapTotal: number } | null,
+    counts: { total: 3, complete: 0, declined: 0, inFlight: 0, ready: 1, waiting: 2, backlog: 2 },
+    blockedOutside: [],
+    cards: [
+      { taskId: "bl-13", step: "3", issue: 13, human: false, line: "Step 3 · waits on steps 1 (#11), 2 (#12)", tone: "muted" as const },
+      { taskId: "bl-11", step: "1", issue: 11, human: true, line: "Step 1 · yours to do — open the issue", tone: "warning" as const },
+    ],
     humanReady: [{ step: "1", issue: 11, title: "[Human] Provide the sample device", url: "https://github.com/o/r/issues/11" }],
     needsUser: [{ step: "2", issue: 12, title: "Inventory the widgets", url: "https://github.com/o/r/issues/12", reason: "PR #77 merged but the issue is still open" }],
     nextWaiting: [],
@@ -187,5 +193,49 @@ describe("roadmapNeedsYou — roadmap steps with no card", () => {
     expect(roadmapNeedsYou(autopilot(true, { issue: 601 }))).toEqual([]);
     expect(roadmapNeedsYou({ config: { enabled: true, roadmap: { issue: 600 } }, state: {} })).toEqual([]);
     expect(roadmapNeedsYou(null)).toEqual([]);
+  });
+});
+
+describe("roadmap backlog cards", () => {
+  const info: import("../../shared/roadmap.ts").RoadmapCardInfo = { taskId: "bl-13", step: "3", issue: 13, human: false, line: "Step 3 · waits on steps 1 (#11), 2 (#12)", tone: "muted" };
+  const idle = run({ status: "idle", snapshot: null });
+  const st = (t: Task, roadmap: typeof info | null) => cardStatus(t, { pr: null, lease: noLease, now: NOW, roadmap });
+
+  test("a never-started card says its step and what it waits on", () => {
+    expect(st(task({ id: "bl-13", column: "backlog", runId: null, pipelineRun: idle }), info)).toEqual({ line: "Step 3 · waits on steps 1 (#11), 2 (#12)", tone: "muted", needsYou: null });
+    // The owner's card doesn't ask twice: the Needs you strip already lists its step.
+    const owner = { ...info, taskId: "bl-11", human: true, line: "Step 1 · yours to do — open the issue", tone: "warning" as const };
+    expect(st(task({ id: "bl-11", column: "backlog", runId: null, pipelineRun: idle }), owner)).toEqual({ line: "Step 1 · yours to do — open the issue", tone: "warning", needsYou: null });
+  });
+
+  test("once it runs, or is done, the card speaks for itself", () => {
+    const running = task({ id: "bl-13", column: "running", pipelineRun: run({ active: [{ stepId: "build", taskId: "s1", seq: 1 }] }) });
+    expect(st(running, info).line).toBe("Build step starting");
+    expect(st(task({ id: "bl-13", column: "done", runId: null, pipelineRun: idle }), info).line).toBe("Done");
+  });
+
+  test("a pipeline card nothing has run is in the backlog — not 'finished without a PR'", () => {
+    expect(st(task({ column: "backlog", runId: null, pipelineRun: idle }), null)).toEqual({ line: "In backlog", tone: "muted", needsYou: null });
+    expect(st(task({ column: "ready", runId: null, pipelineRun: idle }), null)).toEqual({ line: "Ready to run", tone: "muted", needsYou: null });
+  });
+
+  test("roadmapCardInfo: the current run's cards by id — paused too, never another milestone's", () => {
+    const scoped = { issue: 600, scope: { number: 2, title: "M02", roadmapTotal: 6 }, cards: [info] } as never;
+    const a = (enabled: boolean, milestone: { number: number } | null) => ({ config: { enabled, roadmap: { issue: 600 }, milestone }, state: { roadmap: scoped } });
+    expect([...roadmapCardInfo(a(true, { number: 2 })).keys()]).toEqual(["bl-13"]);
+    expect([...roadmapCardInfo(a(false, { number: 2 })).keys()]).toEqual(["bl-13"]);
+    expect(roadmapCardInfo(a(true, { number: 3 })).size).toBe(0);
+    expect(roadmapCardInfo(a(true, null)).size).toBe(0);
+    expect(roadmapCardInfo(null).size).toBe(0);
+    // A status saved before cards existed has none.
+    expect(roadmapCardInfo({ config: { roadmap: { issue: 600 }, milestone: null }, state: { roadmap: { issue: 600 } as never } }).size).toBe(0);
+  });
+
+  test("Needs you follows the scope: another milestone's status raises nothing", () => {
+    const scoped = { issue: 600, scope: { number: 2, title: "M02", roadmapTotal: 6 }, needsUser: [], humanReady: [{ step: "1", issue: 11, title: "[Human] Provide the sample device", url: null }] } as never;
+    const a = (milestone: { number: number } | null) => ({ config: { enabled: true, roadmap: { issue: 600 }, milestone }, state: { roadmap: scoped } });
+    expect(roadmapNeedsYou(a({ number: 2 })).map((n) => n.key)).toEqual(["human:11"]);
+    expect(roadmapNeedsYou(a({ number: 3 }))).toEqual([]);
+    expect(roadmapNeedsYou(a(null))).toEqual([]);
   });
 });

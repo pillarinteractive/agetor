@@ -69,8 +69,18 @@ export function fixesLine(number: number): string {
   );
 }
 
-/** Create (and by default start) a pipeline task for an issue. Refuses when
- *  a live task is already on it, so a double click can't start two runs. */
+/**
+ * Create (and by default start) a pipeline task for an issue. Refuses when
+ * a live task is already on it, so a double click can't start two runs.
+ *
+ * With `start: false` the card lands in Backlog and nothing else happens: one
+ * read of the issue thread from GitHub, a few read-only `git rev-parse` calls
+ * (the base commit, a free branch name), the task row, its base-branch
+ * preference entry and the thread snapshot file under the data dir. No
+ * worktree, no branch, no setup command, no agent session and no write to
+ * GitHub until the card is started — Autopilot's tracker mode makes one such
+ * card per open step of a milestone (src/bun/autopilot.ts).
+ */
 export async function createTaskFromIssue(input: {
   dir: string;
   number: number;
@@ -81,8 +91,8 @@ export async function createTaskFromIssue(input: {
   /** A Done card on the issue doesn't count as "already working on it" (a
    *  reopened issue gets a new card). */
   allowAfterDone?: boolean;
-}): Promise<{ task: Task } | { error: string; status: 400 | 409 | 502 }> {
-  const thread = await gitHost.issueThread({ dir: input.dir, number: input.number, includeComments: true });
+}, deps: { issueThread: typeof gitHost.issueThread } = gitHost): Promise<{ task: Task } | { error: string; status: 400 | 409 | 502 }> {
+  const thread = await deps.issueThread({ dir: input.dir, number: input.number, includeComments: true });
   if (!thread.ok) return { error: thread.error, status: 502 };
   const existing = taskForIssue(
     thread.item.htmlUrl,

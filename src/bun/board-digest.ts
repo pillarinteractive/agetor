@@ -6,6 +6,7 @@
  * agent reads, so it's written for a reader, not a parser.
  */
 import type { Task } from "../shared/types.ts";
+import type { RoadmapCardInfo } from "../shared/roadmap.ts";
 import { cardStatus, formatAge } from "../mainview/lib/card-status.ts";
 import { leaseInfoForTask } from "../mainview/lib/leases.ts";
 import { progressLine } from "../mainview/lib/progress.ts";
@@ -43,7 +44,15 @@ export interface BoardDigest {
 }
 
 /** Live top-level cards, minus any the caller hides (the Conductor itself). */
-export function buildBoardDigest(opts: { exclude?: Set<string>; now?: number } = {}): BoardDigest {
+export function buildBoardDigest(
+  opts: {
+    exclude?: Set<string>;
+    now?: number;
+    /** Autopilot's word on its never-started backlog cards, by card id
+     *  (src/mainview/lib/card-status.ts `roadmapCardInfo`). */
+    roadmap?: ReadonlyMap<string, RoadmapCardInfo>;
+  } = {},
+): BoardDigest {
   const now = opts.now ?? Date.now();
   const leases = listLeases();
   const progress = listProgress();
@@ -51,7 +60,7 @@ export function buildBoardDigest(opts: { exclude?: Set<string>; now?: number } =
     .list()
     .filter((t) => t.archivedAt == null && !t.pipelineParentId && !opts.exclude?.has(t.id))
     .sort((a, b) => b.updatedAt - a.updatedAt)
-    .map((t) => digestCard(t, { leases, progress, now }));
+    .map((t) => digestCard(t, { leases, progress, now, roadmap: opts.roadmap }));
   return {
     generatedAt: now,
     cards,
@@ -64,13 +73,13 @@ export function buildBoardDigest(opts: { exclude?: Set<string>; now?: number } =
 
 function digestCard(
   t: Task,
-  ctx: { leases: ReturnType<typeof listLeases>; progress: ReturnType<typeof listProgress>; now: number },
+  ctx: { leases: ReturnType<typeof listLeases>; progress: ReturnType<typeof listProgress>; now: number; roadmap?: ReadonlyMap<string, RoadmapCardInfo> },
 ): DigestCard {
   const pr = prStatusForTask(t.id);
   const lease = leaseInfoForTask(t, ctx.leases);
   const progressActive = ctx.progress.some((p) => p.taskId === t.id && p.active);
   const blockedBy = blockedByFor(t.id);
-  const status = cardStatus({ ...t, lastActivityAt: lastActivityAt(t), blockedBy }, { pr, lease, now: ctx.now, progressActive });
+  const status = cardStatus({ ...t, lastActivityAt: lastActivityAt(t), blockedBy }, { pr, lease, now: ctx.now, progressActive, roadmap: ctx.roadmap?.get(t.id) });
   return {
     id: t.id,
     title: t.title,

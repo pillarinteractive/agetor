@@ -46,7 +46,7 @@ import { activeTrain, mergedViaTrain, trainFor } from "./merge-train.ts";
 import { isPriority, readPriority, setPriority } from "./priority.ts";
 import { setMergeQueued } from "./merge-intent.ts";
 import { KEEP_AWAKE_PREF_KEY, KEEP_SCREEN_ON_PREF_KEY, recheckKeepAwake } from "./keep-awake.ts";
-import { AUTOPILOT_PREF, AUTOPILOT_STATE_PREF, requestAutopilotPass, setAutopilotNotifier, parseConfig as parseAutopilotConfig, readState as readAutopilotState } from "./autopilot.ts";
+import { applyAutopilotPatch, autopilotSnapshot, requestAutopilotPass, setAutopilotNotifier } from "./autopilot.ts";
 import { departTrainNow, refreshMergeColumn } from "./merge-queue.ts";
 import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
@@ -61,6 +61,7 @@ import type { UpdaterSnapshot } from "./updater.ts";
 import { listLeases } from "./lease-watch.ts";
 import { listProgress } from "./progress-watch.ts";
 import { buildBoardDigest, renderBoardDigest } from "./board-digest.ts";
+import { roadmapCardInfo } from "../mainview/lib/card-status.ts";
 import { readBlockLog, summarizeBlocks } from "./block-log.ts";
 import { listPrStatuses } from "./pr-watch.ts";
 import { createTaskFromIssue, listIssueQueue } from "./issue-queue.ts";
@@ -3290,7 +3291,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
 
       "/board/digest": {
         GET: authed((req) => {
-          const digest = buildBoardDigest();
+          const digest = buildBoardDigest({ roadmap: roadmapCardInfo(autopilotSnapshot()) });
           if (new URL(req.url).searchParams.get("format") === "text") {
             return new Response(renderBoardDigest(digest), {
               headers: { ...corsHeaders(req), "content-type": "text/plain; charset=utf-8" },
@@ -3300,37 +3301,15 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
         }),
       },
 
-      // Milestone Autopilot (src/bun/autopilot.ts).
+      // Autopilot (src/bun/autopilot.ts): config, state and the default
+      // tracker issue.
       "/autopilot": {
-        GET: authed((req) =>
-          json({ config: parseAutopilotConfig(preferences.get(AUTOPILOT_PREF)), state: readAutopilotState() }, { headers: corsHeaders(req) }),
-        ),
+        GET: authed((req) => json(autopilotSnapshot(), { headers: corsHeaders(req) })),
         PUT: authed(async (req) => {
           const body = (await req.json().catch(() => ({}))) as Record<string, unknown>;
-          const cur = parseAutopilotConfig(preferences.get(AUTOPILOT_PREF));
-          const next = parseAutopilotConfig(JSON.stringify({ ...cur, ...body }));
-          preferences.set(AUTOPILOT_PREF, JSON.stringify(next));
-          // Starting (or changing the milestone or the roadmap) begins a fresh
-          // run. A different roadmap also drops the old one's status, its
-          // restart guard and its announced human steps.
-          const roadmapChanged = (cur.roadmap?.issue ?? null) !== (next.roadmap?.issue ?? null) || (!!next.roadmap && cur.project !== next.project);
-          if (body.restart === true || roadmapChanged || (next.enabled && (!cur.enabled || cur.milestone?.number !== next.milestone?.number))) {
-            const s = readAutopilotState();
-            preferences.set(
-              AUTOPILOT_STATE_PREF,
-              JSON.stringify({
-                ...s,
-                phase: "idle",
-                held: [],
-                lastError: null,
-                quietUntil: 0,
-                quietSignature: "",
-                ...(roadmapChanged ? { roadmap: null, roadmapStuck: {}, notifiedHuman: [] } : {}),
-              }),
-            );
-          }
+          const next = applyAutopilotPatch(body);
           if (next.enabled) requestAutopilotPass(0);
-          return json({ config: next, state: readAutopilotState() }, { headers: corsHeaders(req) });
+          return json(autopilotSnapshot(), { headers: corsHeaders(req) });
         }),
       },
 

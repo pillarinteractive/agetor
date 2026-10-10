@@ -270,13 +270,32 @@ const COMPLETED: IssueState = { state: "CLOSED", stateReason: "COMPLETED" };
 const roadmapCfg = { ...cfg, threadId: "", milestone: null, maxInFlight: 2, roadmap: { issue: 600 } };
 const NOW = 10_000_000;
 const roadmapCard = (id: string, n: number, column: string, extra: Record<string, unknown> = {}) =>
-  ({ id, title: `Issue #${n}`, issueUrl: `https://github.com/o/r/issues/${n}`, column, archivedAt: null, pipelineParentId: null, pendingInteractionCount: 0, prUrl: null, pipelineRun: null, worktreePath: "/wt", baseRef: "abc", updatedAt: 0, ...extra }) as never as TaskT;
+  ({ id, title: `Issue #${n}`, prompt: `Do #${n}.`, workdir: "/repo", runId: null, issueUrl: `https://github.com/o/r/issues/${n}`, column, archivedAt: null, pipelineParentId: null, pendingInteractionCount: 0, prUrl: null, pipelineRun: null, worktreePath: "/wt", baseRef: "abc", updatedAt: 0, ...extra }) as never as TaskT;
+
+/** The GitHub milestone of each fixture issue: number → title. */
+const GH_MILESTONES: Record<number, string> = { 90: "H — Owner decisions", 1: "M01 — Widget foundations", 2: "M02 — Widget page" };
+const ISSUE_MILESTONE: Record<number, number> = { 11: 90, 12: 1, 13: 1, 14: 2, 15: 2, 16: 2 };
 
 function roadmapDeps(states: Record<number, IssueState>, over: Partial<RDeps> = {}) {
-  const log = { started: [] as { number: number; extraPrompt: string }[], notified: [] as string[], activity: [] as string[], rechecks: 0 };
+  const log = {
+    started: [] as { number: number; extraPrompt: string }[],
+    backlogged: [] as { number: number; extraPrompt: string }[],
+    startedExisting: [] as { id: string; stepPrompt: string }[],
+    done: [] as string[],
+    saves: 0,
+    notified: [] as string[],
+    activity: [] as string[],
+    rechecks: 0,
+  };
   const deps: RDeps = {
     loadTracker: async () => ({ body: ROADMAP_BODY, url: "https://github.com/o/r/issues/600" }),
-    loadStates: async (_p, numbers) => new Map(numbers.map((n) => [n, { ...(states[n] ?? OPEN), url: `https://github.com/o/r/issues/${n}` }])),
+    loadStates: async (_p, numbers) =>
+      new Map(
+        numbers.map((n) => {
+          const m = ISSUE_MILESTONE[n];
+          return [n, { milestone: m ? { number: m, title: GH_MILESTONES[m]! } : null, ...(states[n] ?? OPEN), url: `https://github.com/o/r/issues/${n}` }];
+        }),
+      ),
     aheadCount: async () => 0,
     hasNoPr: () => true,
     mergedPr: () => null,
@@ -286,6 +305,17 @@ function roadmapDeps(states: Record<number, IssueState>, over: Partial<RDeps> = 
       log.started.push({ number, extraPrompt });
       return { task: roadmapCard(`new-${number}`, number, "ready") };
     },
+    createBacklogCard: async ({ number, extraPrompt }) => {
+      log.backlogged.push({ number, extraPrompt });
+      return { task: backlogCard(number) };
+    },
+    startExisting: async ({ task, stepPrompt }) => {
+      log.startedExisting.push({ id: task.id, stepPrompt });
+      return { ok: true };
+    },
+    moveToDone: (t) => void log.done.push(t.id),
+    save: () => void log.saves++,
+    outdated: () => false,
     notify: (n) => {
       log.notified.push(n.body);
       return true;
@@ -297,7 +327,11 @@ function roadmapDeps(states: Record<number, IssueState>, over: Partial<RDeps> = 
   };
   return { deps, log };
 }
-const roadmapState = async (): Promise<import("./autopilot.ts").AutopilotState> => ({ ...(await freshState()), roadmap: null, roadmapStuck: {}, notifiedHuman: [], lastError: null });
+const roadmapState = async (): Promise<import("./autopilot.ts").AutopilotState> => ({ ...(await freshState()), phase: "idle", roadmap: null, roadmapStuck: {}, notifiedHuman: [], roadmapBacklog: {}, lastError: null });
+/** A pipeline card nothing has run: what a backlog card is until it starts. */
+const IDLE_RUN = { status: "idle", active: [], blocked: [], history: [], joins: {} };
+const backlogCard = (n: number, extra: Record<string, unknown> = {}) => roadmapCard(`bl-${n}`, n, "backlog", { pipelineRun: IDLE_RUN, ...extra });
+const RUNNING_RUN = { status: "running", active: [{ stepId: "build", taskId: "s", seq: 1 }], blocked: [], history: [], joins: {} };
 
 test("roadmap: starts the ready agent steps in step order; the human step is announced once, never started", async () => {
   const { roadmapPass } = await import("./autopilot.ts");
@@ -310,7 +344,8 @@ test("roadmap: starts the ready agent steps in step order; the human step is ann
   expect(log.started[0]!.extraPrompt).toContain('"Fixes #12"');
   expect(state.cards).toEqual(["new-12"]);
   expect(state.phase).toBe("running");
-  expect(state.roadmap!.counts).toEqual({ total: 6, complete: 0, declined: 0, inFlight: 1, ready: 1, waiting: 4 });
+  expect(state.roadmap!.counts).toEqual({ total: 6, complete: 0, declined: 0, inFlight: 1, ready: 1, waiting: 4, backlog: 0 });
+  expect(log.backlogged).toEqual([]); // the whole roadmap: no cards up front
   expect(state.roadmap!.humanReady).toEqual([{ step: "1", issue: 11, title: "[Human] Provide the sample device", url: "https://github.com/o/r/issues/11" }]);
   expect(log.notified).toEqual(["Step 1 · #11 [Human] Provide the sample device"]);
 
@@ -442,4 +477,456 @@ test("tick: roadmap mode runs without a milestone or thread; milestone mode stil
     preferences.set(AUTOPILOT_STATE_PREF, before.state ?? "{}");
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ── Tracker mode with a milestone: scope, backlog cards ────────────────────
+
+const M01 = { number: 1, title: GH_MILESTONES[1]! };
+const M02 = { number: 2, title: GH_MILESTONES[2]! };
+const scopedCfg = (milestone: { number: number; title: string }, maxInFlight = 2) => ({ ...roadmapCfg, milestone, maxInFlight });
+/** The cards a pass made, as the board would hand them to the next pass. */
+const ledgerCards = (state: { roadmapBacklog: Record<string, string> }, extra: Record<number, Record<string, unknown>> = {}) =>
+  Object.keys(state.roadmapBacklog).map((k) => backlogCard(Number(k), extra[Number(k)]));
+
+test("scope: only the steps whose issue is in the milestone are worked; the rest still gate the order", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  const state = await roadmapState();
+  const { deps, log } = roadmapDeps({});
+  await roadmapPass(scopedCfg(M02, 5), state, [], [], deps);
+  // #12 (M01) is ready but out of scope: this run doesn't start it, and #14 waits on it.
+  expect(log.started).toEqual([]);
+  expect(log.startedExisting).toEqual([]);
+  expect(log.backlogged.map((b) => b.number)).toEqual([14, 15, 16]);
+  expect(state.roadmap!.scope).toEqual({ number: 2, title: M02.title, roadmapTotal: 6 });
+  expect(state.roadmap!.counts).toEqual({ total: 3, complete: 0, declined: 0, inFlight: 0, ready: 0, waiting: 3, backlog: 3 });
+  expect(state.roadmap!.blockedOutside.map((b) => [b.step, b.milestone])).toEqual([["2", "M01"], ["3", "M01"]]);
+  expect(state.roadmap!.humanReady.map((h) => h.step)).toEqual(["1"]); // #16 waits on the owner's step 1
+  expect(state.roadmap!.idleReason).toContain("waiting on you to do human step 1 (#11)");
+  expect(state.roadmap!.idleReason).toContain("steps 2 (#12), 3 (#13) of milestone M01 must finish first — run that milestone");
+  expect(state.phase).toBe("idle");
+  expect(log.notified).toEqual(["Step 1 · #11 [Human] Provide the sample device"]);
+});
+
+test("scope: an issue moved to another milestone on GitHub follows GitHub, and the mismatch is reported", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  const state = await roadmapState();
+  // The table says #14 is M02; on GitHub it sits in M01.
+  const { deps, log } = roadmapDeps({ 14: { ...OPEN, milestone: { number: 1, title: M01.title } } as IssueState });
+  await roadmapPass(scopedCfg(M01, 5), state, [], [], deps);
+  expect(log.started.map((s) => s.number)).toEqual([12]);
+  expect(log.backlogged.map((b) => b.number)).toEqual([13, 14]);
+  expect(state.roadmap!.problems.map((p) => [p.kind, p.step])).toEqual([["milestone-mismatch", "4"]]);
+  expect(state.roadmap!.problems[0]!.message).toContain("is in this milestone on GitHub, but the table says M02");
+});
+
+test("scope: done when every step in the milestone is complete or declined; a milestone with no step is an error", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  const state = await roadmapState();
+  const { deps, log } = roadmapDeps({ 12: COMPLETED, 13: { state: "CLOSED", stateReason: "NOT_PLANNED" } });
+  await roadmapPass(scopedCfg(M01), state, [], [], deps);
+  expect(state.phase).toBe("done"); // #14–#16 are open, in another milestone
+  expect(log.started).toEqual([]);
+  expect(log.backlogged).toEqual([]);
+
+  const empty = await roadmapState();
+  const e = roadmapDeps({});
+  await roadmapPass(scopedCfg({ number: 77, title: "M77 — Nothing here" }), empty, [], [], e.deps);
+  expect(empty.phase).toBe("idle");
+  expect(empty.lastError).toContain('no step of roadmap #600 has its issue in milestone "M77 — Nothing here"');
+  expect(e.log.backlogged).toEqual([]);
+});
+
+test("backlog: every open step of the milestone gets one unstarted card — once", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  const state = await roadmapState();
+  const { deps, log } = roadmapDeps({});
+  await roadmapPass(scopedCfg(M01), state, [], [], deps);
+  // #12 is ready: started at once (a new card — it had none). #13 waits: a backlog card.
+  expect(log.started.map((s) => s.number)).toEqual([12]);
+  expect(log.backlogged.map((b) => b.number)).toEqual([13]);
+  expect(log.backlogged[0]!.extraPrompt).toContain("Roadmap step 3 (M01)");
+  expect(log.backlogged[0]!.extraPrompt).toContain("2 (#12) was not finished");
+  expect(state.roadmapBacklog).toEqual({ "13": "bl-13" });
+  expect(state.cards).toEqual(["new-12"]); // a backlog card isn't one of the started cards
+  expect(state.roadmap!.cards).toEqual([{ taskId: "bl-13", step: "3", issue: 13, human: false, line: "Step 3 · waits on step 2 (#12)", tone: "muted" }]);
+  expect(log.saves).toBe(2); // the ledger is saved after each card made or started
+  expect(log.activity.at(-1)).toContain("added this to the backlog as step 3 of roadmap #600");
+
+  // The next passes make nothing more.
+  const board = [roadmapCard("new-12", 12, "running", { pipelineRun: RUNNING_RUN }), ...ledgerCards(state)];
+  await roadmapPass(scopedCfg(M01), state, board, [board[0]!], deps);
+  await roadmapPass(scopedCfg(M01), state, board, [board[0]!], deps);
+  expect(log.backlogged.length).toBe(1);
+  expect(log.started.length).toBe(1);
+  expect(state.roadmapBacklog).toEqual({ "13": "bl-13" });
+});
+
+test("backlog: a step added to the milestone later gets its card; a deleted card is made again", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  const state = await roadmapState();
+  const first = roadmapDeps({ 12: COMPLETED, 13: COMPLETED });
+  await roadmapPass(scopedCfg(M02, 1), state, [], [], first.deps);
+  expect(first.log.started.map((s) => s.number)).toEqual([14]);
+  expect(first.log.backlogged.map((b) => b.number)).toEqual([15, 16]);
+  const running = roadmapCard("new-14", 14, "running", { pipelineRun: RUNNING_RUN });
+
+  // #13 is reopened and moved into M02 on GitHub; the user deleted #16's card.
+  const later = roadmapDeps({ 12: COMPLETED, 13: { ...OPEN, milestone: { number: 2, title: M02.title } } as IssueState });
+  await roadmapPass(scopedCfg(M02, 1), state, [running, backlogCard(15)], [running], later.deps);
+  expect(later.log.backlogged.map((b) => b.number)).toEqual([13, 16]);
+  expect(Object.keys(state.roadmapBacklog).sort()).toEqual(["13", "15", "16"]);
+});
+
+test("backlog: a ready step starts its existing card — in step order, within the free slots — not a new one", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  const state = await roadmapState();
+  state.roadmapBacklog = { "14": "bl-14", "15": "bl-15", "16": "bl-16" };
+  state.notifiedHuman = [11];
+  // #11–#13 are complete: #14 and #16 are ready, #15 waits on #14. One slot.
+  const { deps, log } = roadmapDeps({ 11: COMPLETED, 12: COMPLETED, 13: COMPLETED });
+  await roadmapPass(scopedCfg(M02, 1), state, ledgerCards(state), [], deps);
+  expect(log.startedExisting.map((s) => s.id)).toEqual(["bl-14"]);
+  expect(log.started).toEqual([]);
+  expect(log.backlogged).toEqual([]);
+  // The step section is rewritten for the roadmap as it is now.
+  expect(log.startedExisting[0]!.stepPrompt).toContain("are finished and already merged into the base: 2 (#12)");
+  expect(state.cards).toEqual(["bl-14"]);
+  expect(state.roadmapBacklog).toEqual({ "15": "bl-15", "16": "bl-16" });
+  expect(state.phase).toBe("running");
+  expect(state.roadmap!.counts).toMatchObject({ inFlight: 1, ready: 1, waiting: 1, backlog: 2 });
+  expect(state.roadmap!.cards.map((c) => c.line)).toEqual(["Step 5 · waits on step 4 (#14)", "Step 6 · ready — waiting for a slot"]);
+  expect(log.activity).toEqual(["Autopilot started this as step 4 of roadmap #600"]);
+});
+
+test("backlog: a card that won't start stays in the backlog and is tried again", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  const state = await roadmapState();
+  state.roadmapBacklog = { "13": "bl-13" };
+  const { deps, log } = roadmapDeps({ 12: COMPLETED }, { startExisting: async () => ({ error: "its backlog card didn't start: no agent" }) });
+  await roadmapPass(scopedCfg(M01), state, ledgerCards(state), [], deps);
+  expect(state.lastError).toBe("step 3 (#13): its backlog card didn't start: no agent");
+  expect(state.roadmapBacklog).toEqual({ "13": "bl-13" });
+  expect(state.cards).toEqual([]);
+  expect(log.backlogged).toEqual([]);
+});
+
+test("slots: unstarted backlog cards hold none and don't make their issue busy", async () => {
+  const { roadmapPass, slotCounts } = await import("./autopilot.ts");
+  // Three backlog cards, two slots: the two ready ones still start.
+  const state = await roadmapState();
+  state.roadmapBacklog = { "14": "bl-14", "15": "bl-15", "16": "bl-16" };
+  const { deps, log } = roadmapDeps({ 11: COMPLETED, 12: COMPLETED, 13: COMPLETED });
+  await roadmapPass(scopedCfg(M02, 2), state, ledgerCards(state), [], deps);
+  expect(log.startedExisting.map((s) => s.id)).toEqual(["bl-14", "bl-16"]);
+
+  // Once one is running it holds a slot like any card.
+  const next = await roadmapState();
+  next.roadmapBacklog = { "15": "bl-15", "16": "bl-16" };
+  next.cards = ["bl-14"];
+  const running = backlogCard(14, { column: "running", pipelineRun: RUNNING_RUN });
+  const n = roadmapDeps({ 11: COMPLETED, 12: COMPLETED, 13: COMPLETED });
+  await roadmapPass(scopedCfg(M02, 1), next, [running, backlogCard(15), backlogCard(16)], [running], n.deps);
+  expect(n.log.startedExisting).toEqual([]);
+  expect(next.roadmap!.counts).toMatchObject({ inFlight: 1, ready: 1, backlog: 2 });
+
+  // The same in slotCounts' own terms — and without the exemption (thread-driven
+  // milestone mode, any other backlog card) nothing changed: Backlog holds a slot.
+  const open = [14, 15, 16].map((number) => ({ number, title: `#${number}` }));
+  const cards = [backlogCard(14), backlogCard(15), backlogCard(16)];
+  const exempt = new Set(["bl-14", "bl-15"]);
+  const withLedger = slotCounts(cards, [], open, () => false, { project: "/repo", noSlot: exempt, notBusy: exempt });
+  expect([...withLedger.busyIssues]).toEqual([16]);
+  expect(withLedger.inFlight.map((i) => i.number)).toEqual([16]);
+  const plain = slotCounts(cards, [], open);
+  expect([...plain.busyIssues].sort()).toEqual([14, 15, 16]);
+  expect(plain.inFlight.map((i) => i.number)).toEqual([14, 15, 16]);
+  // Thread-driven mode with leftovers: no slot, but the issue stays busy.
+  const threadMode = slotCounts(cards, [], open, () => false, { noSlot: exempt });
+  expect([...threadMode.busyIssues].sort()).toEqual([14, 15, 16]);
+  expect(threadMode.inFlight.map((i) => i.number)).toEqual([16]);
+});
+
+test("slots: only this project's cards count — the same issue number elsewhere is another issue", async () => {
+  const { roadmapPass, slotCounts } = await import("./autopilot.ts");
+  const elsewhere = roadmapCard("x", 12, "running", { workdir: "/other-repo", pipelineRun: RUNNING_RUN });
+  const open = [{ number: 12, title: "t" }];
+  expect([...slotCounts([elsewhere], [], open, () => false, { project: "/repo" }).busyIssues]).toEqual([]);
+  expect([...slotCounts([elsewhere], [], open, () => false, { project: "/other-repo/" }).busyIssues]).toEqual([12]);
+  expect([...slotCounts([elsewhere], [], open).busyIssues]).toEqual([12]); // thread-driven mode: as before
+
+  const state = await roadmapState();
+  const { deps, log } = roadmapDeps({});
+  await roadmapPass({ ...roadmapCfg, maxInFlight: 1 }, state, [elsewhere], [], deps);
+  expect(log.started.map((s) => s.number)).toEqual([12]);
+});
+
+test("the owner's steps get a card that Autopilot never starts and that takes no slot", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  const H = { number: 90, title: GH_MILESTONES[90]! };
+  const state = await roadmapState();
+  const { deps, log } = roadmapDeps({});
+  await roadmapPass(scopedCfg(H, 5), state, [], [], deps);
+  expect(log.backlogged.map((b) => b.number)).toEqual([11]);
+  expect(log.started).toEqual([]);
+  expect(log.startedExisting).toEqual([]);
+  expect(log.activity).toEqual(["Autopilot added this to the backlog: step 1 of roadmap #600 is yours to do — Autopilot never starts it"]);
+  expect(state.roadmap!.cards).toEqual([{ taskId: "bl-11", step: "1", issue: 11, human: true, line: "Step 1 · yours to do — open the issue", tone: "warning" }]);
+  expect(state.roadmap!.humanReady.map((h) => h.issue)).toEqual([11]);
+  expect(state.phase).toBe("idle");
+
+  // Pass after pass, with every slot free, it stays where it is.
+  await roadmapPass(scopedCfg(H, 5), state, ledgerCards(state), [], deps);
+  expect(log.startedExisting).toEqual([]);
+  expect(log.started).toEqual([]);
+  expect(log.backlogged.length).toBe(1);
+  expect(state.cards).toEqual([]);
+
+  // Started by hand, it's the owner's own card: not followed, not signed off.
+  const byHand = backlogCard(11, { column: "running", pipelineRun: RUNNING_RUN });
+  await roadmapPass(scopedCfg(H, 5), state, [byHand], [], deps);
+  expect(state.roadmapBacklog).toEqual({});
+  expect(state.cards).toEqual([]);
+  expect(log.backlogged.length).toBe(1); // its issue has a live card
+});
+
+test("backlog: an agent step's card started by hand is followed like any card Autopilot started", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  const state = await roadmapState();
+  state.roadmapBacklog = { "13": "bl-13" };
+  const { deps, log } = roadmapDeps({});
+  const byHand = backlogCard(13, { column: "running", pipelineRun: RUNNING_RUN });
+  await roadmapPass(scopedCfg(M01, 1), state, [byHand], [], deps);
+  expect(state.cards).toEqual(["bl-13"]);
+  expect(log.started).toEqual([]); // it holds the one slot
+  expect(log.backlogged.map((b) => b.number)).toEqual([12]); // #12 is ready with no slot: it waits as a card
+  expect(state.roadmapBacklog).toEqual({ "12": "bl-12" });
+  expect(log.activity[0]).toContain("step 3 was started by hand");
+});
+
+test("backlog: a card whose issue closes before it starts is moved to Done with a note", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  const state = await roadmapState();
+  state.roadmapBacklog = { "13": "bl-13", "14": "bl-14", "15": "bl-15" };
+  const { deps, log } = roadmapDeps({ 12: COMPLETED, 13: COMPLETED, 14: { state: "CLOSED", stateReason: "NOT_PLANNED" } });
+  await roadmapPass(scopedCfg(M01), state, ledgerCards(state), [], deps);
+  // #13 (in scope) and #14 (left over from another milestone) are closed; #15 is open and out of scope.
+  expect(log.done).toEqual(["bl-13", "bl-14"]);
+  expect(log.activity).toEqual([
+    "Autopilot: #13 was closed (completed) before this card started — moved it to Done",
+    "Autopilot: #14 was closed (not planned) before this card started — moved it to Done",
+  ]);
+  expect(state.roadmapBacklog).toEqual({ "15": "bl-15" });
+  expect(log.startedExisting).toEqual([]);
+  expect(state.phase).toBe("done");
+});
+
+test("switching milestone: cards the other milestone left in the backlog are neither started nor touched", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  const state = await roadmapState();
+  state.roadmapBacklog = { "14": "bl-14", "16": "bl-16" }; // made while working M02
+  state.notifiedHuman = [11];
+  // #14 (M02) is ready, and so is #13 (M01). The run is on M01 now, with one slot.
+  const { deps, log } = roadmapDeps({ 11: COMPLETED, 12: COMPLETED });
+  await roadmapPass(scopedCfg(M01, 1), state, ledgerCards(state), [], deps);
+  expect(log.started.map((s) => s.number)).toEqual([13]); // the leftovers took no slot
+  expect(log.startedExisting).toEqual([]);
+  expect(log.done).toEqual([]);
+  expect(state.roadmapBacklog).toEqual({ "14": "bl-14", "16": "bl-16" });
+  expect(state.roadmap!.cards).toEqual([]); // not this run's
+  expect(state.roadmap!.counts).toMatchObject({ total: 2, inFlight: 1, backlog: 0 });
+
+  // Back on M02 they are its cards again.
+  const back = roadmapDeps({ 11: COMPLETED, 12: COMPLETED });
+  await roadmapPass(scopedCfg(M02, 1), state, ledgerCards(state), [], back.deps);
+  expect(back.log.startedExisting.map((s) => s.id)).toEqual(["bl-14"]);
+  expect(back.log.backlogged.map((b) => b.number)).toEqual([15]);
+});
+
+test("backlog and the restart guard: a step that needs you, or is settling, gets no new card", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  const state = await roadmapState();
+  const { deps, log } = roadmapDeps({}, { mergedPr: () => 77 });
+  const done = roadmapCard("c12", 12, "done", { updatedAt: NOW - 10 * 60_000 });
+  await roadmapPass(scopedCfg(M01), state, [done], [done], deps);
+  expect(state.roadmapStuck["12"]).toMatchObject({ cardId: "c12" });
+  expect(log.backlogged.map((b) => b.number)).toEqual([13]); // not #12
+  expect(log.started).toEqual([]);
+
+  const settling = await roadmapState();
+  const s = roadmapDeps({});
+  const justDone = roadmapCard("c12", 12, "done", { updatedAt: NOW - 5_000 });
+  await roadmapPass(scopedCfg(M01), settling, [justDone], [justDone], s.deps);
+  expect(s.log.backlogged.map((b) => b.number)).toEqual([13]);
+  expect(s.log.started).toEqual([]);
+  expect(s.log.rechecks).toBe(1);
+});
+
+test("backlog: no pipeline, or GitHub failing, is reported and tried again", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  const none = await roadmapState();
+  const n = roadmapDeps({}, { pipelineId: () => null });
+  await roadmapPass(scopedCfg(M02), none, [], [], n.deps);
+  expect(none.lastError).toContain("no pipeline to run issues with");
+  expect(n.log.backlogged).toEqual([]);
+
+  const failing = await roadmapState();
+  let calls = 0;
+  const f = roadmapDeps({}, { createBacklogCard: async () => (calls++, { error: "gh: connection refused" }) });
+  await roadmapPass(scopedCfg(M02), failing, [], [], f.deps);
+  expect(calls).toBe(3); // three in a row: stop until the next pass
+  expect(failing.lastError).toBe("step 4 (#14): no backlog card — gh: connection refused");
+  expect(failing.roadmapBacklog).toEqual({});
+});
+
+// ── Config: PUT /autopilot, the default tracker, configs saved before scopes ──
+
+async function withPrefs(fn: (m: typeof import("./autopilot.ts"), prefs: typeof import("./db.ts")["preferences"]) => void | Promise<void>): Promise<void> {
+  const m = await import("./autopilot.ts");
+  const { preferences } = await import("./db.ts");
+  const keys = [m.AUTOPILOT_PREF, m.AUTOPILOT_STATE_PREF, m.DEFAULT_TRACKER_PREF, "autopilot_config_version"];
+  const before = keys.map((k) => preferences.get(k));
+  try {
+    preferences.set(m.AUTOPILOT_PREF, "{}");
+    preferences.set(m.AUTOPILOT_STATE_PREF, "{}");
+    preferences.set(m.DEFAULT_TRACKER_PREF, "");
+    await fn(m, preferences);
+  } finally {
+    keys.forEach((k, i) => preferences.set(k, before[i] ?? ""));
+  }
+}
+
+test("the default tracker: remembered when a tracker is saved, kept when tracker ordering is turned off", async () => {
+  await withPrefs((m) => {
+    expect(m.autopilotSnapshot().defaultTracker).toBeNull();
+    // Saving a tracker makes it the default.
+    m.applyAutopilotPatch({ project: "/repo", roadmap: { issue: 600 }, milestone: M01 });
+    expect(m.autopilotSnapshot()).toMatchObject({ config: { roadmap: { issue: 600 }, milestone: M01 }, defaultTracker: 600 });
+    // Clearing the field turns tracker ordering off; the default stays to be offered again.
+    m.applyAutopilotPatch({ roadmap: null });
+    expect(m.autopilotSnapshot()).toMatchObject({ config: { roadmap: null, milestone: M01 }, defaultTracker: 600 });
+    // A patch that doesn't mention the tracker leaves the default alone.
+    m.applyAutopilotPatch({ defaultTracker: 700 });
+    m.applyAutopilotPatch({ maxInFlight: 3 });
+    expect(m.autopilotSnapshot()).toMatchObject({ config: { roadmap: null, maxInFlight: 3 }, defaultTracker: 700 });
+    m.applyAutopilotPatch({ defaultTracker: null });
+    expect(m.autopilotSnapshot().defaultTracker).toBeNull();
+    // Not a positive whole number: ignored.
+    m.applyAutopilotPatch({ defaultTracker: "639" });
+    expect(m.autopilotSnapshot().defaultTracker).toBeNull();
+  });
+});
+
+test("PUT /autopilot: a new milestone under the same tracker is a fresh run that keeps the backlog ledger", async () => {
+  await withPrefs((m, preferences) => {
+    m.applyAutopilotPatch({ enabled: true, project: "/repo", roadmap: { issue: 600 }, milestone: M01 });
+    const seeded = { ...m.readState(), phase: "done", cards: ["old-1", "old-2"], held: ["old-1"], roadmap: { issue: 600 }, roadmapStuck: { "12": { cardId: "c", reason: "r", at: 1 } }, notifiedHuman: [11], roadmapBacklog: { "13": "bl-13" } };
+    preferences.set(m.AUTOPILOT_STATE_PREF, JSON.stringify(seeded));
+
+    m.applyAutopilotPatch({ milestone: M02 });
+    expect(m.readState()).toMatchObject({ phase: "idle", cards: ["old-1", "old-2"], held: [], roadmap: null, roadmapStuck: { "12": { cardId: "c" } }, notifiedHuman: [11], roadmapBacklog: { "13": "bl-13" } });
+
+    // Pausing changes nothing in the state.
+    preferences.set(m.AUTOPILOT_STATE_PREF, JSON.stringify(seeded));
+    m.applyAutopilotPatch({ enabled: false });
+    expect(m.readState()).toMatchObject({ phase: "done", held: ["old-1"], roadmapBacklog: { "13": "bl-13" } });
+
+    // Another tracker drops the old one's status, guard and announcements — not its cards.
+    m.applyAutopilotPatch({ roadmap: { issue: 601 } });
+    expect(m.readState()).toMatchObject({ phase: "idle", cards: ["old-1", "old-2"], roadmap: null, roadmapStuck: {}, notifiedHuman: [], roadmapBacklog: { "13": "bl-13" } });
+
+    // Another project: issue numbers mean other issues there.
+    m.applyAutopilotPatch({ project: "/elsewhere" });
+    expect(m.readState().roadmapBacklog).toEqual({});
+    expect(m.readState().cards).toEqual(["old-1", "old-2"]);
+  });
+});
+
+test("a config saved before milestones limited tracker mode keeps working the whole roadmap", async () => {
+  await withPrefs((m, preferences) => {
+    // A tracker run with a milestone left over from an earlier thread-driven run.
+    preferences.set(m.AUTOPILOT_PREF, JSON.stringify({ enabled: true, project: "/repo", threadId: "th", milestone: M02, roadmap: { issue: 600 } }));
+    preferences.set("autopilot_config_version", "");
+    m.normalizeLegacyConfig();
+    expect(m.autopilotSnapshot()).toMatchObject({ config: { enabled: true, milestone: null, roadmap: { issue: 600 }, threadId: "th" }, defaultTracker: 600 });
+    // Once only: a milestone chosen afterwards is a scope and stays.
+    m.applyAutopilotPatch({ milestone: M01 });
+    m.normalizeLegacyConfig();
+    expect(m.autopilotSnapshot().config.milestone).toEqual(M01);
+
+    // A thread-driven config is left exactly as it was.
+    const thread = { enabled: true, project: "/repo", threadId: "th", milestone: M02 };
+    preferences.set(m.AUTOPILOT_PREF, JSON.stringify(thread));
+    preferences.set(m.DEFAULT_TRACKER_PREF, "");
+    preferences.set("autopilot_config_version", "");
+    m.normalizeLegacyConfig();
+    expect(m.autopilotSnapshot()).toMatchObject({ config: { ...thread, roadmap: null }, defaultTracker: null });
+  });
+});
+
+test("milestone mode without a tracker: a state saved by an older build reads with an empty backlog ledger", async () => {
+  await withPrefs((m, preferences) => {
+    const cards = Array.from({ length: 27 }, (_, i) => `card-${i}`);
+    preferences.set(m.AUTOPILOT_STATE_PREF, JSON.stringify({ phase: "running", cards, held: [], roadmapStuck: {}, notifiedHuman: [] }));
+    expect(m.readState()).toMatchObject({ phase: "running", cards, roadmapBacklog: {} });
+    // Turning a tracker on later doesn't touch them either.
+    m.applyAutopilotPatch({ enabled: true, project: "/repo", roadmap: { issue: 600 }, milestone: M01 });
+    expect(m.readState().cards).toEqual(cards);
+  });
+});
+
+test("the rocket's label says what Autopilot works from", async () => {
+  const { autopilotLabel, autopilotMode, neverStarted } = await import("../shared/autopilot.ts");
+  expect(autopilotLabel(null)).toBe("Autopilot");
+  expect(autopilotLabel({ enabled: false, roadmap: null, milestone: null })).toBe("Autopilot — not set up");
+  expect(autopilotLabel({ enabled: true, roadmap: null, milestone: M01 })).toBe('Milestone Autopilot — "M01 — Widget foundations", driven by the Codex thread');
+  expect(autopilotLabel({ enabled: true, roadmap: { issue: 600 }, milestone: M01 })).toBe('Autopilot — milestone "M01 — Widget foundations", in the order of tracker #600');
+  expect(autopilotLabel({ enabled: false, roadmap: { issue: 600 }, milestone: null })).toBe("Autopilot — the whole roadmap of tracker #600 (paused)");
+  expect(autopilotMode({ roadmap: { issue: 0 }, milestone: M01 })).toBe("milestone");
+
+  expect(neverStarted(backlogCard(13))).toBe(true);
+  expect(neverStarted(backlogCard(13, { column: "ready" }))).toBe(true);
+  expect(neverStarted(backlogCard(13, { pipelineRun: RUNNING_RUN }))).toBe(false);
+  expect(neverStarted(backlogCard(13, { runId: "r1" }))).toBe(false);
+  expect(neverStarted(backlogCard(13, { column: "done" }))).toBe(false);
+  expect(neverStarted(backlogCard(13, { archivedAt: 5 }))).toBe(false);
+  expect(neverStarted(backlogCard(13, { pipelineRun: { ...IDLE_RUN, history: [{ seq: 1 }] } }))).toBe(false);
+});
+
+test("a pass that outlives its run stops making cards and leaves the new run's fresh state alone", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  // Pausing (or choosing another milestone) while the backlog cards are being made.
+  const state = await roadmapState();
+  let made = 0;
+  const { deps, log } = roadmapDeps({}, { outdated: () => made >= 1 });
+  deps.createBacklogCard = async ({ number, extraPrompt }) => {
+    made++;
+    log.backlogged.push({ number, extraPrompt });
+    return { task: backlogCard(number) };
+  };
+  await roadmapPass(scopedCfg(M02, 5), state, [], [], deps);
+  expect(log.backlogged.map((b) => b.number)).toEqual([14]); // #15 and #16 are left for whoever runs M02 next
+  expect(state.roadmapBacklog).toEqual({ "14": "bl-14" });
+
+  // The real thing: a pass over a tracker it can't read, with the milestone switched under it.
+  await withPrefs(async (m, preferences) => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const dir = mkdtempSync(`${tmpdir()}/agetor-roadmap-epoch-`);
+    try {
+      m.applyAutopilotPatch({ enabled: true, project: dir, roadmap: { issue: 5 }, milestone: M01 });
+      const tick = m.autopilotTick();
+      // While that pass is reading the tracker, the user picks another milestone: a fresh run.
+      m.applyAutopilotPatch({ milestone: M02 });
+      preferences.set(m.AUTOPILOT_STATE_PREF, JSON.stringify({ ...m.readState(), lastError: "fresh" }));
+      await tick;
+      // The old pass's error and phase didn't overwrite the new run's state.
+      expect(m.readState()).toMatchObject({ phase: "idle", lastError: "fresh" });
+      // The next pass is the new run's own.
+      await m.autopilotTick();
+      expect(m.readState().lastError).toContain("couldn't read tracker issue #5");
+    } finally {
+      m.applyAutopilotPatch({ enabled: false });
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

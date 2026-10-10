@@ -22,7 +22,7 @@ export async function loadRoadmapTracker(project: string, issue: number): Promis
 
 /** One query for up to `BATCH` issues. Pure; exported for tests. */
 export function statesQuery(numbers: number[]): string {
-  const fields = numbers.map((n) => `i${n}: issue(number: ${n}) { number state stateReason url }`).join(" ");
+  const fields = numbers.map((n) => `i${n}: issue(number: ${n}) { number state stateReason url milestone { number title } }`).join(" ");
   return `query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { ${fields} } }`;
 }
 
@@ -39,9 +39,18 @@ export function parseStatesResponse(stdout: string): Map<number, RoadmapIssueSta
   if (!repo || typeof repo !== "object") return null;
   const out = new Map<number, RoadmapIssueState>();
   for (const v of Object.values(repo as Record<string, unknown>)) {
-    const i = v as { number?: unknown; state?: unknown; stateReason?: unknown; url?: unknown } | null;
+    const i = v as { number?: unknown; state?: unknown; stateReason?: unknown; url?: unknown; milestone?: { number?: unknown; title?: unknown } | null } | null;
     if (!i || typeof i.number !== "number" || (i.state !== "OPEN" && i.state !== "CLOSED")) continue;
-    out.set(i.number, { state: i.state, stateReason: typeof i.stateReason === "string" ? i.stateReason : null, url: typeof i.url === "string" ? i.url : null });
+    // The issue's milestone decides whether its step is in a milestone's
+    // scope (src/shared/roadmap.ts `roadmapScope`): null = it has none.
+    const m = i.milestone;
+    const milestone = m && typeof m.number === "number" ? { number: m.number, title: typeof m.title === "string" ? m.title : "" } : m === null ? null : undefined;
+    out.set(i.number, {
+      state: i.state,
+      stateReason: typeof i.stateReason === "string" ? i.stateReason : null,
+      url: typeof i.url === "string" ? i.url : null,
+      ...(milestone !== undefined ? { milestone } : {}),
+    });
   }
   return out;
 }
