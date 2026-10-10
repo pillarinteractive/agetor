@@ -148,7 +148,7 @@ function fakeDeps(answers: (string | { ok: false; busy?: boolean; error: string 
   return { deps, log };
 }
 
-const cfg = { enabled: true, threadId: "th", project: "/repo", milestone: { number: 2, title: "M2" }, maxInFlight: 5, pipelineId: "p", roadmap: null };
+const cfg = { enabled: true, threadId: "th", project: "/repo", milestone: { number: 2, title: "M2" }, milestones: [{ number: 2, title: "M2" }], maxInFlight: 5, pipelineId: "p", roadmap: null, autoContinue: false };
 const freshState = async () => {
   const { readState } = await import("./autopilot.ts");
   return { ...readState(), noWork: {}, waits: {}, reworked: [] as number[], cards: [] as string[] };
@@ -267,7 +267,7 @@ const ROADMAP_BODY = [
 ].join("\n");
 const OPEN: IssueState = { state: "OPEN", stateReason: null };
 const COMPLETED: IssueState = { state: "CLOSED", stateReason: "COMPLETED" };
-const roadmapCfg = { ...cfg, threadId: "", milestone: null, maxInFlight: 2, roadmap: { issue: 600 } };
+const roadmapCfg = { ...cfg, threadId: "", milestone: null, milestones: [] as { number: number; title: string }[], maxInFlight: 2, roadmap: { issue: 600 } };
 const NOW = 10_000_000;
 const roadmapCard = (id: string, n: number, column: string, extra: Record<string, unknown> = {}) =>
   ({ id, title: `Issue #${n}`, prompt: `Do #${n}.`, workdir: "/repo", runId: null, issueUrl: `https://github.com/o/r/issues/${n}`, column, archivedAt: null, pipelineParentId: null, pendingInteractionCount: 0, prUrl: null, pipelineRun: null, worktreePath: "/wt", baseRef: "abc", updatedAt: 0, ...extra }) as never as TaskT;
@@ -283,6 +283,7 @@ function roadmapDeps(states: Record<number, IssueState>, over: Partial<RDeps> = 
     startedExisting: [] as { id: string; stepPrompt: string }[],
     done: [] as string[],
     saves: 0,
+    scopes: [] as string[][],
     notified: [] as string[],
     activity: [] as string[],
     rechecks: 0,
@@ -318,6 +319,10 @@ function roadmapDeps(states: Record<number, IssueState>, over: Partial<RDeps> = 
     moveToDone: (t) => void log.done.push(t.id),
     save: () => void log.saves++,
     outdated: () => false,
+    setScope: (list) => {
+      log.scopes.push(list.map((m) => m.title));
+      return true;
+    },
     notify: (n) => {
       log.notified.push(n.body);
       return true;
@@ -329,7 +334,7 @@ function roadmapDeps(states: Record<number, IssueState>, over: Partial<RDeps> = 
   };
   return { deps, log };
 }
-const roadmapState = async (): Promise<import("./autopilot.ts").AutopilotState> => ({ ...(await freshState()), phase: "idle", held: [], holds: {}, unread: {}, roadmap: null, roadmapStuck: {}, roadmapRedo: {}, notifiedHuman: [], roadmapBacklog: {}, lastError: null });
+const roadmapState = async (): Promise<import("./autopilot.ts").AutopilotState> => ({ ...(await freshState()), phase: "idle", held: [], holds: {}, unread: {}, roadmap: null, roadmapStuck: {}, roadmapRedo: {}, notifiedHuman: [], roadmapOffer: null, notifiedOffer: [], roadmapContinued: [], roadmapBacklog: {}, lastError: null });
 /** A pipeline card nothing has run: what a backlog card is until it starts. */
 const IDLE_RUN = { status: "idle", active: [], blocked: [], history: [], joins: {} };
 const backlogCard = (n: number, extra: Record<string, unknown> = {}) => roadmapCard(`bl-${n}`, n, "backlog", { pipelineRun: IDLE_RUN, ...extra });
@@ -485,7 +490,7 @@ test("tick: roadmap mode runs without a milestone or thread; milestone mode stil
 
 const M01 = { number: 1, title: GH_MILESTONES[1]! };
 const M02 = { number: 2, title: GH_MILESTONES[2]! };
-const scopedCfg = (milestone: { number: number; title: string }, maxInFlight = 2) => ({ ...roadmapCfg, milestone, maxInFlight });
+const scopedCfg = (milestone: { number: number; title: string }, maxInFlight = 2) => ({ ...roadmapCfg, milestone, milestones: [milestone], maxInFlight });
 /** The cards a pass made, as the board would hand them to the next pass. */
 const ledgerCards = (state: { roadmapBacklog: Record<string, string> }, extra: Record<number, Record<string, unknown>> = {}) =>
   Object.keys(state.roadmapBacklog).map((k) => backlogCard(Number(k), extra[Number(k)]));
@@ -499,14 +504,16 @@ test("scope: only the steps whose issue is in the milestone are worked; the rest
   expect(log.started).toEqual([]);
   expect(log.startedExisting).toEqual([]);
   expect(log.backlogged.map((b) => b.number)).toEqual([14, 15, 16]);
-  expect(state.roadmap!.scope).toEqual({ number: 2, title: M02.title, roadmapTotal: 6 });
+  expect(state.roadmap!.scope).toEqual({ number: 2, title: M02.title, roadmapTotal: 6, milestones: [{ number: 2, title: M02.title, total: 3 }] });
   expect(state.roadmap!.counts).toEqual({ total: 3, complete: 0, declined: 0, inFlight: 0, ready: 0, waiting: 3, backlog: 3, held: 0 });
   expect(state.roadmap!.blockedOutside.map((b) => [b.step, b.milestone])).toEqual([["2", "M01"], ["3", "M01"]]);
   expect(state.roadmap!.humanReady.map((h) => h.step)).toEqual(["1"]); // #16 waits on the owner's step 1
   expect(state.roadmap!.idleReason).toContain("waiting on you to do human step 1 (#11)");
   expect(state.roadmap!.idleReason).toContain("steps 2 (#12), 3 (#13) of milestone M01 must finish first — run that milestone");
   expect(state.phase).toBe("idle");
-  expect(log.notified).toEqual(["Step 1 · #11 [Human] Provide the sample device"]);
+  // With 5 slots and 3 steps, M02 can't fill them: the stage before it, which it waits on, is offered.
+  expect(log.notified).toEqual(["M02 has only 3 steps to start — fewer than the 5 that fit in flight. Start M01 — Widget foundations (2 steps) as well?", "Step 1 · #11 [Human] Provide the sample device"]);
+  expect(log.scopes).toEqual([]); // offered, not taken
 });
 
 test("scope: an issue moved to another milestone on GitHub follows GitHub, and the mismatch is reported", async () => {
@@ -526,8 +533,15 @@ test("scope: done when every step in the milestone is complete or declined; a mi
   const state = await roadmapState();
   const { deps, log } = roadmapDeps({ 12: COMPLETED, 13: { state: "CLOSED", stateReason: "NOT_PLANNED" } });
   await roadmapPass(scopedCfg(M01), state, [], [], deps);
-  expect(state.phase).toBe("done"); // #14–#16 are open, in another milestone
+  // #14–#16 are open, in another milestone: M01 is finished, and the run is
+  // done once the owner has said no to M02 (the offer has its own tests).
+  expect(state.phase).toBe("idle");
+  expect(state.roadmap!.nextMilestone).toMatchObject({ stage: "M02", number: 2, reason: "finished", dismissedAt: null });
   expect(log.started).toEqual([]);
+  expect(log.backlogged).toEqual([]);
+  state.roadmapOffer = { milestone: 2, reason: "finished", at: 5 };
+  await roadmapPass(scopedCfg(M01), state, [], [], deps);
+  expect(state.phase).toBe("done");
   expect(log.backlogged).toEqual([]);
 
   const empty = await roadmapState();
@@ -719,7 +733,9 @@ test("backlog: a card whose issue closes before it starts is moved to Done with 
   ]);
   expect(state.roadmapBacklog).toEqual({ "15": "bl-15" });
   expect(log.startedExisting).toEqual([]);
-  expect(state.phase).toBe("done");
+  // M01 is finished; M02 follows and is on offer, so the run isn't done yet.
+  expect(state.phase).toBe("idle");
+  expect(state.roadmap!.nextMilestone).toMatchObject({ number: 2, reason: "finished" });
 });
 
 test("switching milestone: cards the other milestone left in the backlog are neither started nor touched", async () => {
@@ -1419,4 +1435,381 @@ test("POST /autopilot/roadmap/resolve: applied between passes, saved, and the st
     preferences.set(AUTOPILOT_PREF, before.cfg ?? "{}");
     preferences.set(AUTOPILOT_STATE_PREF, before.state ?? "{}");
   }
+});
+
+// ── Several milestones in scope, and the offer to start the next ───────────
+
+const multiCfg = (milestones: { number: number; title: string }[], maxInFlight = 2, extra: Record<string, unknown> = {}) => ({ ...roadmapCfg, milestone: milestones[0] ?? null, milestones, maxInFlight, ...extra });
+
+test("next milestone: offered when the scope can't fill its slots — one notification, nothing started or added without the owner", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  const state = await roadmapState();
+  state.notifiedHuman = [11];
+  // M01 has two agent steps (#12 ready, #13 behind it) and two slots: nothing to offer yet.
+  const full = roadmapDeps({});
+  await roadmapPass(scopedCfg(M01, 1), state, [], [], full.deps);
+  expect(state.roadmap!.nextMilestone).toMatchObject({ stage: "M02", number: 2, title: M02.title, steps: 3, agentSteps: 3, left: 1, reason: null });
+  expect(full.log.notified).toEqual([]);
+
+  // #12 is running: one step left to start, two slots.
+  const running = roadmapCard("new-12", 12, "running", { pipelineRun: RUNNING_RUN });
+  const { deps, log } = roadmapDeps({});
+  const board = () => [running, ...ledgerCards(state)];
+  await roadmapPass(scopedCfg(M01, 2), state, board(), [running], deps);
+  const offer = state.roadmap!.nextMilestone!;
+  expect(offer).toMatchObject({ current: "M01", left: 1, maxInFlight: 2, reason: "nearly-done", underway: true, dismissedAt: null, startable: 0 });
+  // None of M02 can start yet, and the offer says what it waits on: M01's steps and the owner's.
+  expect(offer.waitingOn).toBe("steps 1 (#11), 2 (#12), 3 (#13)");
+  expect(log.notified).toEqual(["M01 is nearly done (1 step left to start). Start M02 — Widget page (3 steps) as well?"]);
+  expect(state.notifiedOffer).toEqual([2]);
+  // Offered — not taken: the scope is untouched and M02 got no card.
+  expect(log.scopes).toEqual([]);
+  expect(log.backlogged.map((b) => b.number)).toEqual([]);
+  expect(Object.keys(state.roadmapBacklog)).toEqual(["13"]);
+  expect(state.roadmap!.scope!.milestones).toEqual([{ number: 1, title: M01.title, total: 2 }]);
+  expect(state.phase).toBe("running");
+
+  // The next passes say it again in the status, but notify no more.
+  await roadmapPass(scopedCfg(M01, 2), state, board(), [running], deps);
+  await roadmapPass(scopedCfg(M01, 2), state, board(), [running], deps);
+  expect(log.notified).toHaveLength(1);
+  expect(state.roadmap!.nextMilestone!.reason).toBe("nearly-done");
+
+  // maxInFlight lowered to 1: the one step left fills the one slot again — the offer is no longer due.
+  await roadmapPass(scopedCfg(M01, 1), state, board(), [running], deps);
+  expect(state.roadmap!.nextMilestone).toMatchObject({ number: 2, reason: null });
+});
+
+test("next milestone: 'not now' is kept across passes and asked again only at a later stage; a finished scope is done once declined", async () => {
+  const { roadmapPass, continueRoadmap } = await import("./autopilot.ts");
+  const state = await roadmapState();
+  state.notifiedHuman = [11];
+  const running12 = roadmapCard("new-12", 12, "running", { pipelineRun: RUNNING_RUN });
+  const a = roadmapDeps({});
+  await roadmapPass(scopedCfg(M01, 2), state, [running12], [running12], a.deps);
+  expect(state.roadmap!.nextMilestone!.reason).toBe("nearly-done");
+
+  const said = continueRoadmap(scopedCfg(M01, 2), state, "dismiss", NOW + 1);
+  expect(said).toMatchObject({ ok: true, config: { milestones: [M01] }, message: "Not now: M02 — Widget page stays out of the scope (asked again when M01 has nothing left to start)" });
+  expect(state.roadmapOffer).toEqual({ milestone: 2, reason: "nearly-done", at: NOW + 1 });
+  // The status says so at once, before any pass.
+  expect(state.roadmap!.nextMilestone!.dismissedAt).toBe(NOW + 1);
+
+  // Poll after poll: still dismissed, no notification, nothing added.
+  for (let i = 0; i < 3; i++) await roadmapPass(scopedCfg(M01, 2), state, [running12, ...ledgerCards(state)], [running12], a.deps);
+  expect(state.roadmap!.nextMilestone).toMatchObject({ reason: "nearly-done", dismissedAt: NOW + 1 });
+  expect(a.log.scopes).toEqual([]);
+
+  // #12 done, #13 running: nothing left to start — a later stage, so it is asked again (no second notification).
+  const running13 = roadmapCard("bl-13", 13, "running", { pipelineRun: RUNNING_RUN });
+  const b = roadmapDeps({ 12: COMPLETED });
+  await roadmapPass(scopedCfg(M01, 2), state, [running13], [running13], b.deps);
+  expect(state.roadmap!.nextMilestone).toMatchObject({ left: 0, reason: "nothing-left", dismissedAt: null, startable: 1 });
+  expect(b.log.notified).toEqual([]);
+  expect(state.phase).toBe("running");
+  continueRoadmap(scopedCfg(M01, 2), state, "dismiss", NOW + 2);
+
+  // The milestone finishes: asked once more, and the run isn't "done" while the question is open.
+  const c = roadmapDeps({ 12: COMPLETED, 13: COMPLETED });
+  await roadmapPass(scopedCfg(M01, 2), state, [], [], c.deps);
+  expect(state.roadmap!.nextMilestone).toMatchObject({ reason: "finished", dismissedAt: null });
+  expect(state.phase).toBe("idle");
+  expect(state.roadmap!.idleReason).toBe("Waiting for your answer: M01 is finished. Start M02 — Widget page (3 steps)?");
+  expect(c.log.backlogged).toEqual([]); // still nothing of M02 on the board
+
+  // Declined: done. It stays offered in the status, for `agetor roadmap continue`.
+  expect(continueRoadmap(scopedCfg(M01, 2), state, "dismiss", NOW + 3)).toMatchObject({ message: "Not now: M02 — Widget page stays out of the scope (not asked again — agetor roadmap continue starts it)" });
+  await roadmapPass(scopedCfg(M01, 2), state, [], [], c.deps);
+  expect(state.phase).toBe("done");
+  expect(state.roadmap!.nextMilestone).toMatchObject({ number: 2, reason: "finished", dismissedAt: NOW + 3 });
+  // Accepting later wakes the finished run up.
+  const later = continueRoadmap(scopedCfg(M01, 2), state, "accept", NOW + 4);
+  expect(later).toMatchObject({ ok: true, config: { milestones: [M01, M02], milestone: M01, autoContinue: false } });
+  expect(state.phase).toBe("idle");
+});
+
+test("next milestone: accepting adds it to the scope — the current milestone keeps running, cards are made, slots are counted as before", async () => {
+  const { roadmapPass, continueRoadmap } = await import("./autopilot.ts");
+  const state = await roadmapState();
+  state.notifiedHuman = [11];
+  // #12 complete, #13 running (the one M01 step left), two slots.
+  const running13 = roadmapCard("bl-13", 13, "running", { pipelineRun: RUNNING_RUN });
+  state.cards = ["bl-13"];
+  const first = roadmapDeps({ 12: COMPLETED });
+  await roadmapPass(scopedCfg(M01, 2), state, [running13], [running13], first.deps);
+  expect(state.roadmap!.nextMilestone).toMatchObject({ reason: "nothing-left", startable: 1 });
+  expect(first.log.started).toEqual([]); // a slot is free, but M02 isn't in scope
+
+  const r = continueRoadmap(scopedCfg(M01, 2), state, "accept", NOW + 1);
+  if (!("ok" in r)) throw new Error("accept failed");
+  expect(r.config).toMatchObject({ milestone: M01, milestones: [M01, M02], autoContinue: false });
+  expect(r.message).toBe("M02 — Widget page is in scope with M01: 3 steps get a Backlog card (1 can start now)");
+  expect(state.roadmapContinued).toEqual([{ number: 2, title: M02.title, stage: "M02", at: NOW + 1, by: "you" }]);
+  expect(state.roadmap!.nextMilestone).toBeNull();
+  // Until the next pass rewrites it, the last status is still the board's: the cards keep their lines.
+  expect(state.roadmap!.scope!.milestones).toEqual([{ number: 1, title: M01.title, total: 2 }, { number: 2, title: M02.title, total: 3 }]);
+  const { currentRoadmapStatus } = await import("../shared/roadmap.ts");
+  expect(currentRoadmapStatus(r.config, state.roadmap)).toBe(state.roadmap);
+  expect(state.held).toEqual([]); // not a fresh run: nothing else in the state is reset
+  expect(state.cards).toEqual(["bl-13"]);
+
+  // The next pass works both: #13 keeps its slot, #14 (ready) takes the free one, #15 and #16 wait as cards.
+  const { deps, log } = roadmapDeps({ 12: COMPLETED });
+  await roadmapPass(r.config, state, [running13], [running13], deps);
+  expect(log.started.map((s) => s.number)).toEqual([14]);
+  expect(log.backlogged.map((b) => b.number)).toEqual([15, 16]);
+  expect(log.scopes).toEqual([]); // M01 isn't finished: both stay in scope
+  expect(state.roadmap!.scope).toEqual({ number: 1, title: M01.title, roadmapTotal: 6, milestones: [{ number: 1, title: M01.title, total: 2 }, { number: 2, title: M02.title, total: 3 }] });
+  expect(state.roadmap!.counts).toMatchObject({ total: 5, complete: 1, inFlight: 2, backlog: 2 });
+  expect(state.roadmap!.continued).toEqual([{ number: 2, title: M02.title, stage: "M02", at: NOW + 1, by: "you" }]);
+  expect(state.roadmap!.nextMilestone).toBeNull(); // nothing follows M02 in this tracker
+  expect(state.phase).toBe("running");
+
+  // Both slots taken: nothing more starts, whatever is ready.
+  const running14 = roadmapCard("new-14", 14, "running", { pipelineRun: RUNNING_RUN });
+  const full = roadmapDeps({ 11: COMPLETED, 12: COMPLETED });
+  await roadmapPass(r.config, state, [running13, running14, ...ledgerCards(state)], [running13, running14], full.deps);
+  expect(full.log.started).toEqual([]);
+  expect(full.log.startedExisting).toEqual([]); // #16 is ready (the owner's step closed) and waits for a slot
+  expect(state.roadmap!.cards.find((c) => c.issue === 16)!.line).toBe("Step 6 · ready — waiting for a slot");
+});
+
+test("several milestones: the needs-you and held lists span the whole scope; a finished milestone leaves it", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  const state = await roadmapState();
+  state.notifiedHuman = [11];
+  // M01: #13's card is Done, its PR merged, the issue still open. M02: #14's card is held in In Review.
+  const done13 = roadmapCard("c13", 13, "done", { prUrl: "https://github.com/o/r/pull/313" });
+  const held14 = roadmapCard("c14", 14, "review", { pipelineRun: { status: "done", active: [], blocked: [], history: [], joins: {} }, prUrl: "https://github.com/o/r/pull/314" });
+  state.cards = ["c13", "c14"];
+  state.held = ["c14"];
+  state.holds = { c14: { pr: 314, url: "https://github.com/o/r/pull/314", headSha: "abc", rules: "r", files: ["apps/web/billing/plan.ts"], count: 1 } };
+  const { deps, log } = roadmapDeps({ 12: COMPLETED }, { mergedPr: (t) => (t.id === "c13" ? 313 : null) });
+  await roadmapPass(multiCfg([M01, M02], 3), state, [done13, held14], [done13, held14], deps);
+  expect(state.roadmap!.needsUser.map((u) => [u.step, u.kind])).toEqual([["3", "stuck"], ["4", "held"]]);
+  expect(state.roadmap!.counts).toMatchObject({ total: 5, inFlight: 1, held: 1 });
+  expect(log.scopes).toEqual([]);
+
+  // #13 is closed: M01 is finished and leaves the scope; M02 carries on.
+  const next = roadmapDeps({ 12: COMPLETED, 13: COMPLETED });
+  await roadmapPass(multiCfg([M01, M02], 3), state, [held14], [held14], next.deps);
+  expect(next.log.scopes).toEqual([[M02.title]]);
+  expect(state.roadmap!.scope!.milestones).toEqual([{ number: 2, title: M02.title, total: 3 }]);
+  expect(state.roadmap!.counts.total).toBe(3);
+  expect(state.phase).not.toBe("done");
+
+  // Everything in scope finished and nothing follows: done, with both milestones still named.
+  const all = roadmapDeps({ 12: COMPLETED, 13: COMPLETED, 14: COMPLETED, 15: COMPLETED, 16: COMPLETED });
+  const finished = await roadmapState();
+  await roadmapPass(multiCfg([M01, M02], 3), finished, [], [], all.deps);
+  expect(finished.phase).toBe("done");
+  expect(all.log.scopes).toEqual([]);
+  expect(finished.roadmap!.nextMilestone).toBeNull();
+  expect(finished.roadmap!.scope!.milestones!.map((m) => m.number)).toEqual([1, 2]);
+});
+
+test("always continue: the next milestone is added by the pass itself, recorded and announced — and only with the flag", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  const running12 = roadmapCard("new-12", 12, "running", { pipelineRun: RUNNING_RUN });
+  // Flag off: offered, never taken.
+  const off = await roadmapState();
+  off.notifiedHuman = [11];
+  const o = roadmapDeps({});
+  await roadmapPass(scopedCfg(M01, 2), off, [running12], [running12], o.deps);
+  expect(o.log.scopes).toEqual([]);
+  expect(off.roadmapContinued).toEqual([]);
+  expect(o.log.backlogged.map((b) => b.number)).toEqual([13]);
+
+  // Flag on: the same board, and M02 joins the scope in that pass.
+  const state = await roadmapState();
+  state.notifiedHuman = [11];
+  const { deps, log } = roadmapDeps({});
+  await roadmapPass(multiCfg([M01], 2, { autoContinue: true }), state, [running12], [running12], deps);
+  expect(log.scopes).toEqual([[M01.title, M02.title]]);
+  expect(state.roadmapContinued).toEqual([{ number: 2, title: M02.title, stage: "M02", at: NOW, by: "auto" }]);
+  expect(state.roadmap!.continued).toEqual(state.roadmapContinued);
+  expect(log.notified).toEqual(["M02 — Widget page — 3 steps added to the Backlog (M01 had 1 left to start)"]);
+  expect(state.notifiedOffer).toEqual([]); // nothing was asked
+  expect(log.backlogged.map((b) => b.number)).toEqual([13, 14, 15, 16]);
+  expect(log.started).toEqual([]); // #13 and #14 wait on #12; nothing is ready
+  expect(state.roadmap!.scope!.milestones!.map((m) => m.number)).toEqual([1, 2]);
+  expect(state.roadmap!.nextMilestone).toBeNull();
+
+  // A finished scope continues too, and the finished milestone drops out.
+  const done = await roadmapState();
+  done.notifiedHuman = [11];
+  const d = roadmapDeps({ 12: COMPLETED, 13: COMPLETED });
+  await roadmapPass(multiCfg([M01], 2, { autoContinue: true }), done, [], [], d.deps);
+  expect(d.log.scopes).toEqual([[M02.title]]);
+  expect(d.log.started.map((s) => s.number)).toEqual([14]);
+  expect(done.phase).toBe("running");
+  expect(d.log.notified).toEqual(["M02 — Widget page — 3 steps added to the Backlog (M01 finished)"]);
+
+  // A pass that outlived its run adds nothing.
+  const stale = await roadmapState();
+  stale.notifiedHuman = [11];
+  const s = roadmapDeps({}, { outdated: () => true });
+  await roadmapPass(multiCfg([M01], 2, { autoContinue: true }), stale, [running12], [running12], s.deps);
+  expect(s.log.scopes).toEqual([]);
+  expect(stale.roadmapContinued).toEqual([]);
+});
+
+test("the whole roadmap has no next milestone; a 'not now' said to another milestone is forgotten", async () => {
+  const { roadmapPass, continueRoadmap } = await import("./autopilot.ts");
+  const state = await roadmapState();
+  state.roadmapOffer = { milestone: 2, reason: "finished", at: 1 };
+  const { deps, log } = roadmapDeps({});
+  await roadmapPass({ ...roadmapCfg, autoContinue: true }, state, [], [], deps);
+  expect(state.roadmap!.nextMilestone).toBeNull();
+  expect(state.roadmap!.scope).toBeNull();
+  expect(log.scopes).toEqual([]);
+  expect(continueRoadmap(roadmapCfg, state, "accept", NOW)).toEqual({ error: "the whole roadmap is in scope — no milestone follows it" });
+  expect(continueRoadmap(roadmapCfg, state, "dismiss", NOW)).toEqual({ error: "the whole roadmap is in scope — no milestone follows it" });
+  // The flag alone can always be set.
+  expect(continueRoadmap(roadmapCfg, state, "always", NOW)).toMatchObject({ ok: true, config: { autoContinue: true, milestones: [] } });
+
+  // Working M02, the offer is M01; a "no" once said to milestone 2 doesn't apply to it.
+  const scoped = await roadmapState();
+  scoped.roadmapOffer = { milestone: 2, reason: "finished", at: 1 };
+  await roadmapPass(scopedCfg(M02, 5), scoped, [], [], roadmapDeps({}).deps);
+  expect(scoped.roadmap!.nextMilestone).toMatchObject({ number: 1, dismissedAt: null });
+  expect(scoped.roadmapOffer).toBeNull();
+});
+
+test("continueRoadmap: answers are checked against the status of the run configured now", async () => {
+  const { roadmapPass, continueRoadmap } = await import("./autopilot.ts");
+  const state = await roadmapState();
+  state.notifiedHuman = [11];
+  await roadmapPass(scopedCfg(M01, 1), state, [], [], roadmapDeps({}).deps);
+  const offer = state.roadmap!.nextMilestone!;
+  expect(offer.reason).toBeNull(); // #12 started, one step left, one slot: not on offer yet
+  // Not due: can't be dismissed, but an explicit accept is the owner's call.
+  expect(continueRoadmap(scopedCfg(M01, 1), state, "dismiss", NOW)).toEqual({ error: "M02 — Widget page isn't on offer yet" });
+  // "always" with nothing due only sets the flag: the scope is Autopilot's to extend when the time comes.
+  expect(continueRoadmap(scopedCfg(M01, 1), state, "always", NOW)).toMatchObject({ ok: true, config: { autoContinue: true, milestones: [M01] } });
+  expect(state.roadmapContinued).toEqual([]);
+  // The scope was changed by hand since that status was written: the offer isn't this run's.
+  expect(continueRoadmap(scopedCfg(M02, 1), state, "accept", NOW)).toEqual({ error: "no milestone follows the scope (or the first pass hasn't finished yet)" });
+  expect(continueRoadmap({ ...roadmapCfg, roadmap: null }, state, "accept", NOW)).toEqual({ error: "Autopilot isn't working a roadmap" });
+  expect(continueRoadmap(scopedCfg(M01, 1), state, "nope" as never, NOW)).toMatchObject({ error: expect.stringContaining("unknown action") });
+  const ok = continueRoadmap(scopedCfg(M01, 1), state, "always", NOW);
+  expect(ok).toMatchObject({ ok: true }); // still not due → flag only
+  const accepted = continueRoadmap(scopedCfg(M01, 1), state, "accept", NOW);
+  expect(accepted).toMatchObject({ ok: true, config: { milestones: [M01, M02] }, message: "M02 — Widget page is in scope with M01: 3 steps get a Backlog card (none can start yet — waiting on steps 1 (#11), 2 (#12), 3 (#13))" });
+});
+
+test("an added milestone's backlog cards respect the per-pass cap", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  // M01: one step. M02: 70 steps, all behind it.
+  const rows = ["| 1 | #1001 Inventory the widgets | M01 | none |", ...Array.from({ length: 70 }, (_, i) => `| ${i + 2} | #${1002 + i} Build widget part ${i + 1} | M02 | 1 |`)];
+  const body = ["## Numbered completion order", "| Step | Task and outcome | Milestone | Predecessor steps |", "| --- | --- | --- | --- |", ...rows].join("\n");
+  const state = await roadmapState();
+  const { deps, log } = roadmapDeps({}, {
+    loadTracker: async () => ({ body, url: null }),
+    loadStates: async (_p, numbers) => new Map(numbers.map((n) => [n, { ...OPEN, milestone: n === 1001 ? M01 : M02, url: null }])),
+  });
+  const running = roadmapCard("c1001", 1001, "running", { pipelineRun: RUNNING_RUN });
+  await roadmapPass(multiCfg([M01, M02], 3), state, [running], [running], deps);
+  expect(log.backlogged).toHaveLength(60);
+  expect(log.rechecks).toBe(1); // the rest on the next pass
+  expect(log.started).toEqual([]);
+  expect(state.roadmap!.links!.length).toBe(71);
+  // Step 1 blocks 70 steps: the link list is capped and says how many more.
+  const hub = state.roadmap!.links!.find((l) => l.issue === 1001)!;
+  expect(hub).toMatchObject({ state: "in-flight", taskId: "c1001", moreSuccessors: 54 });
+  expect(hub.successors).toHaveLength(16);
+});
+
+test("links: each card's predecessors and successors carry the cards on the board, in whatever column", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  const state = await roadmapState();
+  state.notifiedHuman = [11];
+  // #12 is in review (Autopilot's own card), #13 and M02's steps wait in the backlog.
+  const review12 = roadmapCard("c12", 12, "review", { pipelineRun: { status: "running", active: [], blocked: [], history: [], joins: {} } });
+  state.cards = ["c12"];
+  const { deps } = roadmapDeps({});
+  await roadmapPass(multiCfg([M01, M02], 2), state, [review12], [review12], deps);
+  const by = (n: number) => state.roadmap!.links!.find((l) => l.issue === n)!;
+  const brief = (xs: { step: string; state: string; taskId: string | null }[]) => xs.map((x) => `${x.step}:${x.state}:${x.taskId ?? "-"}`);
+  expect(state.roadmap!.links!.map((l) => l.issue)).toEqual([12, 13, 14, 15, 16]);
+  expect(by(12)).toMatchObject({ step: "2", state: "in-flight", taskId: "c12", predecessors: [] });
+  expect(brief(by(12).successors)).toEqual(["3:backlog:bl-13", "4:backlog:bl-14"]);
+  expect(brief(by(15).predecessors)).toEqual(["3:backlog:bl-13", "4:backlog:bl-14"]);
+  // #16 waits on the owner's step, which is outside the scope and has no card.
+  expect(brief(by(16).predecessors)).toEqual(["1:yours:-"]);
+  expect(by(16).successors).toEqual([]);
+});
+
+test("PUT /autopilot: the scope is a list — one milestone sets it, a hand-made change starts the offer over, the slot count doesn't", async () => {
+  await withPrefs((m, preferences) => {
+    // A config saved by a build that knew one milestone reads as a list of one.
+    preferences.set("autopilot_config_version", "2");
+    preferences.set(m.AUTOPILOT_PREF, JSON.stringify({ enabled: true, project: "/repo", roadmap: { issue: 600 }, milestone: M01, maxInFlight: 3 }));
+    expect(m.autopilotSnapshot().config).toMatchObject({ milestone: M01, milestones: [M01], autoContinue: false, enabled: true });
+
+    // The offer was accepted: both milestones are in scope, with the question answered and a card held.
+    preferences.set(m.AUTOPILOT_PREF, JSON.stringify({ ...m.autopilotSnapshot().config, milestones: [M01, M02] }));
+    expect(m.autopilotSnapshot().config).toMatchObject({ milestone: M01, milestones: [M01, M02] });
+    const seeded = { ...m.readState(), phase: "running", held: ["c1"], roadmap: { issue: 600 }, roadmapOffer: { milestone: 3, reason: "nearly-done", at: 1 }, notifiedOffer: [2, 3], roadmapContinued: [{ ...M02, stage: "M02", at: 1, by: "you" }] };
+    preferences.set(m.AUTOPILOT_STATE_PREF, JSON.stringify(seeded));
+
+    // The slot count, pausing and the flag don't touch the scope or the answers.
+    m.applyAutopilotPatch({ maxInFlight: 4 });
+    m.applyAutopilotPatch({ autoContinue: true });
+    expect(m.autopilotSnapshot().config).toMatchObject({ milestones: [M01, M02], maxInFlight: 4, autoContinue: true });
+    expect(m.readState()).toMatchObject({ phase: "running", held: ["c1"], roadmapOffer: { milestone: 3 }, notifiedOffer: [2, 3], roadmapContinued: [{ number: 2 }] });
+    // Sending the same list back (the dialog's Start while paused) is no scope change either.
+    m.applyAutopilotPatch({ milestone: M01, milestones: [M01, M02] });
+    expect(m.readState()).toMatchObject({ roadmapOffer: { milestone: 3 }, notifiedOffer: [2, 3] });
+
+    // The owner picks a milestone by hand while the offer is pending: that one milestone is the scope, and the question starts over.
+    m.applyAutopilotPatch({ milestone: M02 });
+    expect(m.autopilotSnapshot().config).toMatchObject({ milestone: M02, milestones: [M02] });
+    expect(m.readState()).toMatchObject({ phase: "idle", held: [], roadmap: null, roadmapOffer: null, notifiedOffer: [], roadmapContinued: [] });
+
+    // `milestones` sets the list outright; an empty one is the whole roadmap.
+    m.applyAutopilotPatch({ milestones: [M02, M01] });
+    expect(m.autopilotSnapshot().config).toMatchObject({ milestone: M02, milestones: [M02, M01] });
+    m.applyAutopilotPatch({ milestones: [] });
+    expect(m.autopilotSnapshot().config).toMatchObject({ milestone: null, milestones: [] });
+    m.applyAutopilotPatch({ milestone: M01 });
+    m.applyAutopilotPatch({ milestone: null });
+    expect(m.autopilotSnapshot().config).toMatchObject({ milestone: null, milestones: [] });
+  });
+});
+
+test("always continue switched on wakes a run that finished with a milestone still to follow", async () => {
+  await withPrefs((m, preferences) => {
+    m.applyAutopilotPatch({ enabled: true, project: "/repo", roadmap: { issue: 600 }, milestone: M01 });
+    const status = { issue: 600, scope: { ...M01, roadmapTotal: 6, milestones: [{ ...M01, total: 2 }] }, nextMilestone: { number: 2, title: M02.title, reason: "finished", dismissedAt: 5 } };
+    preferences.set(m.AUTOPILOT_STATE_PREF, JSON.stringify({ ...m.readState(), phase: "done", roadmap: status }));
+    m.applyAutopilotPatch({ maxInFlight: 3 });
+    expect(m.readState().phase).toBe("done");
+    m.applyAutopilotPatch({ autoContinue: true });
+    expect(m.readState().phase).toBe("idle");
+    expect(m.readState().roadmap).toMatchObject({ issue: 600 }); // not a fresh run
+  });
+});
+
+test("POST /autopilot/roadmap/continue: applied between passes — the config gains the milestone and the state keeps its cards", async () => {
+  await withPrefs(async (m, preferences) => {
+    preferences.set("autopilot_config_version", "2");
+    // Paused, so the pass the answer asks for does nothing here.
+    preferences.set(m.AUTOPILOT_PREF, JSON.stringify({ enabled: false, project: "/repo", roadmap: { issue: 600 }, milestone: M01 }));
+    const offer = { stage: "M02", number: 2, title: M02.title, steps: 3, agentSteps: 3, startable: 0, waitingOn: "steps 2 (#12)", current: "M01", left: 1, maxInFlight: 2, reason: "nearly-done", dismissedAt: null };
+    const status = { issue: 600, scope: { ...M01, roadmapTotal: 6, milestones: [{ ...M01, total: 2 }] }, nextMilestone: offer };
+    preferences.set(m.AUTOPILOT_STATE_PREF, JSON.stringify({ phase: "running", cards: ["c12"], held: ["c12"], roadmap: status, roadmapBacklog: { "13": "bl-13" } }));
+
+    expect(await m.applyRoadmapContinue("dismiss")).toMatchObject({ ok: true });
+    expect(m.readState()).toMatchObject({ roadmapOffer: { milestone: 2, reason: "nearly-done" }, cards: ["c12"] });
+    expect(m.autopilotSnapshot().config.milestones).toEqual([M01]);
+    expect(m.autopilotSnapshot().state.roadmap!.nextMilestone!.dismissedAt).toBeGreaterThan(0);
+
+    expect(await m.applyRoadmapContinue("always")).toMatchObject({ ok: true, message: expect.stringContaining("M02 — Widget page is in scope with M01") });
+    expect(m.autopilotSnapshot().config).toMatchObject({ milestone: M01, milestones: [M01, M02], autoContinue: true, enabled: false });
+    expect(m.readState()).toMatchObject({ phase: "running", cards: ["c12"], held: ["c12"], roadmapBacklog: { "13": "bl-13" }, roadmapOffer: null, roadmapContinued: [{ number: 2, by: "you" }] });
+    // Asked twice (a double click): the offer is gone with the first answer.
+    expect(await m.applyRoadmapContinue("accept")).toEqual({ error: "no milestone follows the scope (or the first pass hasn't finished yet)" });
+    expect(m.autopilotSnapshot().config.milestones).toEqual([M01, M02]);
+  });
 });

@@ -17,7 +17,18 @@ import {
   scopeDrift,
   unfinishedAncestors,
   withRoadmapStepPrompt,
+  findRoadmapLinks,
+  LINKS_PER_STEP,
+  nextMilestoneText,
+  nextRoadmapMilestone,
+  normalizeMilestones,
+  offerPending,
+  roadmapContinuation,
+  roadmapLinkStateLabel,
+  scopeLabel,
+  scopeMilestones,
   type RoadmapIssueState,
+  type RoadmapStatus,
 } from "./roadmap.ts";
 
 const table = (...rows: string[]) =>
@@ -286,7 +297,7 @@ describe("summarizeRoadmap with a milestone", () => {
 
   test("counts the steps in scope only", () => {
     const s = scoped({ 101: DONE, 102: DONE, 103: DONE }, { busy: [110], backlog: [[111, "c111"], [112, "c112"]] });
-    expect(s.scope).toEqual({ number: 22, title: M02.title, roadmapTotal: 7 });
+    expect(s.scope).toEqual({ number: 22, title: M02.title, roadmapTotal: 7, milestones: [{ number: 22, title: M02.title, total: 4 }] });
     expect(s.counts).toEqual({ total: 4, complete: 1, declined: 0, inFlight: 1, ready: 1, waiting: 1, backlog: 2, held: 0 });
     expect(s.nextWaiting.map((w) => w.step)).toEqual(["3.2"]);
     expect(s.idleReason).toBeNull();
@@ -519,4 +530,259 @@ test("a predecessor may carry a note: still required, and the note reaches the s
   const views = roadmapStatus(r, new Map<number, RoadmapIssueState>([[101, done], [102, open], [103, open]]));
   expect(views[2]).toMatchObject({ status: "waiting", waitingOn: ["2"] });
   expect(roadmapStepPrompt(600, r.steps[2]!, r.steps)).toContain('notes predecessor 2 (#102) as "annual only, if chosen"');
+});
+
+
+// ── The scope as a list, the next milestone, and the offer ───────────────────
+
+describe("the scope as a list of milestones", () => {
+  const a = { number: 21, title: "M01 — Gadget inventory" };
+  const b = { number: 22, title: "M02 — Gadget contract" };
+
+  test("a config that names one `milestone` is a list of one; `milestones` wins when it holds any", () => {
+    expect(normalizeMilestones(undefined, a)).toEqual([a]);
+    expect(normalizeMilestones([], a)).toEqual([a]);
+    expect(normalizeMilestones([a, b], b)).toEqual([a, b]);
+    expect(normalizeMilestones(undefined, null)).toEqual([]);
+    expect(normalizeMilestones("M01", undefined)).toEqual([]);
+    // Junk entries and a milestone named twice are dropped; order is kept.
+    expect(normalizeMilestones([b, { number: "x", title: "bad" }, null, a, { ...b, title: "again" }], undefined)).toEqual([b, a]);
+    expect(scopeMilestones({ milestone: a })).toEqual([a]);
+    expect(scopeMilestones({ milestone: a, milestones: [a, b] })).toEqual([a, b]);
+    expect(scopeMilestones({ milestone: null, milestones: [] })).toEqual([]);
+    expect(scopeLabel([a])).toBe("M01");
+    expect(scopeLabel([a, b])).toBe("M01 and M02");
+    expect(scopeLabel([a, b, { number: 9, title: "Untitled stage" }])).toBe("M01, M02 and Untitled stage");
+  });
+
+  test("a status belongs to the run whose scope lists the same milestones, in order", () => {
+    const status = (milestones: { number: number; title: string }[] | undefined, first = a) => ({ issue: 639, scope: { ...first, roadmapTotal: 7, ...(milestones ? { milestones: milestones.map((m) => ({ ...m, total: 1 })) } : {}) } }) as RoadmapStatus;
+    const both = status([a, b]);
+    expect(currentRoadmapStatus({ roadmap: { issue: 639 }, milestone: a, milestones: [a, b] }, both)).toBe(both);
+    expect(currentRoadmapStatus({ roadmap: { issue: 639 }, milestone: a, milestones: [a] }, both)).toBeNull();
+    expect(currentRoadmapStatus({ roadmap: { issue: 639 }, milestone: b, milestones: [b, a] }, both)).toBeNull();
+    // A status saved before scopes were lists, and a config that only names `milestone`.
+    const old = status(undefined);
+    expect(currentRoadmapStatus({ roadmap: { issue: 639 }, milestone: a }, old)).toBe(old);
+    expect(currentRoadmapStatus({ roadmap: { issue: 639 }, milestone: a, milestones: [a] }, old)).toBe(old);
+    expect(currentRoadmapStatus({ roadmap: { issue: 639 }, milestone: a, milestones: [a, b] }, old)).toBeNull();
+  });
+});
+
+// A tracker whose stages interleave: X07 is named first (step 2) but its open
+// work comes late; the owner's stage and a stage with no GitHub milestone
+// are in between.
+const STAGES = table(
+  "| 1 | #201 [Human] Supply the reference gadget | H | none |",
+  "| 2 | #202 Sketch the gadget dock | X07 | none |",
+  "| 3 | #203 Inventory the gadget surfaces | M01 | none |",
+  "| 4 | #204 Build the gadget store | M01 | 3 |",
+  "| 5 | #205 Draft the gadget notes | N09 | none |",
+  "| 6 | #206 Implement the gadget contract | M02 | 4 |",
+  "| 7 | #207 Calibrate against the gadget | M02 | 1 |",
+  "| 8 | #208 [Human] Approve the gadget dock | X07 | 2 |",
+  "| 9 | #209 Ship the gadget dock | X07 | 6, 8 |",
+  "| 10 | #210 Ship the gadget page | M03 | 6 |",
+);
+const GH = {
+  H: { number: 90, title: "H — Owner decisions" },
+  M01: { number: 21, title: "M01 — Gadget inventory" },
+  M02: { number: 22, title: "M02 — Gadget contract" },
+  M03: { number: 23, title: "M03 — Gadget page" },
+  X07: { number: 27, title: "X07 · Gadget dock" },
+};
+const STAGE_OF: Record<number, keyof typeof GH | null> = { 201: "H", 202: "X07", 203: "M01", 204: "M01", 205: null, 206: "M02", 207: "M02", 208: "X07", 209: "X07", 210: "M03" };
+const stageStates = (o: Record<number, Partial<RoadmapIssueState>> = {}) =>
+  new Map(Object.keys(STAGE_OF).map((k) => [Number(k), { ...OPEN, milestone: STAGE_OF[Number(k)] ? GH[STAGE_OF[Number(k)]!] : null, ...o[Number(k)] } as RoadmapIssueState]));
+
+describe("nextRoadmapMilestone", () => {
+  const parsed = parseRoadmap(STAGES);
+  const next = (o: Record<number, Partial<RoadmapIssueState>>, scoped: (keyof typeof GH)[]) => {
+    const st = stageStates(o);
+    const inScope = new Set(scoped.flatMap((k) => [...roadmapScope(parsed.steps, st, GH[k])]));
+    const n = nextRoadmapMilestone(roadmapStatus(parsed, st), st, inScope);
+    return n ? [n.stage, n.milestone.number, n.steps.map((v) => v.step)] : null;
+  };
+
+  test("stages go in the order the table first names them; the owner's stage is never one", () => {
+    // X07 is named at step 2, before M01 (step 3): it comes first while step 2 is open.
+    expect(next({}, ["M01"])).toEqual(["X07", 27, ["2", "8", "9"]]);
+    // Step 1 is the owner's (H) and step 8 is the owner's inside X07: neither makes a stage "next".
+    expect(next({ 202: DONE, 209: DONE }, ["M01"])).toEqual(["M02", 22, ["6", "7"]]);
+  });
+
+  test("a stage whose agent steps are all complete or declined is passed over; one named early with open work later still goes first", () => {
+    // X07's first step is complete, its step 9 is open: X07 is still the first stage with open agent work.
+    expect(next({ 202: DONE }, ["M01"])).toEqual(["X07", 27, ["2", "8", "9"]]);
+    expect(next({ 202: DONE, 209: NO_GO }, ["M01"])).toEqual(["M02", 22, ["6", "7"]]);
+    // Working M02: the unfinished stage before it comes first — it is what M02 waits on.
+    expect(next({ 202: DONE, 209: DONE }, ["M02"])).toEqual(["M01", 21, ["3", "4"]]);
+    expect(next({ 202: DONE, 209: DONE, 203: DONE, 204: DONE }, ["M02"])).toEqual(["M03", 23, ["10"]]);
+  });
+
+  test("a stage maps to the GitHub milestone its issues are in; one with no GitHub milestone can't be scoped", () => {
+    // N09's only step has no milestone on GitHub: passed over, never offered.
+    expect(next({ 202: DONE, 209: DONE, 206: DONE, 207: DONE }, ["M01"])).toEqual(["M03", 23, ["10"]]);
+    // The table says M03 for #210, GitHub says it is in M02's milestone... which is in scope: nothing follows.
+    expect(next({ 202: DONE, 209: DONE, 210: { milestone: GH.M02 } }, ["M01", "M02"])).toBeNull();
+    // The table says M02 for #206, but its issue sits in X07's milestone: the stage M02 leads to that milestone.
+    expect(next({ 202: DONE, 209: DONE, 206: { milestone: GH.X07 } }, ["M01"])).toEqual(["M02", 27, ["2", "6", "8", "9"]]);
+    // Everything else finished: nothing follows.
+    expect(next({ 202: DONE, 209: DONE, 206: DONE, 207: DONE, 210: DONE }, ["M01"])).toBeNull();
+  });
+});
+
+describe("roadmapContinuation (the next-milestone offer)", () => {
+  const parsed = parseRoadmap(STAGES);
+  const base = { 202: DONE, 209: DONE }; // X07 is out of the way: M01, then M02, then M03
+  const offer = (o: Record<number, Partial<RoadmapIssueState>>, opts: { max?: number; busy?: number[]; exclude?: number[]; scoped?: (keyof typeof GH)[]; dismissal?: { milestone: number; reason: "nearly-done" | "nothing-left" | "finished"; at: number } | null; body?: string } = {}) => {
+    const p = opts.body ? parseRoadmap(opts.body) : parsed;
+    const st = stageStates({ ...base, ...o });
+    const views = roadmapStatus(p, st);
+    const milestones = (opts.scoped ?? ["M01"]).map((k) => GH[k]);
+    const steps = new Set(milestones.flatMap((m) => [...roadmapScope(p.steps, st, m)]));
+    return roadmapContinuation({ views, states: st, milestones, steps, busy: new Set(opts.busy ?? []), exclude: new Set(opts.exclude ?? []), maxInFlight: opts.max ?? 2, finished: roadmapFinished(p, views.filter((v) => steps.has(v.step))), dismissal: opts.dismissal });
+  };
+
+  test("due once fewer steps are left to start than fit in flight — and it follows maxInFlight", () => {
+    // M01 has two agent steps left to start; two slots can still be filled.
+    expect(offer({})).toMatchObject({ stage: "M02", number: 22, title: GH.M02.title, left: 2, reason: null, dismissedAt: null, current: "M01", maxInFlight: 2 });
+    expect(offerPending(offer({}))).toBe(false);
+    // Three slots: two steps can't fill them.
+    expect(offer({}, { max: 3 })).toMatchObject({ left: 2, reason: "nearly-done", underway: false });
+    // One started: one left to start, two slots.
+    expect(offer({}, { busy: [203] })).toMatchObject({ left: 1, reason: "nearly-done", underway: true });
+    expect(offerPending(offer({}, { busy: [203] }))).toBe(true);
+    // ...and with a single slot that one step still fills it.
+    expect(offer({}, { busy: [203], max: 1 })).toMatchObject({ left: 1, reason: null });
+    expect(offer({ 203: DONE }, { busy: [204] })).toMatchObject({ left: 0, reason: "nothing-left" });
+    expect(offer({ 203: DONE, 204: DONE })).toMatchObject({ left: 0, reason: "finished" });
+  });
+
+  test("steps that can't start by themselves don't count as left: needing the owner, settling, held by a roadmap problem", () => {
+    expect(offer({}, { exclude: [204] })).toMatchObject({ left: 1, reason: "nearly-done" });
+    // A cycle between 3 and 4 holds both: nothing in M01 is left that could start.
+    const cyc = STAGES.replace("| 3 | #203 Inventory the gadget surfaces | M01 | none |", "| 3 | #203 Inventory the gadget surfaces | M01 | 4 |");
+    expect(offer({}, { body: cyc })).toMatchObject({ left: 0, reason: "nothing-left" });
+  });
+
+  test("says how much of the next milestone can start, and what it waits on when none can", () => {
+    // M02: #206 waits on step 4 (M01), #207 on the owner's step 1.
+    const none = offer({}, { max: 3 })!;
+    expect(none).toMatchObject({ steps: 2, agentSteps: 2, startable: 0, waitingOn: "steps 1 (#201), 3 (#203), 4 (#204)" });
+    expect(nextMilestoneText(none)).toEqual({
+      question: "M01 has only 2 steps to start — fewer than the 3 that fit in flight. Start M02 — Gadget contract (2 steps) as well?",
+      detail: "0 can start yet — waiting on steps 1 (#201), 3 (#203), 4 (#204)",
+    });
+    const one = offer({ 203: DONE, 201: DONE }, { busy: [204] })!;
+    expect(one).toMatchObject({ startable: 1, waitingOn: null });
+    expect(nextMilestoneText(one)).toEqual({ question: "M01 has nothing left to start. Start M02 — Gadget contract (2 steps) as well?", detail: "1 of its 2 agent steps can start now" });
+    expect(nextMilestoneText(offer({ 203: DONE }, { busy: [204], max: 3 })!).question).toBe("M01 has nothing left to start. Start M02 — Gadget contract (2 steps) as well?");
+    expect(nextMilestoneText(offer({}, { busy: [203] })!).question).toBe("M01 is nearly done (1 step left to start). Start M02 — Gadget contract (2 steps) as well?");
+    expect(nextMilestoneText(offer({ 203: DONE, 204: DONE })!).question).toBe("M01 is finished. Start M02 — Gadget contract (2 steps)?");
+    expect(nextMilestoneText(offer({})!).question).toBe("Next: M02 — Gadget contract (2 steps) — offered once M01 has fewer than 2 steps left to start (2 now)");
+    // Two milestones in scope read as a plural.
+    expect(nextMilestoneText(offer({ 203: DONE, 204: DONE, 201: DONE }, { scoped: ["M01", "M02"], busy: [206] })!).question).toBe("M01 and M02 are nearly done (1 step left to start). Start M03 — Gadget page (1 step) as well?");
+  });
+
+  test("no offer for the whole roadmap, or when nothing follows", () => {
+    expect(offer({}, { scoped: [] })).toBeNull();
+    expect(offer({ 206: DONE, 207: DONE, 210: DONE })).toBeNull();
+    expect(offer({ 210: DONE }, { scoped: ["M01", "M02"] })).toBeNull();
+  });
+
+  test("'not now' holds until the offer reaches a later stage — not on every pass", () => {
+    const at = (reason: "nearly-done" | "nothing-left" | "finished") => ({ milestone: 22, reason, at: 77 });
+    // Dismissed while nearly done: quiet as the count drops within that stage...
+    expect(offer({}, { max: 3, dismissal: at("nearly-done") })).toMatchObject({ reason: "nearly-done", dismissedAt: 77 });
+    expect(offer({}, { busy: [203], dismissal: at("nearly-done") })).toMatchObject({ left: 1, reason: "nearly-done", dismissedAt: 77 });
+    expect(offerPending(offer({}, { busy: [203], dismissal: at("nearly-done") }))).toBe(false);
+    // ...asked again when nothing is left to start, and once more when the milestone finishes.
+    expect(offer({ 203: DONE }, { busy: [204], dismissal: at("nearly-done") })).toMatchObject({ reason: "nothing-left", dismissedAt: null });
+    expect(offer({ 203: DONE }, { busy: [204], dismissal: at("nothing-left") })).toMatchObject({ reason: "nothing-left", dismissedAt: 77 });
+    expect(offer({ 203: DONE, 204: DONE }, { dismissal: at("nothing-left") })).toMatchObject({ reason: "finished", dismissedAt: null });
+    expect(offer({ 203: DONE, 204: DONE }, { dismissal: at("finished") })).toMatchObject({ reason: "finished", dismissedAt: 77 });
+    // A later stage's "no" covers the earlier ones (a count that goes back up), and another milestone's doesn't count.
+    expect(offer({}, { busy: [203], dismissal: at("finished") })).toMatchObject({ reason: "nearly-done", dismissedAt: 77 });
+    expect(offer({}, { busy: [203], dismissal: { milestone: 23, reason: "finished", at: 77 } })).toMatchObject({ dismissedAt: null });
+  });
+});
+
+describe("step links (what a card waits on and blocks)", () => {
+  const parsed = parseRoadmap(BODY);
+  const summary = (o: Record<number, Partial<RoadmapIssueState>>, extra: { busy?: number[]; backlog?: [number, string][]; cards?: [number, string][]; needsUser?: [number, string][]; scoped?: boolean } = {}) => {
+    const st = scopedStates(o);
+    return summarizeRoadmap({
+      issue: 639,
+      url: "u",
+      parsed,
+      views: roadmapStatus(parsed, st),
+      scope: extra.scoped === false ? null : { milestones: [M02], steps: roadmapScope(parsed.steps, st, M02) },
+      busy: new Set(extra.busy ?? []),
+      backlog: new Map(extra.backlog ?? []),
+      cards: new Map(extra.cards ?? []),
+      needsUser: new Map(extra.needsUser ?? []),
+      now: 5,
+    });
+  };
+  const brief = (xs: { step: string; state: string; taskId: string | null }[]) => xs.map((x) => `${x.step}:${x.state}:${x.taskId ?? "-"}`);
+
+  test("every open step in scope lists its direct predecessors with where each stands, and its open successors", () => {
+    // Step 3 (#103) waits on the owner's step 1 and on step 2 of M01; 3.1 runs; the rest wait in the backlog.
+    const s = summary({ 103: DONE }, { busy: [110], cards: [[110, "run-110"]], backlog: [[111, "bl-111"], [112, "bl-112"]] });
+    expect(s.links!.map((l) => `${l.step}:${l.state}:${l.taskId ?? "-"}`)).toEqual(["3.1:in-flight:run-110", "3.2:backlog:bl-111", "3.10:backlog:bl-112"]);
+    const log = s.links!.find((l) => l.step === "3.2")!;
+    expect(brief(log.predecessors)).toEqual(["3.1:in-flight:run-110"]);
+    expect(brief(log.successors)).toEqual(["4:outside:-"]); // step 4 is M03's: open in another milestone, no card
+    expect(log.successors[0]).toMatchObject({ issue: 104, title: "Ship the gadget page", milestone: "M03" });
+    // A finished predecessor is listed too — complete, with no card to point at.
+    expect(brief(s.links!.find((l) => l.step === "3.1")!.predecessors)).toEqual(["3:complete:-"]);
+    expect(brief(s.links!.find((l) => l.step === "3.1")!.successors)).toEqual(["3.2:backlog:bl-111"]);
+  });
+
+  test("predecessors with no card say why: yours to do, another milestone, declined, needs you", () => {
+    const s = summary({}, { backlog: [[103, "bl-103"]] });
+    const contract = s.links!.find((l) => l.step === "3")!;
+    expect(brief(contract.predecessors)).toEqual(["1:yours:-", "2:outside:-"]);
+    expect(contract.predecessors.map(roadmapLinkStateLabel)).toEqual(["yours to do", "open in another milestone (M01)"]);
+    // The owner's step and the other milestone's step have cards after all (made by an earlier run): the link carries them.
+    const carded = summary({}, { backlog: [[103, "bl-103"], [101, "bl-101"], [102, "bl-102"]] });
+    expect(brief(carded.links!.find((l) => l.step === "3")!.predecessors)).toEqual(["1:yours:bl-101", "2:outside:bl-102"]);
+    const declined = summary({ 101: DONE, 102: NO_GO }, { backlog: [[103, "bl-103"]] });
+    expect(declined.links!.find((l) => l.step === "3")!.predecessors.map(roadmapLinkStateLabel)).toEqual(["complete", "declined — unlocks nothing"]);
+    const stuck = summary({ 103: DONE }, { needsUser: [[110, "PR #9 merged but the issue is still open"]], backlog: [[111, "bl-111"]] });
+    expect(brief(stuck.links!.find((l) => l.step === "3.2")!.predecessors)).toEqual(["3.1:needs-you:-"]);
+    expect(roadmapLinkStateLabel({ state: "open", milestone: "" })).toBe("open — no card yet");
+    expect(roadmapLinkStateLabel({ state: "outside", milestone: "" })).toBe("open in another milestone");
+  });
+
+  test("the whole roadmap has links too; a predecessor's note travels with its link", () => {
+    const noted = parseRoadmap(table("| 1 | #101 Inventory the gadgets | M01 | none |", "| 2 | #102 Ship the gadget plan | M01 | #101 (annual only) |"));
+    const s = summarizeRoadmap({ issue: 1, url: "u", parsed: noted, views: roadmapStatus(noted, states({}, [101, 102])), busy: new Set(), needsUser: new Map(), backlog: new Map([[102, "bl-102"]]), now: 5 });
+    expect(s.links!.map((l) => l.step)).toEqual(["1", "2"]);
+    expect(s.links![1]!.predecessors).toEqual([{ step: "1", issue: 101, title: "Inventory the gadgets", milestone: "M01", state: "open", taskId: null, note: "annual only" }]);
+    expect(s.links![0]!.successors.map((x) => x.taskId)).toEqual(["bl-102"]);
+  });
+
+  test("the payload is bounded: a step with many links carries the first few and a count", () => {
+    const n = LINKS_PER_STEP + 5;
+    const rows = Array.from({ length: n }, (_, i) => `| ${i + 1} | #${300 + i} Gadget part ${i + 1} | M01 | none |`);
+    const hub = parseRoadmap(table(...rows, `| ${n + 1} | #999 Assemble the gadget | M01 | ${rows.map((_, i) => i + 1).join(", ")} |`));
+    const all = [...rows.map((_, i) => 300 + i), 999];
+    const s = summarizeRoadmap({ issue: 1, url: "u", parsed: hub, views: roadmapStatus(hub, states({}, all)), busy: new Set(), needsUser: new Map(), now: 5 });
+    const last = s.links!.find((l) => l.issue === 999)!;
+    expect(last.predecessors).toHaveLength(LINKS_PER_STEP);
+    expect(last.morePredecessors).toBe(5);
+    expect(s.links![0]!.moreSuccessors).toBeUndefined();
+  });
+
+  test("a reference names a step or an issue: #n is an issue, a bare number a step first", () => {
+    const tied = parseRoadmap(table("| 1 | #2 Inventory the gadgets | M01 | none |", "| 2 | #7 Ship the gadget plan | M01 | 1 |"));
+    const s = summarizeRoadmap({ issue: 1, url: "u", parsed: tied, views: roadmapStatus(tied, states({}, [2, 7])), busy: new Set(), needsUser: new Map(), now: 5 });
+    expect(findRoadmapLinks(s.links!, "2")).toMatchObject({ readAs: "step", entry: { step: "2", issue: 7 } });
+    expect(findRoadmapLinks(s.links!, "#2")).toMatchObject({ readAs: "issue", entry: { step: "1", issue: 2 } });
+    expect(findRoadmapLinks(s.links!, "7")).toMatchObject({ readAs: "issue", entry: { step: "2" } });
+    expect(findRoadmapLinks(s.links!, "9")).toEqual({ entry: null, readAs: "issue" });
+    expect(findRoadmapLinks(s.links!, "2.5")).toEqual({ entry: null, readAs: "step" });
+  });
 });

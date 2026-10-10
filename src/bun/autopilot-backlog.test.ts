@@ -230,12 +230,15 @@ test("backlog cards: cheap to make, left alone by everything else, started by Au
   expect(tasks.get(id23)!.column).toBe("backlog");
 
   // ── Pass 6: the owner closes #23 without ever starting its card: the card
-  // is closed with a note, and the milestone is done.
+  // is closed with a note, and the milestone is finished — M02 (#24) follows
+  // and is on offer, never started without the owner's word.
   const sixth = await depsFor({ 21: COMPLETED, 22: COMPLETED, 23: COMPLETED });
   await roadmapPass(cfg, state, tasks.listLive(), mine(), sixth.deps);
   expect(tasks.get(id23)!.column).toBe("done");
   expect(state.roadmapBacklog).toEqual({});
-  expect(state.phase).toBe("done");
+  expect(state.phase).toBe("idle");
+  expect(state.roadmap!.nextMilestone).toMatchObject({ stage: "M02", number: 2, reason: "finished", steps: 1 });
+  expect(parseConfig(preferences.get("autopilot")).milestones).toEqual([]); // nothing was added to any saved scope
   const notes = readFileSync(path.join(dataDir, "activity", `${id23}.jsonl`), "utf8");
   expect(notes).toContain("is yours to do — Autopilot never starts it");
   expect(notes).toContain("#23 was closed (completed) before this card started — moved it to Done");

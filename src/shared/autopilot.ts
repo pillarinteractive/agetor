@@ -53,12 +53,15 @@ export function autopilotMode(c: { roadmap: { issue: number } | null; milestone:
 }
 
 /** The rocket button's tooltip. */
-export function autopilotLabel(c: { enabled: boolean; roadmap: { issue: number } | null; milestone: { title: string } | null } | null | undefined): string {
+export function autopilotLabel(
+  c: { enabled: boolean; roadmap: { issue: number } | null; milestone: { title: string } | null; milestones?: { title: string }[] | null } | null | undefined,
+): string {
   if (!c) return "Autopilot";
   const mode = autopilotMode(c);
+  const more = (c.milestones?.length ?? 0) - 1;
   const what =
     mode === "tracker-milestone"
-      ? `Autopilot — milestone "${c.milestone!.title}", in the order of tracker #${c.roadmap!.issue}`
+      ? `Autopilot — milestone "${c.milestone!.title}"${more > 0 ? ` and ${more} more` : ""}, in the order of tracker #${c.roadmap!.issue}`
       : mode === "tracker"
         ? `Autopilot — the whole roadmap of tracker #${c.roadmap!.issue}`
         : mode === "milestone"

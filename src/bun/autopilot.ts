@@ -39,20 +39,32 @@ import { holdsAutopilotSlot, neverStarted, PROGRESSING_COLUMNS, waitingOnQuota }
 import { formatRetryTime, isQuotaPaused } from "./usage-limit.ts";
 import { loadRoadmapStates, loadRoadmapTracker } from "./roadmap-fetch.ts";
 import {
+  currentRoadmapStatus,
+  MAX_SCOPE_MILESTONES,
+  nextMilestoneText,
+  normalizeMilestones,
+  offerPending,
   parseRoadmap,
   pickRoadmap,
   prIssueMention,
   prIssueMentionLine,
+  roadmapContinuation,
   roadmapFinished,
   roadmapScope,
   roadmapStatus,
   roadmapStepPrompt,
   scopeDrift,
+  scopeLabel,
+  scopeMilestones,
   summarizeRoadmap,
   withRoadmapStepPrompt,
   type PrIssueMentionKind,
+  type RoadmapContinued,
   type RoadmapIssueState,
+  type RoadmapMilestone,
   type RoadmapNeedsUser,
+  type RoadmapNextMilestone,
+  type RoadmapOfferDismissal,
   type RoadmapStatus,
   type RoadmapStepView,
 } from "../shared/roadmap.ts";
@@ -85,13 +97,22 @@ export interface AutopilotConfig {
   enabled: boolean;
   threadId: string;
   project: string;
+  /** The first milestone in scope (the only one in thread-driven mode);
+   *  always `milestones[0] ?? null`. */
   milestone: { number: number; title: string } | null;
+  /** Tracker mode: the milestones whose steps are worked, in the order they
+   *  were added (empty = the whole roadmap). A config saved with only
+   *  `milestone` reads as that one milestone. */
+  milestones: { number: number; title: string }[];
   maxInFlight: number;
   pipelineId: string | null;
   /** Tracker mode: the tracker issue (in `project`'s repo) whose step table
-   *  gives the order. When set, `threadId` isn't used and `milestone` limits
-   *  which steps are worked (null = the whole roadmap). */
+   *  gives the order. When set, `threadId` isn't used and `milestones`
+   *  limits which steps are worked. */
   roadmap: { issue: number } | null;
+  /** Tracker mode with a milestone scope: when the scope can no longer fill
+   *  its slots, add the next milestone without asking. */
+  autoContinue: boolean;
 }
 
 export interface AutopilotState {
@@ -140,6 +161,13 @@ export interface AutopilotState {
   roadmapRedo: Record<string, RoadmapRedo>;
   /** Roadmap mode: `[Human]` step issues already announced as ready. */
   notifiedHuman: number[];
+  /** The owner's "not now" to the next-milestone offer (which milestone, at
+   *  which stage): the offer comes back only at a later stage. */
+  roadmapOffer: RoadmapOfferDismissal | null;
+  /** Milestones whose offer was announced with a native notification. */
+  notifiedOffer: number[];
+  /** The milestones this run continued into (the last few), latest last. */
+  roadmapContinued: RoadmapContinued[];
   /** Tracker mode with a milestone: the cards made up front in the Backlog
    *  and not started yet — issue number → card id. Such a card holds no slot
    *  and doesn't make its issue busy. An entry goes when its card starts, is
@@ -204,16 +232,19 @@ export function parseConfig(raw: string | null | undefined): AutopilotConfig {
   } catch {
     // defaults
   }
-  const m = o.milestone as { number?: unknown; title?: unknown } | null | undefined;
   const r = o.roadmap as { issue?: unknown } | null | undefined;
+  // The scope is a list; a config that names one `milestone` is that list.
+  const milestones = normalizeMilestones(o.milestones, o.milestone);
   return {
     enabled: o.enabled === true,
     threadId: typeof o.threadId === "string" ? o.threadId : "",
     project: typeof o.project === "string" ? o.project : "",
-    milestone: m && typeof m.number === "number" && typeof m.title === "string" ? { number: m.number, title: m.title } : null,
+    milestone: milestones[0] ?? null,
+    milestones,
     maxInFlight: typeof o.maxInFlight === "number" && o.maxInFlight >= 1 ? Math.min(10, Math.floor(o.maxInFlight)) : 5,
     pipelineId: typeof o.pipelineId === "string" && o.pipelineId ? o.pipelineId : null,
     roadmap: typeof r?.issue === "number" && Number.isInteger(r.issue) && r.issue > 0 ? { issue: r.issue } : null,
+    autoContinue: o.autoContinue === true,
   };
 }
 
@@ -239,11 +270,14 @@ export function readState(): AutopilotState {
       roadmapStuck: v.roadmapStuck && typeof v.roadmapStuck === "object" ? v.roadmapStuck : {},
       roadmapRedo: v.roadmapRedo && typeof v.roadmapRedo === "object" ? v.roadmapRedo : {},
       notifiedHuman: Array.isArray(v.notifiedHuman) ? v.notifiedHuman : [],
+      roadmapOffer: v.roadmapOffer && typeof v.roadmapOffer === "object" && typeof v.roadmapOffer.milestone === "number" ? v.roadmapOffer : null,
+      notifiedOffer: Array.isArray(v.notifiedOffer) ? v.notifiedOffer : [],
+      roadmapContinued: Array.isArray(v.roadmapContinued) ? v.roadmapContinued : [],
       roadmapBacklog: v.roadmapBacklog && typeof v.roadmapBacklog === "object" ? v.roadmapBacklog : {},
       updatedAt: v.updatedAt ?? 0,
     };
   } catch {
-    return { phase: "idle", cards: [], held: [], holds: {}, unread: {}, audits: 0, lastAnswer: null, lastError: null, quietUntil: 0, quietSignature: "", limitedUntil: 0, noWork: {}, waits: {}, reworked: [], roadmap: null, roadmapStuck: {}, roadmapRedo: {}, notifiedHuman: [], roadmapBacklog: {}, updatedAt: 0 };
+    return { phase: "idle", cards: [], held: [], holds: {}, unread: {}, audits: 0, lastAnswer: null, lastError: null, quietUntil: 0, quietSignature: "", limitedUntil: 0, noWork: {}, waits: {}, reworked: [], roadmap: null, roadmapStuck: {}, roadmapRedo: {}, notifiedHuman: [], roadmapOffer: null, notifiedOffer: [], roadmapContinued: [], roadmapBacklog: {}, updatedAt: 0 };
   }
 }
 
@@ -794,6 +828,10 @@ export interface RoadmapDeps {
   /** The run was changed or paused while this pass was at work: make and
    *  start nothing more. */
   outdated(): boolean;
+  /** Save the scope the pass arrived at (a finished milestone dropped, the
+   *  next one added); false when the run was changed meanwhile and nothing
+   *  was saved. */
+  setScope(milestones: RoadmapMilestone[]): boolean;
   /** A native notification; false when there's no host to show it. */
   notify(n: { title: string; body: string }): boolean;
   activity(taskId: string, text: string, tone: "info" | "warning" | "muted"): void;
@@ -820,7 +858,6 @@ function holdFilesText(hold: CardHold, max = 3): string {
  */
 export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, all: Task[], mine: Task[], deps: RoadmapDeps): Promise<void> {
   const tracker = cfg.roadmap!.issue;
-  const milestone = cfg.milestone;
   const fail = (error: string) => {
     state.lastError = error;
   };
@@ -835,10 +872,6 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
   const states = await deps.loadStates(cfg.project, parsed.steps.map((s) => s.issue));
   if ("error" in states) return fail(states.error);
   const views = roadmapStatus(parsed, states);
-  // The scope: steps whose issue is in the chosen GitHub milestone. Steps
-  // outside it still gate readiness; this run just never starts them.
-  const scope = milestone ? { milestone, steps: roadmapScope(parsed.steps, states, milestone) } : null;
-  const scoped = scope ? views.filter((v) => scope.steps.has(v.step)) : views;
   const viewByIssue = new Map(views.map((v) => [v.issue, v]));
   const openSteps = views.filter(isOpenStep);
   const openByIssue = new Map(openSteps.map((v) => [v.issue, v]));
@@ -972,13 +1005,60 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
   const open = openSteps.map((v) => ({ number: v.issue, title: v.title }));
   const { busyIssues, inFlight, ownLive, quotaWait } = slotCounts(all, own, open, deps.quotaPaused, { project: cfg.project, noSlot: exempt, notBusy: exempt });
 
-  if (scope && scoped.length === 0) {
+  // The scope: steps whose issue is in one of the chosen GitHub milestones.
+  // Steps outside it still gate readiness; this run just never starts them.
+  const wanted = scopeMilestones(cfg);
+  const stepSets = new Map<number, Set<string>>();
+  const stepsOf = (m: RoadmapMilestone) => stepSets.get(m.number) ?? stepSets.set(m.number, roadmapScope(parsed.steps, states, m)).get(m.number)!;
+  const scopeOf = (list: RoadmapMilestone[]) => ({ milestones: list.map((m) => ({ number: m.number, title: m.title, total: stepsOf(m).size })), steps: new Set(list.flatMap((m) => [...stepsOf(m)])) });
+  const finishedIn = (steps: ReadonlySet<string>) => roadmapFinished(parsed, views.filter((v) => steps.has(v.step)));
+  let scope = wanted.length > 0 ? scopeOf(wanted) : null;
+  if (scope && scope.steps.size === 0) {
     state.roadmap = summarizeRoadmap({ issue: tracker, url: doc.url, parsed, views, scope, busy: busyIssues, needsUser: stuck, held: heldForUser, now: deps.now() });
     state.phase = "idle";
-    return fail(`no step of roadmap #${tracker} has its issue in milestone "${milestone!.title}" — check the issues' milestone on GitHub, or choose All milestones`);
+    return fail(
+      `no step of roadmap #${tracker} has its issue in ${wanted.length === 1 ? `milestone "${wanted[0]!.title}"` : `milestones ${wanted.map((m) => `"${m.title}"`).join(", ")}`} — check the issues' milestone on GitHub, or choose All milestones`,
+    );
   }
 
+  // What follows the scope. A finished milestone leaves the scope while
+  // another is still being worked; once the scope can no longer fill its
+  // slots the next milestone is offered to the owner — or, with "always
+  // continue", added here and now. Adding never replaces: what is left of
+  // the current milestones keeps running.
+  let next: RoadmapNextMilestone | null = null;
+  const offerFor = (list: RoadmapMilestone[], sc: { steps: ReadonlySet<string> }, busyNow: ReadonlySet<number> = busyIssues) =>
+    roadmapContinuation({ views, states, milestones: list, steps: sc.steps, busy: busyNow, exclude: new Set([...stuck.keys(), ...settling]), maxInFlight: cfg.maxInFlight, finished: finishedIn(sc.steps), dismissal: state.roadmapOffer });
+  if (scope) {
+    let active = wanted.filter((m) => stepsOf(m).size > 0 && !finishedIn(stepsOf(m)));
+    let list = active.length > 0 ? active : wanted;
+    scope = scopeOf(list);
+    next = offerFor(list, scope);
+    for (let i = 0; cfg.autoContinue && next?.reason && active.length < MAX_SCOPE_MILESTONES && i < 4 && !deps.outdated(); i++) {
+      const m = { number: next.number, title: next.title };
+      const from = next;
+      active = [...active, m];
+      list = active;
+      scope = scopeOf(list);
+      state.roadmapContinued = [...state.roadmapContinued, { ...m, stage: from.stage, at: deps.now(), by: "auto" as const }].slice(-10);
+      deps.notify({
+        title: "Roadmap: continued into the next milestone",
+        body: `${m.title} — ${from.steps} step${from.steps === 1 ? "" : "s"} added to the Backlog (${from.current} ${from.reason === "finished" ? "finished" : from.reason === "nothing-left" ? "had nothing left to start" : `had ${from.left} left to start`})`,
+      });
+      next = offerFor(list, scope);
+    }
+    const key = (xs: RoadmapMilestone[]) => xs.map((m) => m.number).join(",");
+    if (key(list) !== key(wanted)) deps.setScope(list);
+  }
+  const scoped = scope ? views.filter((v) => scope!.steps.has(v.step)) : views;
+
   const free = cfg.maxInFlight - Math.max(ownLive, inFlight.length);
+  // The started live card of each issue, for the status' links.
+  const liveCards = new Map<number, string>();
+  for (const t of all) {
+    const n = t.pipelineParentId || !live(t) || exempt.has(t.id) || !sameDir(t.workdir, cfg.project) ? null : issueOf(t);
+    if (n != null && !liveCards.has(n)) liveCards.set(n, t.id);
+  }
   const picks = pickRoadmap(scoped, { busy: busyIssues, exclude: new Set([...stuck.keys(), ...settling]), free });
   const pipelineId = deps.pipelineId(cfg);
   // A step being done again tells its new card about the earlier PR.
@@ -992,6 +1072,7 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
   // another now would only run into the same limit (as in milestone mode).
   let error: string | null = null;
   const started = new Set<number>();
+  const startedIds = new Map<number, string>();
   if (picks.start.length > 0 && !quotaWait) {
     if (!pipelineId) error = noPipeline;
     else {
@@ -1019,6 +1100,7 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
           id = r.task.id;
         }
         started.add(v.issue);
+        startedIds.set(v.issue, id);
         state.cards.push(id);
         deps.save(state);
         deps.activity(id, `Autopilot started this as step ${v.step} of roadmap #${tracker}${state.roadmapRedo[String(v.issue)] ? " — again, at your request" : ""}`, "info");
@@ -1057,6 +1139,21 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
     if (missing.length > BACKLOG_PER_PASS) deps.recheck(5_000);
   }
 
+  // The offer as it stands after this pass's starts.
+  if (scope) {
+    next = offerFor(scope.milestones, scope, new Set([...busyIssues, ...started]));
+    // A "not now" belongs to the milestone it was said to.
+    if (state.roadmapOffer && state.roadmapOffer.milestone !== next?.number) state.roadmapOffer = null;
+    if (cfg.autoContinue) {
+      // This pass's starts made it due: the next pass adds the milestone.
+      if (next?.reason && scope.milestones.length < MAX_SCOPE_MILESTONES && !deps.outdated()) deps.recheck(5_000);
+    } else if (offerPending(next) && !state.notifiedOffer.includes(next.number)) {
+      // Asked once per milestone, with a native notification; the board's
+      // popup and `agetor roadmap status` carry it from the status.
+      if (deps.notify({ title: "Roadmap: start the next milestone?", body: nextMilestoneText(next).question })) state.notifiedOffer = [...state.notifiedOffer, next.number].slice(-50);
+    }
+  }
+
   const status = summarizeRoadmap({
     issue: tracker,
     url: doc.url,
@@ -1067,24 +1164,34 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
     backlog: new Map([...backlog].map(([n, t]) => [n, t.id])),
     needsUser: stuck,
     held: heldForUser,
+    cards: new Map([...liveCards, ...startedIds]),
+    nextMilestone: next,
+    continued: state.roadmapContinued.slice(-3),
     now: deps.now(),
   });
   if (!status.idleReason && quotaWait && picks.start.length > 0) status.idleReason = "Holding new starts while a card waits for a usage limit to reset";
   // The table's milestone column and GitHub disagreeing is worth knowing: a
   // step the table puts in this milestone isn't worked unless its issue is.
   if (scope) {
-    for (const s of scopeDrift(parsed.steps, states, scope.milestone)) {
-      const inIt = scope.steps.has(s.step);
-      status.problems = [
-        ...status.problems,
-        {
-          kind: "milestone-mismatch",
-          step: s.step,
-          message: inIt
-            ? `step ${s.step} (#${s.issue}) is in this milestone on GitHub, but the table says ${s.milestone || "none"} — it is worked`
-            : `step ${s.step} (#${s.issue}): the table says ${s.milestone}, but its issue isn't in this milestone on GitHub — it is not worked`,
-        },
-      ];
+    const single = scope.milestones.length === 1;
+    const reported = new Set<string>();
+    for (const m of scope.milestones) {
+      for (const s of scopeDrift(parsed.steps, states, m)) {
+        if (reported.has(s.step)) continue;
+        reported.add(s.step);
+        const inIt = scope.steps.has(s.step);
+        const gh = states.get(s.issue)?.milestone?.title;
+        status.problems = [
+          ...status.problems,
+          {
+            kind: "milestone-mismatch",
+            step: s.step,
+            message: inIt
+              ? `step ${s.step} (#${s.issue}) is in ${single || !gh ? "this milestone" : `milestone "${gh}"`} on GitHub, but the table says ${s.milestone || "none"} — it is worked`
+              : `step ${s.step} (#${s.issue}): the table says ${s.milestone}, but its issue isn't in ${single ? "this milestone" : "that milestone"} on GitHub — it is not worked`,
+          },
+        ];
+      }
     }
   }
   state.roadmap = status;
@@ -1096,7 +1203,12 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
     if (deps.notify({ title: "Roadmap: a step needs you", body: `Step ${h.step} · #${h.issue} ${h.title}` })) state.notifiedHuman.push(h.issue);
   }
 
-  if (roadmapFinished(parsed, scoped)) state.phase = "done";
+  // Every milestone in scope is finished: done — unless a milestone follows
+  // and the owner hasn't answered the offer yet.
+  if (roadmapFinished(parsed, scoped)) {
+    state.phase = offerPending(next) ? "idle" : "done";
+    if (offerPending(next)) status.idleReason = `Waiting for your answer: ${nextMilestoneText(next).question}`;
+  }
   // A step whose card waits in In Review for the owner is in flight, yet
   // nothing is running because of it.
   else state.phase = status.counts.inFlight - (status.counts.held ?? 0) === 0 && started.size === 0 ? "idle" : "running";
@@ -1227,6 +1339,100 @@ export async function applyRoadmapResolve(input: { issue: number; action: Roadma
   }
 }
 
+// ── Continuing into the next milestone ───────────────────────────────────
+
+export type RoadmapContinueAction = "accept" | "always" | "dismiss";
+
+/**
+ * The owner's answer to the next-milestone offer in the last pass's status
+ * (`state.roadmap.nextMilestone`):
+ *
+ *   accept  — add that milestone to the scope. Nothing is replaced: what is
+ *             left of the current milestones keeps running, and the next
+ *             pass makes the new milestone's Backlog cards. Also allowed
+ *             before the offer is due (an explicit request).
+ *   always  — accept, and from now on continue without asking
+ *             (`autoContinue`). With nothing on offer it sets the flag only.
+ *   dismiss — "not now": the offer comes back only at a later stage (nothing
+ *             left to start, then the scope finished).
+ *
+ * Mutates `state` and returns the config to save. Pure but for that;
+ * exported for tests.
+ */
+export function continueRoadmap(
+  cfg: AutopilotConfig,
+  state: AutopilotState,
+  action: RoadmapContinueAction,
+  now: number,
+): { ok: true; config: AutopilotConfig; message: string } | { error: string } {
+  if (!cfg.roadmap || !cfg.project) return { error: "Autopilot isn't working a roadmap" };
+  if (action !== "accept" && action !== "always" && action !== "dismiss") return { error: `unknown action "${String(action)}" — accept, always or dismiss` };
+  const list = scopeMilestones(cfg);
+  const offer = currentRoadmapStatus(cfg, state.roadmap)?.nextMilestone ?? null;
+  if (action === "always" && !offer?.reason) {
+    return {
+      ok: true,
+      config: { ...cfg, autoContinue: true },
+      message: list.length === 0 ? "Always continue is on — it only matters with a milestone scope (the whole roadmap is in scope now)" : "Always continue is on: Autopilot adds the next milestone by itself once this one can no longer fill its slots",
+    };
+  }
+  if (!offer) return { error: list.length === 0 ? "the whole roadmap is in scope — no milestone follows it" : "no milestone follows the scope (or the first pass hasn't finished yet)" };
+  if (action === "dismiss") {
+    if (!offer.reason) return { error: `${offer.title} isn't on offer yet` };
+    state.roadmapOffer = { milestone: offer.number, reason: offer.reason, at: now };
+    state.roadmap = { ...state.roadmap!, nextMilestone: { ...offer, dismissedAt: now } };
+    const again = offer.reason === "finished" ? "not asked again — agetor roadmap continue starts it" : offer.reason === "nothing-left" ? `asked again when ${offer.current} is finished` : `asked again when ${offer.current} has nothing left to start`;
+    return { ok: true, config: cfg, message: `Not now: ${offer.title} stays out of the scope (${again})` };
+  }
+  if (list.some((m) => m.number === offer.number)) return { error: `${offer.title} is already in scope` };
+  if (list.length >= MAX_SCOPE_MILESTONES) return { error: `the scope already holds ${list.length} milestones` };
+  const milestones = [...list, { number: offer.number, title: offer.title }];
+  state.roadmapContinued = [...state.roadmapContinued, { number: offer.number, title: offer.title, stage: offer.stage, at: now, by: "you" as const }].slice(-10);
+  state.roadmapOffer = null;
+  // A finished run has something to do again.
+  if (state.phase === "done") state.phase = "idle";
+  // The last pass's status stays the board's until the next pass rewrites
+  // it (the cards keep their lines meanwhile): it now belongs to the wider
+  // scope, with the offer answered.
+  const before = state.roadmap!;
+  state.roadmap = {
+    ...before,
+    nextMilestone: null,
+    scope: before.scope ? { ...before.scope, milestones: [...(before.scope.milestones?.length ? before.scope.milestones : [{ number: before.scope.number, title: before.scope.title, total: before.counts.total }]), { number: offer.number, title: offer.title, total: offer.steps }] } : before.scope,
+  };
+  const can = offer.agentSteps === 0 ? "all of them yours to do" : offer.startable > 0 ? `${offer.startable} can start now` : `none can start yet — waiting on ${offer.waitingOn ?? "unfinished steps"}`;
+  return {
+    ok: true,
+    config: { ...cfg, milestones, milestone: milestones[0]!, autoContinue: action === "always" ? true : cfg.autoContinue },
+    message: `${offer.title} is in scope with ${scopeLabel(list)}: ${offer.steps} step${offer.steps === 1 ? "" : "s"} get a Backlog card (${can})${action === "always" ? ". Always continue is on" : ""}`,
+  };
+}
+
+/**
+ * `POST /autopilot/roadmap/continue`: apply the owner's answer between
+ * passes (a pass at work holds its own copy of the state and the scope),
+ * save, and ask for a pass. Not a fresh run: holds, cards and the ledger
+ * stay as they are.
+ */
+export async function applyRoadmapContinue(action: RoadmapContinueAction): Promise<{ ok: true; message: string } | { error: string }> {
+  for (let i = 0; busy && i < 240; i++) await new Promise((r) => setTimeout(r, 500));
+  if (busy) return { error: "Autopilot is in the middle of a long pass — try again in a minute" };
+  busy = true;
+  try {
+    normalizeLegacyConfig();
+    const cfg = parseConfig(preferences.get(AUTOPILOT_PREF));
+    const state = readState();
+    const r = continueRoadmap(cfg, state, action, Date.now());
+    if ("error" in r) return r;
+    preferences.set(AUTOPILOT_PREF, JSON.stringify(r.config));
+    writeState(state);
+    return { ok: true, message: r.message };
+  } finally {
+    busy = false;
+    requestAutopilotPass(0);
+  }
+}
+
 let notifier: ((n: { title: string; body: string }) => void) | null = null;
 
 /** The host's native notifications (the API server has them; a headless
@@ -1273,6 +1479,14 @@ export const ROADMAP_DEPS: RoadmapDeps = {
   moveToDone: (t) => void tasks.update(t.id, { column: "done" }),
   save: (state) => savePassState(state),
   outdated: () => passOutdated(),
+  setScope(milestones) {
+    // Only the scope: whatever else was saved meanwhile (the slot count, a
+    // pause) stands. A run that was changed meanwhile isn't this pass's.
+    if (passRun && passRun.epoch !== runEpoch) return false;
+    const cur = parseConfig(preferences.get(AUTOPILOT_PREF));
+    preferences.set(AUTOPILOT_PREF, JSON.stringify({ ...cur, milestones, milestone: milestones[0] ?? null }));
+    return true;
+  },
   notify(n) {
     if (!notifier) return false;
     try {
@@ -1454,7 +1668,19 @@ export function applyAutopilotPatch(body: Record<string, unknown>): AutopilotCon
   normalizeLegacyConfig();
   preferences.set(CONFIG_VERSION_PREF, "2"); // what is saved from here on is saved by this build
   const cur = parseConfig(preferences.get(AUTOPILOT_PREF));
-  const next = parseConfig(JSON.stringify({ ...cur, ...body }));
+  // The scope is `milestones`. A patch that names only `milestone` (the
+  // dialog's one choice, `agetor roadmap start --milestone`, an older
+  // client) sets the scope to that one milestone.
+  const scopePatch =
+    "milestones" in body
+      ? (() => {
+          const list = normalizeMilestones(body.milestones);
+          return { milestones: list, milestone: list[0] ?? null };
+        })()
+      : "milestone" in body
+        ? { milestones: [] }
+        : {};
+  const next = parseConfig(JSON.stringify({ ...cur, ...body, ...scopePatch }));
   preferences.set(AUTOPILOT_PREF, JSON.stringify(next));
   if (typeof body.defaultTracker === "number" && Number.isInteger(body.defaultTracker) && body.defaultTracker > 0) {
     preferences.set(DEFAULT_TRACKER_PREF, String(body.defaultTracker));
@@ -1468,7 +1694,8 @@ export function applyAutopilotPatch(body: Record<string, unknown>): AutopilotCon
   // same tracker drops the status only (it counts the old scope). Backlog
   // cards already made are never touched here — they stay where they are.
   const projectChanged = cur.project !== next.project;
-  const milestoneChanged = (cur.milestone?.number ?? null) !== (next.milestone?.number ?? null);
+  const scopeKey = (c: AutopilotConfig) => c.milestones.map((m) => m.number).join(",");
+  const milestoneChanged = scopeKey(cur) !== scopeKey(next);
   const roadmapChanged = (cur.roadmap?.issue ?? null) !== (next.roadmap?.issue ?? null) || (!!next.roadmap && projectChanged);
   const scopeChanged = !!next.roadmap && milestoneChanged;
   if (body.restart === true || roadmapChanged || scopeChanged || (next.enabled && (!cur.enabled || milestoneChanged))) {
@@ -1486,11 +1713,18 @@ export function applyAutopilotPatch(body: Record<string, unknown>): AutopilotCon
         quietUntil: 0,
         quietSignature: "",
         ...(roadmapChanged ? { roadmap: null, roadmapStuck: {}, roadmapRedo: {}, notifiedHuman: [] } : scopeChanged ? { roadmap: null } : {}),
+        // A scope chosen by hand starts the next-milestone question over.
+        ...(roadmapChanged || scopeChanged ? { roadmapOffer: null, notifiedOffer: [], roadmapContinued: [] } : {}),
         // The ledger is keyed by issue number, which means another issue in
         // another project.
         ...(projectChanged ? { roadmapBacklog: {} } : {}),
       }),
     );
+  } else if (next.autoContinue && !cur.autoContinue) {
+    // "Always continue" switched on for a run that finished with a
+    // milestone still to follow: it has something to do again.
+    const s = readState();
+    if (s.phase === "done" && currentRoadmapStatus(next, s.roadmap)?.nextMilestone) preferences.set(AUTOPILOT_STATE_PREF, JSON.stringify({ ...s, phase: "idle" }));
   }
   return next;
 }
@@ -1512,7 +1746,7 @@ export function normalizeLegacyConfig(): void {
   if (!raw) return;
   const cfg = parseConfig(raw);
   if (cfg.roadmap) {
-    if (cfg.milestone) preferences.set(AUTOPILOT_PREF, JSON.stringify({ ...cfg, milestone: null }));
+    if (cfg.milestone) preferences.set(AUTOPILOT_PREF, JSON.stringify({ ...cfg, milestone: null, milestones: [] }));
     if (readDefaultTracker() == null) preferences.set(DEFAULT_TRACKER_PREF, String(cfg.roadmap.issue));
   }
   preferences.set(CONFIG_VERSION_PREF, "2");

@@ -46,7 +46,7 @@ import { activeTrain, mergedViaTrain, trainFor } from "./merge-train.ts";
 import { isPriority, readPriority, setPriority } from "./priority.ts";
 import { setMergeQueued } from "./merge-intent.ts";
 import { KEEP_AWAKE_PREF_KEY, KEEP_SCREEN_ON_PREF_KEY, recheckKeepAwake } from "./keep-awake.ts";
-import { applyAutopilotPatch, applyRoadmapResolve, autopilotSnapshot, noteSignOffWithdrawn, requestAutopilotPass, setAutopilotNotifier } from "./autopilot.ts";
+import { applyAutopilotPatch, applyRoadmapContinue, applyRoadmapResolve, autopilotSnapshot, noteSignOffWithdrawn, requestAutopilotPass, setAutopilotNotifier } from "./autopilot.ts";
 import { departTrainNow, refreshMergeColumn } from "./merge-queue.ts";
 import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
@@ -3325,6 +3325,22 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: 'expected {"issue": <number>, "action": "close" | "redo"}' }, { status: 400, headers: corsHeaders(req) });
           }
           const r = await applyRoadmapResolve({ issue, action: body.action });
+          if ("error" in r) return json({ error: r.error }, { status: 409, headers: corsHeaders(req) });
+          return json({ ...r, ...autopilotSnapshot() }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // The owner's answer to the next-milestone offer in the roadmap status
+      // (`state.roadmap.nextMilestone`): `accept` adds that milestone to the
+      // scope, `always` also turns on continuing without asking, `dismiss`
+      // is "not now". Nothing but `autoContinue` accepts on its own.
+      "/autopilot/roadmap/continue": {
+        POST: authed(async (req) => {
+          const body = (await req.json().catch(() => ({}))) as { action?: unknown };
+          if (body.action !== "accept" && body.action !== "always" && body.action !== "dismiss") {
+            return json({ error: 'expected {"action": "accept" | "always" | "dismiss"}' }, { status: 400, headers: corsHeaders(req) });
+          }
+          const r = await applyRoadmapContinue(body.action);
           if ("error" in r) return json({ error: r.error }, { status: 409, headers: corsHeaders(req) });
           return json({ ...r, ...autopilotSnapshot() }, { headers: corsHeaders(req) });
         }),
