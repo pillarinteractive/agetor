@@ -398,7 +398,9 @@ which is set up (`autopilotLabel` in `src/shared/autopilot.ts`).
 
 - **Config** — `autopilot` preference: `enabled`, `project` (path), `milestone` `{number, title}`, `threadId` (the
   Codex thread), `maxInFlight` (default 5, 1–10), `pipelineId` (else `default_pipeline`), `roadmap` `{issue}` (the
-  tracker; set → tracker order, and `threadId` is unused).
+  tracker; set → tracker order, and `threadId` is unused), and for tracker order `milestones` (the scope as an
+  ordered list; `milestone` is always its first entry, and a config saved with only `milestone` reads as a list of
+  one) and `autoContinue` (next section).
 - **State** — `autopilot_state` preference: `phase` (`idle` / `running` / `auditing` / `done`), `cards` (the cards
   Autopilot started), `held` with `holds` (why, for which PR head and rules) and `unread`, `lastAnswer`, `lastError`,
   the back-offs (`quietUntil`, `limitedUntil`), `noWork`, `waits`, `reworked`, and the tracker fields. Two more
@@ -408,7 +410,8 @@ which is set up (`autopilotLabel` in `src/shared/autopilot.ts`).
   config (`applyAutopilotPatch`) and runs a pass at once when enabled. Enabling, changing the milestone, the tracker
   or the project, or `"restart": true` begins a fresh run (`phase` back to `idle`; `held`, `lastError` and the
   20-minute quiet back-off cleared). `phase: "done"` stays until then. `POST /autopilot/roadmap/resolve` is the
-  owner's answer to a tracker step that finished without closing its issue (next section).
+  owner's answer to a tracker step that finished without closing its issue, and `POST /autopilot/roadmap/continue`
+  the answer to the next-milestone offer (both in the next section).
 - **Which issues** (thread-driven) — Autopilot doesn't choose. It resumes the user's milestone-manager Codex thread
   (`src/bun/codex-thread.ts`: `~/.agetor/bin/codex exec resume <threadId>` in the project, one request at a time) with
   the open issues nobody is working on, what is in flight, and the number of free slots; the thread answers with a
@@ -491,8 +494,11 @@ nothing-to-build decision and no audit: the table decides the order.
   shows. Where the two disagree the step is listed under the roadmap problems (`milestone-mismatch`); only an issue
   whose state couldn't be read falls back to comparing the table's code with the code the milestone title starts with
   (`M01 — …`, `X07 · …`, `H — …`). Steps outside the milestone still gate readiness; this run never starts them.
-  `phase: "done"` when every step in the milestone is complete or declined; a milestone none of the roadmap's issues
-  is in is an error, not "done". No milestone ("All milestones") works the whole roadmap, as before.
+  A milestone none of the roadmap's issues is in is an error, not "done". No milestone ("All milestones") works the
+  whole roadmap, as before. The scope can hold several milestones (see "The next milestone" below): the steps in
+  scope are then the steps of all of them, and counts, backlog cards, needs-you and holds span them.
+  `phase: "done"` when every step in scope is complete or declined *and* no milestone follows, or the owner said no
+  to the one that does.
 - **Backlog cards up front** (with a milestone). Every pass makes a card in the Backlog for each open step in scope
   that has no live card — the owner's steps too — without starting it, so a step added to the milestone later gets
   its card as well. Making a card (`createTaskFromIssue` with `start: false`) reads the issue thread from GitHub once,
@@ -517,6 +523,67 @@ nothing-to-build decision and no audit: the table decides the order.
     stay in the Backlog, untouched and never started by the new run (they hold no slot); switching back picks them up
     again. In thread-driven mode leftovers hold no slot either, but their issues stay busy — archive or start them
     first if the thread should work those issues.
+- **The next milestone** — no more switching milestones by hand. Each pass works out which milestone follows the
+  scope (`nextRoadmapMilestone` in `src/shared/roadmap.ts`): stages are the table's milestone column in the order
+  the table first names them; the owner's stage (`H`) is never one; a stage with no open agent step outside the
+  scope is passed over; and the stage maps to a GitHub milestone through its steps' issues (the first open agent
+  step whose issue is in one — the same milestone the scope rule reads). So an unfinished stage *before* the one
+  being worked comes first: it is what the scope waits on. A stage none of whose open steps has a GitHub milestone
+  can't be scoped and is passed over. An ordered-milestones section elsewhere in the tracker is not read: the
+  table is the authority for order.
+  - **When it is offered** (`roadmapContinuation`): once the agent steps in scope that haven't started and still
+    can (not busy, not needing you, not held by a roadmap problem; the owner's steps never count) are fewer than
+    `maxInFlight` — the scope can no longer fill its slots. The offer is `nextMilestone` in `state.roadmap`: stage,
+    GitHub milestone, how many steps it has and how many can start now ("0 can start yet — waiting on steps 3
+    (#13), 4 (#14)"), how many are left in the current scope, why it is offered (`reason`: `nearly-done` →
+    `nothing-left` → `finished`; null while not due) and `dismissedAt`. It is recomputed every pass, so changing
+    `maxInFlight` moves it. A milestone smaller than `maxInFlight` is on offer from its first pass.
+  - **The answer** is the owner's: the board's popup (`NextMilestonePrompt.tsx` — **Start M02**, **Always
+    continue**, **Not now**), the Autopilot dialog, or `agetor roadmap continue [--always | --not-now]`, all through
+    `POST /autopilot/roadmap/continue {"action": "accept" | "always" | "dismiss"}` (`continueRoadmap`; applied
+    between passes, 409 with the reason when there is nothing to answer). One native notification per offered
+    milestone (`notifiedOffer`).
+    - **Accepting adds, never replaces**: the milestone is appended to `milestones`. What is left of the current
+      milestones keeps running, the new one's open steps get Backlog cards on the next pass (the usual 60 per
+      pass) and start as slots free — slot accounting is unchanged. It is not a fresh run: holds, cards and
+      ledgers stay. `accept` is also allowed before the offer is due (an explicit request).
+    - **Not now** is remembered (`roadmapOffer`: milestone and stage) and holds for that stage: the offer comes
+      back when it reaches a later one — nothing left to start, then the scope finished — not on every pass.
+      Declined when finished, the run is `done`; `agetor roadmap continue` still starts it later.
+    - While a finished scope's offer is unanswered the run is `idle`, not `done`.
+  - **Always continue** (`autoContinue`; the popup's button, the dialog's checkbox, `agetor roadmap start
+    --auto-continue`, `agetor roadmap continue --always` / `--off`): the pass adds the next milestone by itself
+    under the same condition, records it (`roadmapContinued`, shown as "continued into M02 at …" in the dialog and
+    `agetor roadmap status`) and sends a native notification instead of asking. Never without the flag. It applies
+    the same rule to the wider scope, so several small milestones can be pulled in one after another (at most 4
+    per pass, 12 in scope).
+  - **Finished milestones leave the scope** while another is still being worked (the pass saves the shorter
+    list). When everything in scope is finished they stay named, so the status still says what is done.
+  - **Choosing a milestone by hand** (the dialog, `agetor roadmap start --milestone`, `PUT /autopilot` with
+    `milestone` or `milestones`) sets the scope to exactly that — a fresh run, and the offer, its "not now" and the
+    continued list start over. While Autopilot is on, the dialog sends only the slot count and the flag, so a
+    scope the pass changed meanwhile isn't written back.
+  - The whole roadmap ("All milestones") has no next milestone and never offers one.
+- **Blocker lines** (`BlockerLines.tsx`, `src/mainview/lib/blocker-lines.ts`): hovering a card — or reaching it
+  with the keyboard — draws a line from every card it waits on (solid, the warning colour) and to every card it
+  blocks (dashed, the info colour), whichever column those are in, outlines them, and shows a small panel that
+  lists every direct predecessor and successor as "step · #issue title — state". The panel is where the links
+  with no card show up, since they can't have a line: a finished step (complete), a step of another milestone
+  ("open in another milestone (M02)"), the owner's step ("yours to do"), a declined one. Arrows point the way the
+  work flows. Direct links only; **hold Shift** for the whole chain (fainter lines). A card scrolled out of view
+  gets its line cut at the board's edge with a label ("↑ step 2 · #12"); a card that isn't rendered (filtered out,
+  folded into Done's "Show more") is listed as not shown.
+  - **Data**: `links` in `state.roadmap` (`RoadmapStepLinks`): every open step in scope with its direct
+    predecessors (all of them, with where each stands) and open successors, each carrying its card id when it has
+    a live card. Bounded: steps in scope only (300 at most), 16 links per step and direction with a count of the
+    rest, titles cut to 100 characters.
+  - **Manual `card_dependencies`** (the "waits on" / "blocks" chips) are drawn the same way, from the task's
+    `blockedBy` / `blocking`.
+  - An overlay beside the board's scroller that takes no pointer events and listens on the board for pointer and
+    focus events reaching a `[data-task-id]` card; nothing is drawn while a mouse button is down, so dragging is
+    untouched. Positions are read in an animation-frame loop that runs only while lines are shown. No animation.
+  - Without a mouse: `agetor roadmap why <issue|step>` prints the same — what the step waits on, its finished
+    predecessors and what it blocks (`#12` is an issue, `2.1` a step, a bare number a step when one has that id).
 - **Yours**: ready owner steps are never given to an agent. With a milestone, the ones raised are those in it plus
   those outside it that a step in it waits on, directly or through other steps. Each gets one native notification
   (the app only; the headless daemon has none) and a line in the Needs you strip at the top of the board that opens
@@ -574,16 +641,29 @@ nothing-to-build decision and no audit: the table decides the order.
   [--pipeline <id|name>]` (`--issue` defaults to the default tracker; `--milestone M01` matches the milestone whose
   title starts with it; none = the whole roadmap), `agetor roadmap status [--json]` (scope, counts incl. backlog
   cards, needs-you with each PR's stated reason and how to resolve it, what waits on other milestones),
-  `agetor roadmap pause`, `agetor roadmap resolve <issue> --close | --redo` (`src/cli/commands/roadmap.ts`; all go
-  through `GET/PUT /autopilot` and `POST /autopilot/roadmap/resolve`).
+  `agetor roadmap pause`, `agetor roadmap resolve <issue> --close | --redo`, `agetor roadmap why <issue|step>`,
+  `agetor roadmap continue [--always | --off | --not-now]` and `start --auto-continue`
+  (`src/cli/commands/roadmap.ts`; all go through `GET/PUT /autopilot` and `POST /autopilot/roadmap/resolve` /
+  `continue`). `status` names the next milestone, why it is or isn't on offer yet, and the command that starts it.
 - **State**: status, the restart guard, the steps being done again, the announced owner steps and the backlog
-  ledger are `roadmap`, `roadmapStuck`, `roadmapRedo`, `notifiedHuman` and `roadmapBacklog` in `autopilot_state`. A
-  different tracker drops the first four; a different milestone drops the status; a different project also empties
-  the ledger (the cards stay).
+  ledger are `roadmap`, `roadmapStuck`, `roadmapRedo`, `notifiedHuman` and `roadmapBacklog` in `autopilot_state`;
+  the "not now", the announced offers and the milestones continued into are `roadmapOffer`, `notifiedOffer` and
+  `roadmapContinued`. A different tracker drops the first four; a scope chosen by hand drops the status and the
+  last three; a different project also empties the ledger (the cards stay).
 - **Upgrading**: before this, a tracker made Autopilot ignore `milestone`. A config saved then with both (a
   milestone left from an earlier thread-driven run) has that milestone dropped once, on first start
   (`normalizeLegacyConfig`, marked by `autopilot_config_version`), so a run on the whole roadmap isn't silently
   narrowed; its tracker becomes the default tracker.
+- **Upgrading to scope lists**: no migration. A config with one `milestone` is a scope of that one milestone, and
+  the run in progress carries on untouched (no fresh run, no card moved). The first pass after installing adds
+  `links` and `nextMilestone` to the status; if the milestone already has fewer steps left to start than
+  `maxInFlight`, the popup and one notification appear then. Nothing is added to the scope without an answer.
+  Going back to an older build is safe too: it reads `milestone` (the first in scope) and drops the list when it
+  next saves the config, so later milestones' unstarted cards just wait in the Backlog.
+- **Rendered checks**: `e2e/roadmap-board.spec.ts` draws both pieces in Chromium against a throwaway core, with
+  the status built by the real pure functions from a synthetic tracker (`bunx --bun playwright test
+  e2e/roadmap-board.spec.ts`; set `ROADMAP_SHOTS=<dir>` to keep the screenshots). The app's real web view is
+  WebKit, which this doesn't exercise.
 - **Upgrading to segment-based sign-off**: no migration. On the first pass after installing (30 s after the core
   starts), every card in `held` is decided again under the rules above — one that was held only because a path
   *contained* a sensitive word, or because its file list couldn't be read, is signed off and moves to Ready to
