@@ -13,8 +13,12 @@
  *   | 1 | #12 [Human] Supply the reference profile | H | none |
  *   | 2.1 | #14 Implement the wire contract | M01 | 1, 2 |
  *
- * Step ids are strings (`78.1` is a step between 78 and 79); predecessors
- * name steps, not issues. A title starting `[Human]` is the owner's to do.
+ * Step ids are strings (`78.1` is a step between 78 and 79). Predecessors
+ * name steps (`1, 2`) or the steps' issues (`#12, #14`). A step is the
+ * owner's to do when its title starts `[Human]` or its milestone is `H`.
+ *
+ * The heading may be any that contains "completion order", and the two
+ * middle columns may be named differently (`Task`, `Stage`).
  */
 
 export const ROADMAP_SECTION = "Numbered completion order";
@@ -23,7 +27,7 @@ export interface RoadmapStep {
   step: string;
   issue: number;
   title: string;
-  /** Title starts with `[Human]`: never given to an agent. */
+  /** Title starts with `[Human]`, or the milestone is `H`: never given to an agent. */
   human: boolean;
   milestone: string;
   /** Step ids, as written (an id that names no step is kept and reported). */
@@ -81,8 +85,8 @@ const isSeparator = (line: string) => /^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|
 export function parseRoadmap(body: string): ParsedRoadmap {
   const fail = (kind: RoadmapProblemKind, message: string): ParsedRoadmap => ({ steps: [], problems: [{ kind, message }], held: {}, error: message });
   const lines = (body ?? "").split(/\r?\n/);
-  const heading = lines.findIndex((l) => new RegExp(`^#{1,6}\\s+${ROADMAP_SECTION}\\s*#*\\s*$`, "i").test(l.trim()));
-  if (heading < 0) return fail("missing-section", `the tracker has no "## ${ROADMAP_SECTION}" section`);
+  const heading = lines.findIndex((l) => /^#{1,6}\s+.*\bcompletion order\b/i.test(l.trim()));
+  if (heading < 0) return fail("missing-section", `the tracker has no "completion order" section`);
 
   // The section's first table: a header row followed by a separator row.
   let header = -1;
@@ -137,7 +141,7 @@ export function parseRoadmap(body: string): ParsedRoadmap {
       step,
       issue,
       title,
-      human: /^\[human\]/i.test(title),
+      human: /^\[human\]/i.test(title) || /^H$/i.test(milestone),
       milestone,
       predecessors: none ? [] : preds.split(",").map((p) => p.trim()).filter(Boolean),
     };
@@ -156,6 +160,14 @@ export function parseRoadmap(body: string): ParsedRoadmap {
     return { steps: [], problems: [{ kind: "no-rows", message }, ...problems], held: {}, error: message };
   }
   steps.sort((a, b) => compareStepIds(a.step, b.step));
+
+  // A predecessor written as an issue (`#12`) means the step for that issue.
+  for (const s of steps) {
+    s.predecessors = s.predecessors.map((p) => {
+      const m = p.match(/^#(\d+)$/);
+      return (m && byIssue.get(Number(m[1]))?.step) || p;
+    });
+  }
 
   for (const s of steps) {
     const unknown = s.predecessors.filter((p) => !byStep.has(p));

@@ -404,7 +404,7 @@ test("roadmap: done only when every step is complete or declined; an unreadable 
   const b = roadmapDeps({}, { loadTracker: async () => ({ body: "## Something else\n", url: null }) });
   await roadmapPass(roadmapCfg, broken, [], [], b.deps);
   expect(b.log.started).toEqual([]);
-  expect(broken.lastError).toContain("Numbered completion order");
+  expect(broken.lastError).toContain("completion order");
   expect(broken.roadmap!.problems[0]!.kind).toBe("missing-section");
 });
 

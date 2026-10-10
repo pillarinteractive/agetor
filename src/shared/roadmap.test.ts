@@ -51,7 +51,7 @@ describe("parseRoadmap", () => {
   });
 
   test("no section, no table, or no valid row: an error and no steps", () => {
-    expect(parseRoadmap("## Summary\nnothing")).toMatchObject({ steps: [], error: expect.stringContaining("Numbered completion order"), problems: [{ kind: "missing-section" }] });
+    expect(parseRoadmap("## Summary\nnothing")).toMatchObject({ steps: [], error: expect.stringContaining("completion order"), problems: [{ kind: "missing-section" }] });
     expect(parseRoadmap("## Numbered completion order\nJust prose.\n## Next\n| Step | Task and outcome | Milestone | Predecessor steps |\n| --- | --- | --- | --- |")).toMatchObject({
       steps: [],
       problems: [{ kind: "missing-table" }],
@@ -83,10 +83,10 @@ describe("parseRoadmap", () => {
   });
 
   test("a predecessor that names no step holds the step", () => {
-    const r = parseRoadmap(table("| 1 | #101 First | M | none |", "| 2 | #102 Second | M | 1, 7, #101 |"));
-    expect(r.problems).toEqual([expect.objectContaining({ kind: "unknown-predecessor", step: "2", message: "step 2: predecessor 7, #101 names no step" })]);
+    const r = parseRoadmap(table("| 1 | #101 First | M | none |", "| 2 | #102 Second | M | 1, 7, #999 |"));
+    expect(r.problems).toEqual([expect.objectContaining({ kind: "unknown-predecessor", step: "2", message: "step 2: predecessor 7, #999 names no step" })]);
     const views = roadmapStatus(r, states({ 101: DONE }, [101, 102]));
-    expect(views[1]).toMatchObject({ status: "held", waitingOn: ["7", "#101"] });
+    expect(views[1]).toMatchObject({ status: "held", waitingOn: ["7", "#999"] });
     expect(pickRoadmap(views, { busy: new Set(), free: 5 }).start).toEqual([]);
   });
 
@@ -186,4 +186,23 @@ describe("summarizeRoadmap", () => {
     // An agent step that's ready is not an idle roadmap.
     expect(sum({ 101: DONE, 102: DONE }).idleReason).toBeNull();
   });
+});
+
+test("the table may name predecessors by issue, mark the owner's steps by milestone H, and sit under another 'completion order' heading", () => {
+  const body = [
+    "## Single completion order",
+    "",
+    "| Step | Task | Stage | Predecessors |",
+    "| --- | --- | --- | --- |",
+    "| 1 | #806 Inventory surfaces | M01 | — |",
+    "| 2 | #807 Validate records | M01 | #806 |",
+    "| 3 | #1200 Review the dossier | H | #806, #807 |",
+    "| 4 | #808 Build on a missing one | M01 | #999 |",
+  ].join("\n");
+  const r = parseRoadmap(body);
+  expect(r.error).toBeNull();
+  expect(r.steps.map((s) => s.predecessors)).toEqual([[], ["1"], ["1", "2"], ["#999"]]);
+  expect(r.steps.map((s) => s.human)).toEqual([false, false, true, false]);
+  expect(r.problems.map((p) => p.kind)).toEqual(["unknown-predecessor"]);
+  expect(r.held["4"]).toContain("#999");
 });
