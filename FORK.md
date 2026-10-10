@@ -300,3 +300,30 @@ PRs drop out and merge alone), pushes it, opens "Merge train: #a, #b" — CI run
 disband, members merge individually. A lone ready PR waits the window for company, then merges alone. One train at a
 time. Config `merge_train` = {"enabled":true,"windowMin":10,"max":6}. Cards show "In merge train #T" / "Merged in
 merge train #T" (`Task.mergeTrain`).
+
+## Roadmap mode (`feat/roadmap-autopilot`)
+
+Autopilot (`src/bun/autopilot.ts`, the rocket button) can work a **roadmap** instead of a milestone: a tracker issue
+whose body has a `## Numbered completion order` section with one table — `Step | Task and outcome | Milestone |
+Predecessor steps`, each task written `#123 Title`. Step ids are strings (`78.1` sits between 78 and 79), predecessors
+name steps, and a title starting `[Human]` is yours to do. No Codex thread is involved: the table decides the order.
+
+- **Rules** (`src/shared/roadmap.ts`, pure): a step is *complete* when its issue is closed as completed, *declined*
+  when closed any other way (a no-go: unlocks nothing, never started), *ready* when open with every predecessor
+  complete. Each pass starts the ready agent steps in step order, up to `maxInFlight`, through the same card creation,
+  slot accounting, usage-limit hold and Ready to Merge sign-off as milestone mode. The card's prompt names its step,
+  the tracker and its predecessors' issues, and asks for `Fixes #n` — a step only closes (and unlocks the next) when
+  its PR says so.
+- **Yours**: ready `[Human]` steps are never given to an agent. Each gets one native notification and a line in the
+  Needs you strip at the top of the board (roadmap entries only; they have no card) that opens the issue. Closing the
+  issue as completed releases what waits on it — picked up within 5 minutes (roadmap mode polls GitHub).
+- **No restart loops**: if a step's card finished (Done / PR merged, or a run with no commits and no PR) and the issue
+  is still open, Autopilot doesn't start another; the step shows under Needs you ("PR #n merged but the issue is still
+  open") until you close the issue or start the work again yourself from the Issues queue.
+- **Problems** in the table (duplicate step or issue, a predecessor that names no step, a cycle, a malformed row) are
+  listed in the dialog and `agetor roadmap status`; the steps they touch are held. A tracker with no usable table
+  starts nothing.
+- **Use**: Autopilot dialog → Work from **Roadmap** → tracker issue number, or
+  `agetor roadmap start --project <dir> --issue <n> [--max <n>] [--pipeline <id|name>]`, `agetor roadmap status
+  [--json]`, `agetor roadmap pause`. Config is `roadmap: {"issue": n}` in the `autopilot` preference; status, the
+  restart guard and the announced human steps live in `autopilot_state` (no migration).
