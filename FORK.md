@@ -221,6 +221,8 @@ suggestion rules are gone.
   (1 → 5 → 15 → 30 min apart), then left for a person. A step stopped by a usage limit waits for the reset and is
   retried then, without giving up (see "Usage limits, retries and keepalive"). A "blocked" handoff for a real reason
   or a user Stop never is. The schedule is stored on the run (`autoRetry`) and re-armed when the core restarts.
+  A step the limit stopped part-way is continued in its own session rather than restarted (see "Unfinished steps
+  stay put").
 - **Pipelines own their PRs**: auto Fix CI is on by default for pipeline cards (`pr_autofix` true/false overrides;
   max 2 per PR, never twice on one head). A PR behind its base whose failing checks pass on the base gets its branch
   updated automatically (`pr_autoupdate=false` to stop) — so the Update-branch suggestion only exists when that's off.
@@ -382,6 +384,42 @@ So an unattended board keeps going:
   `/Applications/Agetor.app` when `~/.agetor/keepalive-enabled` exists, no app process is running and the last exit
   wasn't a quit the user approved (`~/.agetor/keepalive-quit`, written on an approved quit and cleared on launch). At
   most 5 reopens an hour. Off until `agetor keepalive on`.
+
+## Unfinished steps stay put; the next step gets the whole report (`feat/roadmap-autopilot`)
+
+Two things a run got wrong, both in `settleStepRun` / `launchStep` (`src/bun/pipeline-runner.ts`) and
+`src/shared/pipeline.ts`:
+
+- **A `blocked` handoff no longer moves the run along its only edge.** Build has one way forward, so its handoff
+  contract says `set "next" to "Review"`; a Build stopped by Claude's usage-limit grace window wrote exactly that with
+  `status: "blocked"`, and the "a blocked handoff that names a next step follows it" rule (meant for Review/Finish
+  sending work back) started Review on half-done work. Now (`blockedHandoffChoosesNext`): a blocked handoff routes only
+  when the step had a real choice and made one — several outgoing edges, or `canFinish` — and never when the turn hit
+  a usage limit. Otherwise the run stays on the step:
+  - **Usage limit** (Claude's own status notices in that turn, `quotaNoticeFrom`): the run waits for the reset with
+    `autoRetry.kind = "quota"` and `autoRetry.resume`, then **continues the same session** with a note
+    (`composeLimitResumeNote`, sent through `sendInput` like the await wake-up) telling it to finish and write a new
+    handoff. A limit that fails a turn mid-work (any tool call already made) resumes the same way; one hit before any
+    work relaunches the step as before. If the note can't be delivered the step is relaunched.
+  - **Blocked for another reason**: the run blocks on that step (Needs you), as it did before that rule existed.
+  - The timeline says which: "Build stopped at its usage limit before finishing — resuming it at 7:25 PM instead of
+    handing unfinished work to Review" / "Build handed off "blocked" with its work unfinished — holding the run on
+    Build instead of starting Review".
+  - The contract now tells every step what `blocked` does. Not done: holding back a handoff that says `done` because
+    a limit notice appeared in the turn (in the board's history those were finished, committed steps), and a
+    "nothing changed since the last Review" check (a Build that answers a finding without changing code is a
+    legitimate hand-back).
+- **A step receives the sending step's full final report**, not just its handoff. The handoff's `summary` is a line
+  per finding; the findings themselves (file:line, the failing case, the fix) are the body of the same message. The
+  step(s) a step is entered from now contribute that body inside the same untrusted span as their handoff
+  (`stepFinalReport` reads it from the step's recorded turns; nothing new is stored in the run state or the
+  database). Budget: `PIPELINE_LIMITS.reportInlineMaxBytes` = 24 KB per prompt, shared by the senders, cut from the
+  middle (first third + last two thirds kept) with a marker; the whole report is always written to
+  `<data dir>/pipeline-runs/<card>/report-<generation>-<step number>.md` and the prompt names the file. A
+  follow-up still gets every earlier handoff, with the report of the newest step only.
+- **Reading them yourself**: `agetor pipeline status <card> --handoffs` prints each step's whole handoff;
+  `agetor pipeline handoff <card> [<step number> | <step name> | --all]` prints a step's full final message
+  (`GET /tasks/:id/pipeline/reports`).
 
 ## Milestone Autopilot (`feat/milestone-autopilot`, `feat/autopilot-events`, `feat/autopilot-run-last`)
 
