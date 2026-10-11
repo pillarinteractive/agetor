@@ -1539,7 +1539,10 @@ function makeFakeAgent(
           openQuestions: [] as string[],
           status: "done" as const,
         };
-        onChunk("assistant", `Done.\n<${HANDOFF_TAG}>\n${JSON.stringify(handoff)}\n</${HANDOFF_TAG}>`);
+        // `AGETOR_FAKE_CLAUDE_HANDOFF_BODY`: the prose a real step writes
+        // ahead of its handoff (a reviewer's findings) — its final report.
+        const body = process.env.AGETOR_FAKE_CLAUDE_HANDOFF_BODY ?? "Done.";
+        onChunk("assistant", `${body}\n<${HANDOFF_TAG}>\n${JSON.stringify(handoff)}\n</${HANDOFF_TAG}>`);
       }
     });
     after(resolveDelayMs, () => { onChunk("status", "turn complete"); resolveDone(0); });

@@ -734,6 +734,22 @@ export interface PipelineRunState {
   autoRetry?: PipelineAutoRetry;
 }
 
+/** One step execution with its full final report — a row of `GET
+ *  /tasks/:id/pipeline/reports`. `report` is the whole final message of the
+ *  step (prose and handoff block), null when its turns hold no handoff. */
+export interface PipelineStepReport {
+  seq: number;
+  stepId: string;
+  stepName: string;
+  taskId: string;
+  outcome: PipelineStepRecord["outcome"];
+  responseKind: StepResponseKind | null;
+  startedAt: number;
+  endedAt: number | null;
+  handoff: Handoff | null;
+  report: string | null;
+}
+
 export interface PipelineAutoRetry {
   stepId: string;
   kind: "quota" | "transient";
@@ -763,6 +779,16 @@ export const PIPELINE_LIMITS = {
   maxStepsDefault: 25,
   maxStepsMax: 200,
   handoffInlineMaxBytes: 16_384,
+  /** UTF-8 bytes of previous-step REPORT text (the body of the sending
+   *  step's final message — a reviewer's findings with file:line and
+   *  reproductions, a plan) one step prompt may inline, shared equally by
+   *  the senders it arrives from; on top of `handoffInlineMaxBytes` for
+   *  their handoff JSON. A longer body is cut from the middle and the whole
+   *  report stays in a file the prompt names. 24 KB: the largest final
+   *  message among ~950 real step reports was 18.4 KB (Review bodies:
+   *  median 1.2 KB, max 4.7 KB), so in practice nothing is cut, while a
+   *  runaway report can add at most ~6k tokens to a prompt. */
+  reportInlineMaxBytes: 24_576,
   handoffField: 8_000,
   handoffArray: 50,
   /** Hard bound on the JSON byte size of ONE normalized {@link Handoff} as

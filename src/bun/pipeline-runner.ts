@@ -72,9 +72,11 @@ import {
   normalizeHandoff,
   outgoingSteps,
   renderHandoffFile,
+  renderReportFile,
   resolveNextSteps,
   resolveStartStep,
   stepNameById,
+  stepReportFromMessages,
   validatePipelineGraph,
 } from "../shared/pipeline.ts";
 import { promptByteOverage } from "../shared/prompt-limits.ts";
@@ -94,6 +96,7 @@ import type {
   PipelineRunStatus,
   PipelineStep,
   PipelineStepRecord,
+  PipelineStepReport,
   Task,
   TaskReference,
 } from "../shared/types.ts";
@@ -828,6 +831,61 @@ export function executionAssistantText(taskId: string, runId: string, since: num
   return siblings.map((r) => assistantTextFrom(mainStreamEventsForRun(r.id))).filter(Boolean).join("\n");
 }
 
+/**
+ * A step execution's final report, read from its recorded turns: the
+ * assistant messages of the newest run (since the execution started) that
+ * holds a valid handoff, up to and including that message, plus the split
+ * {@link stepReportFromMessages} makes of it. This is what the next step is
+ * given in full and what `agetor pipeline handoff` prints — the handoff JSON
+ * kept on the run's history is only the block at its end. Null when no run
+ * of the step holds a handoff (it failed, was advanced by hand, or its
+ * events are gone). Exported for tests.
+ */
+export function stepFinalReport(
+  taskId: string,
+  since: number | null,
+): { body: string; final: string; handoff: Handoff; messages: string[] } | null {
+  const candidates = runs
+    .listForTask(taskId)
+    .filter((r) => since == null || r.startedAt >= since - 1_000)
+    .sort((a, b) => b.startedAt - a.startedAt);
+  for (const r of candidates) {
+    const messages = mainStreamEventsForRun(r.id).filter((e) => e.stream === "assistant").map((e) => e.data);
+    const report = stepReportFromMessages(messages);
+    if (report) return { ...report, messages: messages.slice(0, messages.lastIndexOf(report.final) + 1) };
+  }
+  return null;
+}
+
+/** One row per step execution of a pipeline task's run, oldest first, with
+ *  its handoff and its full final report text — `GET
+ *  /tasks/:id/pipeline/reports`, `agetor pipeline handoff`. `seq` narrows it
+ *  to one execution. Null for a task that isn't a pipeline task. */
+export function pipelineStepReports(parentId: string, seq?: number): PipelineStepReport[] | null {
+  const parent = tasks.get(parentId);
+  if (!parent?.pipelineId) return null;
+  const run = parent.pipelineRun;
+  if (!run) return [];
+  return run.history
+    .filter((h) => seq == null || h.seq === seq)
+    .sort((a, b) => a.seq - b.seq)
+    .map((h) => {
+      const report = stepFinalReport(h.taskId, h.startedAt);
+      return {
+        seq: h.seq,
+        stepId: h.stepId,
+        stepName: run.snapshot ? stepNameById(run.snapshot.graph, h.stepId) : h.stepId,
+        taskId: h.taskId,
+        outcome: h.outcome,
+        responseKind: h.responseKind ?? null,
+        startedAt: h.startedAt,
+        endedAt: h.endedAt,
+        handoff: h.handoff,
+        report: report?.final ?? null,
+      };
+    });
+}
+
 /** Best-effort "why did it fail" tail for a `step-failed` blocked message —
  *  the last main-stream `status`/`stderr` row, capped so one giant stack
  *  trace doesn't blow up the blocked entry's `message`. `null` when the run
@@ -1121,8 +1179,19 @@ async function launchStep(
 
   const runDir = pipelineRunsDir(parent.id);
   mkdirSync(runDir, { recursive: true });
-  const previousWithFiles: { stepName: string; handoff: Handoff | null; filePath: string | null }[] = [];
+  const previousWithFiles: {
+    stepName: string;
+    handoff: Handoff | null;
+    filePath: string | null;
+    report: { body: string; filePath: string | null } | null;
+  }[] = [];
   const handoffRefs: TaskReference[] = [];
+  // The step(s) this one is entered from hand over their whole final report,
+  // not just the handoff block: a reviewer's findings (file:line, the failing
+  // case, the suggested fix) are in the message body, and the handoff's
+  // summary is a line apiece. A follow-up gets every earlier handoff as
+  // background — only the newest of those carries its report.
+  const reportSeqs = new Set(isFollowUpStepId(step.id) ? previous.slice(-1).map((p) => p.seq) : previous.map((p) => p.seq));
   // M-R8: handoff files are namespaced by run GENERATION (`run.startedAt`,
   // base36 — set once per fresh run/restart, never per retry) so a restart's
   // seq 1..N never overwrites the replaced run's files, which the archived
@@ -1142,7 +1211,25 @@ async function launchStep(
         written.push(filePath);
         handoffRefs.push({ path: filePath, isDirectory: false });
       }
-      previousWithFiles.push({ stepName, handoff: p.handoff, filePath });
+      let report: { body: string; filePath: string | null } | null = null;
+      const sender = p.handoff && reportSeqs.has(p.seq)
+        ? run.history.find((h) => h.seq === p.seq && h.stepId === p.stepId && h.outcome === "succeeded")
+        : undefined;
+      const full = sender ? stepFinalReport(sender.taskId, sender.startedAt) : null;
+      if (full && full.body.trim().length > 0) {
+        // Keyed by the SENDER's execution, so every step it hands to (a
+        // fan-out, a retried launch) names the same file; never part of
+        // `written` — a failed launch must not delete a sibling's copy.
+        let reportPath: string | null = join(runDir, `report-${generation}-${p.seq}.md`);
+        try {
+          writeFileSync(reportPath, renderReportFile({ fromStepName: stepName, seq: p.seq, messages: full.messages }));
+          handoffRefs.push({ path: reportPath, isDirectory: false });
+        } catch {
+          reportPath = null; // the inline copy still goes out
+        }
+        report = { body: full.body, filePath: reportPath };
+      }
+      previousWithFiles.push({ stepName, handoff: p.handoff, filePath, report });
     }
   } catch (err) {
     // L-R3: a write that fails partway is a PRE-insert throw — `launchTarget`
