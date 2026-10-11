@@ -16,6 +16,7 @@ import {
 import { tasks } from "./db.ts";
 import * as gitHost from "./git-host.ts";
 import { createTask, startTask } from "./orchestrator.ts";
+import { claimIssue, releaseIssue } from './dispatch-claims.ts';
 
 export interface IssueQueueItem {
   item: GitHubListItem;
@@ -91,6 +92,9 @@ export async function createTaskFromIssue(input: {
   /** A Done card on the issue doesn't count as "already working on it" (a
    *  reopened issue gets a new card). */
   allowAfterDone?: boolean;
+  /** Revalidate source/state/claims after awaited preparation before spawn. */
+  validate?: () => Promise<string | null>;
+  onCreated?: (task:Task)=>void;
 }, deps: { issueThread: typeof gitHost.issueThread } = gitHost): Promise<{ task: Task } | { error: string; status: 400 | 409 | 502 }> {
   const thread = await deps.issueThread({ dir: input.dir, number: input.number, includeComments: true });
   if (!thread.ok) return { error: thread.error, status: 502 };
@@ -99,6 +103,15 @@ export async function createTaskFromIssue(input: {
     tasks.list().filter((t) => !input.allowAfterDone || t.column !== "done"),
   );
   if (existing) return { error: `"${existing.title}" is already working on this issue`, status: 409 };
+
+  const claimed = claimIssue(thread.item.htmlUrl);
+  if ('error' in claimed) return {error:claimed.error,status:409};
+  try {
+  // Reread while owning the durable canonical claim: a concurrent manual
+  // create may have completed while the issue thread was being fetched.
+  const freshExisting=taskForIssue(thread.item.htmlUrl,tasks.list().filter(t=>!input.allowAfterDone||t.column!=='done'));
+  if(freshExisting) return {error:`"${freshExisting.title}" is already working on this issue`,status:409};
+  if(input.validate) {const error=await input.validate();if(error)return {error,status:409};}
 
   const prompt =
     `${buildIssueTaskPrompt({ ...thread, snapshotAttached: true }).prompt}\n\n${fixesLine(thread.item.number)}` +
@@ -114,11 +127,13 @@ export async function createTaskFromIssue(input: {
     issueUrl: thread.item.htmlUrl,
     issueSnapshot: renderIssueThreadMarkdown(thread),
     column: start ? "ready" : "backlog",
-  });
+  }, { reservedTaskId: claimed.claim.taskId });
   if ("error" in created) return { error: created.error, status: 400 };
+  input.onCreated?.(created.task);
   if (start) {
-    const started = await startTask(created.task.id);
+    const started = await startTask(created.task.id, {validate:input.validate});
     if ("error" in started) return { error: `created, but it didn't start: ${started.error}`, status: 409 };
   }
   return { task: tasks.get(created.task.id) ?? created.task };
+  } finally { releaseIssue(claimed.key,claimed.claim.token); }
 }

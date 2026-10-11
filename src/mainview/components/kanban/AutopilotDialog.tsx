@@ -22,13 +22,13 @@ const ROADMAP_PHASE: Record<AutopilotStateDto["phase"], string> = {
   idle: "Waiting — nothing can start",
   running: "Working the roadmap",
   auditing: "Working the roadmap",
-  done: "Roadmap done — every step is complete or declined",
+  done: "Roadmap done — every step is complete",
 };
 const SCOPED_PHASE: Record<AutopilotStateDto["phase"], string> = {
   idle: "Waiting — nothing in this milestone can start",
   running: "Working the milestone in the tracker's order",
   auditing: "Working the milestone in the tracker's order",
-  done: "Milestone done — every step in it is complete or declined",
+  done: "Milestone done — every step in it is complete",
 };
 
 /** Autopilot (src/bun/autopilot.ts): pick a milestone — the scope — and a
@@ -135,6 +135,7 @@ export function AutopilotDialog({ open, projects, tasks, onClose, onVelocity }: 
   const done = mine.filter((t) => t.column === "done").length;
   const mode = autopilotMode(config);
   const roadmapMode = mode === "tracker" || mode === "tracker-milestone";
+  const projectWide=roadmapMode&&config.roadmap?.issue===639;
   const ready = !!config.project && (roadmapMode || (!!config.threadId && !!config.milestone));
   // The status of the run that's configured now, not of another tracker's or
   // another milestone's.
@@ -174,7 +175,7 @@ export function AutopilotDialog({ open, projects, tasks, onClose, onVelocity }: 
             <select
               data-testid="autopilot-milestone"
               value={config.milestone?.number ?? ""}
-              disabled={config.enabled}
+              disabled={config.enabled||projectWide}
               onChange={(e) => {
                 const m = milestones.find((x) => x.number === Number(e.target.value));
                 const one = m ? { number: m.number, title: m.title } : null;
@@ -193,6 +194,7 @@ export function AutopilotDialog({ open, projects, tasks, onClose, onVelocity }: 
                 </option>
               ))}
             </select>
+            {projectWide&&<span className="text-muted-foreground">Live #639 queues the earliest eligible work across all milestones. Blocked and owned issues are skipped.</span>}
             {roadmapMode && scope.length > 1 && (
               <span className="text-muted-foreground" data-testid="autopilot-scope-list">
                 In scope: {scope.map((m) => m.title).join(" + ")} — the run continued into {scope.length === 2 ? "the second" : "the later ones"}. Choosing a
@@ -200,7 +202,7 @@ export function AutopilotDialog({ open, projects, tasks, onClose, onVelocity }: 
               </span>
             )}
           </label>
-          {mode === "tracker-milestone" && (
+          {mode === "tracker-milestone" && !projectWide && (
             <label className="flex items-start gap-2">
               <input
                 type="checkbox"
@@ -271,6 +273,7 @@ export function AutopilotDialog({ open, projects, tasks, onClose, onVelocity }: 
                     {roadmap.counts.complete} of {roadmap.counts.total} steps complete
                     {roadmap.scope && ` (of ${roadmap.scope.roadmapTotal} in roadmap #${roadmap.issue})`} · {roadmap.counts.inFlight} in flight ·{" "}
                     {roadmap.counts.ready} ready · {roadmap.counts.waiting} waiting
+                    {roadmap.runners && ` · ${roadmap.runners.used}/${roadmap.runners.max} active runners · ${roadmap.runners.heavy}/${roadmap.runners.heavyMax} verification slots`}
                     {roadmap.counts.declined > 0 && ` · ${roadmap.counts.declined} declined`}
                     {(roadmap.counts.backlog ?? 0) > 0 && ` · ${roadmap.counts.backlog} card${roadmap.counts.backlog === 1 ? "" : "s"} in the backlog`}
                   </div>

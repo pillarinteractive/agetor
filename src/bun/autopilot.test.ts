@@ -340,6 +340,40 @@ const IDLE_RUN = { status: "idle", active: [], blocked: [], history: [], joins: 
 const backlogCard = (n: number, extra: Record<string, unknown> = {}) => roadmapCard(`bl-${n}`, n, "backlog", { pipelineRun: IDLE_RUN, ...extra });
 const RUNNING_RUN = { status: "running", active: [{ stepId: "build", taskId: "s", seq: 1 }], blocked: [], history: [], joins: {} };
 
+test("live #639 scans past dependency and concurrent ownership holds across milestones to fill free runners", async () => {
+  const { assembleQueue } = await import('../shared/canonical-roadmap.ts');
+  const { roadmapPass } = await import('./autopilot.ts');
+  const { createHash } = await import('node:crypto');
+  const table = '## Numbered completion order\n|Step|Task|Milestone|Predecessor steps|\n|---|---|---|---|\n'
+    + [90, 1, 2, 3, 4, 5, 6].map((n, i) => `|${i + 1}|#${n} ${n === 90 ? '[Human] ' : ''}Work|M09|none|`).join('\n');
+  const contract = (n: number) => '## Dependencies and required inputs\nThis is the sole controlling whole-task predecessor list.\n'
+    + (n === 1 ? '- #90 Required owner evidence' : 'None.')
+    + '\n### Conditional and action-specific input predicates\nNo additional conditional predicate is recorded.';
+  const states = new Map([90, 1, 2, 3, 4, 5, 6].map(n => [n, {
+    ...OPEN, body: contract(n), updatedAt: 'current', url: `https://github.com/o/r/issues/${n}`,
+    milestone: { number: 9, title: 'M09' },
+  }]));
+  const queue = assembleQueue({ body: table, states, membership: [...states.keys()], supplements: [],
+    sources: [], version: 'live-v1', hash: s => createHash('sha256').update(s).digest('hex') });
+  let remaining = 2;
+  const f = roadmapDeps({}, {
+    loadQueue: async () => ({ ...queue, states, body: table, url: 'https://github.com/o/r/issues/639' }),
+    runnerFree: () => remaining,
+    validator: (_p, _t, _q, n) => async () => n === 2 ? 'external Claude owns this issue' : null,
+  });
+  const start = f.deps.startCard;
+  f.deps.startCard = async input => { const r = await start(input); remaining--; return r; };
+  const state = await roadmapState();
+  const owned = roadmapCard('existing-3', 3, 'running', { pipelineRun: RUNNING_RUN });
+  await roadmapPass({ ...roadmapCfg, maxInFlight: 8, roadmap: { issue: 639 }, milestones: [{ number: 1, title: 'M01' }] },
+    state, [owned], [], f.deps);
+  expect(f.log.started.map(s => s.number)).toEqual([4, 5]);
+  expect(f.log.started.every(s => s.extraPrompt.includes('live-v1') && s.extraPrompt.includes(contract(s.number)))).toBe(true);
+  expect(state.roadmap?.projectWide).toBe(true);
+  expect(state.roadmapOffer).toBeNull();
+  expect(f.log.notified.some(s => s.includes('next milestone'))).toBe(false);
+});
+
 test("roadmap: starts the ready agent steps in step order; the human step is announced once, never started", async () => {
   const { roadmapPass } = await import("./autopilot.ts");
   const state = await roadmapState();
@@ -428,7 +462,7 @@ test("roadmap: a card that just reached Done gets time for its issue to close", 
   expect(log.rechecks).toBe(1);
 });
 
-test("roadmap: done only when every step is complete or declined; an unreadable roadmap starts nothing", async () => {
+test("roadmap: declined requirements remain unfinished; an unreadable roadmap starts nothing", async () => {
   const { roadmapPass } = await import("./autopilot.ts");
   const all = { 11: COMPLETED, 12: COMPLETED, 13: COMPLETED, 14: COMPLETED, 15: COMPLETED };
   const waiting = await roadmapState();
@@ -439,7 +473,7 @@ test("roadmap: done only when every step is complete or declined; an unreadable 
 
   const finished = await roadmapState();
   await roadmapPass(roadmapCfg, finished, [], [], roadmapDeps({ ...all, 12: { state: "CLOSED", stateReason: "NOT_PLANNED" }, 16: COMPLETED }).deps);
-  expect(finished.phase).toBe("done");
+  expect(finished.phase).toBe("idle");
   expect(finished.roadmap!.counts).toMatchObject({ total: 6, complete: 5, declined: 1 });
 
   const broken = await roadmapState();
@@ -531,7 +565,7 @@ test("scope: an issue moved to another milestone on GitHub follows GitHub, and t
 test("scope: done when every step in the milestone is complete or declined; a milestone with no step is an error", async () => {
   const { roadmapPass } = await import("./autopilot.ts");
   const state = await roadmapState();
-  const { deps, log } = roadmapDeps({ 12: COMPLETED, 13: { state: "CLOSED", stateReason: "NOT_PLANNED" } });
+  const { deps, log } = roadmapDeps({ 12: COMPLETED, 13: COMPLETED });
   await roadmapPass(scopedCfg(M01), state, [], [], deps);
   // #14–#16 are open, in another milestone: M01 is finished, and the run is
   // done once the owner has said no to M02 (the offer has its own tests).
@@ -605,7 +639,7 @@ test("backlog: a ready step starts its existing card — in step order, within t
   expect(log.started).toEqual([]);
   expect(log.backlogged).toEqual([]);
   // The step section is rewritten for the roadmap as it is now.
-  expect(log.startedExisting[0]!.stepPrompt).toContain("are finished and already merged into the base: 2 (#12)");
+  expect(log.startedExisting[0]!.stepPrompt).toContain("are graph-complete: 2 (#12)");
   expect(state.cards).toEqual(["bl-14"]);
   expect(state.roadmapBacklog).toEqual({ "15": "bl-15", "16": "bl-16" });
   expect(state.phase).toBe("running");

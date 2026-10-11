@@ -33,6 +33,8 @@ import { syncBaseNote } from "./sync-base.ts";
 import { logBlocks, newBlocks } from "./block-log.ts";
 import { isMergeQueued } from "./merge-intent.ts";
 import { currentSlots, slotDecision, slotUse } from "./step-slots.ts";
+import { reserveRunner, releaseUnspawnedRunner } from './dispatch-claims.ts';
+import { reconcileCardInputs } from './queue-validation.ts';
 import { isPriority, priorityFirst } from "./priority.ts";
 import { awaitsFor } from "./awaits.ts";
 import { classifyFailure, formatRetryTime, harnessQuotaNotice, isQuotaPaused, nextRetryAt, TRANSIENT_RETRY_MAX, type FailureClass } from "./usage-limit.ts";
@@ -1707,6 +1709,22 @@ async function launchStep(
   }
   slotWaitSince.delete(`${parent.id}:${step.id}`);
 
+  const inputReconciliation=await reconcileCardInputs(parent.id);
+  if(inputReconciliation.hold) {
+    upsertBlocked(run,{taskId:null,stepId:step.id,kind:'step-blocked',message:inputReconciliation.hold,pending:{stepId:step.id,arrivals:pendingArrivals}});
+    persist(parent.id,run);return {ok:false};
+  }
+
+  // Reserve before syncBaseNote or any other awaited preparation. Priority
+  // changes queue order, never the global runner or verification cap.
+  const childId = randomUUID();
+  const reservation=reserveRunner(childId,step.name,isTaskRunLive);
+  if('error' in reservation) {
+    upsertBlocked(run,{taskId:null,stepId:step.id,kind:'slot-wait',message:`${step.name} is ${reservation.error}`,pending:{stepId:step.id,arrivals:pendingArrivals}});
+    persist(parent.id,run);return {ok:false};
+  }
+  try {
+
   const seq = ++run.stepCount;
 
   const runDir = pipelineRunsDir(parent.id);
@@ -1824,6 +1842,7 @@ async function launchStep(
   const withDecisions = (prompt: string) => snapshot.decisionPolicy === "planner-recommendation"
     ? `${prompt}\n\n${plannerDecisionInstructions(parent.id, snapshot.capturedAt)}` : prompt;
   let composed = withSync(withRouting(withDecisions(composeStepPrompt({ ...composeArgs, inlineHandoff: true }))));
+  if(inputReconciliation.note)composed+=`\n\n${inputReconciliation.note}`;
   // m12/D10: measure the SAME wrapping `startTaskInner` will actually launch
   // with — `composeLaunchPrompt` (the profile's instructions/skills
   // preamble) then `appendReferences` (the references block) — not the raw
@@ -1837,7 +1856,6 @@ async function launchStep(
   }
 
   const now = Date.now();
-  const childId = randomUUID();
   tasks.insert({
     id: childId,
     title: `${run.pipelineName} · ${step.name}`,
@@ -1898,6 +1916,7 @@ async function launchStep(
     return { ok: false };
   }
   return { ok: true, runId: started.runId, ...(started.pending ? { pending: true as const } : {}) };
+  } finally {releaseUnspawnedRunner(childId);}
 }
 
 /**
@@ -2150,7 +2169,7 @@ async function performPipelineRetry(
  */
 export async function startPipelineRun(
   parent: Task,
-  opts?: { restart?: boolean },
+  opts?: { restart?: boolean; validate?:()=>Promise<string|null> },
 ): Promise<{ runId: string; pending?: true } | { error: string }> {
   return runExclusive(parent.id, async () => {
     // Minor 5: a delete cascade tombstones the parent (and removes its row)
@@ -2251,6 +2270,7 @@ export async function startPipelineRun(
     const prepared = await refreshParentWorktree(fresh, run);
     if ("error" in prepared) return { error: prepared.error };
     let parentRow = prepared.parent;
+    if(opts?.validate) {const error=await opts.validate();if(error)return {error};}
 
     // Minor 3: only now — graph validated, snapshot built, start step
     // resolved, worktree prepared, so this restart is known startable —

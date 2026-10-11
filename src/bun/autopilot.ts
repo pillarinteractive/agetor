@@ -34,12 +34,17 @@ import { createTaskFromIssue } from "./issue-queue.ts";
 import { setMergeQueued } from "./merge-intent.ts";
 import { describeRiskyFiles, parseRiskyRules, riskyFiles, RISKY_PATHS_PREF, type RiskyRules } from "../shared/risky-paths.ts";
 import { hasConfirmedNoPr, prStatusForTask } from "./pr-watch.ts";
-import { onCardRemoved, startTask, subscribeGlobal } from "./orchestrator.ts";
+import { onCardRemoved, startTask, subscribeGlobal, isTaskRunLive } from "./orchestrator.ts";
+import { runnerUse } from './dispatch-claims.ts';
+import { beginQueueCycle, completeQueueCycle, restoredQueueDelay } from './queue-cycle.ts';
+import { currentSlots } from './step-slots.ts';
+import { freezeCardInputs, queueValidator } from './queue-validation.ts';
+import type { CanonicalQueue } from '../shared/canonical-roadmap.ts';
 import { holdsAutopilotSlot, neverStarted, PROGRESSING_COLUMNS, waitingOnQuota } from "../shared/autopilot.ts";
 import { formatRetryTime, isQuotaPaused } from "./usage-limit.ts";
 import { listLeases } from "./lease-watch.ts";
 import { blockedCardLine } from "../shared/block-reason.ts";
-import { loadRoadmapStates, loadRoadmapTracker } from "./roadmap-fetch.ts";
+import { loadCanonicalQueue, loadRoadmapStates, loadRoadmapTracker } from "./roadmap-fetch.ts";
 import { recordVelocityPass, type VelocityPassInput } from "./roadmap-velocity.ts";
 import {
   currentRoadmapStatus,
@@ -239,7 +244,7 @@ export function parseConfig(raw: string | null | undefined): AutopilotConfig {
   }
   const r = o.roadmap as { issue?: unknown } | null | undefined;
   // The scope is a list; a config that names one `milestone` is that list.
-  const milestones = normalizeMilestones(o.milestones, o.milestone);
+  const milestones = r?.issue===639 ? [] : normalizeMilestones(o.milestones, o.milestone);
   return {
     enabled: o.enabled === true,
     threadId: typeof o.threadId === "string" ? o.threadId : "",
@@ -808,6 +813,10 @@ const ROADMAP_POLL_MS = 5 * 60_000;
 const BACKLOG_PER_PASS = 60;
 
 export interface RoadmapDeps {
+  loadQueue?(project:string,issue:number):Promise<(CanonicalQueue & {states:Map<number,RoadmapIssueState>;body:string;url:string|null})|{error:string}>;
+  runnerFree?():number;
+  validator?(project:string,tracker:number,queue:CanonicalQueue,issue:number,cardId?:string):()=>Promise<string|null>;
+  freeze?(project:string,tracker:number,queue:CanonicalQueue,issue:number,taskId:string):void;
   loadTracker(project: string, issue: number): Promise<{ body: string; url: string | null } | { error: string }>;
   loadStates(project: string, numbers: number[]): Promise<Map<number, RoadmapIssueState> | { error: string }>;
   aheadCount: NoWorkDeps["aheadCount"];
@@ -823,11 +832,11 @@ export interface RoadmapDeps {
   leaseLabels?(project: string): string[];
   pipelineId(cfg: AutopilotConfig): string | null;
   /** Create a card for the issue and start it. */
-  startCard(input: { dir: string; number: number; pipelineId: string; extraPrompt: string }): Promise<{ task: Task } | { error: string }>;
+  startCard(input: { dir: string; number: number; pipelineId: string; extraPrompt: string;validate?:()=>Promise<string|null>;onCreated?:(task:Task)=>void }): Promise<{ task: Task } | { error: string }>;
   /** Create a card for the issue in the Backlog, not started. */
   createBacklogCard(input: { dir: string; number: number; pipelineId: string; extraPrompt: string }): Promise<{ task: Task } | { error: string }>;
   /** Start a backlog card made earlier, with its step section rewritten. */
-  startExisting(input: { task: Task; stepPrompt: string }): Promise<{ ok: true } | { error: string }>;
+  startExisting(input: { task: Task; stepPrompt: string;validate?:()=>Promise<string|null> }): Promise<{ ok: true } | { error: string }>;
   moveToDone(t: Task): void;
   /** Persist the state mid-pass (after each card made or started, so a core
    *  that stops half way still knows its cards). */
@@ -872,15 +881,19 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
   const fail = (error: string) => {
     state.lastError = error;
   };
-  const doc = await deps.loadTracker(cfg.project, tracker);
+  const fullQueue=tracker===639;
+  const canonical=fullQueue&&deps.loadQueue ? await deps.loadQueue(cfg.project,tracker) : null;
+  if(canonical&&'error'in canonical)return fail(canonical.error);
+  const queue=canonical&&'parsed'in canonical?canonical:null;
+  const doc = queue ?? await deps.loadTracker(cfg.project, tracker);
   if ("error" in doc) return fail(doc.error);
-  const parsed = parseRoadmap(doc.body);
+  const parsed = queue?.parsed ?? parseRoadmap(doc.body);
   if (parsed.error) {
     // Nothing starts from a roadmap that can't be read.
     state.roadmap = summarizeRoadmap({ issue: tracker, url: doc.url, parsed, views: [], busy: new Set(), needsUser: new Map(), now: deps.now() });
     return fail(`roadmap #${tracker}: ${parsed.error}`);
   }
-  const states = await deps.loadStates(cfg.project, parsed.steps.map((s) => s.issue));
+  const states = queue?.states ?? await deps.loadStates(cfg.project, parsed.steps.map((s) => s.issue));
   if ("error" in states) return fail(states.error);
   const views = roadmapStatus(parsed, states);
   const viewByIssue = new Map(views.map((v) => [v.issue, v]));
@@ -1018,7 +1031,7 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
 
   // The scope: steps whose issue is in one of the chosen GitHub milestones.
   // Steps outside it still gate readiness; this run just never starts them.
-  const wanted = scopeMilestones(cfg);
+  const wanted = fullQueue ? [] : scopeMilestones(cfg);
   const stepSets = new Map<number, Set<string>>();
   const stepsOf = (m: RoadmapMilestone) => stepSets.get(m.number) ?? stepSets.set(m.number, roadmapScope(parsed.steps, states, m)).get(m.number)!;
   const scopeOf = (list: RoadmapMilestone[]) => ({ milestones: list.map((m) => ({ number: m.number, title: m.title, total: stepsOf(m).size })), steps: new Set(list.flatMap((m) => [...stepsOf(m)])) });
@@ -1075,14 +1088,14 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
   }
   const scoped = scope ? views.filter((v) => scope!.steps.has(v.step)) : views;
 
-  const free = cfg.maxInFlight - Math.max(ownLive, inFlight.length);
+  const free = Math.min(cfg.maxInFlight - Math.max(ownLive, inFlight.length),fullQueue?(deps.runnerFree?.()??Infinity):Infinity);
   // The started live card of each issue, for the status' links.
   const liveCards = new Map<number, string>();
   for (const t of all) {
     const n = t.pipelineParentId || !live(t) || exempt.has(t.id) || !sameDir(t.workdir, cfg.project) ? null : issueOf(t);
     if (n != null && !liveCards.has(n)) liveCards.set(n, t.id);
   }
-  const picks = pickRoadmap(scoped, { busy: busyIssues, exclude: new Set([...stuck.keys(), ...settling]), free });
+  const picks = pickRoadmap(scoped, { busy: busyIssues, exclude: new Set([...stuck.keys(), ...settling]), free:fullQueue?scoped.length:free });
   const pipelineId = deps.pipelineId(cfg);
   // A step being done again tells its new card about the earlier PR.
   const priorOf = (issue: number) => {
@@ -1101,11 +1114,17 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
     else {
       for (const v of picks.start) {
         if (deps.outdated()) break;
-        const stepPrompt = roadmapStepPrompt(tracker, v, parsed.steps, { prior: priorOf(v.issue) });
+        if(started.size>=free || (fullQueue&&(deps.runnerFree?.()??Infinity)<=0))break;
+        const basePrompt = roadmapStepPrompt(tracker, v, parsed.steps, { prior: priorOf(v.issue) });
+        const dispatchRecord=queue?.records.find(r=>r.issue===v.issue);
+        const stepPrompt=queue?`${basePrompt}\n\nDispatch graph ${queue.version}; owning contract revision ${dispatchRecord?.updatedAt}; SHA-256 ${dispatchRecord?.bodyHash}. The attached earlier issue snapshot is historical if it differs. Current controlling contract at dispatch:\n\n${states.get(v.issue)?.body??''}`:basePrompt;
         const card = backlog.get(v.issue);
+        const validate=queue&&deps.validator?deps.validator(cfg.project,tracker,queue,v.issue,card?.id):undefined;
+        if(validate){const reason=await validate();if(reason){error??=`step ${v.step} (#${v.issue}): ${reason}`;continue;}}
         let id: string;
         if (card) {
-          const r = await deps.startExisting({ task: card, stepPrompt });
+          if(queue)deps.freeze?.(cfg.project,tracker,queue,v.issue,card.id);
+          const r = await deps.startExisting({ task: card, stepPrompt,validate });
           if ("error" in r) {
             // Still in the backlog, still in the ledger: the next pass tries again.
             error = `step ${v.step} (#${v.issue}): ${r.error}`;
@@ -1115,7 +1134,7 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
           backlog.delete(v.issue);
           delete state.roadmapBacklog[String(v.issue)];
         } else {
-          const r = await deps.startCard({ dir: cfg.project, number: v.issue, pipelineId, extraPrompt: stepPrompt });
+          const r = await deps.startCard({ dir: cfg.project, number: v.issue, pipelineId, extraPrompt: stepPrompt,validate,onCreated:queue?(t)=>deps.freeze?.(cfg.project,tracker,queue,v.issue,t.id):undefined });
           if ("error" in r) {
             error = `step ${v.step} (#${v.issue}): ${r.error}`;
             continue;
@@ -1134,7 +1153,7 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
   // Backlog cards up front: with a milestone, every open step in it that has
   // no live card gets one, not started — the owner's steps too. Idempotent:
   // a step added to the milestone later gets its card on the next pass.
-  if (scope) {
+  if (scope || fullQueue) {
     const missing = scoped.filter((v) => isOpenStep(v) && !busyIssues.has(v.issue) && !started.has(v.issue) && !backlog.has(v.issue) && !stuck.has(v.issue) && !settling.has(v.issue));
     if (missing.length > 0 && !pipelineId) error ??= noPipeline;
     let failures = 0;
@@ -1159,7 +1178,7 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
         "muted",
       );
     }
-    if (missing.length > BACKLOG_PER_PASS) deps.recheck(5_000);
+    if (missing.length > BACKLOG_PER_PASS && !fullQueue) deps.recheck(5_000);
   }
 
   // The offer as it stands after this pass's starts.
@@ -1193,6 +1212,11 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
     continued: state.roadmapContinued.slice(-3),
     now: deps.now(),
   });
+  if(fullQueue) {
+    status.projectWide=true;
+    const measured=runnerUse(isTaskRunLive),slots=currentSlots();
+    status.runners={used:measured.total,max:slots.max,heavy:measured.heavy,heavyMax:slots.heavy.max};
+  }
   if (!status.idleReason && quotaWait && picks.start.length > 0) status.idleReason = "Holding new starts while a card waits for a usage limit to reset";
   // The table's milestone column and GitHub disagreeing is worth knowing: a
   // step the table puts in this milestone isn't worked unless its issue is.
@@ -1219,7 +1243,7 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
     }
   }
   state.roadmap = status;
-  state.lastError = error;
+  state.lastError = error ?? (queue?.errors.length ? queue.errors.join('; ') : null);
 
   // Velocity: what completed, and how full the slots are right now.
   if (deps.velocity) {
@@ -1518,6 +1542,10 @@ let recheckTimer: ReturnType<typeof setTimeout> | null = null;
 
 /** Exported for tests, which swap the GitHub reads. */
 export const ROADMAP_DEPS: RoadmapDeps = {
+  loadQueue:loadCanonicalQueue,
+  runnerFree:()=>Math.max(0,currentSlots().max-runnerUse(isTaskRunLive).total),
+  validator:queueValidator,
+  freeze:freezeCardInputs,
   loadTracker: loadRoadmapTracker,
   loadStates: loadRoadmapStates,
   aheadCount: (t) => NO_WORK_DEPS.aheadCount(t),
@@ -1542,12 +1570,12 @@ export const ROADMAP_DEPS: RoadmapDeps = {
     const r = await createTaskFromIssue({ ...input, start: false, allowAfterDone: true });
     return "error" in r ? { error: r.error } : { task: r.task };
   },
-  async startExisting({ task, stepPrompt }) {
+  async startExisting({ task, stepPrompt,validate }) {
     // The step section was written when the card was made; say what holds now.
     const fresh = tasks.get(task.id);
     if (!fresh || fresh.archivedAt != null) return { error: "its backlog card is gone" };
     tasks.update(task.id, { prompt: withRoadmapStepPrompt(fresh.prompt, stepPrompt) });
-    const r = await startTask(task.id);
+    const r = await startTask(task.id,{validate});
     return "error" in r ? { error: `its backlog card didn't start: ${r.error}` } : { ok: true };
   },
   moveToDone: (t) => void tasks.update(t.id, { column: "done" }),
@@ -1591,12 +1619,15 @@ export async function autopilotTick(): Promise<void> {
   if (!cfg.enabled || !cfg.project || busy) return;
   // Tracker mode needs neither a milestone nor the thread.
   if (!cfg.roadmap && (!cfg.threadId || !cfg.milestone)) return;
+  const cycle=cfg.roadmap?.issue===639?beginQueueCycle(cfg.project,639):null;
+  if(cfg.roadmap?.issue===639&&!cycle)return;
   busy = true;
   passRun = { epoch: runEpoch, project: cfg.project };
   const state = readState();
+  const cardsBefore=state.cards.length;
   try {
     // A finished milestone stays finished until the user restarts Autopilot.
-    if (state.phase === "done") return;
+    if (state.phase === "done"&&!cfg.roadmap) return;
     if (state.phase === "idle") state.phase = "running";
     const all = tasks.listLive();
     const mine = state.cards.map((id) => all.find((t) => t.id === id)).filter((t): t is Task => !!t && t.archivedAt == null);
@@ -1717,6 +1748,10 @@ export async function autopilotTick(): Promise<void> {
     savePassState(state);
     passRun = null;
     busy = false;
+    if(cycle) {
+      const outcome=state.lastError?'error':state.cards.length>cardsBefore?'progress':(ROADMAP_DEPS.runnerFree?.()??0)<=0?'full':'empty';
+      ROADMAP_DEPS.recheck(completeQueueCycle(cycle,outcome));
+    }
   }
 }
 
@@ -1865,7 +1900,8 @@ export function requestAutopilotPass(delayMs = 3_000): void {
 export function freesSlot(e: { kind: string; column?: Task["column"]; prev?: Task["column"] | null; status?: string }): boolean {
   // A pipeline run that stops on a block (a question, a failure, a usage
   // limit) stops holding its slot.
-  if (e.kind === "pipeline") return e.status === "blocked";
+  if (e.kind === "pipeline") return e.status === "blocked" || e.status === 'done' || e.status === 'cancelled';
+  if(e.kind==='run-status')return e.status==='succeeded'||e.status==='failed'||e.status==='cancelled';
   if (e.kind !== "column" || !e.column) return false;
   return e.column === "done" || (!!e.prev && BUILDING.has(e.prev) && !PROGRESSING_COLUMNS.has(e.column));
 }
@@ -1886,5 +1922,5 @@ export function startAutopilot(): void {
   setInterval(() => {
     if (enabled() && parseConfig(preferences.get(AUTOPILOT_PREF)).roadmap) void runPass();
   }, ROADMAP_POLL_MS).unref?.();
-  requestAutopilotPass(30_000);
+  requestAutopilotPass(Math.min(30_000,restoredQueueDelay()));
 }

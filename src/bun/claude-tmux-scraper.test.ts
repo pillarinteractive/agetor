@@ -1606,6 +1606,22 @@ test("pickScrapeMatch — a footer-bearing unknown modal resolves to the unparsa
   expect(dispatched!.unparsable).toBe(true);
 });
 
+test("pickScrapeMatch — #944 completed handoff with an unsent repair draft is not a question", () => {
+  const pane = `</handoff>
+✻ Worked for 12s · done 4:22PM
+────────────────────────────────────────────────────────────────────────────────
+❯ fix the inventory role and commit
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents`;
+  expect(paneShowsComposerText(pane)).toBe(true);
+  expect(paneShowsIdleInputBox(pane)).toBe(false);
+  expect(pickScrapeMatch(pane, { paneWorking: false, watchdogArmed: true })).toBeNull();
+  // An actual unknown confirmation replacing the idle chrome remains a hold.
+  expect(pickScrapeMatch(pane + '\nDevice authorization required\nEnter to confirm · Esc to cancel', {
+    paneWorking: false, watchdogArmed: true,
+  })?.unparsable).toBe(true);
+});
+
 test("pickScrapeMatch — boot semantics: the boot poller always passes watchdogArmed:false, so a footerless stuck pane never cards there (only the footer arm can ever fire at boot)", () => {
   const stuckPane = `● Running Bash(a very long build)…
 

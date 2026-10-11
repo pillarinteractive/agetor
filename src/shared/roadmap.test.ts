@@ -139,11 +139,11 @@ describe("roadmapStatus", () => {
     expect(v[2]).toMatchObject({ status: "held", reason: "the state of #103 couldn't be read", waitingOn: ["1", "2"] });
   });
 
-  test("finished only when every step is complete or declined", () => {
+  test("declined required scope never completes a roadmap", () => {
     const parsed = parseRoadmap(BODY);
     const all = { 101: DONE, 102: DONE, 103: DONE, 110: DONE, 111: NO_GO, 112: DONE };
     expect(roadmapFinished(parsed, roadmapStatus(parsed, states(all)))).toBe(false); // #104 open (and stuck behind a no-go)
-    expect(roadmapFinished(parsed, roadmapStatus(parsed, states({ ...all, 104: NO_GO })))).toBe(true);
+    expect(roadmapFinished(parsed, roadmapStatus(parsed, states({ ...all, 104: NO_GO })))).toBe(false);
     // A dropped row means the roadmap isn't what it says: never "done".
     const dropped = parseRoadmap(table("| 1 | #101 Good | M | none |", "| x | #102 Bad | M | none |"));
     expect(roadmapFinished(dropped, roadmapStatus(dropped, states({ 101: DONE }, [101])))).toBe(false);
@@ -350,11 +350,11 @@ describe("summarizeRoadmap with a milestone", () => {
     expect(m03.idleReason).toContain("of other milestones (M01, M02) must finish first — run those milestones");
   });
 
-  test("finished when every step in scope is complete or declined, whatever else is open", () => {
+  test("declined scope remains unfinished, whatever else is open", () => {
     const st = scopedStates({ 101: DONE, 102: DONE, 103: DONE, 110: NO_GO, 111: DONE, 112: DONE });
     const views = roadmapStatus(parsed, st);
     const scope = roadmapScope(parsed.steps, st, M02);
-    expect(roadmapFinished(parsed, views.filter((v) => scope.has(v.step)))).toBe(true);
+    expect(roadmapFinished(parsed, views.filter((v) => scope.has(v.step)))).toBe(false);
     expect(roadmapFinished(parsed, views)).toBe(false); // #104 is open
     expect(roadmapFinished(parsed, [])).toBe(false); // an empty scope is never "done"
   });
@@ -406,7 +406,7 @@ describe("backlog cards", () => {
     const prompt = `Fix the gadget page.\n\nFixes #104\n\n${early}`;
     const atStart = withRoadmapStepPrompt(prompt, roadmapStepPrompt(639, step4, parsed.steps));
     expect(atStart.startsWith("Fix the gadget page.\n\nFixes #104\n\n## Roadmap step 4 (M03)")).toBe(true);
-    expect(atStart).toContain("are finished and already merged into the base: 3.2 (#111), 3.10 (#112)");
+    expect(atStart).toContain("are graph-complete: 3.2 (#111), 3.10 (#112)");
     expect(atStart).not.toContain("was not finished");
     expect(atStart.match(/## Roadmap step/g)!.length).toBe(1);
     // A prompt without the section gets it appended.

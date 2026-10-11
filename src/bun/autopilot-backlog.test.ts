@@ -210,7 +210,8 @@ test("backlog cards: cheap to make, left alone by everything else, started by Au
   expect(state.cards).toEqual([id21, id22]);
   expect(state.roadmapBacklog).toEqual({ "23": id23 });
   const prompt22 = tasks.get(id22)!.prompt;
-  expect(prompt22).toContain("are finished and already merged into the base: 1 (#21)");
+  expect(prompt22).toContain("predecessor issues are graph-complete: 1 (#21)");
+  expect(prompt22).toContain("Issue closure alone proves neither merge nor qualification");
   expect(prompt22).not.toContain("was not finished");
   expect(prompt22).toContain('"Fixes #22"');
   await waitFor(() => tasks.get(id22)!.pipelineRun?.status === "done");

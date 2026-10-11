@@ -221,6 +221,9 @@ export function parseRoadmap(body: string): ParsedRoadmap {
 
 /** An issue's state as GitHub's GraphQL API reports it. */
 export interface RoadmapIssueState {
+  body?: string;
+  title?: string;
+  updatedAt?: string;
   state: "OPEN" | "CLOSED";
   /** COMPLETED | NOT_PLANNED | DUPLICATE | REOPENED | null */
   stateReason: string | null;
@@ -591,8 +594,8 @@ export function roadmapStepPrompt(
     preds.length === 0
       ? "It has no predecessor steps."
       : pending.length === 0
-        ? `Its predecessor steps are finished and already merged into the base: ${preds.map(label).join(", ")}. Build on them.`
-        : `Its predecessor steps are ${preds.map(label).join(", ")}. When this card was created, ${pending.map(label).join(", ")} ${pending.length === 1 ? "was" : "were"} not finished: before building on them, check that their issues are closed and their work is merged into the base.`;
+        ? `Its predecessor issues are graph-complete: ${preds.map(label).join(", ")}. Before Build or integration, verify their actual versioned artifacts, exact revisions/hashes, selected scope and passing independent receipts. Issue closure alone proves neither merge nor qualification.`
+        : `Its predecessor steps are ${preds.map(label).join(", ")}. When this card was created, ${pending.map(label).join(", ")} ${pending.length === 1 ? "was" : "were"} not finished: before building, verify their current states AND the actual scoped artifacts/receipts; never infer implementation or qualification from closure.`;
   return [
     `${STEP_PROMPT_HEADING}${step.step} (${step.milestone})`,
     "",
@@ -600,7 +603,7 @@ export function roadmapStepPrompt(
     predLine,
     ...noteLines,
     `Later steps start only once #${step.issue} is closed, so finish the whole definition of done in this PR and say "Fixes #${step.issue}" in its description.`,
-    `If part of it can't be done here, say "Refs #${step.issue}" and list what's left: the step then stays open for the owner and nothing after it starts.`,
+    `If part of it can't be done here, say "Refs #${step.issue}" and list what's left. Dependent slices remain held; independent ready work continues. Routine engineering choices use the planner recommendation with a retrospective record. Real permissions, inputs, protected review and finite budgets remain gates.`,
     ...(opts.prior ? priorAttemptLines(step, opts.prior) : []),
   ].join("\n");
 }
@@ -847,6 +850,8 @@ export interface RoadmapContinued extends RoadmapMilestone {
 }
 
 export interface RoadmapStatus {
+  projectWide?: boolean;
+  runners?: {used:number;max:number;heavy:number;heavyMax:number};
   /** The tracker issue. */
   issue: number;
   url: string | null;
@@ -1096,7 +1101,7 @@ export function summarizeRoadmap(input: {
 export function roadmapFinished(parsed: ParsedRoadmap, views: RoadmapStepView[]): boolean {
   if (parsed.error || views.length === 0) return false;
   if (parsed.problems.some((p) => p.kind === "malformed-row" || p.kind === "duplicate-step")) return false;
-  return views.every((v) => v.status === "complete" || v.status === "declined");
+  return views.every((v) => v.status === "complete");
 }
 
 /** The status that belongs to the run configured now — not to another
@@ -1106,6 +1111,7 @@ export function currentRoadmapStatus(
   status: RoadmapStatus | null | undefined,
 ): RoadmapStatus | null {
   if (!config.roadmap || !status || status.issue !== config.roadmap.issue) return null;
+  if(status.projectWide) return status.scope==null ? status : null;
   const key = (xs: { number: number }[]) => xs.map((m) => m.number).join(",");
   const want = config.milestones?.length ? config.milestones : config.milestone ? [config.milestone] : [];
   const have = status.scope ? (status.scope.milestones?.length ? status.scope.milestones : [status.scope]) : [];

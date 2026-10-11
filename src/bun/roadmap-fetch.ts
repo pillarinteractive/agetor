@@ -6,6 +6,10 @@
  */
 import { run } from "./github.ts";
 import type { RoadmapIssueState } from "../shared/roadmap.ts";
+import { createHash } from 'node:crypto';
+import { preferences } from './db.ts';
+import { assembleQueue, coverageIssues, type CanonicalQueue, type QueueSource, type SupplementalTask, type QueueSelection } from '../shared/canonical-roadmap.ts';
+import { parseRoadmap } from '../shared/roadmap.ts';
 
 const BATCH = 100;
 
@@ -22,7 +26,7 @@ export async function loadRoadmapTracker(project: string, issue: number): Promis
 
 /** One query for up to `BATCH` issues. Pure; exported for tests. */
 export function statesQuery(numbers: number[]): string {
-  const fields = numbers.map((n) => `i${n}: issue(number: ${n}) { number state stateReason closedAt url milestone { number title } }`).join(" ");
+  const fields = numbers.map((n) => `i${n}: issue(number: ${n}) { number title body updatedAt state stateReason closedAt url milestone { number title } }`).join(" ");
   return `query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { ${fields} } }`;
 }
 
@@ -39,7 +43,7 @@ export function parseStatesResponse(stdout: string): Map<number, RoadmapIssueSta
   if (!repo || typeof repo !== "object") return null;
   const out = new Map<number, RoadmapIssueState>();
   for (const v of Object.values(repo as Record<string, unknown>)) {
-    const i = v as { number?: unknown; state?: unknown; stateReason?: unknown; closedAt?: unknown; url?: unknown; milestone?: { number?: unknown; title?: unknown } | null } | null;
+    const i = v as { number?: unknown; title?: unknown; body?: unknown; updatedAt?: unknown; state?: unknown; stateReason?: unknown; closedAt?: unknown; url?: unknown; milestone?: { number?: unknown; title?: unknown } | null } | null;
     if (!i || typeof i.number !== "number" || (i.state !== "OPEN" && i.state !== "CLOSED")) continue;
     // The issue's milestone decides whether its step is in a milestone's
     // scope (src/shared/roadmap.ts `roadmapScope`): null = it has none.
@@ -49,12 +53,93 @@ export function parseStatesResponse(stdout: string): Map<number, RoadmapIssueSta
       state: i.state,
       stateReason: typeof i.stateReason === "string" ? i.stateReason : null,
       url: typeof i.url === "string" ? i.url : null,
+      ...(typeof i.body === 'string' ? { body: i.body } : {}),
+      ...(typeof i.title === 'string' ? { title: i.title } : {}),
+      ...(typeof i.updatedAt === 'string' ? { updatedAt: i.updatedAt } : {}),
       // When it closed: what velocity counts from (src/shared/velocity.ts).
       ...(typeof i.closedAt === "string" && Number.isFinite(Date.parse(i.closedAt)) ? { closedAt: Date.parse(i.closedAt) } : {}),
       ...(milestone !== undefined ? { milestone } : {}),
     });
   }
   return out;
+}
+
+const hash = (s: string) => createHash('sha256').update(s).digest('hex');
+export const QUEUE_FACTS_PREF = 'autopilot_queue_facts_v1';
+export const QUEUE_SELECTIONS_PREF = 'autopilot_queue_selections_v1';
+export const REGISTERED_ISSUES_PREF = 'autopilot_registered_issues_v1';
+
+/** Explicit immutable artifact references from the tracker, bounded to its repo. */
+export function trackerArtifacts(body: string, trackerUrl: string): { url: string; owner: string; repo: string; revision: string; path: string }[] {
+  const target = new URL(trackerUrl);
+  const repoPath = target.pathname.split('/').slice(1,3).join('/').toLowerCase();
+  const out = [];
+  for (const match of body.matchAll(/https:\/\/github\.com\/([^/\s]+)\/([^/\s]+)\/blob\/([a-f0-9]{40})\/([^\s)<>]+\.(?:csv|json))/gi)) {
+    const [,owner,repo,revision,path] = match;
+    if (`${owner}/${repo}`.toLowerCase() !== repoPath || !path!.startsWith('docs/plans/')) continue;
+    if (!/(?:roadmap-review-coverage|roadmap-supplements|adapter-architecture)/.test(path!)) continue;
+    out.push({ url: match[0], owner: owner!, repo: repo!, revision: revision!, path: path! });
+  }
+  return [...new Map(out.map(a=>[a.url,a])).values()].slice(0,8);
+}
+
+/** A finite fresh cycle: exact sources + current issue contracts, no thread transcript. */
+export async function loadCanonicalQueue(project: string, issue: number): Promise<(CanonicalQueue & { states: Map<number,RoadmapIssueState>; body: string; url: string | null }) | { error: string }> {
+  const configAtStart=preferences.get('autopilot');
+  const tracker = await loadRoadmapTracker(project,issue);
+  if ('error' in tracker) return tracker;
+  if (!tracker.url) return { error: 'tracker repository identity is unavailable' };
+  const artifacts = trackerArtifacts(tracker.body,tracker.url);
+  const coverage = artifacts.find(a=>a.path.includes('roadmap-review-coverage') && a.path.endsWith('.csv'));
+  if (!coverage) return { error: 'live tracker has no explicit immutable canonical membership CSV' };
+  const sourceReads = await Promise.all(artifacts.map(async a => {
+    const r = await run(['gh','api',`repos/${a.owner}/${a.repo}/contents/${a.path}?ref=${a.revision}`,'-H','Accept: application/vnd.github.raw+json'],project,60_000,process.env);
+    return { a, r };
+  }));
+  const sources: QueueSource[] = [{ url: tracker.url, revision: hash(tracker.body), hash: hash(tracker.body) }];
+  let membership: number[] | null = null;
+  const supplements: SupplementalTask[] = [];
+  const errors: string[] = [];
+  for (const {a,r} of sourceReads) {
+    if (!r.ok) { errors.push(`unreadable queue source ${a.url}`); continue; }
+    sources.push({url:a.url,revision:a.revision,hash:hash(r.stdout)});
+    try {
+      if (a.url === coverage.url) membership = coverageIssues(r.stdout);
+      else {
+        const manifest = JSON.parse(r.stdout);
+        if (Array.isArray(manifest.tasks)) supplements.push(...manifest.tasks.filter((t: SupplementalTask)=>Number.isSafeInteger(t.issue)));
+        if (Array.isArray(manifest.new_tasks)) supplements.push(...manifest.new_tasks);
+        // The tracker links this manifest; its explicit sibling pointer is
+        // interpreted at the SAME immutable commit, never a moving branch.
+        const sibling = manifest.adapter_architecture_batch?.registry;
+        if (typeof sibling === 'string' && /^adapter-architecture-[\d-]+\.registry\.json$/.test(sibling)) {
+          const path = a.path.slice(0,a.path.lastIndexOf('/')+1)+sibling;
+          const extra = await run(['gh','api',`repos/${a.owner}/${a.repo}/contents/${path}?ref=${a.revision}`,'-H','Accept: application/vnd.github.raw+json'],project,60_000,process.env);
+          if (!extra.ok) errors.push(`unreadable architecture membership at ${a.revision}`);
+          else { const d=JSON.parse(extra.stdout); supplements.push(...(d.new_tasks??[])); sources.push({url:`https://github.com/${a.owner}/${a.repo}/blob/${a.revision}/${path}`,revision:a.revision,hash:hash(extra.stdout)}); }
+        }
+      }
+    } catch { errors.push(`invalid queue source ${a.url}`); }
+  }
+  if (!membership) return {error:errors.join('; ') || 'canonical membership unavailable; existing queue preserved'};
+  const registered: SupplementalTask[] = [];
+  try {
+    const v=JSON.parse(preferences.get(REGISTERED_ISSUES_PREF)??'{}');
+    if (v.project===project && v.tracker===issue && v.authority && Array.isArray(v.tasks)) registered.push(...v.tasks.filter((t: SupplementalTask)=>Number.isSafeInteger(t.issue)));
+  } catch { errors.push('invalid explicitly registered task metadata'); }
+  const baseline=parseRoadmap(tracker.body);
+  const numbers=[...new Set([...membership,...baseline.steps.map(s=>s.issue),...registered.map(t=>t.issue)])];
+  const states=await loadRoadmapStates(project,numbers);
+  if ('error' in states) return states;
+  let selections: Record<string,QueueSelection>={};
+  try { const v=JSON.parse(preferences.get(QUEUE_SELECTIONS_PREF)??'{}');if(v.project===project&&v.tracker===issue) selections=v.issues??{}; } catch { errors.push('invalid scoped selection metadata'); }
+  const version=hash(JSON.stringify({sources,issues:[...states].map(([n,s])=>[n,s.state,s.stateReason,s.updatedAt,hash(s.body??'')]),selections,registered}));
+  const queue=assembleQueue({body:tracker.body,states,membership,supplements,sources,version,hash,selections,registered});
+  queue.errors.push(...errors);
+  if(preferences.get('autopilot')!==configAtStart)return {error:'stale queue read discarded after scheduler configuration changed'};
+  // Compact replace-in-place facts; no accumulated scheduler conversation.
+  preferences.set(QUEUE_FACTS_PREF,JSON.stringify({version:1,project,tracker:issue,graphVersion:version,at:Date.now(),coverage:membership.length,sources,errors:queue.errors,records:queue.records}));
+  return {...queue,states,body:tracker.body,url:tracker.url};
 }
 
 export async function loadRoadmapStates(project: string, numbers: number[]): Promise<Map<number, RoadmapIssueState> | { error: string }> {

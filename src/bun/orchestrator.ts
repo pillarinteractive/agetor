@@ -40,6 +40,8 @@ import {
 import { cliVersionSatisfies, formatMinCliVersionError } from "../shared/cli-version.ts";
 import { isFxRecoveryResumable, parseFxAutoResumePrefs, parseFxRecoveryPayload } from "../shared/fx-recovery.ts";
 import { resolveStartStep } from "../shared/pipeline.ts";
+import { bindRunner, reserveRunner, releaseUnspawnedRunner, releaseDeletedRunner, claimIssue, releaseIssue } from './dispatch-claims.ts';
+import { canonicalIssue } from '../shared/canonical-roadmap.ts';
 import {
   cascadePipelineArchive,
   cascadePipelineDelete,
@@ -1332,18 +1334,20 @@ export function isTaskRunCancelling(taskId: string): boolean {
  */
 export async function startTask(
   taskId: string,
+  opts?: {validate?: () => Promise<string | null>},
 ): Promise<{ runId: string; unresolvedRefs?: string[]; pending?: true } | { error: string }> {
   let task = tasks.get(taskId);
   if (!task) return { error: "task not found" };
   if (task.runId && active.has(task.runId)) return { error: "task already running" };
   if (startingTaskIds.has(taskId)) return { error: "task is already starting" };
   startingTaskIds.add(taskId);
-  return startTaskInner(taskId, task);
+  return startTaskInner(taskId, task, opts);
 }
 
 async function startTaskInner(
   taskId: string,
   task: Task,
+  opts?: {validate?: () => Promise<string | null>},
 ): Promise<{ runId: string; unresolvedRefs?: string[]; pending?: true } | { error: string }> {
   // Whether ownership of releasing the `startingTaskIds` claim (added by
   // `startTask` above) has been handed off to the detached spawn
@@ -1352,6 +1356,7 @@ async function startTaskInner(
   // still owns the release itself, via the `finally` below.
   let claimTransferred = false;
   try {
+  if(opts?.validate) {const error=await opts.validate();if(error)return {error};}
   // startTask auto-unarchives and materializes the worktree below — it must
   // not race a teardown archiveTask (or deleteTask) deferred for this task,
   // or a `detachWorktree`/`removeWorktree` still in flight could yank the
@@ -1375,8 +1380,15 @@ async function startTaskInner(
   // the parent row itself — the runner does its own pre-flight per step via
   // the ordinary `startTask` path for each child.
   if (task.pipelineId) {
-    return startPipelineRun(task);
+    return startPipelineRun(task,{validate:opts?.validate});
   }
+
+  const parent=task.pipelineParentId?tasks.get(task.pipelineParentId):null;
+  const stepName=parent?.pipelineRun?.snapshot?.graph.steps.find(s=>s.id===task.pipelineStepId)?.name ?? task.title;
+  const reservation=reserveRunner(taskId,stepName,id=>id===taskId
+    ? !!task.runId&&active.has(task.runId)||isTaskHeldByBackgroundAgents(task)
+    : isTaskRunLive(id));
+  if('error' in reservation)return reservation;
 
   // Freeze-at-first-run (docs/plans/agent-profiles.md D2): resolve the
   // task's agent profile — if any — BEFORE the harness pre-flight below, so
@@ -1590,6 +1602,7 @@ async function startTaskInner(
   // Single transaction: flip the task into running with the new run id, branch,
   // worktree path; insert the run row. Either everything sticks or nothing does.
   const persist = db.transaction(() => {
+    bindRunner(taskId,runId);
     tasks.update(taskId, {
       column: "running",
       branch: prepared.branch,
@@ -1759,6 +1772,7 @@ async function startTaskInner(
   if (!raced.value.ok) return { error: `failed to start agent: ${raced.value.message}` };
   return { runId, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) };
   } finally {
+    releaseUnspawnedRunner(taskId);
     if (!claimTransferred) startingTaskIds.delete(taskId);
   }
 }
@@ -5708,6 +5722,8 @@ export interface CreateTaskInput extends Partial<Task> {
  * `CreateTaskInput`, so anything on that type is client-supplied.
  */
 export interface CreateTaskInternal {
+  /** Durable issue dispatch allocates its identity before awaited prep. */
+  reservedTaskId?: string;
   /**
    * A profile the caller has ALREADY resolved and validated (e.g.
    * `POST /projects/clone`, which checks the profile's harness and the
@@ -5753,6 +5769,18 @@ export async function createTask(
   input: CreateTaskInput,
   internal: CreateTaskInternal = {},
 ): Promise<{ task: Task } | { error: string }> {
+  const identity=canonicalIssue(input.issueUrl);
+  if(identity&&!internal.reservedTaskId) {
+    const existing=tasks.list().find(t=>!t.pipelineParentId&&t.archivedAt==null&&canonicalIssue(t.issueUrl)===identity);
+    if(existing)return {error:`issue is already owned by card ${existing.id}`};
+    const claimed=claimIssue(input.issueUrl!);if('error'in claimed)return claimed;
+    try{return await createTaskInner(input,{...internal,reservedTaskId:claimed.claim.taskId});}
+    finally{releaseIssue(claimed.key,claimed.claim.token);}
+  }
+  return createTaskInner(input,internal);
+}
+
+async function createTaskInner(input:CreateTaskInput,internal:CreateTaskInternal):Promise<{task:Task}|{error:string}> {
   const now = Date.now();
   // Only the trimmed, explicitly-provided workdir counts as user intent. We
   // still fall back to process.cwd() for the task itself so direct API
@@ -5814,7 +5842,7 @@ export async function createTask(
   // Previously we upserted on every task create, which silently surfaced
   // worktree temp paths and stray ad-hoc dirs in the sidebar.
 
-  const id = randomUUID();
+  const id = internal.reservedTaskId ?? randomUUID();
 
   // Pipeline binding (D1, docs/plans/pipelines.md): mutually exclusive with
   // `agentProfileId` — a pipeline task never launches an agent of its own
@@ -6522,6 +6550,7 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
   } catch (e) {
     console.warn(`[agetor] failed to remove issue thread snapshot dir for task ${taskId}:`, e);
   }
+  releaseDeletedRunner(taskId);
   tasks.delete(taskId);
   } catch (err) {
     if (isPipelineParent) tombstonedPipelineParents.delete(taskId);

@@ -5341,7 +5341,7 @@ function matchUnparsableModal(tail: string, watchdogArmed: boolean): ScrapeMatch
  */
 function pickScrapeMatch(tail: string, opts: { paneWorking: boolean; watchdogArmed: boolean }): ScrapeMatch | null {
   return matchNumberedModal(tail) ?? matchYesNoModal(tail) ?? matchSliderModal(tail)
-    ?? (opts.paneWorking ? null : matchUnparsableModal(tail, opts.watchdogArmed));
+    ?? (opts.paneWorking || paneShowsComposerText(tail) ? null : matchUnparsableModal(tail, opts.watchdogArmed));
 }
 
 /**
@@ -6644,6 +6644,10 @@ async function scrapeOnce(state: SessionState): Promise<void> {
   // below to keep the watchdog arm from carding an idle pane, and to drive
   // the idle-settle net that closes such a turn out instead.
   const paneIdle = paneShowsIdleInputBox(tail);
+  // A non-empty idle composer is also not a modal. Keep the draft intact:
+  // it disarms the question watchdog but does not qualify for idle-settle,
+  // which must not finish a run while a message is awaiting delivery.
+  const paneAtComposer = paneIdle || paneShowsComposerText(tail);
   const match = (claudeIsWriting || (askOnPane && !askUnrecoverable))
     ? null
     : pickScrapeMatch(tail, {
@@ -6654,7 +6658,7 @@ async function scrapeOnce(state: SessionState): Promise<void> {
           now,
           paneWorking,
           askCardLive: state.askCardId !== null,
-          paneIdle,
+          paneIdle: paneAtComposer,
         }),
       });
 
