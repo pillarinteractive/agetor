@@ -516,6 +516,49 @@ test("step cap: A↔B cycle with maxSteps 3 blocks with step-cap after 3 executi
   await waitUntilIdle(parentId);
 });
 
+test("a step visited again runs as a new task in a new session, never a resume of its earlier visit", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { tasks, pipelines, runs } = await import("./db.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+
+  const profile = await makeProfile("revisit");
+  const A = newStep({ name: "A", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const B = newStep({ name: "B", agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+  const graph = {
+    steps: [A, B],
+    edges: [
+      { id: "e1", from: A.id, to: B.id, label: "" },
+      { id: "e2", from: B.id, to: A.id, label: "" },
+    ],
+    startStepId: A.id,
+  };
+  const pipeline = pipelines.insert({ name: uniqueName("revisit-pipeline"), graph, maxSteps: 3 });
+  const created = await createTask({ title: "revisit run", prompt: "goal", workdir: freshWorkdir(), isolation: "none", pipelineId: pipeline.id });
+  if ("error" in created) throw new Error(created.error);
+  const parentId = created.task.id;
+  liveParentIds.push(parentId);
+  const started = await startTask(parentId);
+  if ("error" in started) throw new Error(started.error);
+
+  const blocked = await waitFor(() => {
+    const t = tasks.get(parentId);
+    return t?.pipelineRun?.status === "blocked" ? t : undefined;
+  }, 8000);
+  // A, B, A again: the two visits of A are different step tasks…
+  const visits = blocked.pipelineRun!.history.filter((h) => h.stepId === A.id);
+  expect(visits.length).toBe(2);
+  expect(visits[0]!.taskId).not.toBe(visits[1]!.taskId);
+  // …each with exactly one run of its own: the second visit was launched,
+  // not sent as a follow-up turn into the first visit's session (a session
+  // belongs to its step task — the fake driver records no session id).
+  const own = visits.map((v) => runs.listForTask(v.taskId));
+  expect(own.map((r) => r.length)).toEqual([1, 1]);
+  expect(own[0]![0]!.id).not.toBe(own[1]![0]!.id);
+  expect(tasks.get(visits[1]!.taskId)!.prompt).toContain("step 3 of at most");
+  await waitUntilIdle(parentId);
+});
+
 test("cancel mid-step then retry restarts the same step task", async () => {
   const { createTask, startTask } = await import("./orchestrator.ts");
   const { tasks, pipelines } = await import("./db.ts");
