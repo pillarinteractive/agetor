@@ -12,6 +12,16 @@ import {
 
 const DENY = DEFAULT_DISALLOWED_TOOLS.join(",");
 
+test("planner policy removes interactive routine questions without adding permission bypass flags", () => {
+  const args = claudeStepLaunchArgs(parseClaudeStepLaunch(null), "Build", false, true);
+  expect(args).toEqual(["--disallowedTools", `${DENY},AskUserQuestion`]);
+  expect(args).not.toContain("--dangerously-skip-permissions");
+  expect(args).not.toContain("--permission-mode");
+});
+test("planner question policy remains enabled when optional context reductions are disabled", () => {
+  expect(claudeStepLaunchArgs(parseClaudeStepLaunch('{"enabled":false}'), "Build", false, true)).toEqual(["--disallowedTools", "AskUserQuestion"]);
+});
+
 test("with no preference a step leaves out the unused tools and nothing else", () => {
   const config = parseClaudeStepLaunch(null);
   expect(claudeStepLaunchArgs(config, "Build")).toEqual(["--disallowedTools", DENY]);

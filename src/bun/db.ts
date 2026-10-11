@@ -668,7 +668,8 @@ const sanitizeRunSnapshot = (raw: unknown): PipelineRunSnapshot | null => {
   const maxSteps = isFiniteNumber(rec.maxSteps) ? rec.maxSteps : PIPELINE_LIMITS.maxStepsDefault;
   const capturedAt = isFiniteNumber(rec.capturedAt) ? rec.capturedAt : 0;
 
-  return { graph, profiles, maxSteps, capturedAt };
+  return { graph, profiles, maxSteps, capturedAt,
+    ...(rec.decisionPolicy === "planner-recommendation" ? { decisionPolicy: "planner-recommendation" as const } : {}) };
 };
 
 /**

@@ -94,6 +94,52 @@ Blocked cards in that project show who holds it or that it's free, and dropping 
 
 ## Updating instructions on a stopped run
 
+### Planner recommendations without routine owner waits
+
+The `pipeline_decisions` preference is an explicit project opt-in:
+`{"mode":"planner-recommendation","projects":["/absolute/project/path"]}`.
+The exact project path and policy are captured at a fresh run's start; existing
+snapshots and other projects keep their current instructions and permissions.
+
+With that policy, every step chooses the planner's supported recommendation
+for ordinary implementation, design and product choices within the issue's
+authorized scope and continues the same card. If the planner has not made a
+recommendation, the step reasons from the issue, acceptance criteria and
+approved repository decisions first. Issue fidelity comes first, then
+correctness/privacy/security, then throughput, then token cost. Native
+AskUserQuestion is left out of these Claude step sessions; genuine authority
+requirements are reported in a blocked handoff. This does not remove native
+permission prompts or override reviewer denials. The exact optional Claude
+environment-teaching reminder is dismissed with “Don't show again”; no other
+generic modal is automatically answered.
+
+Before acting on a routine choice, the step calls
+`agetor pipeline decision <parent> <record.json>`. The JSON contains the run's
+`capturedAt`, `category` (`routine` or `required-authority`), `question`, an
+explicit `recommendation`, `rationale`, nonempty `evidence`, and
+`affectedArtifacts`. The authenticated route saves a redacted private ledger
+under `pipeline-runs/<parent>/decisions-<runStartedAt>.json`, deduplicates the
+question, and attempts one GitHub follow-up issue per run in the verified
+owning repository. Later decisions update that same issue. Inspect the full
+records with `agetor pipeline decisions <parent>`; the remote issue contains
+runner-generated record references rather than arbitrary agent prose, panes,
+private files or credentials. Confirmation is retrospective for routine
+choices and does not block continued work. Uncertain remote creates are
+recorded and never automatically replayed into issue spam. Instruction refresh
+keeps the same run ledger and issue; changed recommendations retain up to eight
+previous revisions per question instead of silently overwriting the audit.
+
+Recording is passive: it never starts/retries an execution, answers a
+permission, grants approval or clears a blocked sibling. Missing action-time
+permission, credentials, protected/destructive actions, contradictory
+requirements and essential decisions outside the delegated scope remain
+accurate per-card owner holds; their unfinished dependents remain blocked and
+unrelated ready cards retain capacity. Failing tests and review defects go
+through repair and independent review; unmet dependencies stay dependencies.
+No caps, approvals, merge protections or commercial/planning source policy
+are changed. A real session teardown cancels its obsolete interaction cards,
+while a defensive reattach preserves the live session's interactions.
+
 An edited template does not silently change an existing run. Use
 `agetor pipeline refresh-instructions <parent-id>` to apply its instruction edits
 to a blocked or cancelled run before Retry or Advance. This never starts an agent

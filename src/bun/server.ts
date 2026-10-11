@@ -69,6 +69,7 @@ import { listActivity, recordActivity } from "./activity.ts";
 import { VELOCITY_GATE_PREF, velocityAnswerCached } from "./roadmap-velocity.ts";
 import { applySuggestion, listSuggestions } from "./suggestions.ts";
 import { listFollowUps, startFollowUp } from "./pipeline-followups.ts";
+import { readPipelineDecisions, recordPipelineDecision } from "./pipeline-decisions.ts";
 import {
   bundledTmuxAvailable,
   bundledTmuxPath,
@@ -6144,6 +6145,14 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           }
           const ok = answerFxPermission(req.params.id, { optionId });
           return json({ ok }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/tasks/:id/pipeline/decisions": {
+        GET: authed((req) => json(readPipelineDecisions(req.params.id), { headers: corsHeaders(req) })),
+        POST: authed(async (req) => {
+          const result = await recordPipelineDecision(req.params.id, await req.json().catch(() => null));
+          return json(result, { status: "error" in result ? 409 : 200, headers: corsHeaders(req) });
         }),
       },
 

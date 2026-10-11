@@ -19,6 +19,7 @@ import { ensureInstalledForCwd } from "./hook-installer.ts";
 import {
   activeTmuxPromptsForTask,
   answerTmuxPrompt,
+  cancelPendingForTask,
   findTmuxPromptByFingerprint,
   registerScrapedAskQuestions,
   registerTmuxPrompt,
@@ -28,6 +29,7 @@ import {
 } from "./interactions.ts";
 import { resolveTmuxBin, tmuxSocketArgs, tmuxSpawnOptions, ensureDisclaimedServer } from "./tmux-resolution.ts";
 import { createDeathProbe } from "./session-liveness.ts";
+import { environmentReminderKey } from "./optional-claude-prompt.ts";
 import { detectAskModal, isLossyAskPane, parseModalPane, type AskModalKind, type DriveStep, type NavKey, type ParsedQuestionPane } from "./claude-questions.ts";
 
 /**
@@ -6774,6 +6776,19 @@ async function scrapeOnce(state: SessionState): Promise<void> {
   const runId = tasks.get(state.taskId)?.runId;
   if (!runId) return;
 
+  const task = tasks.get(state.taskId);
+  const parent = task?.pipelineParentId ? tasks.get(task.pipelineParentId) : null;
+  const scoped = parent?.pipelineRun?.snapshot?.decisionPolicy === "planner-recommendation"
+    && parent.pipelineRun.status === "running" && parent.pipelineRun.active.some((a) => a.taskId === state.taskId);
+  const reminderKey = scoped ? environmentReminderKey(match.paneText, match.choices) : null;
+  if (reminderKey && await dismissTmuxPrompt(state.taskId, reminderKey, {
+    choices: match.choices, cursorIndex: match.cursorIndex, nav: match.nav, confirmKey: match.confirmKey,
+  })) {
+    markTmuxPromptAnswered(state.taskId, match.fingerprint);
+    recordActivity(parent!.id, { kind: "auto", text: "Dismissed the optional Claude environment-teaching reminder with Don't show again; no permissions granted", tone: "info" });
+    return;
+  }
+
   registerTmuxPrompt({
     taskId: state.taskId,
     runId,
@@ -9238,6 +9253,9 @@ export function cycleToMode(taskId: string, targetAgetorMode: string): Promise<C
  * deleteTask and reconcileOrphans.
  */
 export async function dropSession(taskId: string): Promise<void> {
+  // A permanent teardown leaves no modal to answer. Reattach's defensive
+  // dispose does not pass through here and must retain live interactions.
+  cancelPendingForTask(taskId, "session permanently torn down");
   const state = sessions.get(taskId);
   if (state) {
     // `orphanSubagents: true` — this task's session is being torn down for

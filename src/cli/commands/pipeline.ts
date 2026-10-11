@@ -29,6 +29,18 @@ export async function cmdPipeline(args: string[], flags: Flags): Promise<void> {
   const sub = args[0] ?? "ls";
   const client = await getClient(flags);
   switch (sub) {
+    case "decision":
+    case "decisions": {
+      const ref = args[1];
+      if (!ref) throw new Error("usage: agetor pipeline decision <parent> <record.json> | decisions <parent>");
+      const task = await resolvePipelineTask(client, ref);
+      const route = `/tasks/${encodeURIComponent(task.id)}/pipeline/decisions`;
+      if (sub === "decisions") return printJson(await client.call("GET", route));
+      const file = args[2];
+      if (!file) throw new Error("decision record JSON file required");
+      const body = JSON.parse(file === "-" ? await Bun.stdin.text() : readFileSync(file, "utf8"));
+      return printJson(await client.call("POST", route, body));
+    }
     case "ls":
     case "list": {
       const pipelines = await client.listPipelines();
@@ -256,7 +268,7 @@ export async function cmdPipeline(args: string[], flags: Flags): Promise<void> {
       throw new Error(
         "unknown pipeline subcommand: " +
           sub +
-          " (use ls | show | rm | export | import | retry | advance | refresh-instructions | restart | status | handoff)",
+          " (use ls | show | rm | export | import | retry | advance | refresh-instructions | restart | status | handoff | decision | decisions)",
       );
   }
 }

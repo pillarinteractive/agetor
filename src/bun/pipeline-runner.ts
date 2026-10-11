@@ -40,6 +40,7 @@ import { listLeases } from "./lease-watch.ts";
 import { ownFailures, prStatusForTask } from "./pr-watch.ts";
 import { run as runCommand } from "./github.ts";
 import { waitingOnQuota } from "../shared/autopilot.ts";
+import { decisionPolicyForProject, PIPELINE_DECISIONS_PREF, plannerDecisionInstructions } from "../shared/pipeline-decisions.ts";
 import {
   BLOCK_WAIT_PREF,
   classifyBlock,
@@ -1820,7 +1821,9 @@ async function launchStep(
   const withRouting = (prompt: string) => manuallyRouted
     ? `${prompt}\n\nThis step was explicitly selected by manual Advance. The preceding verdict and findings are preserved for you to address. This routing decision is not approval of the change and grants no additional permissions.`
     : prompt;
-  let composed = withSync(withRouting(composeStepPrompt({ ...composeArgs, inlineHandoff: true })));
+  const withDecisions = (prompt: string) => snapshot.decisionPolicy === "planner-recommendation"
+    ? `${prompt}\n\n${plannerDecisionInstructions(parent.id, snapshot.capturedAt)}` : prompt;
+  let composed = withSync(withRouting(withDecisions(composeStepPrompt({ ...composeArgs, inlineHandoff: true }))));
   // m12/D10: measure the SAME wrapping `startTaskInner` will actually launch
   // with — `composeLaunchPrompt` (the profile's instructions/skills
   // preamble) then `appendReferences` (the references block) — not the raw
@@ -1829,7 +1832,7 @@ async function launchStep(
   if (profile.harnessKind === "gemini") {
     const fullPrompt = appendReferences(composeLaunchPrompt(profile, composed), references);
     if (promptByteOverage("gemini", fullPrompt)) {
-      composed = withSync(withRouting(composeStepPrompt({ ...composeArgs, inlineHandoff: false })));
+      composed = withSync(withRouting(withDecisions(composeStepPrompt({ ...composeArgs, inlineHandoff: false }))));
     }
   }
 
@@ -2216,6 +2219,8 @@ export async function startPipelineRun(
       const built = buildSnapshot(validated.graph, pipeline.maxSteps, Date.now());
       if ("error" in built) return { error: built.error };
       snapshot = built.snapshot;
+      const decisionPolicy = decisionPolicyForProject(preferences.get(PIPELINE_DECISIONS_PREF), fresh.workdir);
+      if (decisionPolicy) snapshot.decisionPolicy = decisionPolicy;
     } else if (run.snapshot) {
       // The pipeline row itself is gone (deleted) — the only graph left to
       // run is the one already frozen on this task's previous snapshot.

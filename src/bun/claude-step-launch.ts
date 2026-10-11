@@ -102,13 +102,14 @@ export function parseClaudeStepLaunch(raw: string | null | undefined): ClaudeSte
  * the step's agent profile names skills, which need slash commands — they
  * are then kept whatever the preference says. Pure.
  */
-export function claudeStepLaunchArgs(config: ClaudeStepLaunchConfig, stepName: string, profileUsesSkills = false): string[] {
-  if (!config.enabled) return [];
+export function claudeStepLaunchArgs(config: ClaudeStepLaunchConfig, stepName: string, profileUsesSkills = false, plannerDecisions = false): string[] {
+  if (!config.enabled) return plannerDecisions ? ["--disallowedTools", "AskUserQuestion"] : [];
   const o: ClaudeStepLaunchOptions = { ...config, ...(config.steps[stepName.trim().toLowerCase()] ?? {}) };
   const args: string[] = [];
   // One comma-separated value: `--disallowedTools` takes several, and a
   // separate value per tool would let it swallow what follows.
-  if (o.disallowedTools.length > 0) args.push("--disallowedTools", o.disallowedTools.join(","));
+  const disallowed = plannerDecisions ? [...new Set([...o.disallowedTools, "AskUserQuestion"])] : o.disallowedTools;
+  if (disallowed.length > 0) args.push("--disallowedTools", disallowed.join(","));
   if (!o.skills && !profileUsesSkills) args.push("--disable-slash-commands");
   if (o.strictMcp) args.push("--strict-mcp-config");
   if (o.autocompact != null) args.push("--autocompact", String(o.autocompact));
@@ -133,7 +134,9 @@ export function claudeStepArgsForTask(taskId: string): string[] {
     if (!task?.pipelineParentId) return [];
     const config = parseClaudeStepLaunch(preferences.get(CLAUDE_STEP_LAUNCH_PREF));
     const usesSkills = (task.agentProfile?.skills?.length ?? 0) > 0;
-    return claudeStepLaunchArgs(config, stepNameOfTask(task, tasks.get(task.pipelineParentId)), usesSkills);
+    const parent = tasks.get(task.pipelineParentId);
+    return claudeStepLaunchArgs(config, stepNameOfTask(task, parent), usesSkills,
+      parent?.pipelineRun?.snapshot?.decisionPolicy === "planner-recommendation");
   } catch {
     return [];
   }

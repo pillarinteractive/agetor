@@ -689,6 +689,8 @@ export interface PipelineRunSnapshot {
    *  `agentProfileId` or `subagents.profileIds` at capture time. */
   profiles: Record<string, AgentProfileSnapshot>;
   capturedAt: number;
+  /** Explicit project opt-in; instructions only, never an action approval. */
+  decisionPolicy?: "planner-recommendation";
 }
 
 /**
