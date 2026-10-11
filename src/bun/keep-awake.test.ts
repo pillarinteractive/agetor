@@ -31,6 +31,12 @@ describe("hasRunningWork", () => {
     expect(hasRunningWork([waiting(Date.now() + 60_000)])).toBe(true);
     expect(hasRunningWork([waiting(null)])).toBe(false);
   });
+
+  test("so does a card parked in the blocked-step wait queue; one the queue gave up doesn't", () => {
+    const parked = (state: string) => task({ column: "blocked", pipelineRun: { status: "blocked", wait: { state, at: Date.now() + 60_000 } } as never });
+    expect(hasRunningWork([parked("waiting")])).toBe(true);
+    expect(hasRunningWork([parked("escalated")])).toBe(false);
+  });
 });
 
 describe("KeepAwake", () => {

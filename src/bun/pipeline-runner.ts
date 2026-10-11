@@ -35,10 +35,29 @@ import { isMergeQueued } from "./merge-intent.ts";
 import { currentSlots, slotDecision, slotUse } from "./step-slots.ts";
 import { isPriority, priorityFirst } from "./priority.ts";
 import { awaitsFor } from "./awaits.ts";
-import { classifyFailure, formatRetryTime, nextRetryAt, TRANSIENT_RETRY_MAX, type FailureClass } from "./usage-limit.ts";
+import { classifyFailure, formatRetryTime, harnessQuotaNotice, isQuotaPaused, nextRetryAt, TRANSIENT_RETRY_MAX, type FailureClass } from "./usage-limit.ts";
+import { listLeases } from "./lease-watch.ts";
+import { ownFailures, prStatusForTask } from "./pr-watch.ts";
+import { run as runCommand } from "./github.ts";
+import { waitingOnQuota } from "../shared/autopilot.ts";
+import {
+  BLOCK_WAIT_PREF,
+  classifyBlock,
+  escalationLine,
+  fmtSpan,
+  issueRef,
+  parseBlockWaitConfig,
+  planWait,
+  triedLine,
+  waitHasTrigger,
+  waitLine,
+  type BlockSignals,
+  type BlockVerdict,
+  type WaitingRow,
+} from "../shared/block-wait.ts";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { agentProfiles, backlog, dataDir, harnesses, pipelines, runs, tasks } from "./db.ts";
+import { agentProfiles, backlog, dataDir, harnesses, pipelines, preferences, runs, tasks } from "./db.ts";
 import {
   appendRunStatusLine,
   archiveTask,
@@ -61,6 +80,7 @@ import {
   parseHandoff,
   blockedHandoffChoosesNext,
   classifyStepResponse,
+  composeBlockedResumeNote,
   composeHandoffReminder,
   composeLimitResumeNote,
   composeStepPrompt,
@@ -86,9 +106,12 @@ import type {
   ColumnId,
   GlobalEvent,
   Handoff,
+  BlockWaitCategory,
+  LeaseStatus,
   Pipeline,
   PipelineActiveStep,
   PipelineBlock,
+  PipelineBlockWait,
   PipelineGraph,
   PipelineJoinArrival,
   PipelineRunSnapshot,
@@ -98,6 +121,7 @@ import type {
   PipelineStepRecord,
   PipelineStepReport,
   Task,
+  TaskPrStatus,
   TaskReference,
 } from "../shared/types.ts";
 
@@ -265,7 +289,12 @@ function failureTextFrom(events: MainStreamEvent[], max = 12): string {
  *  grace window makes the agent stop and hand off "blocked"): only claude's
  *  own notices (status rows), never the agent's prose. */
 function quotaNoticeFrom(events: MainStreamEvent[]): FailureClass | null {
-  const status = events.filter((e) => e.stream === "status").map((e) => e.data);
+  // Claude's notices are status rows. Codex reports a limit as the message
+  // of a `turn.failed` / `error` event, which lands on stderr
+  // (src/bun/codex-tmux.ts): those rows count only when the row IS the
+  // limit message (`harnessQuotaNotice`), since codex's stderr also carries
+  // log lines that quote the agent's own commands.
+  const status = events.filter((e) => e.stream === "status" || (e.stream === "stderr" && harnessQuotaNotice(e.data))).map((e) => e.data);
   // The limit reset later in the same turn ("Your claude.ai usage limit has
   // reset…", "[Earlier usage-limit notes no longer apply…]"): the block, if
   // any, is about something else.
@@ -440,6 +469,422 @@ export function stopPipelineAutoRetryTimers(): void {
   autoRetryTimers.clear();
 }
 
+// ---------------------------------------------------------------------------
+// The blocked-step wait queue
+// ---------------------------------------------------------------------------
+
+/**
+ * A step that hands off `blocked` with nowhere to route the work used to sit
+ * for a person whatever it was blocked on. Now the block is classified
+ * (`classifyBlock`, src/shared/block-wait.ts) and, when it is something that
+ * clears by itself — a shared resource that is busy, another change that
+ * has to land, a transient failure, or nothing recognisable — the run is
+ * parked in the queue (`run.wait`) and the SAME step is resumed in its own
+ * session when what it waits on changes or on a backoff, a bounded number
+ * of times; then it goes to the owner with what was tried. Anything that
+ * asks the owner something never enters the queue.
+ *
+ * The run stays `blocked` while it waits, so it holds no Autopilot slot and
+ * no step slot, and its issue stays busy (no second card). Nothing here
+ * launches a different step.
+ *
+ * The queue is the persisted `run.wait` of every blocked run; there are no
+ * timers. `releaseBlockWaits` (every {@link BLOCK_WAIT_TICK_MS}) reads it,
+ * so a core restart loses nothing.
+ */
+const BLOCK_WAIT_TICK_MS = 30_000;
+/** A resume set off by a watcher (the lease freed) never follows the last
+ *  resume of the same card sooner than this: a watcher that says "free"
+ *  while the step keeps finding it busy must not burn the attempts in
+ *  minutes. */
+const TRIGGER_MIN_GAP_MS = 5 * 60_000;
+/** After resuming one card for a lease, give it this long to take the lease
+ *  before the next in line is resumed (as the lab queue always did). */
+const LEASE_RESUME_GAP_MS = 5 * 60_000;
+/** A resume that was recorded but never started (the core died between the
+ *  two) goes back in the queue after this long. */
+const STRANDED_RESUME_MS = 10 * 60_000;
+const REF_STATE_TTL_MS = 2 * 60_000;
+
+export type RefState = "open" | "closed" | "unknown";
+
+/** Whether issue or PR `n` of the repository at `project` is still open.
+ *  One `gh api` call (an issue lookup answers for a PR too). */
+async function githubRefState(project: string, n: number): Promise<RefState> {
+  const r = await runCommand(["gh", "api", `repos/{owner}/{repo}/issues/${n}`, "--jq", ".state"], project, 30_000, process.env).catch(() => null);
+  const state = r?.ok ? r.stdout.trim().toLowerCase() : "";
+  return state === "open" ? "open" : state === "closed" ? "closed" : "unknown";
+}
+
+/** What the queue reads from the rest of the core — replaceable in tests. */
+export const blockWaitDeps: {
+  leases: () => LeaseStatus[];
+  pr: (taskId: string) => TaskPrStatus | null;
+  refState: (project: string, n: number) => Promise<RefState>;
+  rng: () => number;
+} = {
+  leases: () => listLeases(),
+  pr: (taskId) => prStatusForTask(taskId),
+  refState: githubRefState,
+  rng: Math.random,
+};
+
+const sameProject = (a: string, b: string) => a.replace(/\/+$/, "") === b.replace(/\/+$/, "");
+const blockWaitConfig = () => parseBlockWaitConfig(preferences.get(BLOCK_WAIT_PREF));
+
+function leasesOf(parent: Task): LeaseStatus[] {
+  return blockWaitDeps.leases().filter((l) => sameProject(l.project, parent.workdir));
+}
+
+/** A check of the card's PR that fails on its base branch too, and none of
+ *  its own. */
+function baseCiRed(pr: TaskPrStatus | null): { baseRef: string } | null {
+  if (!pr || pr.state !== "open" || pr.checks !== "failure") return null;
+  return pr.failingChecks.some((c) => c.alsoOnBase) && ownFailures(pr).length === 0 ? { baseRef: pr.baseRef ?? "the base branch" } : null;
+}
+
+function blockSignalsFor(parent: Task): BlockSignals {
+  return {
+    leases: leasesOf(parent).map((l) => ({ label: l.label, held: l.held, heldByOther: l.held && l.holderTaskId !== parent.id, error: l.error != null })),
+    baseCiRed: baseCiRed(blockWaitDeps.pr(parent.id)),
+  };
+}
+
+const waitTrigger = (parent: Task, w: PipelineBlockWait) => waitHasTrigger(w, leasesOf(parent).map((l) => l.label));
+
+/**
+ * A step handed off `blocked` and the run is held on it: decide whether it
+ * is the owner's or the queue's, and park it. `prev` is this execution's
+ * queue entry when the queue had resumed it. Mutates `run`; the caller
+ * persists. Returns what it decided.
+ */
+function scheduleBlockWait(
+  parentId: string,
+  parent: Task,
+  run: PipelineRunState,
+  active: PipelineActiveStep,
+  handoff: Handoff,
+  stepName: string,
+  now = Date.now(),
+): BlockVerdict["category"] | "escalated" {
+  const config = blockWaitConfig();
+  const prev = run.wait && run.wait.taskId === active.taskId ? run.wait : null;
+  // One entry per run: a second step blocking beside a parked one is left
+  // for the owner rather than replacing it.
+  const taken = run.wait != null && run.wait.taskId !== active.taskId && run.wait.state !== "escalated";
+  const verdict = classifyBlock(handoff, blockSignalsFor(parent), { declaredOutranksQuestions: config.declaredOutranksQuestions });
+  if (verdict.category === "owner" || !config.enabled || taken) {
+    if (prev) {
+      delete run.wait;
+      recordActivity(parentId, {
+        kind: "step",
+        text:
+          verdict.category === "owner"
+            ? `${stepName} now waits on you (${verdict.why}) — its automatic retries have stopped${prev.attempt ? ` after ${prev.attempt}` : ""}`
+            : `${stepName} is still blocked — left for you`,
+        tone: "warning",
+      });
+    }
+    return "owner";
+  }
+  const category: BlockWaitCategory = verdict.category;
+  const wait = planWait({
+    stepId: active.stepId,
+    taskId: active.taskId,
+    verdict: { ...verdict, category },
+    reason: handoff.reason.trim() || handoff.summary,
+    prev,
+    config,
+    now,
+    rng: blockWaitDeps.rng,
+  });
+  run.wait = wait;
+  if (wait.state === "escalated") {
+    recordActivity(parentId, {
+      kind: "step",
+      text: `${stepName} ${wait.escalation} — left for you (${triedLine(wait, now)}). It says: ${wait.reason}`,
+      tone: "danger",
+    });
+    return "escalated";
+  }
+  const line = waitLine(stepName, wait, now, waitTrigger(parent, wait));
+  recordActivity(parentId, {
+    kind: "step",
+    // "retrying automatically": what the velocity ledger reads as a wait
+    // that isn't the owner's (src/shared/velocity.ts).
+    text: `${line.replace(" — retrying ", " — retrying automatically ")} (${verdict.why})`,
+    tone: "info",
+  });
+  return category;
+}
+
+/** Give a parked run to the owner: out of time. */
+async function escalateWait(parentId: string, why: string, now: number): Promise<void> {
+  await runExclusive(parentId, async () => {
+    const run = tasks.get(parentId)?.pipelineRun;
+    const w = run?.wait;
+    if (!run || !w || w.state !== "waiting") return;
+    run.wait = { ...w, state: "escalated", at: null, escalatedAt: now, escalation: why };
+    persist(parentId, run);
+    const stepName = run.snapshot ? stepNameById(run.snapshot.graph, w.stepId) : w.stepId;
+    recordActivity(parentId, { kind: "step", text: `${stepName} ${why} — left for you (${triedLine(w, now)}). It says: ${w.reason}`, tone: "danger" });
+  }).catch(() => undefined);
+}
+
+const refStates = new Map<string, { at: number; state: RefState }>();
+async function refStateCached(project: string, n: number, now: number): Promise<RefState> {
+  const key = `${project.replace(/\/+$/, "")}#${n}`;
+  const hit = refStates.get(key);
+  if (hit && now - hit.at < REF_STATE_TTL_MS) return hit.state;
+  const state = await blockWaitDeps.refState(project, n).catch(() => "unknown" as const);
+  refStates.set(key, { at: now, state });
+  return state;
+}
+
+/**
+ * What the watchers say about the thing a parked run waits on:
+ *   cleared — it changed (the lease is free, #n closed, the base's checks
+ *             no longer fail): resume now;
+ *   holding — it is known to be unchanged: resuming would be wasted;
+ *   unknown — nothing watches it (or the watcher failed): the timer decides.
+ */
+async function waitTriggerState(parent: Task, w: PipelineBlockWait, now: number): Promise<{ state: "cleared" | "holding" | "unknown"; text: string }> {
+  if (w.category === "resource" && w.ref) {
+    const lease = leasesOf(parent).find((l) => l.label.toLowerCase() === w.ref!.toLowerCase());
+    if (!lease || lease.error) return { state: "unknown", text: "" };
+    if (lease.held && lease.holderTaskId !== parent.id) return { state: "holding", text: `the ${lease.label} is still held${lease.holderTitle ? ` by "${lease.holderTitle}"` : ""}` };
+    return { state: "cleared", text: `the ${lease.label} is free` };
+  }
+  if (w.category === "dependency" && w.ref === "base-ci") {
+    const pr = blockWaitDeps.pr(parent.id);
+    if (!pr) return { state: "unknown", text: "" };
+    return baseCiRed(pr) ? { state: "holding", text: `the same checks still fail on ${pr.baseRef ?? "the base branch"}` } : { state: "cleared", text: `the checks that failed on ${pr.baseRef ?? "the base branch"} no longer fail there` };
+  }
+  const n = w.category === "dependency" ? issueRef(w.ref) : null;
+  if (n != null) {
+    const state = await refStateCached(parent.workdir, n, now);
+    if (state === "closed") return { state: "cleared", text: `#${n} is closed` };
+    return state === "open" ? { state: "holding", text: `#${n} is still open` } : { state: "unknown", text: "" };
+  }
+  return { state: "unknown", text: "" };
+}
+
+const lastLeaseResumeAt = new Map<string, number>();
+
+/**
+ * Resume the parked step of `parentId` in its own session with a note
+ * (`composeBlockedResumeNote`): check whether the block has cleared, finish
+ * if so, else say what it waits on. Counts an attempt. When the note can't
+ * be delivered the step is started again instead — still the same step. Sent
+ * with no lock held (L-R7). Exported for tests.
+ */
+export async function resumeBlockedStep(parentId: string, trigger: string, cleared: string | null, now = Date.now()): Promise<boolean> {
+  const go = await runExclusive(parentId, async () => {
+    const parent = tasks.get(parentId);
+    const run = parent?.pipelineRun;
+    const w = run?.wait;
+    if (!parent || !run || !w || w.state !== "waiting" || parent.archivedAt != null || run.status !== "blocked") return null;
+    const graph = run.snapshot?.graph;
+    const step = graph?.steps.find((s) => s.id === w.stepId);
+    const target = run.active.find((a) => a.taskId === w.taskId);
+    const runId = tasks.get(w.taskId)?.runId;
+    if (!graph || !step || !target || !runId || isTaskRunLive(w.taskId)) return null;
+    run.wait = { ...w, state: "resuming", attempt: w.attempt + 1, at: null, tried: [...w.tried, { at: now, trigger }].slice(-12) };
+    persist(parentId, run);
+    return {
+      taskId: w.taskId,
+      runId,
+      stepName: step.name,
+      attempt: w.attempt + 1,
+      max: w.max,
+      note: composeBlockedResumeNote({
+        stepName: step.name,
+        reason: w.reason,
+        cleared,
+        attempt: w.attempt + 1,
+        max: w.max,
+        outgoing: outgoingSteps(graph, w.stepId).map((o) => ({ name: o.step.name, label: o.edge.label })),
+        transition: step.transition,
+        canFinish: step.canFinish === true,
+      }),
+    };
+  }).catch(() => null);
+  if (!go) return false;
+
+  let sent: Awaited<ReturnType<typeof sendInput>>;
+  try {
+    sent = await sendInput(go.runId, go.note);
+  } catch (err) {
+    sent = { delivered: false, reason: err instanceof Error ? err.message : String(err) };
+  }
+  const count = `automatic retry ${go.attempt} of ${go.max}`;
+  if (sent.delivered) {
+    recordActivity(parentId, {
+      kind: "step",
+      text: `Resumed ${go.stepName} in its own session to check its block${cleared ? ` — ${cleared}` : ""} (${count})`,
+      tone: "info",
+    });
+    return true;
+  }
+  if (sent.withheld && sent.savedToBacklog) {
+    try {
+      const item = tasks.get(go.taskId)?.backlog.find((b) => b.text === go.note);
+      if (item) backlog.remove(go.taskId, item.id);
+    } catch {
+      // best-effort
+    }
+  }
+  const relaunched = await retryPipelineStep(parentId, { taskId: go.taskId }).catch((e: unknown) => ({ error: String(e) }));
+  if (!("error" in relaunched)) {
+    recordActivity(parentId, {
+      kind: "step",
+      text: `Couldn't resume ${go.stepName} in its own session (${sent.reason.slice(0, 120)}) — started the step again instead (${count})`,
+      tone: "warning",
+    });
+    return true;
+  }
+  // Neither worked: back in the queue, the attempt spent.
+  await runExclusive(parentId, async () => {
+    const parent = tasks.get(parentId);
+    const run = parent?.pipelineRun;
+    const w = run?.wait;
+    if (!parent || !run || !w || w.state !== "resuming") return;
+    const handoff = run.history.find((h) => h.taskId === w.taskId && h.seq === run.active.find((a) => a.taskId === w.taskId)?.seq)?.handoff;
+    const active = run.active.find((a) => a.taskId === w.taskId);
+    if (!handoff || !active) {
+      delete run.wait;
+    } else {
+      scheduleBlockWait(parentId, parent, run, active, handoff, go.stepName);
+    }
+    persist(parentId, run);
+  }).catch(() => undefined);
+  recordActivity(parentId, { kind: "step", text: `The automatic retry of ${go.stepName} didn't start: ${relaunched.error}`, tone: "warning" });
+  return false;
+}
+
+/**
+ * One pass of the wait queue. For each parked run, oldest first (priority
+ * cards ahead): past its deadline → the owner's; what it waits on has
+ * changed, or its timer is due and nothing says it is unchanged → resume
+ * its step. Bounded: at most `maxPerPass` resumes a pass, none while any
+ * card waits on a usage limit (a resume would only hit it), none over the
+ * step-slot limits, one card per freed lease at a time. Exported for tests.
+ */
+export async function releaseBlockWaits(now = Date.now()): Promise<number> {
+  const config = blockWaitConfig();
+  const live = tasks.listLive().filter((t) => t.archivedAt == null);
+  const parked = live.filter((t) => !t.pipelineParentId && t.pipelineRun?.status === "blocked" && t.pipelineRun.wait != null);
+  if (parked.length === 0) return 0;
+
+  // A resume the core recorded but never sent: back in the queue.
+  for (const t of parked) {
+    const w = t.pipelineRun!.wait!;
+    const lastTried = w.tried[w.tried.length - 1]?.at ?? w.since;
+    if (w.state !== "resuming" || isTaskRunLive(w.taskId) || now - lastTried < STRANDED_RESUME_MS) continue;
+    if (t.pipelineRun!.autoRetry?.at != null) continue; // the retry machinery has it
+    await runExclusive(t.id, async () => {
+      const run = tasks.get(t.id)?.pipelineRun;
+      if (!run?.wait || run.wait.state !== "resuming" || !run.blocked.some((b) => b.taskId === run.wait!.taskId && b.kind === "step-blocked")) return;
+      run.wait = { ...run.wait, state: "waiting", at: now };
+      persist(t.id, run);
+    }).catch(() => undefined);
+  }
+
+  const waiting = priorityFirst(
+    parked.filter((t) => tasks.get(t.id)?.pipelineRun?.wait?.state === "waiting").sort((a, b) => a.pipelineRun!.wait!.since - b.pipelineRun!.wait!.since),
+    (t) => t.id,
+  );
+  const quotaHold = live.some((t) => waitingOnQuota(t.pipelineRun) || (t.pipelineRun?.active ?? []).some((a) => isQuotaPaused(a.taskId)));
+  let resumed = 0;
+  for (const t of waiting) {
+    const w = tasks.get(t.id)?.pipelineRun?.wait;
+    if (!w || w.state !== "waiting") continue;
+    if (now >= w.deadline) {
+      await escalateWait(t.id, `still waiting on ${w.what} after ${fmtSpan(now - w.since)}`, now);
+      continue;
+    }
+    const trigger = await waitTriggerState(t, w, now);
+    const due = w.at != null && now >= w.at;
+    const lastTried = w.tried[w.tried.length - 1]?.at ?? 0;
+    const triggered = trigger.state === "cleared" && now - lastTried >= TRIGGER_MIN_GAP_MS;
+    if (!due && !triggered) continue;
+    if (trigger.state === "holding") {
+      // The timer came due, but what it waits on is known not to have
+      // changed: look again later, without spending a resume.
+      const backoff = config.backoffMin[w.category];
+      const again = now + (backoff[Math.min(w.attempt, backoff.length - 1)] ?? 15) * 60_000;
+      await runExclusive(t.id, async () => {
+        const run = tasks.get(t.id)?.pipelineRun;
+        if (!run?.wait || run.wait.state !== "waiting") return;
+        run.wait = { ...run.wait, at: Math.min(again, run.wait.deadline) };
+        persist(t.id, run);
+      }).catch(() => undefined);
+      continue;
+    }
+    if (quotaHold || resumed >= config.maxPerPass) continue;
+    const leaseKey = w.category === "resource" && w.ref ? `${t.workdir.replace(/\/+$/, "")}\0${w.ref.toLowerCase()}` : null;
+    if (leaseKey && now - (lastLeaseResumeAt.get(leaseKey) ?? 0) < LEASE_RESUME_GAP_MS) continue;
+    if (!isPriority(t.id)) {
+      const slots = currentSlots();
+      const stepName = t.pipelineRun?.snapshot ? stepNameById(t.pipelineRun.snapshot.graph, w.stepId) : "";
+      if (!slotDecision(stepName, slotUse(isTaskRunLive, slots), slots).ok) continue;
+    }
+    const cleared = trigger.state === "cleared" ? trigger.text : null;
+    if (await resumeBlockedStep(t.id, cleared ?? "its retry time came", cleared, now)) {
+      resumed++;
+      if (leaseKey) lastLeaseResumeAt.set(leaseKey, now);
+    }
+  }
+  return resumed;
+}
+
+/** Every run the queue holds or has given up, for `GET /waiting` and
+ *  `agetor waiting`: parked and resuming first (oldest first), then the
+ *  escalated ones. */
+export function listBlockWaits(now = Date.now()): WaitingRow[] {
+  const rows: WaitingRow[] = [];
+  for (const t of tasks.listLive()) {
+    const run = t.pipelineRun;
+    const w = run?.wait;
+    if (!run || !w || t.archivedAt != null || t.pipelineParentId) continue;
+    if (w.state !== "resuming" && run.status !== "blocked") continue;
+    const step = run.snapshot ? stepNameById(run.snapshot.graph, w.stepId) : w.stepId;
+    const triggered = waitTrigger(t, w);
+    rows.push({
+      taskId: t.id,
+      title: t.title,
+      step,
+      category: w.category,
+      source: w.source,
+      what: w.what,
+      ref: w.ref,
+      reason: w.reason,
+      state: w.state,
+      since: w.since,
+      attempt: w.attempt,
+      max: w.max,
+      nextAt: w.state === "waiting" ? w.at : null,
+      deadline: w.deadline,
+      triggered,
+      tried: w.tried,
+      escalation: w.escalation ?? null,
+      line: w.state === "escalated" ? escalationLine(step, w, now).line : waitLine(step, w, now, triggered),
+    });
+  }
+  const rank = (r: WaitingRow) => (r.state === "escalated" ? 1 : 0);
+  return rows.sort((a, b) => rank(a) - rank(b) || a.since - b.since);
+}
+
+/** Test hook. */
+export function resetBlockWaitsForTests(): void {
+  refStates.clear();
+  lastLeaseResumeAt.clear();
+  blockWaitDeps.leases = () => listLeases();
+  blockWaitDeps.pr = (taskId) => prStatusForTask(taskId);
+  blockWaitDeps.refState = githubRefState;
+  blockWaitDeps.rng = Math.random;
+}
+
 /** When each queued step started waiting (`<parentId>:<stepId>`) — slots go
  *  to the longest-waiting first. In memory: after a restart the order is
  *  rebuilt from the first pass. */
@@ -599,6 +1044,9 @@ export function startSlotScheduler(): void {
   slotLoop.unref?.();
   setInterval(() => void recoverUnsettledSteps().catch(() => 0), 5 * 60_000).unref?.();
   setInterval(() => void reapInactiveStepSessions().catch(() => 0), 60_000).unref?.();
+  // The blocked-step wait queue: persisted on the runs, so the first pass
+  // after a restart picks up where the last one left off.
+  setInterval(() => void releaseBlockWaits().catch(() => 0), BLOCK_WAIT_TICK_MS).unref?.();
 }
 
 function noteSuperseded(parentId: string, steps: string[], by: string): void {
@@ -678,6 +1126,33 @@ function persist(parentId: string, run: PipelineRunState, opts?: { preserveStatu
   // PATCH on a parent whose run is live; both guards stay.
   const previousRun = tasks.get(parentId)?.pipelineRun ?? null;
   const previousStatus = previousRun?.status ?? null;
+  // The wait queue's entry belongs to one blocked execution. Once that
+  // execution is gone (it finished, was advanced past or superseded) the
+  // entry goes with it; and when its block is gone while the queue wasn't
+  // the one resuming it, a person took the step up — Retry, a message to
+  // the step, an answer — which always wins over the queue.
+  if (run.wait) {
+    const w = run.wait;
+    const stillActive = run.active.some((a) => a.taskId === w.taskId);
+    const stillBlocked = run.blocked.some((b) => b.taskId === w.taskId);
+    const otherBlock = run.blocked.find((b) => b.taskId === w.taskId && b.kind !== "step-blocked");
+    if (!stillActive) {
+      delete run.wait;
+    } else if (w.state === "resuming" && otherBlock && run.autoRetry?.at == null) {
+      // The resumed turn ended some other way (no handoff, a failure the
+      // retries gave up on): an ordinary block, for the owner.
+      delete run.wait;
+    } else if (w.state !== "resuming" && !stillBlocked) {
+      delete run.wait;
+      if (w.state === "waiting") {
+        recordActivity(parentId, {
+          kind: "step",
+          text: `${run.snapshot ? stepNameById(run.snapshot.graph, w.stepId) : "The step"} was resumed outside the wait queue — its automatic retries are cancelled`,
+          tone: "muted",
+        });
+      }
+    }
+  }
   tasks.setPipelineRun(parentId, run);
   const parent = tasks.get(parentId);
   // Every new block goes in the block log (src/bun/block-log.ts).
@@ -2108,8 +2583,10 @@ export async function cancelPipelineRun(parentId: string): Promise<{ task: Task 
     const runningTargets = run.active.filter((a) => isTaskRunLive(a.taskId));
     // Stop on a card that's only waiting for an automatic retry cancels the
     // retry; the step stays blocked for the user.
-    if (runningTargets.length === 0 && run.autoRetry?.at != null) {
-      run.autoRetry = { ...run.autoRetry, at: null };
+    if (runningTargets.length === 0 && (run.autoRetry?.at != null || run.wait?.state === "waiting")) {
+      if (run.autoRetry?.at != null) run.autoRetry = { ...run.autoRetry, at: null };
+      // Out of the wait queue too: the block stays, for the user.
+      if (run.wait?.state === "waiting") delete run.wait;
       persist(parentId, run);
       recordActivity(parentId, { kind: "step", text: "Automatic retry cancelled — left for you", tone: "muted" });
       return { task: tasks.get(parentId)! };
@@ -2630,6 +3107,8 @@ async function settleStepRun(
           kind: "step-blocked",
           message: `step "${stepName}" is waiting for you`,
         });
+        // It asked the user something: never the queue's to retry.
+        if (run.wait?.taskId === taskId) delete run.wait;
         checkJoinIncomplete(run);
         persist(parentId, run);
         return null;
@@ -2687,12 +3166,18 @@ async function settleStepRun(
           // the reset; the retry then finds the step running and stands
           // down).
           scheduleAutoRetry(parentId, run, activeEntry.stepId, limitNotice, "hit a usage limit", { resume: "handoff", insteadOf });
-        } else if (insteadOf.length > 0 && !alreadyHeld) {
-          recordActivity(parentId, {
-            kind: "step",
-            text: `${stepName} handed off "blocked" with its work unfinished — holding the run on ${stepName} instead of starting ${insteadOf.join(", ")}`,
-            tone: "warning",
-          });
+        } else if (!alreadyHeld) {
+          // Whose move is it? Something that clears by itself parks the run
+          // in the wait queue and this same step is resumed later; anything
+          // that asks the owner stays here for them.
+          const decided = scheduleBlockWait(parentId, parent, run, activeEntry, handoff, stepName);
+          if (decided === "owner" && insteadOf.length > 0) {
+            recordActivity(parentId, {
+              kind: "step",
+              text: `${stepName} handed off "blocked" with its work unfinished — holding the run on ${stepName} instead of starting ${insteadOf.join(", ")}`,
+              tone: "warning",
+            });
+          }
         }
         checkJoinIncomplete(run);
         persist(parentId, run);
@@ -2915,6 +3400,9 @@ async function settleStepRun(
       // just relaunches, as does every other failure.
       const midWork = failure?.kind === "quota" && events.some((e) => e.stream === "tool_use");
       scheduleAutoRetry(parentId, run, activeEntry.stepId, failure, why, midWork ? { resume: "cut-off" } : undefined);
+      // A turn the wait queue resumed crashed: the retry above carries it
+      // (the entry keeps its attempts); once that gives up, so does the queue.
+      if (run.wait?.taskId === taskId && run.autoRetry?.at == null) delete run.wait;
       persist(parentId, run);
       return null;
     }
@@ -2929,6 +3417,8 @@ async function settleStepRun(
     // case (including `cancelPipelineRun`'s own already-set status,
     // idempotently reaffirmed here) collapses the whole run.
     removeBlockedFor(run, taskId);
+    // A Stop (or a lost session) ends the queue's hold on this execution.
+    if (run.wait?.taskId === taskId) delete run.wait;
     if (historyEntry) {
       historyEntry.endedAt = Date.now();
       historyEntry.outcome = "cancelled";

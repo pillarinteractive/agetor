@@ -1516,17 +1516,24 @@ function makeFakeAgent(
           schemaVersion: 1,
           purpose: "fake purpose",
           summary: "stopped early",
-          reason: suffix === "quota-blocked" ? "Your usage limit was reached, so I stopped." : "needs a product decision",
+          // `AGETOR_FAKE_CLAUDE_BLOCKED_REASON` / `_QUESTIONS` (JSON array) /
+          // `_WAITING` (JSON merged into the handoff: `waitingOn`,
+          // `waitingRef`) shape a plain block for the wait-queue tests.
+          reason: suffix === "quota-blocked" ? "Your usage limit was reached, so I stopped." : (process.env.AGETOR_FAKE_CLAUDE_BLOCKED_REASON ?? "needs a product decision"),
           // A real agent obeys the contract's `next` rule even when it
           // stops early ("set next to Review"): `AGETOR_FAKE_CLAUDE_BLOCKED_NEXT`
           // names that step.
           next: process.env.AGETOR_FAKE_CLAUDE_BLOCKED_NEXT ?? null,
           artifacts: [] as string[],
-          openQuestions: [] as string[],
+          openQuestions: (suffix === "blocked" && process.env.AGETOR_FAKE_CLAUDE_BLOCKED_QUESTIONS ? JSON.parse(process.env.AGETOR_FAKE_CLAUDE_BLOCKED_QUESTIONS) : []) as string[],
           status: "blocked" as const,
+          ...(suffix === "blocked" && process.env.AGETOR_FAKE_CLAUDE_BLOCKED_WAITING ? (JSON.parse(process.env.AGETOR_FAKE_CLAUDE_BLOCKED_WAITING) as Record<string, unknown>) : {}),
         };
         onChunk("assistant", `Stopping.\n<${HANDOFF_TAG}>\n${JSON.stringify(handoff)}\n</${HANDOFF_TAG}>`);
         if (suffix === "quota-blocked") onChunk("status", process.env.AGETOR_FAKE_CLAUDE_QUOTA_NOTICE ?? "Usage limit reached · continuing automatically at 11:30pm · esc to cancel");
+        // A row on stderr beside a plain block — where codex's own error
+        // messages land (a usage limit among them).
+        if (suffix === "blocked" && process.env.AGETOR_FAKE_CLAUDE_BLOCKED_STDERR) onChunk("stderr", process.env.AGETOR_FAKE_CLAUDE_BLOCKED_STDERR);
       } else {
         const next = suffix && suffix !== "done" ? suffix : null;
         const handoff = {

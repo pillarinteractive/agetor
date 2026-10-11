@@ -1,6 +1,7 @@
 import { test, expect } from "bun:test";
 import {
   classifyFailure,
+  harnessQuotaNotice,
   matchClaudeResetNotice,
   nextRetryAt,
   parseResetTime,
@@ -42,6 +43,27 @@ test("codex usage-limit messages (codex-cli 0.160 strings) are quotas", () => {
   expect(model.resetAt).toBe(local(2026, 9, 9, 1, 0));
   expect(classifyFailure("Quota exceeded. Check your plan and billing details.", NOW)?.kind).toBe("quota");
   expect(classifyFailure("You've hit your usage limit. Try again later.", NOW)).toEqual({ kind: "quota", resetAt: null, detail: "You've hit your usage limit. Try again later." });
+});
+
+test("a harness's limit message standing alone on a row is its notice; a log line quoting the words is not", () => {
+  for (const row of [
+    "You've hit your usage limit. Upgrade to Plus to continue using Codex (https://chatgpt.com/explore/plus), or try again at 11:45 PM.",
+    "You've hit your usage limit for gpt-6.1-sol. Switch to another model now, or try again at Oct 9th, 2026 1:00 AM.",
+    "  You’ve reached your weekly limit.",
+    "Quota exceeded. Check your plan and billing details.",
+    "You're out of credits.",
+  ]) {
+    expect(harnessQuotaNotice(row)).toBe(true);
+  }
+  for (const row of [
+    "2026-10-05T01:38:01.844298Z ERROR codex_core::tools::router: error=exec_command failed: Rejected(\"echo You've hit your usage limit.\")",
+    "warning: the docs say \"Quota exceeded\" is returned by the API",
+    "Selected model is at capacity. Please try a different model.",
+    "stream disconnected before completion",
+    "",
+  ]) {
+    expect(harnessQuotaNotice(row)).toBe(false);
+  }
 });
 
 test("overload, capacity and launch failures are transient; other text is unclassified", () => {

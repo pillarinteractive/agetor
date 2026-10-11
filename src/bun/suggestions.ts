@@ -18,6 +18,7 @@ import { handoffHeadline } from "../shared/pipeline.ts";
 import { runs, tasks } from "./db.ts";
 import { listLeases } from "./lease-watch.ts";
 import { blockInfo, blockMentionsLease } from "../shared/block-reason.ts";
+import { waitingInQueue } from "../shared/block-wait.ts";
 import { PR_AUTOUPDATE_PREF, prStatusForTask, staleAgainstBase } from "./pr-watch.ts";
 import { parseFollowUpPresets, FOLLOW_UPS_PREF, startFollowUp } from "./pipeline-followups.ts";
 import { preferences } from "./db.ts";
@@ -58,7 +59,9 @@ export function suggestFor(
     const lease = ctx.leases.find(
       (l) => l.project.replace(/\/+$/, "") === task.workdir.replace(/\/+$/, "") && blockMentionsLease(block.text, l.label),
     );
-    if (lease && !lease.held && !lease.error) {
+    // A card in the blocked-step wait queue is resumed by the queue when the
+    // lease frees: nothing to suggest.
+    if (lease && !lease.held && !lease.error && !waitingInQueue(task.pipelineRun)) {
       return {
         ...base,
         id: `lease-retry:${block.stepTaskId ?? task.id}`,

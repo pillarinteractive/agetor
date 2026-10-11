@@ -18,6 +18,7 @@
 import type { Subprocess } from "bun";
 import type { Task } from "../shared/types.ts";
 import { preferences, tasks } from "./db.ts";
+import { waitingInQueue } from "../shared/block-wait.ts";
 import { subscribeGlobal } from "./orchestrator.ts";
 
 export const KEEP_AWAKE_PREF_KEY = "keepAwakeWhileRunning";
@@ -34,10 +35,10 @@ export function keepAwakeEnabled(pref: string | null, platform: string = process
 
 /** Any live (non-archived) task — a pipeline step included — in Running, or
  *  a card waiting on an automatic retry (a usage-limit reset or a transient
- *  backoff, src/bun/pipeline-runner.ts): its timer only fires on time if the
- *  Mac stays awake until then. */
+ *  backoff, src/bun/pipeline-runner.ts) or parked in the blocked-step wait
+ *  queue: its retry only fires on time if the Mac stays awake until then. */
 export function hasRunningWork(list: Task[]): boolean {
-  return list.some((t) => t.archivedAt == null && (t.column === "running" || t.pipelineRun?.autoRetry?.at != null));
+  return list.some((t) => t.archivedAt == null && (t.column === "running" || t.pipelineRun?.autoRetry?.at != null || waitingInQueue(t.pipelineRun)));
 }
 
 type Spawn = (argv: string[]) => Pick<Subprocess, "kill" | "exited">;

@@ -232,7 +232,18 @@ export async function autoRetryQueued(now = Date.now()): Promise<string | null> 
   for (const [key, s] of statuses) {
     if (s.held || s.error || !s.queue?.length) continue;
     if (now - (lastAutoRetryAt.get(key) ?? 0) < AUTORETRY_GAP_MS) continue;
-    const next = s.queue.find((q) => !autoRetried.has(`${q.taskId}:${q.since}`));
+    // A card in the blocked-step wait queue is resumed by that queue
+    // (`releaseBlockWaits`, src/bun/pipeline-runner.ts), which counts its
+    // attempts; one the queue gave up is the owner's. This retry is for
+    // the rest: blocks the queue left to the owner that name the lease.
+    // Nor is a step that says outright that it waits on the owner.
+    const next = s.queue.find((q) => {
+      if (autoRetried.has(`${q.taskId}:${q.since}`)) return false;
+      const run = tasks.get(q.taskId)?.pipelineRun;
+      const blockedTask = run?.blocked[0]?.taskId;
+      const declared = [...(run?.history ?? [])].reverse().find((r) => r.taskId === blockedTask)?.handoff?.waitingOn?.on;
+      return run?.wait == null && declared !== "owner";
+    });
     if (!next) continue;
     autoRetried.add(`${next.taskId}:${next.since}`);
     lastAutoRetryAt.set(key, now);

@@ -75,6 +75,20 @@ export function classifyFailure(text: string, now: number = Date.now()): Failure
   return null;
 }
 
+/** A harness's own usage-limit message standing alone on a row — codex's
+ *  `turn.failed` / `error` text (see the file comment), which starts with
+ *  the limit sentence. A log line that merely contains the words (codex's
+ *  `ERROR codex_core::…` lines quote the agent's commands) doesn't count. */
+const HARNESS_QUOTA_ROW_RES: RegExp[] = [
+  /^\s*You['’]ve hit your\b[^.\n·]*\blimit/i,
+  /^\s*You['’]ve reached your\b[^.\n·]*\blimit/i,
+  /^\s*Quota exceeded\b/i,
+  /^\s*You['’]re out of (?:usage )?credits/i,
+];
+export function harnessQuotaNotice(row: string): boolean {
+  return HARNESS_QUOTA_ROW_RES.some((re) => re.test(row));
+}
+
 const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
 
 function at(base: Date, hour12: number, minute: number, ampm: string): Date {
