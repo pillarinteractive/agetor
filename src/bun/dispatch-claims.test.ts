@@ -38,7 +38,7 @@ test('fresh cycles serialize, complete and back off without accumulating context
 
 function card(column:Task['column'],title='Finish') {
  const id=randomUUID(),now=Date.now();created.push(id);
- return tasks.insert({id,title,prompt:'synthetic',column,agent:'claude-code',model:'sonnet-5.5',effort:null,mode:'auto',workdir:'/synthetic',worktreePath:null,branch:null,branchSource:'created',baseRef:null,isolation:'none',runId:null,createdAt:now,updatedAt:now,archivedAt:null,taskType:'task',prUrl:null,fast:false,maxMode:false,references:[],backlog:[],draft:null,plans:[],agentProfileId:null,agentProfile:null,pipelineId:null,pipelineRun:null,pipelineParentId:null,pipelineStepId:null});
+ return tasks.insert({id,title,prompt:'synthetic',column,agent:'claude-code',model:'sonnet-5.5',effort:null,mode:'auto',workdir:'/synthetic',worktreePath:null,branch:null,branchSource:'created',baseRef:null,isolation:'none',runId:null,createdAt:now,updatedAt:now,archivedAt:null,taskType:'task',prUrl:null,fast:false,maxMode:false,references:[],backlog:[],draft:null,plans:[],agentProfileId:null,agentProfile:null,pipelineId:null,pipelineRun:null,pipelineParentId:null,pipelineStepId:null,hasOpenableRun:false,pendingInteractionCount:0,openTerminalCount:0});
 }
 function receipt(id:string,status:Run['status']) {
  const runId=randomUUID();runs.insert({id:runId,taskId:id,agent:'claude-code',status,startedAt:Date.now(),endedAt:status==='running'?null:Date.now(),exitCode:status==='running'?null:0,tmuxSession:null,claudeSessionId:null,codexSessionId:null,cursorSessionId:null,geminiSessionId:null,fxSessionId:null});tasks.update(id,{runId});return runId;
