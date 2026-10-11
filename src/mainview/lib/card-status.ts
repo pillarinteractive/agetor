@@ -12,6 +12,7 @@ import { blockReasonLine, handoffHeadline } from "../../shared/pipeline.ts";
 import type { TaskLeaseInfo } from "./leases.ts";
 import { ordinal } from "../../shared/block-reason.ts";
 import { shortCardName } from "./card-names.ts";
+import { escalatedWait, escalationLine, issueRef, waitingInQueue, waitLine } from "../../shared/block-wait.ts";
 
 export type NeedsYouAction = "open" | "retry" | "open-pr";
 
@@ -200,6 +201,22 @@ export function cardStatus(
       const waiting = lease.waiting.find((w) => !w.free);
       const inLine = (w: { position: number; queueLength: number }) =>
         w.queueLength > 1 ? `, ${ordinal(w.position)} of ${w.queueLength} in line` : "";
+      // Parked in the blocked-step wait queue (src/shared/block-wait.ts): it
+      // is retried by itself — what it waits on, when, and which attempt.
+      const parked = waitingInQueue(run) ? run.wait! : null;
+      if (parked) {
+        const name = stepName(run, parked.stepId);
+        const onLease = parked.category === "resource" && parked.ref != null ? lease.waiting.find((w) => w.label.toLowerCase() === parked.ref!.toLowerCase()) : undefined;
+        const line = waitLine(name, parked, now, onLease != null || (parked.category === "dependency" && (parked.ref === "base-ci" || issueRef(parked.ref) != null)));
+        const held = onLease && !onLease.free ? ` (held by ${onLease.heldBy}${inLine(onLease)})` : "";
+        return { line: held ? line.replace(" — retrying ", `${held} — retrying `) : line, tone: "muted", needsYou: null };
+      }
+      // The queue gave it up: the owner's now, with what was tried.
+      const gaveUp = escalatedWait(run);
+      if (gaveUp) {
+        const e = escalationLine(stepName(run, gaveUp.stepId), gaveUp, now);
+        return { line: e.line, tone: "danger", needsYou: { reason: e.reason, action: "open", actionLabel: "Open" } };
+      }
       if (waiting) {
         return {
           line: `Waiting for ${waiting.label} (held by ${waiting.heldBy}${inLine(waiting)})`,

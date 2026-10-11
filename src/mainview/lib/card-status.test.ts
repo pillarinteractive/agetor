@@ -44,6 +44,33 @@ describe("cardStatus — pipelines", () => {
     expect(status(gaveUp).line).not.toContain("retrying automatically");
   });
 
+  test("parked in the blocked-step wait queue: what it waits on, when it is retried, which attempt — and not the owner's", () => {
+    const blocked = [{ taskId: "s1", stepId: "build", kind: "step-blocked" as const, message: 'step "Build" reported it is blocked: the fixture service did not come up' }];
+    const at = new Date(2031, 2, 4, 15, 40).getTime();
+    const wait = (o: Record<string, unknown> = {}) => ({ stepId: "build", taskId: "s1", category: "unknown", source: "none", what: "its own stated reason", ref: null, reason: "the fixture service did not come up", state: "waiting", since: at - 60 * 60_000, attempt: 1, max: 3, at, deadline: at + 86_400_000, tried: [{ at: at - 45 * 60_000, trigger: "its retry time came" }], ...o }) as never;
+    const card = (w: unknown) => task({ column: "blocked", pipelineRun: run({ status: "blocked", blocked, active: [{ stepId: "build", taskId: "s1", seq: 1 }], wait: w as never }) });
+    const now = at - 20 * 60_000;
+    const st = (t: Task, lease = noLease) => cardStatus(t, { pr: null, lease, now });
+    expect(st(card(wait()))).toEqual({ line: "Build blocked — retrying at 3:40 PM · attempt 2 of 3", tone: "muted", needsYou: null });
+    expect(st(card(wait({ category: "dependency", what: "#41", ref: "#41", max: 4 }))).line).toBe("Build waiting on #41 — retrying when it lands or at 3:40 PM · attempt 2 of 4");
+    // A watched lease: who holds it, and the place in line.
+    const lab = wait({ category: "resource", source: "signal", what: "the lab", ref: "lab", max: 6 });
+    expect(st(card(lab), { holds: [], waiting: [{ label: "lab", heldBy: "E2E", free: false, position: 2, queueLength: 3 }] })).toMatchObject({
+      line: "Build waiting for the lab (held by E2E, 2nd of 3 in line) — retrying when it frees or at 3:40 PM · attempt 2 of 6",
+      needsYou: null,
+    });
+    expect(st(card(lab)).line).toBe("Build waiting for the lab — retrying at 3:40 PM · attempt 2 of 6");
+
+    // The queue gave up: the owner's, with the reason and what was tried.
+    const gaveUp = st(card(wait({ state: "escalated", attempt: 3, at: null, escalatedAt: now, escalation: "still blocked after 3 automatic retries", tried: [{ at: at - 200 * 60_000, trigger: "t" }, { at: at - 150 * 60_000, trigger: "t" }, { at: at - 45 * 60_000, trigger: "t" }] })));
+    expect(gaveUp).toMatchObject({ line: "Build still blocked after 3 automatic retries: the fixture service did not come up", tone: "danger" });
+    expect(gaveUp.needsYou).toEqual({ reason: "Build still blocked after 3 automatic retries — retried 3 times (12:20 PM, 1:10 PM, 2:55 PM); it says: the fixture service did not come up", action: "open", actionLabel: "Open" });
+    expect(needsYouList([{ task: card(wait()), status: st(card(wait())) }])).toEqual([]);
+
+    // No queue entry: a block is the owner's, as before.
+    expect(st(card(undefined)).needsYou).not.toBeNull();
+  });
+
   test("second in line for a busy lease says so", () => {
     const t = task({ column: "blocked", pipelineRun: run({ status: "blocked", blocked: [{ taskId: "s1", stepId: "build", kind: "step-blocked", message: "m" }] }) });
     expect(status(t, { lease: { holds: [], waiting: [{ label: "lab", heldBy: "E2E", free: false, position: 2, queueLength: 3 }] } }).line).toBe("Waiting for lab (held by E2E, 2nd of 3 in line)");
