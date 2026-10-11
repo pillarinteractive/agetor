@@ -759,6 +759,13 @@ export interface PipelineStepRecord {
    *  any — one reminder max per execution (see {@link
    *  PipelineStepReminder}). Optional/additive. */
   reminder?: PipelineStepReminder | null;
+  /** When the turn now being judged began: the start of the run that last
+   *  took this step task from idle back to running — its launch, a resume
+   *  after a usage limit, the handoff reminder, a wait-queue resume, an
+   *  await wake-up, a Retry, a message from its panel. Runs that started
+   *  before it are earlier turns: a handoff in them is void and never read
+   *  again (`executionAssistantText`). Optional/additive. */
+  turnStartedAt?: number | null;
 }
 
 /**

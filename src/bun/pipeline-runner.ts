@@ -966,8 +966,8 @@ export async function recoverUnsettledSteps(now = Date.now()): Promise<number> {
       const active = run.active.find((a) => a.taskId === b.taskId);
       const step = tasks.get(b.taskId);
       if (!active || !step?.runId || isTaskRunLive(b.taskId)) continue;
-      const since = run.history.find((h) => h.taskId === b.taskId && h.seq === active.seq)?.startedAt ?? null;
-      if (!parseHandoff(executionAssistantText(b.taskId, step.runId, since)).ok) continue;
+      const entry = run.history.find((h) => h.taskId === b.taskId && h.seq === active.seq);
+      if (!parseHandoff(executionAssistantText(b.taskId, step.runId, entry?.startedAt ?? null, entry?.turnStartedAt ?? null)).ok) continue;
       await runExclusive(parent.id, async () => {
         const fresh = tasks.get(parent.id)?.pipelineRun;
         if (!fresh) return;
@@ -1294,13 +1294,23 @@ function assistantTextFrom(events: MainStreamEvent[]): string {
  *  delivered into a run that gets split or duplicated, and the agent's valid
  *  handoff then sits in a sibling run (#416: the reply landed in one run, the
  *  settle read an empty twin and blocked an approved Review). The parser
- *  takes the LAST block, so a later reply still wins. Exported for tests. */
-export function executionAssistantText(taskId: string, runId: string, since: number | null): string {
+ *  takes the LAST block, so a later reply still wins.
+ *
+ *  Only the turn being judged counts. A step is often sent back into its
+ *  own session after it already wrote a handoff — resumed when a usage limit
+ *  resets, reminded, resumed by the wait queue, retried, messaged from its
+ *  panel — and each of those starts a new run. `turnStartedAt`
+ *  ({@link PipelineStepRecord.turnStartedAt}) is where the newest such turn
+ *  began: runs before it are left out, so a turn that ends without a
+ *  handoff reads as "no handoff", not as the stale one from before it was
+ *  re-entered. Exported for tests. */
+export function executionAssistantText(taskId: string, runId: string, since: number | null, turnStartedAt: number | null = null): string {
   const own = assistantTextFrom(mainStreamEventsForRun(runId));
   if (own.includes("<handoff>") || since == null) return own;
+  const from = Math.max(since - 1_000, turnStartedAt ?? 0);
   const siblings = runs
     .listForTask(taskId)
-    .filter((r) => r.startedAt >= since - 1_000)
+    .filter((r) => r.startedAt >= from)
     .sort((a, b) => a.startedAt - b.startedAt);
   if (siblings.length < 2) return own;
   return siblings.map((r) => assistantTextFrom(mainStreamEventsForRun(r.id))).filter(Boolean).join("\n");
@@ -3032,7 +3042,9 @@ async function settleStepRun(
       // branches below) so `historyEntry.responseKind` always reflects the
       // outcome, even for a settle that never reaches the reminder logic.
       // L-R6: the run's main-stream rows are loaded ONCE here.
-      const assistantText = executionAssistantText(taskId, runId, historyEntry?.startedAt ?? null);
+      // Only this turn's text: a handoff from before the step was re-entered
+      // (a usage-limit resume, a reminder, a retry…) is void.
+      const assistantText = executionAssistantText(taskId, runId, historyEntry?.startedAt ?? null, historyEntry?.turnStartedAt ?? null);
       const pendingInteractions = pendingInteractionsForRun(taskId, runId);
       const classified = classifyStepResponse({ runStatus: status, assistantText, pendingInteractions });
       if (historyEntry) historyEntry.responseKind = classified.kind;
@@ -3506,6 +3518,8 @@ async function handleColumnChange(
   taskId: string,
   column: ColumnId,
   reason: ColumnGlobalEvent["reason"],
+  /** The run the transition belongs to — for `running`, the turn that starts. */
+  eventRunId: string | null = null,
 ): Promise<void> {
   // "pipeline"-reasoned transitions are the runner's OWN column writes
   // (`pipelineUpdateColumn`) — reprocessing them here would be at best
@@ -3570,6 +3584,20 @@ async function handleColumnChange(
           historyEntry.outcome = null;
           historyEntry.endedAt = null;
           historyEntry.responseKind = null;
+          changed = true;
+        }
+        // A new turn of this step starts here (its launch; or it was idle
+        // and something sent it back in — a usage-limit resume, the handoff
+        // reminder, the wait queue, an await wake-up, a Retry, a message
+        // from its panel): from now on only this turn's reply is judged
+        // (`executionAssistantText`), and a "blocked" handoff an earlier
+        // turn left on the record is void, as the resume notes tell the
+        // agent. The same run carrying on (an answered prompt) is not a new
+        // turn: its start doesn't move.
+        const turnStart = (eventRunId ? runs.get(eventRunId)?.startedAt : null) ?? runs.listForTask(taskId)[0]?.startedAt ?? null;
+        if (historyEntry && turnStart != null && turnStart > (historyEntry.turnStartedAt ?? 0)) {
+          historyEntry.turnStartedAt = turnStart;
+          historyEntry.handoff = null;
           changed = true;
         }
         if (changed) persist(parentId, run);
@@ -3727,7 +3755,7 @@ export function initPipelineRunner(): void {
     if (e.kind === "run-status") {
       void handleRunStatus(e.taskId, e.runId, e.status);
     } else if (e.kind === "column") {
-      void handleColumnChange(e.taskId, e.column, e.reason);
+      void handleColumnChange(e.taskId, e.column, e.reason, e.runId);
     }
   });
 }

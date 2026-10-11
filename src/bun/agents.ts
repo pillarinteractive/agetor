@@ -1029,7 +1029,10 @@ function resolveFakeHandoffTurnSuffix(rawSuffix: string | null, turn: number): s
   if (!match) return rawSuffix;
   const firstTurnBehavior: string = match[1] ?? rawSuffix;
   const laterToken: string = match[2] ?? rawSuffix;
-  return turn <= 1 ? firstTurnBehavior : laterToken;
+  // The token after `-then-` may itself be a two-turn suffix
+  // (`quota-blocked-then-missing-then-done`: blocked, then no handoff, then
+  // done), read against the turns that follow.
+  return turn <= 1 ? firstTurnBehavior : resolveFakeHandoffTurnSuffix(laterToken, turn - 1);
 }
 
 /**

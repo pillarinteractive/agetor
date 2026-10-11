@@ -240,8 +240,20 @@ export function awaitResultMessage(done: AwaitRecord[], now = Date.now()): strin
   ].join("\n");
 }
 
-/** Step + await pairs ready to be woken: an `await` block whose awaits have
- *  all finished. Pure over its inputs. Exported for tests. */
+/** Blocks a finished await wakes a step out of. `await` is the step parked
+ *  on purpose. The other two are the safety net: the step's turn ended with
+ *  no usable handoff, so nothing was asked of the owner, and a command it
+ *  started has results it was never told — left alone it would sit until a
+ *  person looked. (Each record wakes a step once: `notified`.)
+ *
+ *  Not `step-blocked`: that is the step saying it is blocked or asking the
+ *  owner something, or a usage-limit stop — which the limit's own resume
+ *  continues, after which the turn parks on its awaits like any other. */
+const WAKEABLE = new Set<string>(["await", "handoff-missing", "handoff-invalid"]);
+
+/** Step + await pairs ready to be woken: an active, idle step under a
+ *  {@link WAKEABLE} block whose awaits have all finished. Pure over its
+ *  inputs. Exported for tests. */
 export function readyToWake(
   list: Task[],
   all: AwaitRecord[],
@@ -250,11 +262,20 @@ export function readyToWake(
   for (const parent of list) {
     const run: PipelineRunState | null | undefined = parent.pipelineRun;
     if (!run || parent.archivedAt != null || !parent.worktreePath) continue;
+    const seen = new Set<string>();
     for (const b of run.blocked) {
-      if (b.kind !== "await" || !b.taskId || !b.stepId) continue;
+      if (!WAKEABLE.has(b.kind) || !b.taskId || !b.stepId || seen.has(b.taskId)) continue;
+      if (b.kind !== "await") {
+        // Only the step the run is on, and only while it is idle.
+        if (!run.active.some((a) => a.taskId === b.taskId)) continue;
+        if (list.find((t) => t.id === b.taskId)?.column === "running") continue;
+      }
       const since = run.history.filter((h) => h.taskId === b.taskId).reduce((m, h) => Math.min(m, h.startedAt), Infinity);
       const mine = awaitsFor(parent.worktreePath, Number.isFinite(since) ? since : 0, all);
-      if (mine.length && mine.every((a) => a.finished)) out.push({ parent, stepTaskId: b.taskId, stepId: b.stepId, done: mine });
+      if (mine.length && mine.every((a) => a.finished)) {
+        seen.add(b.taskId);
+        out.push({ parent, stepTaskId: b.taskId, stepId: b.stepId, done: mine });
+      }
     }
   }
   return out;

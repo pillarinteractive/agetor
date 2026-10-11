@@ -593,6 +593,7 @@ const sanitizeStepRecord = (raw: unknown): PipelineStepRecord | null => {
     nextStepIds,
     responseKind: sanitizeResponseKind(rec.responseKind),
     reminder: sanitizeStepReminder(rec.reminder),
+    ...(isFiniteNumber(rec.turnStartedAt) ? { turnStartedAt: rec.turnStartedAt } : {}),
   };
 };
 

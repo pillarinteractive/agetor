@@ -424,6 +424,23 @@ Two things a run got wrong, both in `settleStepRun` / `launchStep` (`src/bun/pip
 - **Reading them yourself**: `agetor pipeline status <card> --handoffs` prints each step's whole handoff;
   `agetor pipeline handoff <card> [<step number> | <step name> | --all]` prints a step's full final message
   (`GET /tasks/:id/pipeline/reports`).
+- **A step sent back into its session is judged on what it writes from then on.** Two Builds resumed after a usage
+  limit finished their work, started verification with `agetor-await` and ended the turn to wait; the settle found no
+  handoff in that turn's run, fell back to "every run of the step since it started" (the sibling-run lookup for a
+  reply that lands in a twin run) and read the pre-limit `blocked` handoff again. The cards were held as "handed off
+  blocked", never parked as `await`, and never woken when the commands passed. Now each step record carries
+  `turnStartedAt`: the start of the run that last took the step from idle to running (`handleColumnChange`,
+  `running`). `executionAssistantText` reads only runs from there on, and the record's old handoff is cleared. This
+  covers every way back in, which all had the same fault: the usage-limit resume, the handoff reminder, the wait
+  queue's resume, a Retry (the lease watcher's too — a new session in the same step task), an await wake-up and a
+  message from the step's panel. A resumed turn with awaits out parks and is woken; one with no handoff and no awaits
+  gets the one reminder. No migration (a field in the run-state JSON).
+  - Safety net (`readyToWake`, `src/bun/awaits.ts`): an idle step blocked as `handoff-missing` / `handoff-invalid`
+    whose own awaits have all finished untold is woken with the results, once per record. Not woken: `step-blocked`
+    (the step says it is blocked or asks the owner; a usage-limit stop is continued by its own resume, and waking it
+    earlier would only hit the limit) and `step-failed` (the retries have it).
+  - Not done: a message folded into a turn that is still running stays in the same run, so a handoff written earlier
+    in that run still counts if the reply has none.
 
 ## The blocked-step wait queue (`feat/roadmap-autopilot`)
 

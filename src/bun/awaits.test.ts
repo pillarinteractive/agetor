@@ -83,6 +83,41 @@ test("a parked step wakes only once every await it started has finished", () => 
   expect(readyToWake([parent], listAwaits(root))).toEqual([]);
 });
 
+test("safety net: a step left without a handoff is woken by its finished awaits; a step that says it is blocked is not", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "awaits-"));
+  const wt = mkdtempSync(path.join(tmpdir(), "wt-"));
+  record(root, "x", { cwd: wt, started: 2000, exit: "0" });
+  const card = (kind: string, column = "review", active = true) => [
+    {
+      id: "p",
+      archivedAt: null,
+      worktreePath: wt,
+      pipelineRun: {
+        blocked: [{ taskId: "s1", stepId: "build", kind, message: "" }],
+        history: [{ taskId: "s1", stepId: "build", seq: 1, startedAt: 1_900_000 }],
+        active: active ? [{ taskId: "s1", stepId: "build", seq: 1 }] : [],
+      },
+    },
+    { id: "s1", archivedAt: null, column, pipelineParentId: "p" },
+  ] as unknown as Task[];
+  const woken = (list: Task[]) => readyToWake(list, listAwaits(root)).map((w) => [w.stepTaskId, w.done.map((a) => a.id)]);
+  expect(woken(card("handoff-missing"))).toEqual([["s1", ["x"]]]);
+  expect(woken(card("handoff-invalid"))).toEqual([["s1", ["x"]]]);
+  // The step said it is blocked (or asked the owner something): theirs.
+  expect(woken(card("step-blocked"))).toEqual([]);
+  expect(woken(card("step-failed"))).toEqual([]);
+  // Already running again, or no longer the step the run is on.
+  expect(woken(card("handoff-missing", "running"))).toEqual([]);
+  expect(woken(card("handoff-missing", "review", false))).toEqual([]);
+  // Not until every await it started has finished; told once.
+  record(root, "y", { cwd: wt, started: 2001 });
+  expect(woken(card("handoff-missing"))).toEqual([]);
+  writeFileSync(path.join(root, "y", "exit"), "1");
+  expect(woken(card("handoff-missing"))).toEqual([["s1", ["x", "y"]]]);
+  for (const id of ["x", "y"]) writeFileSync(path.join(root, id, "notified"), "1");
+  expect(woken(card("handoff-missing"))).toEqual([]);
+});
+
 test("the wake-up message carries the outcome, the command, the log path and its tail", () => {
   const root = mkdtempSync(path.join(tmpdir(), "awaits-"));
   record(root, "z", { cwd: "/w", started: Math.floor(Date.now() / 1000) - 600, exit: "2", log: "a\nFAILED test_x\n" });
