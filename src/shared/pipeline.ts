@@ -724,7 +724,8 @@ export function normalizeHandoff(input: unknown): Handoff {
     reason: capField(typeof parsed.reason === "string" ? parsed.reason : ""),
     next: normalizeNext(parsed.next),
     artifacts: capArray(toStringArray(parsed.artifacts)),
-    openQuestions: capArray(toStringArray(parsed.openQuestions)),
+    openQuestions: capArray(typeof parsed.openQuestions === "string"
+      ? [capField(parsed.openQuestions)] : toStringArray(parsed.openQuestions)),
   };
   if (parsed.status === "done" || parsed.status === "blocked") handoff.status = parsed.status;
   // Preserve authorization/dependency holds even when an agent misspells
@@ -739,7 +740,7 @@ export function normalizeHandoff(input: unknown): Handoff {
     handoff.status = "blocked";
   }
   if (waitingOn) handoff.waitingOn = waitingOn;
-  else if (invalidQuestions) handoff.waitingOn = { on: "owner" };
+  else if (invalidQuestions) handoff.waitingOn = { on: handoff.openQuestions.some((q) => q.trim()) ? "owner" : "other" };
   else if (invalidWait) handoff.waitingOn = { on: "other" };
   const hadQuestions = handoff.openQuestions.some((q) => q.trim());
   fitHandoffToBudget(handoff);

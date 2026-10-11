@@ -2212,6 +2212,12 @@ describe("classifyStepResponse", () => {
       reason: largeField, openQuestions: ["May I access production?"] });
     expect(capped.status).toBe("blocked");
     expect(capped.waitingOn).toEqual({ on: "owner" });
+    const scalarQuestion = normalizeHandoff({ status: "done", next: "approved", openQuestions: "May I access production?" });
+    expect(scalarQuestion.openQuestions).toEqual(["May I access production?"]);
+    expect(scalarQuestion.waitingOn).toEqual({ on: "owner" });
+    const malformedEmptyQuestions = normalizeHandoff({ status: "done", next: "approved", openQuestions: null });
+    expect(malformedEmptyQuestions.status).toBe("blocked");
+    expect(malformedEmptyQuestions.waitingOn).toEqual({ on: "other" }); // formatting is recoverable, not an invented owner decision
   });
   test("cancelled run -> cancelled, regardless of text", () => {
     const result = classifyStepResponse({ runStatus: "cancelled", assistantText: "whatever", pendingInteractions: 0 });
