@@ -172,3 +172,64 @@ test("permanent session teardown cancels stale questions while other tasks' live
   expect(listPendingForTask("old-session")).toHaveLength(0); expect(listPendingForTask("held-sibling")).toHaveLength(1);
   cancelPendingForTask("held-sibling", "fixture cleanup");
 });
+
+test("an identical record retries a failed lookup before any mutation without duplicating the record", async () => {
+  const { id, parent } = await fixture(); const api = await adapters(); let lookups = 0;
+  api.deps.repo = async () => { if (++lookups === 1) throw new Error("temporary lookup failure"); return { owner: "acme", name: "widget", remoteHost: "github.com" }; };
+  const input = record(parent.pipelineRun!.snapshot!.capturedAt);
+  expect((await api.call(id, input)).publication).toBe("not-attempted");
+  const retry = await api.call(id, input);
+  expect(retry.publication).toBe("published"); expect(retry.deduplicated).toBe(true);
+  expect(api.counts()).toEqual({ created: 1, updated: 0 });
+  expect(JSON.parse(readFileSync(retry.path as string, "utf8")).records).toHaveLength(1);
+});
+
+test("repository lookup failures before an update retry the same existing follow-up", async () => {
+  const { id, parent } = await fixture(); const api = await adapters(); const at = parent.pipelineRun!.snapshot!.capturedAt;
+  await api.call(id, record(at));
+  api.deps.repo = async () => { throw new Error("lookup unavailable before update"); };
+  await api.call(id, record(at, "Second choice?"));
+  api.deps.repo = async () => ({ owner: "acme", name: "widget", remoteHost: "github.com" });
+  expect((await api.call(id, record(at, "Second choice?"))).publication).toBe("published");
+  expect(api.counts()).toEqual({ created: 1, updated: 1 });
+  await api.call(id, record(at, "Second choice?"));
+  expect(api.counts()).toEqual({ created: 1, updated: 1 });
+});
+
+test("a corrected repository mismatch never creates a second issue for an existing follow-up", async () => {
+  const { id, parent } = await fixture(); const api = await adapters(); const at = parent.pipelineRun!.snapshot!.capturedAt;
+  await api.call(id, record(at));
+  api.deps.repo = async () => ({ owner: "other", name: "widget", remoteHost: "github.com" });
+  expect((await api.call(id, record(at, "Next choice?"))).publication).toBe("unavailable");
+  api.deps.repo = async () => ({ owner: "acme", name: "widget", remoteHost: "github.com" });
+  expect((await api.call(id, record(at, "Next choice?"))).publication).toBe("published");
+  expect(api.counts()).toEqual({ created: 1, updated: 1 });
+});
+
+test("real create and update stay bound to the verified owning repository after remote changes", async () => {
+  const { id, parent } = await fixture(); const { tasks } = await import("./db.ts"); const wd = tasks.get(id)!.workdir;
+  const git = (...args: string[]) => { const r = Bun.spawnSync(["git", ...args], { cwd: wd }); if (r.exitCode) throw new Error(r.stderr.toString()); };
+  git("init"); git("remote", "add", "origin", "https://github.com/acme/widget.git");
+  const { repoForDir, createGitHubIssue, updateGitHubIssue } = await import("./github.ts");
+  const { recordPipelineDecision } = await import("./pipeline-decisions.ts");
+  const previousFetch = globalThis.fetch, previousToken = process.env.GITHUB_TOKEN;
+  const attempted: Array<{ url: string; method: string }> = []; process.env.GITHUB_TOKEN = "synthetic-test-token";
+  globalThis.fetch = (async (url: unknown, options?: RequestInit) => {
+    attempted.push({ url: String(url), method: options?.method ?? "GET" });
+    return new Response(JSON.stringify({ number: 91, title: "Human follow-up", state: "open", html_url: "https://github.com/acme/widget/issues/91" }), { status: 200, headers: { "content-type": "application/json" } });
+  }) as typeof fetch;
+  try {
+    const deps = {
+      repo: async (dir: string) => { const verified = await repoForDir(dir); git("remote", "set-url", "origin", "https://github.com/unrelated/widget.git"); return verified; },
+      create: createGitHubIssue, update: updateGitHubIssue,
+    };
+    const at = parent.pipelineRun!.snapshot!.capturedAt;
+    expect((await recordPipelineDecision(id, record(at), deps)).publication).toBe("published");
+    git("remote", "set-url", "origin", "https://github.com/acme/widget.git");
+    expect((await recordPipelineDecision(id, record(at, "Another recommendation?"), deps)).publication).toBe("published");
+    expect(attempted).toEqual([
+      { url: "https://api.github.com/repos/acme/widget/issues", method: "POST" },
+      { url: "https://api.github.com/repos/acme/widget/issues/91", method: "PATCH" },
+    ]);
+  } finally { globalThis.fetch = previousFetch; if (previousToken === undefined) delete process.env.GITHUB_TOKEN; else process.env.GITHUB_TOKEN = previousToken; }
+});

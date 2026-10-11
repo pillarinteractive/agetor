@@ -87,6 +87,7 @@ import {
   jsonlPathFor,
   rebuildEventsFromJsonl,
   markTmuxPromptAnswered,
+  probeInteractionSession,
   resolveAskCard,
   sendModalKeys,
   sessionExists,
@@ -6039,18 +6040,32 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             // the UI can drop the card on its next poll.
             return json({ ok: false }, { headers: corsHeaders(req) });
           }
+          const checkDeliverySession = async () => {
+            const liveness = await probeInteractionSession(pending.taskId, pending.id);
+            if (liveness === "gone") return json(
+              { ok: false, cancelled: true, undelivered: true, reason: "tmux session confirmed gone; answer undelivered" },
+              { headers: corsHeaders(req) },
+            );
+            if (liveness === "unreachable") return json(
+              { ok: false, error: "tmux session could not be verified; question retained for retry" },
+              { status: 503, headers: corsHeaders(req) },
+            );
+            if (findTmuxPromptById(pending.id) !== pending) return json({ ok: false }, { headers: corsHeaders(req) });
+            const currentRun = tasks.get(pending.taskId)?.runId;
+            if (currentRun && currentRun !== pending.runId) return json(
+              { ok: false, error: "question belongs to an older run; no keystroke delivered" },
+              { status: 409, headers: corsHeaders(req) },
+            );
+            return null;
+          };
           // Reject: the user wants none of the options. Esc the modal and drop
           // the card. Once no card is pending the message box re-enables, so
           // the user sends their redirect as a normal, separate turn — no
           // in-flight Esc-then-send interrupt (which is what corrupts the run
           // accounting). The modal having been Esc'd, the message reaches claude.
           if (body.reject === true) {
-            if (!(await sessionExists(pending.taskId))) {
-              return json(
-                { ok: false, error: "tmux session is gone — cancel the run and start a new one" },
-                { status: 410, headers: corsHeaders(req) },
-              );
-            }
+            const unavailable = await checkDeliverySession();
+            if (unavailable) return unavailable;
             await sendModalKeys(pending.taskId, ["Escape"]);
             markTmuxPromptAnswered(pending.taskId, pending.fingerprint);
             const ok = answerTmuxPrompt(req.params.id, { key: "__external__" });
@@ -6072,18 +6087,14 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               { status: 400, headers: corsHeaders(req) },
             );
           }
-          // Drive tmux FIRST. If the session is gone or send-keys
+          // Drive tmux FIRST. If the session is unreachable or send-keys
           // fails, we must not resolve the interaction — doing so would
           // remove the card from the UI while leaving claude paused on
           // the modal. The user clicks "Yes", the card vanishes, and
           // nothing actually happens. Surface the failure so the UI
           // can leave the card up for retry.
-          if (!(await sessionExists(pending.taskId))) {
-            return json(
-              { ok: false, error: "tmux session is gone — cancel the run and start a new one" },
-              { status: 410, headers: corsHeaders(req) },
-            );
-          }
+          const unavailable = await checkDeliverySession();
+          if (unavailable) return unavailable;
           const delivered = await dismissTmuxPrompt(pending.taskId, key, {
             choices: pending.choices,
             cursorIndex: pending.cursorIndex,

@@ -128,6 +128,17 @@ choices and does not block continued work. Uncertain remote creates are
 recorded and never automatically replayed into issue spam. Instruction refresh
 keeps the same run ledger and issue; changed recommendations retain up to eight
 previous revisions per question instead of silently overwriting the audit.
+Repository lookup failures before a write can retry the same record without
+duplicating it. Follow-up creates and updates carry the verified repository
+identity through the mutation, even if a worktree's remote changes meanwhile.
+
+Confirmed-dead tmux sessions cancel only the questions captured for that
+session as undelivered and emit a removal event for the open UI. Changed runs,
+replaced sessions, later questions and inconclusive liveness checks retain
+their questions. History is preserved; cancellation is never an answer or
+permission grant. A full app restart clears the in-memory interaction registry;
+boot reattachment restores running sessions only. Inventory legitimate pending
+questions before rollout instead of assuming all idle-session prompts survive.
 
 Recording is passive: it never starts/retries an execution, answers a
 permission, grants approval or clears a blocked sibling. Missing action-time

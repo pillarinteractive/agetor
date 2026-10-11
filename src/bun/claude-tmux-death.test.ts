@@ -58,6 +58,68 @@ function freshSession() {
   return { taskId, jsonlPath, state };
 }
 
+test("confirmed death cancels captured questions as undelivered while later questions and other tasks survive", async () => {
+  const { registerTmuxPrompt, registerScrapedAskQuestions, registerFxPermission, listPendingForTask, cancelPendingForTask } = await import("./interactions.ts");
+  const { taskId, state } = freshSession(); const sibling = randomUUID();
+  const old = registerTmuxPrompt({ taskId, runId: "old-run", paneText: "Optional setup?", choices: [{ key: "3", label: "Skip" }], fingerprint: "old" });
+  const ask = registerScrapedAskQuestions({ taskId, runId: "old-run", questions: [{ question: "Pick?", options: [{ label: "A" }] }], fingerprint: "old-ask" });
+  const observed = __forTest.observeSessionInteractions(taskId);
+  const fresh = registerTmuxPrompt({ taskId, runId: "new-run", paneText: "Required authority", choices: [{ key: "1", label: "Allow" }], fingerprint: "new" });
+  const fx = registerFxPermission({ taskId, runId: "fx-run", toolCall: { toolCallId: "fx-call", title: "Protected action" }, options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }], mode: "ask" });
+  registerTmuxPrompt({ taskId: sibling, runId: "live-run", paneText: "Permission", choices: [{ key: "1", label: "Allow" }], fingerprint: "sibling" });
+  try {
+    const done = __forTest.pushTurnSlot(state, () => {});
+    __forTest.signalSessionDeath(state, observed); await done;
+    expect(await old.answer).toEqual({ key: "__cancelled__" });
+    expect(listPendingForTask(taskId).map((r) => r.id)).toEqual([fresh.id, fx.id]);
+    expect(listPendingForTask(taskId).some((r) => r.id === ask.id)).toBe(false);
+    expect(listPendingForTask(sibling)).toHaveLength(1);
+  } finally { cancelPendingForTask(taskId, "cleanup"); cancelPendingForTask(sibling, "cleanup"); __forTest.uninstallSession(taskId); }
+});
+
+test("a replaced session never inherits an old session's death", async () => {
+  const { registerTmuxPrompt, listPendingForTask, cancelPendingForTask } = await import("./interactions.ts");
+  const { taskId, state, jsonlPath } = freshSession();
+  __forTest.installSession(taskId, jsonlPath);
+  registerTmuxPrompt({ taskId, runId: "new-run", paneText: "Permission", choices: [{ key: "1", label: "Allow" }], fingerprint: "new-session" });
+  try { __forTest.signalSessionDeath(state); expect(listPendingForTask(taskId)).toHaveLength(1); }
+  finally { cancelPendingForTask(taskId, "cleanup"); __forTest.uninstallSession(taskId); }
+});
+
+test("a changed run on the same session never inherits an earlier death observation", async () => {
+  const { registerTmuxPrompt, listPendingForTask, cancelPendingForTask } = await import("./interactions.ts");
+  const { taskId, state } = freshSession(); tasks.insert({ ...baseTask(taskId), runId: "old-run" });
+  const observed = __forTest.observeSessionInteractions(taskId);
+  tasks.update(taskId, { runId: "new-run" });
+  registerTmuxPrompt({ taskId, runId: "new-run", paneText: "Permission", choices: [{ key: "1", label: "Allow" }], fingerprint: "new-run" });
+  try { __forTest.signalSessionDeath(state, observed); expect(listPendingForTask(taskId)).toHaveLength(1); }
+  finally { cancelPendingForTask(taskId, "cleanup"); __forTest.uninstallSession(taskId); }
+});
+
+test("an idle session's provably dead question is cancelled even after its turn succeeded", async () => {
+  const { registerTmuxPrompt, listPendingForTask, cancelPendingForTask } = await import("./interactions.ts");
+  const { taskId, state } = freshSession();
+  const old = registerTmuxPrompt({ taskId, runId: "retired-run", paneText: "Optional setup", choices: [{ key: "3", label: "Skip" }], fingerprint: "retired" });
+  try { __forTest.signalSessionDeath(state); expect(await old.answer).toEqual({ key: "__cancelled__" }); expect(listPendingForTask(taskId)).toHaveLength(0); }
+  finally { cancelPendingForTask(taskId, "cleanup"); __forTest.uninstallSession(taskId); }
+});
+
+test("unreachable and live sessions retain questions; a gone session cancels only the probed request", async () => {
+  const { registerTmuxPrompt, listPendingForTask, cancelPendingForTask } = await import("./interactions.ts");
+  const { probeInteractionSession } = await import("./claude-tmux.ts");
+  const { taskId } = freshSession();
+  const old = registerTmuxPrompt({ taskId, runId: "old", paneText: "Optional setup", choices: [{ key: "3", label: "Skip" }], fingerprint: "old-probed" });
+  registerTmuxPrompt({ taskId, runId: "new", paneText: "Permission", choices: [{ key: "1", label: "Allow" }], fingerprint: "new-unprobed" });
+  try {
+    let restore = fakeTmux(1, "resource temporarily unavailable");
+    try { expect(await probeInteractionSession(taskId, old.id)).toBe("unreachable"); expect(listPendingForTask(taskId)).toHaveLength(2); } finally { restore(); }
+    restore = fakeTmux(0, "");
+    try { expect(await probeInteractionSession(taskId, old.id)).toBe("alive"); expect(listPendingForTask(taskId)).toHaveLength(2); } finally { restore(); }
+    restore = fakeTmux(1, "can't find session");
+    try { expect(await probeInteractionSession(taskId, old.id)).toBe("gone"); expect(listPendingForTask(taskId)).toHaveLength(1); expect(await old.answer).toEqual({ key: "__cancelled__" }); } finally { restore(); }
+  } finally { cancelPendingForTask(taskId, "cleanup"); __forTest.uninstallSession(taskId); }
+});
+
 test("signalSessionDeath settles the in-flight turn and emits the session-died sentinel", async () => {
   const { taskId, state } = freshSession();
   const rec = recorder();

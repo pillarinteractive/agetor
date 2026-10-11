@@ -2617,8 +2617,10 @@ export async function closeGitHubPull(input: CloseGitHubPullInput): Promise<GitH
   };
 }
 
-export async function createGitHubIssue(input: CreateGitHubIssueInput): Promise<GitHubIssueResponse> {
-  const repo = await repoForDir(input.dir);
+/** Trusted internal callers may bind a previously verified repository. Copy
+ * its identity before any await; HTTP input never supplies this argument. */
+export async function createGitHubIssue(input: CreateGitHubIssueInput, verifiedRepo?: Readonly<GitHubRepo>): Promise<GitHubIssueResponse> {
+  const repo = verifiedRepo ? Object.freeze({ ...verifiedRepo }) : await repoForDir(input.dir);
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
   const title = input.title.trim();
   if (!title) return { ok: false, error: "issue title required" };
@@ -2651,8 +2653,8 @@ export async function createGitHubIssue(input: CreateGitHubIssueInput): Promise<
   return { ok: true, item, message: "Issue created." };
 }
 
-export async function updateGitHubIssue(input: UpdateGitHubIssueInput): Promise<GitHubIssueResponse> {
-  const repo = await repoForDir(input.dir);
+export async function updateGitHubIssue(input: UpdateGitHubIssueInput, verifiedRepo?: Readonly<GitHubRepo>): Promise<GitHubIssueResponse> {
+  const repo = verifiedRepo ? Object.freeze({ ...verifiedRepo }) : await repoForDir(input.dir);
   if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
   if (!Number.isInteger(input.number) || input.number <= 0) {
     return { ok: false, error: "issue number must be positive" };

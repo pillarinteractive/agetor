@@ -314,6 +314,9 @@ export interface InteractionResolved {
   kind: InteractionKind;
   /** Mirrors the request's `pipelineParentId` — see `AskQuestionsRequest`. */
   pipelineParentId?: string;
+  cancelled?: true;
+  undelivered?: true;
+  reason?: string;
 }
 
 type ResolveBroadcastFn = (res: InteractionResolved) => void;
@@ -343,12 +346,13 @@ export function setResolvedBroadcaster(fn: ResolveBroadcastFn): void {
 /** Internal helper — every answer* / cancel* path that deletes from one
  *  of the maps should call this with the request it removed so the UI
  *  hears about it. */
-function fanoutResolved(req: AnyRequest): void {
+function fanoutResolved(req: AnyRequest, cancellation?: { cancelled: true; undelivered: true; reason: string }): void {
   broadcastResolved({
     id: req.id,
     taskId: req.taskId,
     runId: req.runId,
     kind: req.kind,
+    ...cancellation,
     ...(req.pipelineParentId !== undefined ? { pipelineParentId: req.pipelineParentId } : {}),
   });
 }
@@ -640,39 +644,45 @@ export function findFxPermissionById(id: string): FxPermissionRequest | null {
  * Shared helpers
  * ────────────────────────────────────────────────────────────────────────── */
 
-/**
- * Resolve every pending interaction for this task with a synthetic
- * "cancelled" answer so subprocess waiters unblock immediately. Called from
- * cancelRun (Stop button) and deleteTask — if we just kill the tmux session
- * without doing this first, the in-flight curl / MCP children would hang
- * until their HTTP timeout instead of returning cleanly.
- */
-export function cancelPendingForTask(taskId: string, reason: string): void {
-  for (const [id, entry] of askQuestions) {
-    if (entry.req.taskId !== taskId) continue;
+/** Cancel one captured request as undelivered, never as a selected answer.
+ * The immutable request id keeps asynchronous cleanup from clearing a newer
+ * question or a different run on the same task. */
+export function cancelPendingInteraction(id: string, reason: string): boolean {
+  const ask = askQuestions.get(id);
+  if (ask) {
     askQuestions.delete(id);
-    entry.resolve({
-      answers: entry.req.questions.map(() => ({ selected: [], custom: reason })),
+    ask.resolve({
+      answers: ask.req.questions.map(() => ({ selected: [], custom: reason })),
     });
-    fanoutResolved(entry.req);
+    fanoutResolved(ask.req, { cancelled: true, undelivered: true, reason });
+    return true;
   }
-  for (const [id, entry] of tmuxPrompts) {
-    if (entry.req.taskId !== taskId) continue;
+  const tmux = tmuxPrompts.get(id);
+  if (tmux) {
     tmuxPrompts.delete(id);
     // Sentinel — the route handler reads this and skips the send-keys
     // step so we don't inject random keystrokes into a session that's
     // already being torn down.
-    entry.resolve({ key: "__cancelled__" });
-    fanoutResolved(entry.req);
+    tmux.resolve({ key: "__cancelled__" });
+    fanoutResolved(tmux.req, { cancelled: true, undelivered: true, reason });
+    return true;
   }
-  for (const [id, entry] of fxPermissions) {
-    if (entry.req.taskId !== taskId) continue;
+  const fx = fxPermissions.get(id);
+  if (fx) {
     fxPermissions.delete(id);
     // Unblocks the fx-acp driver's awaiter — it answers fx's RPC with
     // `outcome: "cancelled"` instead of ever registering a resolved pick.
-    entry.resolve({ cancelled: true });
-    fanoutResolved(entry.req);
+    fx.resolve({ cancelled: true });
+    fanoutResolved(fx.req, { cancelled: true, undelivered: true, reason });
+    return true;
   }
+  return false;
+}
+
+/** Resolve pending task interactions with cancellation so subprocess waiters
+ * unblock on Stop/delete. Snapshot ids before broadcasting any removal. */
+export function cancelPendingForTask(taskId: string, reason: string): void {
+  for (const req of listPendingForTask(taskId)) cancelPendingInteraction(req.id, reason);
 }
 
 export function listPendingForTask(taskId: string): AnyRequest[] {

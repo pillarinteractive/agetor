@@ -19,8 +19,10 @@ import { ensureInstalledForCwd } from "./hook-installer.ts";
 import {
   activeTmuxPromptsForTask,
   answerTmuxPrompt,
+  cancelPendingInteraction,
   cancelPendingForTask,
   findTmuxPromptByFingerprint,
+  listPendingForTask,
   registerScrapedAskQuestions,
   registerTmuxPrompt,
   resolveScrapedAskQuestions,
@@ -6870,6 +6872,42 @@ export const DEATH_MISS_THRESHOLD = 4;
  *  Exported and shared with codex-tmux (see `DEATH_MISS_THRESHOLD`). */
 export const DEATH_JSONL_QUIET_MS = 3_000;
 
+/** Capture request identities before probing. A replaced session, a changed
+ * run, or a newly registered question must never inherit an older death. */
+function observeSessionInteractions(taskId: string, requestId?: string) {
+  return {
+    taskId,
+    state: sessions.get(taskId),
+    runId: tasks.get(taskId)?.runId ?? null,
+    requests: listPendingForTask(taskId).filter((r) => r.kind !== "fx_permission" && (!requestId || r.id === requestId)),
+  };
+}
+type SessionInteractionObservation = ReturnType<typeof observeSessionInteractions>;
+function observationIsCurrent(observed: SessionInteractionObservation): boolean {
+  return sessions.get(observed.taskId) === observed.state && (tasks.get(observed.taskId)?.runId ?? null) === observed.runId;
+}
+function cancelDeadSessionQuestions(observed: SessionInteractionObservation): void {
+  if (!observationIsCurrent(observed)) return;
+  let cancelled = 0;
+  for (const req of observed.requests) {
+    if (!observationIsCurrent(observed)) break;
+    if (cancelPendingInteraction(req.id, "tmux session confirmed gone; answer undelivered")) cancelled++;
+  }
+  if (cancelled && tasks.get(observed.taskId)) recordActivity(observed.taskId, {
+    kind: "auto", text: `Cancelled ${cancelled} obsolete session question(s); session confirmed gone, answer undelivered`, tone: "info",
+  });
+}
+
+/** Delivery routes distinguish confirmed absence from a transient tmux
+ * failure. Only the request observed before the probe is cancelled. */
+export async function probeInteractionSession(taskId: string, requestId: string): Promise<SessionLiveness> {
+  const observed = observeSessionInteractions(taskId, requestId);
+  const liveness = await sessionLiveness(observed.state?.sessionName ?? sessionNameFor(taskId));
+  if (!observationIsCurrent(observed)) return "unreachable";
+  if (liveness === "gone") cancelDeadSessionQuestions(observed);
+  return liveness;
+}
+
 /**
  * Settle an in-flight turn (or a held task — see below) because its tmux
  * session died unexpectedly.
@@ -6887,7 +6925,8 @@ export const DEATH_JSONL_QUIET_MS = 3_000;
  * actually releases to `review` instead. That case emits a plain status
  * chunk WITHOUT the sentinel prefix — see the held branch below.
  *
- * No-ops when no turn is in flight AND the task isn't held for background
+ * After cancelling captured undeliverable questions, leaves run settlement
+ * alone when no turn is in flight AND the task isn't held for background
  * agents (`heldProbeSafe`): if the final flush already popped the slot
  * (the turn genuinely completed a beat before the session vanished) and
  * nothing is holding the card open, there's nothing to settle — an idle
@@ -6899,7 +6938,10 @@ export const DEATH_JSONL_QUIET_MS = 3_000;
  * unconditionally at the bottom, orphans any still-`running` subagent rows,
  * which is what lets the orchestrator's settle hook release the hold.
  */
-function signalSessionDeath(state: SessionState): void {
+function signalSessionDeath(state: SessionState, observed = observeSessionInteractions(state.taskId)): void {
+  if (observed.state !== state || !observationIsCurrent(observed)) return;
+  cancelDeadSessionQuestions(observed);
+  if (!observationIsCurrent(observed)) return;
   const inFlight = turnInFlight(state);
   if (!inFlight && !heldProbeSafe(state.taskId)) return;
   // The turn (if any) is being settled by a different sentinel below — an
@@ -7205,6 +7247,7 @@ function startDeathWatch(state: SessionState): void {
     resolvePid: panePidFor,
   });
   let misses = 0;
+  let watchedRunId = tasks.get(state.taskId)?.runId ?? null;
   // Guards a tick against overlapping the previous one now that the
   // authoritative probe is awaited (no timeout — an owner decision, see
   // docs/plans/fix-task-details-load-delay.md §8): without it, a stalled
@@ -7215,7 +7258,10 @@ function startDeathWatch(state: SessionState): void {
   let tickInFlight = false;
   state.deathTimer = setInterval(() => {
     if (tickInFlight) return;
-    if (!turnInFlight(state) && !heldProbeSafe(state.taskId)) { misses = 0; return; } // idle & not held — skip the poll
+    const observed = observeSessionInteractions(state.taskId);
+    if (observed.state !== state) return;
+    if (observed.runId !== watchedRunId) { misses = 0; watchedRunId = observed.runId; }
+    if (!turnInFlight(state) && !heldProbeSafe(state.taskId) && !observed.requests.length) { misses = 0; return; }
     tickInFlight = true;
     void (async () => {
       try {
@@ -7223,6 +7269,7 @@ function startDeathWatch(state: SessionState): void {
         // probe, and `gone` is the rare tick, so we skip a statSync on every
         // `alive` poll.
         const liveness = await probe.probe();
+        if (!observationIsCurrent(observed)) { misses = 0; return; }
         const outcome = deathTickOutcome({
           liveness,
           logFresh: liveness === "gone" && fileWrittenWithin(state.jsonlPath, DEATH_JSONL_QUIET_MS),
@@ -7233,8 +7280,13 @@ function startDeathWatch(state: SessionState): void {
         if (outcome === "wait") { misses++; return; }
         if (state.deathTimer) { clearInterval(state.deathTimer); state.deathTimer = null; }
         setTimeout(() => {
+          if (!observationIsCurrent(observed)) {
+            if (sessions.get(state.taskId) === state) startDeathWatch(state);
+            return;
+          }
           flushSync(state);
-          signalSessionDeath(state);
+          signalSessionDeath(state, observed);
+          if (!observationIsCurrent(observed) && sessions.get(state.taskId) === state) startDeathWatch(state);
         }, DEATH_GRACE_MS);
       } catch {
         /* never crash the watch */
@@ -9452,6 +9504,7 @@ export const __forTest = {
   /** Death-watch settlement — exposed so the death test can drive it against a
    *  synthetic session without a real tmux server. */
   signalSessionDeath,
+  observeSessionInteractions,
   /** Background-agent API-error settlement — exposed so the subagent
    *  API-error test can drive it against a synthetic session without a real
    *  tmux server or a live `attachSubagentWatcher`. */

@@ -20,6 +20,7 @@ interface Ledger {
   runStartedAt: number;
   records: Array<DecisionRecord & { id: string; recordedAt: number; revisions?: DecisionRecord[] }>;
   publication: "not-attempted" | "pending" | "published" | "uncertain" | "unavailable";
+  publicationDirty?: boolean;
   issueNumber?: number;
   issueUrl?: string;
 }
@@ -94,39 +95,49 @@ export async function recordPipelineDecision(id: string, input: unknown, deps = 
     const ledger: Ledger = existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : { capturedAt: record.capturedAt, runStartedAt: run.startedAt ?? record.capturedAt, records: [], publication: "not-attempted" };
     const key = createHash("sha256").update(record.question.toLowerCase().replace(/\s+/g, " ")).digest("hex").slice(0, 24);
     const prior = ledger.records.find((r) => r.id === key);
-    // An identical request is a read, including after an uncertain network
-    // result. Never replay a remote create or repeatedly update the issue.
+    // Record deduplication is separate from publication. A lookup that failed
+    // before any mutation can safely retry; pending/uncertain writes cannot.
     const comparable = (r: DecisionRecord) => JSON.stringify([r.question, r.recommendation, r.rationale, r.evidence, r.affectedArtifacts, r.category]);
-    if (prior && comparable(prior) === comparable(record)) return { recorded: true, deduplicated: true, path: file, issueUrl: ledger.issueUrl, publication: ledger.publication, approvalGranted: false };
-    if (prior) {
+    const deduplicated = !!prior && comparable(prior) === comparable(record);
+    const result = () => ({ recorded: true, deduplicated, path: file, issueUrl: ledger.issueUrl, publication: ledger.publication, approvalGranted: false });
+    if (prior && !deduplicated) {
       if ((prior.revisions?.length ?? 0) >= 8) return { error: "decision revision limit reached; no additional publication attempted" };
       const previous: DecisionRecord = { question: prior.question, recommendation: prior.recommendation, rationale: prior.rationale, evidence: prior.evidence, affectedArtifacts: prior.affectedArtifacts, category: prior.category, capturedAt: prior.capturedAt };
       ledger.records[ledger.records.indexOf(prior)] = { ...record, id: key, recordedAt: Date.now(), revisions: [...(prior.revisions ?? []), previous] };
-    } else {
+    } else if (!prior) {
       if (ledger.records.length >= 64) return { error: "decision ledger limit reached; no additional publication attempted" };
       ledger.records.push({ ...record, id: key, recordedAt: Date.now() });
     }
-    save(file, ledger);
-    recordActivity(id, { kind: "auto", text: `Recorded planner decision ${key} for human follow-up (${record.category}); no permission granted`, tone: "info" });
+    if (!deduplicated) {
+      ledger.publicationDirty = true;
+      save(file, ledger);
+      recordActivity(id, { kind: "auto", text: `Recorded planner decision ${key} for human follow-up (${record.category}); no permission granted`, tone: "info" });
+    }
+    if (ledger.publication !== "not-attempted" && ledger.publication !== "unavailable" && !(ledger.publication === "published" && ledger.issueNumber && ledger.publicationDirty)) return result();
     const origin = parseIssueUrl(parent.issueUrl);
-    const repo = origin?.provider === "github" && origin.host === "github.com" ? await deps.repo(parent.workdir) : null;
+    let repo;
+    try { repo = origin?.provider === "github" && origin.host === "github.com" ? await deps.repo(parent.workdir) : null; }
+    catch { return result(); } // No mutation attempted; the same record can retry.
     if (!origin || !repo || origin.owner.toLowerCase() !== repo.owner.toLowerCase() || origin.repo.toLowerCase() !== repo.name.toLowerCase()) {
       ledger.publication = "unavailable";
-    } else if (ledger.publication === "not-attempted" || (ledger.publication === "published" && ledger.issueNumber)) {
-      const update = ledger.publication === "published";
+    } else {
+      // Bind both create and update to the verified identity, rather than
+      // letting the mutation helper re-resolve a mutable worktree remote.
+      const verifiedRepo = Object.freeze({ owner: repo.owner, name: repo.name, remoteHost: repo.remoteHost });
+      const update = !!ledger.issueNumber;
       ledger.publication = "pending";
       save(file, ledger); // durable claim before any remote mutation
       const body = decisionIssueBody(id, `https://github.com/${origin.owner}/${origin.repo}/issues/${origin.number}`, ledger);
       try {
         const result = update
-          ? await deps.update({ dir: parent.workdir, number: ledger.issueNumber!, body })
-          : await deps.create({ dir: parent.workdir, title: `Human follow-up: planner decisions for #${origin.number} (${id.slice(0, 8)})`, body });
+          ? await deps.update({ dir: parent.workdir, number: ledger.issueNumber!, body }, verifiedRepo)
+          : await deps.create({ dir: parent.workdir, title: `Human follow-up: planner decisions for #${origin.number} (${id.slice(0, 8)})`, body }, verifiedRepo);
         if (result.ok) {
-          ledger.issueNumber = result.item.number; ledger.issueUrl = result.item.htmlUrl; ledger.publication = "published";
+          ledger.issueNumber = result.item.number; ledger.issueUrl = result.item.htmlUrl; ledger.publication = "published"; ledger.publicationDirty = false;
         } else ledger.publication = "uncertain";
       } catch { ledger.publication = "uncertain"; }
     }
     save(file, ledger);
-    return { recorded: true, deduplicated: false, path: file, issueUrl: ledger.issueUrl, publication: ledger.publication, approvalGranted: false };
+    return result();
   } finally { claims.delete(id); }
 }
