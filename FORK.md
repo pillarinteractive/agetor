@@ -500,6 +500,53 @@ the owner with what was tried. Nothing in the queue ever starts a different step
   them. The lease watcher's own retry still handles blocks the queue left to the owner that name a free lease, but
   no longer a step that declares `owner`. An escalation does not send a notification.
 
+## What a Claude step costs, and the launch flags that trim it (`feat/roadmap-autopilot`)
+
+Measured from Claude Code's own transcripts for one day of this board (2026-10-10: 20 cards, 69 Opus step sessions,
+2,783 model calls; weighted tokens = output×5 + cache-write×1.25 + input + cache-read×0.1):
+
+- **Every step visit is already its own session.** `launchStep` inserts a new step task per visit, so a Build
+  sent back by Review starts fresh at ~50k tokens (49 Build sessions for 20 cards; none resumed). Only a
+  usage-limit resume, a wait-queue resume, an await wake-up and a handoff reminder continue a session — the same
+  visit's. Resuming the earlier Build instead would start each fix round at ~360k.
+- **Where the tokens go**: re-reading the session on every call is 54% (cache-read), output 28% (40% of it
+  thinking), writing new context 18%. A Build visit makes 61 calls (39 when revisited) and its context grows ~5k
+  tokens a call, to 364k on average (max 642k: Opus runs in the 1M window, and auto-compaction never fired). By what
+  is being carried: the agent's own earlier output 22%, command output 19%, the starting context 15%, file reads
+  11%. No cache was ever lost to a wait (1-hour cache; the longest await was 19 min) and the 44 await wake-ups
+  cost about 1% — awaits are not a cost.
+- **The starting context** (~50–57k tokens, sent with all 2,783 calls) is ~30k of tool definitions, of which
+  about 80% belong to tools a step never calls (`Artifact` alone 47%), plus the skill list (~5k), the user's own
+  MCP connectors and the step prompt (5–10k).
+
+What changed:
+
+- **Launch flags for step sessions** (`src/bun/claude-step-launch.ts`, preference `pipeline_claude_launch`): a
+  Claude pipeline step is started with `--disallowedTools Artifact,SendFeedback,Workflow,ScheduleWakeup,ReportFindings`
+  by default — a deny-listed tool is left out of the context. Plain tasks are untouched; the flags are repeated
+  on `--resume`. Options, all per step name too:
+  `agetor config pipeline_claude_launch '{"skills":false,"strictMcp":true,"steps":{"Build":{"autocompact":300000}}}'`
+  - `disallowedTools` — bare tool names; `[]` passes none.
+  - `skills: false` → `--disable-slash-commands` (drops the skill list; ignored for a profile that names skills).
+  - `strictMcp: true` → `--strict-mcp-config` (no MCP servers at all: the user's connectors, but also a
+    project's `.mcp.json`).
+  - `autocompact: <tokens>` → `--autocompact` (100k–1M): compact the session at that size instead of letting it
+    grow in the 1M window. Off by default: replaying the day's sessions, compacting at 250–300k saves 3–11% if the
+    step needs little re-reading afterwards and nothing if it needs a lot; below ~200k it costs more than it saves.
+  - `{"enabled":false}` turns all of it off.
+  Checked with `claude -p` on 2.1.296: the default deny list takes 3.3k tokens off a 23.8k print-mode context,
+  `skills:false` 2.6k more, `strictMcp` 1.6k more. An interactive session carries more tools (`Artifact` is not in
+  print mode), so the saving there should be larger — not yet measured on a real step.
+- **"Working economically" in every step prompt** (`STEP_ECONOMY_GUIDANCE`, `src/shared/pipeline.ts`): read ranges
+  not whole large files, query big JSON/lockfiles instead of printing them, keep command output to the failing part,
+  batch lookups, don't re-read the handoff/report files already quoted. A third of all tool-result text was in
+  results over 12 KB. Project-specific advice (which files, which commands) goes in the agent profiles.
+
+Not changed: the await wake-up (60-line tail, ~1.3k tokens — nothing to gain), effort and model on the profiles
+(the owner's call: thinking is ~11% of the cost directly and about as much again carried), and hard caps on tool
+output (`BASH_MAX_OUTPUT_LENGTH`, `CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS` can be set in the harness's env; a
+capped read that the step then repeats in pieces costs more calls, so this is left to try deliberately).
+
 ## Milestone Autopilot (`feat/milestone-autopilot`, `feat/autopilot-events`, `feat/autopilot-run-last`)
 
 `src/bun/autopilot.ts` (the rocket button, `AutopilotDialog.tsx`) works a GitHub milestone to done: it keeps up to
