@@ -57,14 +57,34 @@ describe("parseWaitingOn", () => {
     expect(parseWaitingOn(Object.create({ waitingOn: "resource" }))).toBeNull();
   });
 
-  test("the handoff keeps it only when blocked", () => {
+  test("the handoff preserves declared waits and their references", () => {
     expect(normalizeHandoff({ status: "blocked", waitingOn: "resource", waitingRef: "rig" }).waitingOn).toEqual({ on: "resource", ref: "rig" });
-    expect(normalizeHandoff({ status: "done", waitingOn: "resource" }).waitingOn).toBeUndefined();
-    expect(normalizeHandoff({ status: "blocked", waitingOn: "whenever" }).waitingOn).toBeUndefined();
     const parsed = parseHandoff('<handoff>\n{"schemaVersion":1,"summary":"s","reason":"r","next":null,"status":"blocked","waitingOn":{"kind":"dependency","ref":"#41"}}\n</handoff>');
     expect(parsed.ok && parsed.handoff.waitingOn).toEqual({ on: "dependency", ref: "#41" });
     // What the database gives back normalizes to itself.
     expect(normalizeHandoff({ status: "blocked", waitingOn: { on: "dependency", ref: "#41" } }).waitingOn).toEqual({ on: "dependency", ref: "#41" });
+  });
+
+  test("a contradictory done verdict stays blocked on its declared wait", () => {
+    for (const [on, category] of [["resource", "resource"], ["dependency", "dependency"], ["owner", "owner"]] as const) {
+      const input = { status: "done", waitingOn: { on, ref: on === "dependency" ? "#41" : "rig" } };
+      const normalized = normalizeHandoff(input);
+      expect(normalized).toMatchObject({ status: "blocked", waitingOn: input.waitingOn });
+      expect(classifyBlock(normalized)).toMatchObject({ category, source: "declared" });
+      const parsed = parseHandoff(`<handoff>${JSON.stringify(input)}</handoff>`);
+      expect(parsed.ok && parsed.handoff).toEqual(normalized);
+    }
+  });
+
+  test("an unreadable wait stays blocked and cannot erase an owner question", () => {
+    for (const status of ["blocked", "done"] as const) {
+      const normalized = normalizeHandoff({ status, waitingOn: "whenever" });
+      expect(normalized).toMatchObject({ status: "blocked", waitingOn: { on: "other" } });
+      expect(classifyBlock(normalized)).toMatchObject({ category: "unknown", source: "declared" });
+      const withQuestion = normalizeHandoff({ status, waitingOn: "whenever", openQuestions: ["May I skip the rig test?"] });
+      expect(withQuestion).toMatchObject({ status: "blocked", waitingOn: { on: "other" }, openQuestions: ["May I skip the rig test?"] });
+      expect(classifyBlock(withQuestion)).toMatchObject({ category: "owner", source: "questions" });
+    }
   });
 });
 
