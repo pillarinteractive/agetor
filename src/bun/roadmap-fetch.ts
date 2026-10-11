@@ -107,8 +107,10 @@ export async function loadCanonicalQueue(project: string, issue: number): Promis
       if (a.url === coverage.url) membership = coverageIssues(r.stdout);
       else {
         const manifest = JSON.parse(r.stdout);
-        if (Array.isArray(manifest.tasks)) supplements.push(...manifest.tasks.filter((t: SupplementalTask)=>Number.isSafeInteger(t.issue)));
-        if (Array.isArray(manifest.new_tasks)) supplements.push(...manifest.new_tasks);
+        if (!manifest || typeof manifest !== 'object' || (!Array.isArray(manifest.tasks) && !Array.isArray(manifest.new_tasks))) throw new Error('invalid manifest');
+        const entries=[...(manifest.tasks??[]),...(manifest.new_tasks??[])];
+        if(entries.some(t=>!t||!Number.isSafeInteger(t.issue)||t.issue<=0))throw new Error('invalid manifest identity');
+        supplements.push(...entries);
         // The tracker links this manifest; its explicit sibling pointer is
         // interpreted at the SAME immutable commit, never a moving branch.
         const sibling = manifest.adapter_architecture_batch?.registry;
@@ -116,12 +118,16 @@ export async function loadCanonicalQueue(project: string, issue: number): Promis
           const path = a.path.slice(0,a.path.lastIndexOf('/')+1)+sibling;
           const extra = await run(['gh','api',`repos/${a.owner}/${a.repo}/contents/${path}?ref=${a.revision}`,'-H','Accept: application/vnd.github.raw+json'],project,60_000,process.env);
           if (!extra.ok) errors.push(`unreadable architecture membership at ${a.revision}`);
-          else { const d=JSON.parse(extra.stdout); supplements.push(...(d.new_tasks??[])); sources.push({url:`https://github.com/${a.owner}/${a.repo}/blob/${a.revision}/${path}`,revision:a.revision,hash:hash(extra.stdout)}); }
+          else {
+            const d=JSON.parse(extra.stdout);
+            if(!Array.isArray(d.new_tasks)||d.new_tasks.some((t:SupplementalTask)=>!t||!Number.isSafeInteger(t.issue)||t.issue<=0))throw new Error('invalid architecture manifest');
+            supplements.push(...d.new_tasks);sources.push({url:`https://github.com/${a.owner}/${a.repo}/blob/${a.revision}/${path}`,revision:a.revision,hash:hash(extra.stdout)});
+          }
         }
       }
     } catch { errors.push(`invalid queue source ${a.url}`); }
   }
-  if (!membership) return {error:errors.join('; ') || 'canonical membership unavailable; existing queue preserved'};
+  if (!membership || errors.length) return {error:errors.join('; ') || 'canonical membership unavailable; existing queue preserved'};
   const registered: SupplementalTask[] = [];
   try {
     const v=JSON.parse(preferences.get(REGISTERED_ISSUES_PREF)??'{}');

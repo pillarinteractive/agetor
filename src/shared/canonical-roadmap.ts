@@ -54,6 +54,24 @@ export function coverageIssues(csv: string): number[] {
   return ids;
 }
 
+/** An unknown or malformed disposition never means excluded. */
+export function applicableInputs(owning: ReturnType<typeof controllingInputs>, selection: QueueSelection): { inputs: number[]; hold: string | null } {
+  const inputs = [...owning.hard];
+  let hold = owning.error;
+  for (const predicate of owning.conditional) {
+    const value = selection?.predicates?.[predicate];
+    if (!selection || typeof selection.slice !== 'string' || !selection.slice.trim()
+      || !value || !['included', 'excluded'].includes(value.disposition)
+      || typeof value.authority !== 'string' || !value.authority.trim()
+      || typeof value.evidence !== 'string' || !value.evidence.trim()) {
+      hold ??= `unresolved selected-slice predicate: ${predicate}`;
+      continue;
+    }
+    if (value.disposition === 'included') inputs.push(...[...predicate.matchAll(/#(\d+)/g)].map(m => Number(m[1])));
+  }
+  return { inputs: [...new Set(inputs)], hold };
+}
+
 /** Stable supplemental priority is derived, and never presented as numeric order. */
 export function assembleQueue(input: {
   body: string; states: ReadonlyMap<number, RoadmapIssueState>; membership: number[];
@@ -67,6 +85,9 @@ export function assembleQueue(input: {
   const byIssue = new Map(baseline.steps.map(s => [s.issue, s]));
   const membership = new Set(input.membership);
   for (const n of byIssue.keys()) if (!membership.has(n)) errors.push(`historical #${n} is missing from canonical membership`);
+  const duplicates = new Set(baseline.steps.filter((s,i,all)=>all.findIndex(t=>t.issue===s.issue)!==i).map(s=>s.issue));
+  const inconsistent = errors.length > 0 || membership.size !== input.membership.length;
+  if (membership.size !== input.membership.length) errors.push('duplicate canonical membership identities');
   const overlays = new Map<number, SupplementalTask>();
   const conflicts = new Set<number>();
   for (const t of input.supplements) {
@@ -75,7 +96,7 @@ export function assembleQueue(input: {
     else overlays.set(t.issue, t);
   }
   const registered = new Map((input.registered ?? []).map(t => [t.issue, t]));
-  const steps = baseline.steps.map(s => ({ ...s, predecessors: [...s.predecessors] }));
+  const steps = baseline.steps.filter((s,i,all)=>all.findIndex(t=>t.issue===s.issue)===i).map(s => ({ ...s, predecessors: [...s.predecessors] }));
   // Supplemental placement follows its latest published historical producer,
   // then stable issue number. This never reorders the original 417 entries.
   for (const issue of [...new Set([...input.membership, ...registered.keys()])].sort((a,b) => a-b)) {
@@ -95,18 +116,14 @@ export function assembleQueue(input: {
     const state = input.states.get(s.issue);
     const owning = controllingInputs(state?.body ?? '');
     const selection = input.selections?.[String(s.issue)] ?? { slice: 'bounded input validation; no implementation or authority inferred', predicates: {} };
-    let hold = owning.error;
+    const resolved = applicableInputs(owning, selection);
+    let hold = resolved.hold;
+    if (inconsistent) hold = 'canonical membership is inconsistent with the published completion order';
+    if (duplicates.has(s.issue)) hold = 'duplicate historical issue identity; reconcile source records';
     if (!state?.body || !state.updatedAt) hold = 'current issue body/revision is unavailable';
     if (conflicts.has(s.issue)) hold = 'conflicting supplemental identity; reconcile source records';
     const conditional = owning.conditional;
-    const applicable = [...owning.hard];
-    for (const p of conditional) {
-      const disposition = selection.predicates[p];
-      if (!disposition || disposition.disposition === 'unresolved' || !disposition.authority || !disposition.evidence) {
-        hold ??= `unresolved selected-slice predicate: ${p}`; continue;
-      }
-      if (disposition.disposition === 'included') applicable.push(...[...p.matchAll(/#(\d+)/g)].map(m => Number(m[1])));
-    }
+    const applicable = resolved.inputs;
     const missing = applicable.filter(n => !allByIssue.has(n));
     if (missing.length) hold ??= `input identities absent from canonical coverage: ${missing.map(n=>'#'+n).join(', ')}`;
     s.predecessors = [...new Set(applicable)].map(n => allByIssue.get(n)?.step ?? '#'+n);

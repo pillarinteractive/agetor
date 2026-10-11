@@ -7,8 +7,8 @@
  *
  * Configured with the `step_slots` preference:
  *   {"max": 3, "heavy": {"max": 1, "steps": ["Finish", "Open PR", …]}}
- * A plain (non-pipeline) task the user starts is never held, but it does
- * count toward `max`.
+ * Plain tasks also reserve global runner capacity; heavy task titles count
+ * toward the same verification cap as named pipeline steps.
  */
 import type { Task } from "../shared/types.ts";
 import { preferences, tasks } from "./db.ts";
@@ -99,6 +99,7 @@ export function slotUse(
       }
     } else if (!t.pipelineParentId && t.column === "running" && !waiting(t.id)) {
       total++;
+      if (isHeavyStep(t.title ?? '', slots)) heavy++;
     }
   }
   return { total, heavy };

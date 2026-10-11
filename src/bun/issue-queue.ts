@@ -15,7 +15,7 @@ import {
 } from "../shared/issue-task.ts";
 import { tasks } from "./db.ts";
 import * as gitHost from "./git-host.ts";
-import { createTask, startTask } from "./orchestrator.ts";
+import { createTask, startTask, isTaskRunLive } from "./orchestrator.ts";
 import { claimIssue, releaseIssue } from './dispatch-claims.ts';
 
 export interface IssueQueueItem {
@@ -104,7 +104,7 @@ export async function createTaskFromIssue(input: {
   );
   if (existing) return { error: `"${existing.title}" is already working on this issue`, status: 409 };
 
-  const claimed = claimIssue(thread.item.htmlUrl);
+  const claimed = claimIssue(thread.item.htmlUrl,isTaskRunLive);
   if ('error' in claimed) return {error:claimed.error,status:409};
   try {
   // Reread while owning the durable canonical claim: a concurrent manual

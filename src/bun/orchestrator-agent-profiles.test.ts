@@ -1,4 +1,4 @@
-import { test, expect, beforeAll } from "bun:test";
+import { test, expect, beforeAll, afterEach } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -36,6 +36,13 @@ process.env.AGETOR_GEMINI_BIN = "/bin/echo";
 
 beforeAll(async () => {
   await import("./db.ts");
+});
+// Each case owns its fixture runners. Synthetic running receipts from an
+// earlier case must not consume the real resource cap in a later case.
+afterEach(async()=>{
+  const {tasks,preferences}=await import('./db.ts');const {deleteTask}=await import('./orchestrator.ts');
+  for(const task of tasks.list())await deleteTask(task.id);
+  preferences.set('dispatch_runner_reservations_v1','{}');
 });
 
 async function settle(ms = 200) {

@@ -21,16 +21,29 @@ function alive(pid: number): boolean { try { process.kill(pid,0);return true; } 
 function atomic<T>(fn:()=>T): T { return db.transaction(fn).immediate(); }
 
 /** Claim before awaited creation. An uncertain owner is never timed out. */
-export function claimIssue(url: string): { key: string; claim: IssueClaim } | { error: string } {
+export function claimIssue(url: string, isLive:(id:string)=>boolean=()=>false): { key: string; claim: IssueClaim } | { error: string } {
   const key=canonicalIssue(url);
   if (!key) return {error:'invalid canonical issue identity'};
   return atomic(()=>{
     const claims=read<IssueClaim>(ISSUE_PREF), previous=claims[key];
     if (previous) {
       const t=tasks.get(previous.taskId);
-      // A bound card is reconciled by the caller's normal existing-card
-      // check. A dead creator with no inserted row provably never spawned.
-      if (t || alive(previous.pid)) return {error:`issue dispatch already claimed (${previous.taskId})`};
+      if (alive(previous.pid)) return {error:`issue dispatch already claimed (${previous.taskId})`};
+      if (t) {
+        const bound=[t,...tasks.stepsForParent(t.id)];
+        const runnerClaims=read<RunnerClaim>(RUNNER_PREF);
+        const uncertain=bound.some(card=>{
+          const receipt=runnerClaims[card.id];
+          return isLive(card.id) || card.column==='running' || card.runId&&!runs.get(card.runId)
+            || receipt?.runId&&!runs.get(receipt.runId)
+            || receipt&&!receipt.runId&&alive(receipt.pid)
+            || runs.listForTask(card.id).some(r=>!['succeeded','failed','cancelled'].includes(r.status))
+            || card.worktreePath&&awaitsFor(card.worktreePath,previous.at).some(a=>!a.finished);
+        });
+        const terminal=(t.column==='done'||t.archivedAt!=null)
+          && (!t.pipelineRun||['done','cancelled','idle'].includes(t.pipelineRun.status));
+        if (!terminal||uncertain) return {error:`issue dispatch already claimed (${previous.taskId})`};
+      }
       delete claims[key];
     }
     const claim={token:randomUUID(),taskId:randomUUID(),pid:process.pid,at:Date.now()};
@@ -47,18 +60,24 @@ function measured(isLive:(id:string)=>boolean, claims:Record<string,RunnerClaim>
   const list=tasks.listLive(), slots=currentSlots();
   const without=list.map(t=>t.pipelineRun ? {...t,pipelineRun:{...t.pipelineRun,active:t.pipelineRun.active.filter(a=>a.taskId!==exclude)}} : t).filter(t=>t.id!==exclude);
   const use=slotUse(isLive,slots,without);
-  const represented=new Set<string>();
+  const represented=new Set<string>(), heavyRepresented=new Set<string>();
   for(const t of without) {
     if(t.pipelineRun) for(const a of t.pipelineRun.active) {
       const child=tasks.get(a.taskId), settled=t.pipelineRun.history.find(h=>h.taskId===a.taskId&&h.seq===a.seq)?.outcome!=null;
-      if((isLive(a.taskId)||(!settled&&!t.pipelineRun.blocked.some(b=>b.taskId===a.taskId))) && !(child?.pendingInteractionCount??0) && !isQuotaPaused(a.taskId)) represented.add(a.taskId);
+      if((isLive(a.taskId)||(!settled&&!t.pipelineRun.blocked.some(b=>b.taskId===a.taskId))) && !(child?.pendingInteractionCount??0) && !isQuotaPaused(a.taskId)) {
+        represented.add(a.taskId);
+        const name=t.pipelineRun.snapshot?.graph.steps.find(s=>s.id===a.stepId)?.name??'';
+        if(isHeavyStep(name,slots))heavyRepresented.add(a.taskId);
+      }
     }
-    else if(!t.pipelineParentId&&t.column==='running'&&!t.pendingInteractionCount&&!isQuotaPaused(t.id)) represented.add(t.id);
+    else if(!t.pipelineParentId&&t.column==='running'&&!t.pendingInteractionCount&&!isQuotaPaused(t.id)) {
+      represented.add(t.id);if(isHeavyStep(t.title??'',slots))heavyRepresented.add(t.id);
+    }
   }
   for(const [id,c] of Object.entries(claims)) {
     if(id===exclude) continue;
     const t=tasks.get(id), r=c.runId ? runs.get(c.runId) : t?.runId ? runs.get(t.runId) : null;
-    if(c.runId&&!r) {if(!represented.has(id)){use.total++;if(isHeavyStep(c.name,slots))use.heavy++;}continue;}
+    if(c.runId&&!r) {if(!represented.has(id))use.total++;if(!heavyRepresented.has(id)&&isHeavyStep(c.name,slots))use.heavy++;continue;}
     const detached=!!t?.worktreePath && awaitsFor(t.worktreePath,c.at).some(a=>!a.finished);
     if(!isLive(id)&&!detached&&r&&['succeeded','failed','cancelled'].includes(r.status)) {delete claims[id];continue;}
     if(!r&&!t&&!alive(c.pid)) {delete claims[id];continue;}
@@ -66,7 +85,8 @@ function measured(isLive:(id:string)=>boolean, claims:Record<string,RunnerClaim>
     // pre-inserted ready row survives. Running/orphaned rows remain held.
     if(!r&&!isLive(id)&&!alive(c.pid)) {delete claims[id];continue;}
     if(t?.pendingInteractionCount||isQuotaPaused(id)) continue;
-    if(!represented.has(id)) {use.total++;if(isHeavyStep(c.name,slots))use.heavy++;}
+    if(!represented.has(id))use.total++;
+    if(!heavyRepresented.has(id)&&isHeavyStep(c.name,slots))use.heavy++;
   }
   return use;
 }

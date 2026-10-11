@@ -1,4 +1,4 @@
-import { test, expect, describe } from "bun:test";
+import { test, expect, describe, afterEach } from "bun:test";
 import { mkdtempSync, writeFileSync, chmodSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -19,10 +19,13 @@ process.env.AGETOR_CLAUDE_DRIVER = "fake";
 process.env.AGETOR_CLAUDE_BIN = "/bin/echo";
 process.env.AGETOR_TMUX_BIN = "/bin/echo"; // has-session / send-keys probes all exit 0
 process.env.AGETOR_CLAUDE_ARGS = "";
-// Dedicated port for the one test in this file that starts a real HTTP
-// server (nav end-to-end) — distinct from every other server*.test.ts file's
-// port so a full `bun test` run never fights over a bind.
-process.env.AGETOR_API_PORT = "4427";
+// Ephemeral ports let parallel independent review tests bind safely.
+process.env.AGETOR_API_PORT = "0";
+afterEach(async()=>{
+  const {tasks,preferences}=await import('./db.ts');const {deleteTask}=await import('./orchestrator.ts');
+  for(const task of tasks.list())await deleteTask(task.id);
+  preferences.set('dispatch_runner_reservations_v1','{}');
+});
 
 /** Poll `check` until it returns true or `timeoutMs` elapses. Used instead of
  *  fixed sleeps for every async settle in this file (paste-withhold chains,
@@ -415,7 +418,7 @@ describe("nav end-to-end via POST /tmux-prompts/:id/answer", () => {
       const claudeTmux = await import("./claude-tmux.ts");
       const { registerTmuxPrompt } = await import("./interactions.ts");
 
-      const server = startApiServer() as unknown as { stop: () => void };
+      const server = startApiServer() as unknown as { stop: () => void; port: number };
       const taskId = randomUUID();
       claudeTmux.__forTest.installSession(taskId, freshJsonl());
 
@@ -433,7 +436,7 @@ describe("nav end-to-end via POST /tmux-prompts/:id/answer", () => {
           fingerprint: "fp-nav-e2e-horizontal",
         });
 
-        const res = await fetch(`http://127.0.0.1:4427/tmux-prompts/${req.id}/answer`, {
+        const res = await fetch(`http://127.0.0.1:${server.port}/tmux-prompts/${req.id}/answer`, {
           method: "POST",
           headers: { authorization: `Bearer ${API_TOKEN}`, "content-type": "application/json" },
           body: JSON.stringify({ key: "3" }),
@@ -459,7 +462,7 @@ describe("nav end-to-end via POST /tmux-prompts/:id/answer", () => {
       const claudeTmux = await import("./claude-tmux.ts");
       const { registerTmuxPrompt } = await import("./interactions.ts");
 
-      const server = startApiServer() as unknown as { stop: () => void };
+      const server = startApiServer() as unknown as { stop: () => void; port: number };
       const taskId = randomUUID();
       claudeTmux.__forTest.installSession(taskId, freshJsonl());
 
@@ -475,7 +478,7 @@ describe("nav end-to-end via POST /tmux-prompts/:id/answer", () => {
           fingerprint: "fp-nav-e2e-vertical",
         });
 
-        const res = await fetch(`http://127.0.0.1:4427/tmux-prompts/${req.id}/answer`, {
+        const res = await fetch(`http://127.0.0.1:${server.port}/tmux-prompts/${req.id}/answer`, {
           method: "POST",
           headers: { authorization: `Bearer ${API_TOKEN}`, "content-type": "application/json" },
           body: JSON.stringify({ key: "3" }),
@@ -1432,9 +1435,9 @@ test("POST /ask-questions/:id/answer: a custom free-text answer while a blocking
     fingerprint: "fp-ask-answer-withheld",
   });
 
-  const server = startApiServer() as unknown as { stop: () => void };
+  const server = startApiServer() as unknown as { stop: () => void; port: number };
   try {
-    const httpRes = await fetch(`http://127.0.0.1:4427/ask-questions/${askReq.id}/answer`, {
+    const httpRes = await fetch(`http://127.0.0.1:${server.port}/ask-questions/${askReq.id}/answer`, {
       method: "POST",
       headers: { authorization: `Bearer ${API_TOKEN}`, "content-type": "application/json" },
       body: JSON.stringify({ answers: [{ selected: [], custom: "my own answer" }] }),

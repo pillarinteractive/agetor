@@ -68,3 +68,24 @@ test('declined producer unlocks nothing and current input cycles hold all involv
  const st=states([1,2,3,4],[2]);st.get(1)!.stateReason='NOT_PLANNED';st.get(2)!.body=contract([1]);expect(roadmapStatus(small(st).parsed,st).find(s=>s.issue===2)!.status).toBe('waiting');
  st.get(1)!.state='OPEN';st.get(1)!.body=contract([2]);const q=small(st);expect(q.parsed.held['1']).toContain('cycle');expect(q.parsed.held['2']).toContain('cycle');
 });
+
+test('unsupported, empty or malformed conditional dispositions retain their hold',()=>{
+ const st=states([1,2,3,4],[1,2]),predicate='#1 only if annual_profile selected';st.get(2)!.body=contract([], [predicate]);
+ for(const disposition of ['exclude','unresolved',null,42]) {
+  const selections={'2':{slice:'annual undecided',predicates:{[predicate]:{disposition,authority:'operator',evidence:'recorded'}}}} as unknown as Record<string,QueueSelection>;
+  expect(roadmapStatus(small(st,selections).parsed,st).find(s=>s.issue===2)!.status).toBe('held');
+ }
+ for(const selection of [{slice:' ',predicates:{}},{slice:'selected',predicates:null}]) {
+  expect(small(st,{'2':selection} as unknown as Record<string,QueueSelection>).records.find(r=>r.issue===2)!.hold).toContain('unresolved');
+ }
+});
+test('inconsistent membership cannot publish ready identities; duplicate baseline is one held identity',()=>{
+ const st=states([1,2,3,4],[1,2,3,4]);
+ const mismatched=assembleQueue({body:table,states:st,membership:[2,3,4],supplements:[],sources:[],version:'v',hash});
+ expect(pickRoadmap(roadmapStatus(mismatched.parsed,st),{busy:new Set(),free:8}).start).toHaveLength(0);
+ expect(mismatched.errors[0]).toContain('missing');
+ const duplicated=assembleQueue({body:table.replace('#2 Waiting','#1 Conflicting'),states:st,membership:[1,3,4],supplements:[],sources:[],version:'v',hash});
+ expect(duplicated.records.filter(r=>r.issue===1)).toHaveLength(1);
+ expect(duplicated.records.find(r=>r.issue===1)!.hold).toContain('duplicate');
+ expect(roadmapStatus(duplicated.parsed,st).find(s=>s.issue===1)!.status).toBe('held');
+});

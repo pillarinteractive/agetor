@@ -509,7 +509,12 @@ const sanitizeBlock = (raw: unknown): PipelineBlock | null => {
   const stepId = typeof rec.stepId === "string" ? rec.stepId : null;
   const message = typeof rec.message === "string" ? rec.message : "";
   const pending = sanitizeBlockPending(rec.pending);
-  return { taskId, stepId, kind: kind as PipelineBlockKind, message, ...(pending ? { pending } : {}) };
+  const retry = isPlainObject(rec.inputRetry) ? rec.inputRetry as Record<string,unknown> : null;
+  const inputRetry = kind === 'step-blocked' && taskId === null && pending && retry
+    && typeof retry.at === 'number' && Number.isFinite(retry.at) && retry.at >= 0
+    && typeof retry.attempt === 'number' && Number.isSafeInteger(retry.attempt) && retry.attempt >= 1 && retry.attempt <= 32
+    ? { at: retry.at, attempt: retry.attempt } : null;
+  return { taskId, stepId, kind: kind as PipelineBlockKind, message, ...(pending ? { pending } : {}), ...(inputRetry ? { inputRetry } : {}) };
 };
 
 const STEP_RECORD_OUTCOMES = new Set<string>(["succeeded", "failed", "cancelled", "advanced-manually"]);

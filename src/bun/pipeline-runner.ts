@@ -910,12 +910,13 @@ const slotWaitSince = new Map<string, number>();
 /** Launch queued steps while slots are free, longest-waiting first. Each
  *  launch re-checks the slots itself (a heavy step may still have to wait
  *  while a light one behind it goes). Exported for tests. */
-export async function releaseSlotWaits(): Promise<number> {
+export async function releaseSlotWaits(now = Date.now()): Promise<number> {
   const waiting: { parentId: string; stepId: string; since: number }[] = [];
   for (const t of tasks.listLive()) {
-    if (t.archivedAt != null || !t.pipelineRun) continue;
+    if (t.archivedAt != null || !t.pipelineRun || ['cancelled','done','idle'].includes(t.pipelineRun.status)) continue;
     for (const b of t.pipelineRun.blocked) {
-      if (b.kind !== "slot-wait" || !b.stepId) continue;
+      const inputDue = b.kind === 'step-blocked' && b.taskId === null && b.pending && b.inputRetry && b.inputRetry.at <= now;
+      if ((b.kind !== "slot-wait" && !inputDue) || !b.stepId) continue;
       const key = `${t.id}:${b.stepId}`;
       if (!slotWaitSince.has(key)) slotWaitSince.set(key, Date.now());
       waiting.push({ parentId: t.id, stepId: b.stepId, since: slotWaitSince.get(key)! });
@@ -931,15 +932,16 @@ export async function releaseSlotWaits(): Promise<number> {
     const ok = await runExclusive(w.parentId, async () => {
       const parent = tasks.get(w.parentId);
       const run = parent?.pipelineRun;
-      if (!parent || !run || parent.archivedAt != null) return false;
-      const block = run.blocked.find((b) => b.kind === "slot-wait" && b.stepId === w.stepId);
+      if (!parent || !run || parent.archivedAt != null || ['cancelled','done','idle'].includes(run.status)) return false;
+      const block = run.blocked.find((b) => b.stepId === w.stepId && (b.kind === "slot-wait"
+        || b.kind === 'step-blocked' && b.taskId === null && b.inputRetry && b.inputRetry.at <= now));
       const step = run.snapshot?.graph.steps.find((s) => s.id === w.stepId);
       if (!block?.pending || !step) return false;
       // Still over a limit for this step (e.g. the verification slot)? Leave it queued.
       if (!urgent && !slotDecision(step.name, slotUse(isTaskRunLive, slots), slots).ok) return false;
       run.blocked = run.blocked.filter((b) => b !== block);
       const previous = block.pending.arrivals.map((a) => ({ stepId: a.fromStepId, seq: a.seq, handoff: a.handoff }));
-      const r = await launchTarget(parent, run, step, previous);
+      const r = await launchTarget(parent, run, step, previous, { inputRetryAttempt: block.inputRetry?.attempt });
       persist(w.parentId, run);
       return r.ok;
     }).catch(() => false);
@@ -1618,7 +1620,7 @@ async function launchStep(
   run: PipelineRunState,
   step: PipelineStep,
   previous: { stepId: string; seq: number; handoff: Handoff | null }[],
-  opts?: { batchSiblingStepIds?: string[]; skipWorktreeRefresh?: boolean; ignoreSlots?: boolean },
+  opts?: { batchSiblingStepIds?: string[]; skipWorktreeRefresh?: boolean; ignoreSlots?: boolean; inputRetryAttempt?: number },
 ): Promise<LaunchResult> {
   const snapshot = run.snapshot;
   if (!snapshot) {
@@ -1709,9 +1711,14 @@ async function launchStep(
   }
   slotWaitSince.delete(`${parent.id}:${step.id}`);
 
+  const statusBeforeInputs=tasks.get(parent.id)?.pipelineRun?.status;
   const inputReconciliation=await reconcileCardInputs(parent.id);
+  const afterInputs=tasks.get(parent.id);
+  if(!afterInputs||afterInputs.archivedAt!=null||afterInputs.pipelineRun?.status==='cancelled'&&statusBeforeInputs!=='cancelled'||tombstonedPipelineParents.has(parent.id))return {ok:false};
   if(inputReconciliation.hold) {
-    upsertBlocked(run,{taskId:null,stepId:step.id,kind:'step-blocked',message:inputReconciliation.hold,pending:{stepId:step.id,arrivals:pendingArrivals}});
+    const attempt=Math.min(32,(opts?.inputRetryAttempt??0)+1);
+    const delay=Math.min(300_000,30_000*2**Math.min(4,attempt-1));
+    upsertBlocked(run,{taskId:null,stepId:step.id,kind:'step-blocked',message:inputReconciliation.hold,pending:{stepId:step.id,arrivals:pendingArrivals},inputRetry:{at:Date.now()+delay,attempt}});
     persist(parent.id,run);return {ok:false};
   }
 
@@ -1946,7 +1953,7 @@ async function launchTarget(
   run: PipelineRunState,
   step: PipelineStep,
   previous: { stepId: string; seq: number; handoff: Handoff | null }[],
-  opts?: { batchSiblingStepIds?: string[]; skipWorktreeRefresh?: boolean },
+  opts?: { batchSiblingStepIds?: string[]; skipWorktreeRefresh?: boolean; inputRetryAttempt?: number },
 ): Promise<LaunchResult> {
   const activeIdsBefore = new Set(run.active.map((a) => a.taskId));
   const stepCountBefore = run.stepCount;

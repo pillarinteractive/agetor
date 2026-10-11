@@ -1,12 +1,15 @@
 import {test,expect,beforeEach,afterEach} from 'bun:test';
-import {preferences} from './db.ts';
+import {preferences,tasks,runs} from './db.ts';
+import {randomUUID} from 'node:crypto';
+import type {Task,Run} from '../shared/types.ts';
 import {claimIssue,releaseIssue,reserveRunner,releaseUnspawnedRunner,runnerUse,bindRunner} from './dispatch-claims.ts';
 import {beginQueueCycle,completeQueueCycle,QUEUE_WAKE_PREF} from './queue-cycle.ts';
 
 const keys=['step_slots','dispatch_issue_claims_v1','dispatch_runner_reservations_v1',QUEUE_WAKE_PREF];
 let original:Record<string,string|null>={};
+let created:string[]=[];
 beforeEach(()=>{original=Object.fromEntries(keys.map(k=>[k,preferences.get(k)]));for(const k of keys)preferences.set(k,'{}');preferences.set('step_slots',JSON.stringify({max:8,heavy:{max:2,steps:['Finish']}}));});
-afterEach(()=>{for(const k of keys)preferences.set(k,original[k]??'{}');});
+afterEach(()=>{for(const id of created)tasks.delete(id);created=[];for(const k of keys)preferences.set(k,original[k]??'{}');});
 test('concurrent canonical issue claims reserve before any awaited insert; host/repo remain separate',async()=>{
  const claims=await Promise.all(Array.from({length:20},()=>Promise.resolve(claimIssue('https://github.com/O/R/issues/12/?q=1'))));expect(claims.filter(c=>!('error'in c))).toHaveLength(1);
  expect('error'in claimIssue('https://github.com/o/other/issues/12')).toBe(false);
@@ -31,4 +34,30 @@ test('fresh cycles serialize, complete and back off without accumulating context
  const first=beginQueueCycle('/synthetic',639)!;expect(beginQueueCycle('/synthetic',639)).toBeNull();expect(completeQueueCycle(first,'full')).toBe(300000);
  for(let i=0;i<100;i++){const token=beginQueueCycle('/synthetic',639)!;expect(completeQueueCycle(token,'empty')).toBeLessThanOrEqual(300000);}
  const state=JSON.parse(preferences.get(QUEUE_WAKE_PREF)!);expect(state.recent).toHaveLength(25);expect(state.cursor).toBe(101);expect(state.token).toBeUndefined();expect(JSON.stringify(state).length).toBeLessThan(2500);
+});
+
+function card(column:Task['column'],title='Finish') {
+ const id=randomUUID(),now=Date.now();created.push(id);
+ return tasks.insert({id,title,prompt:'synthetic',column,agent:'claude-code',model:'sonnet-5.5',effort:null,mode:'auto',workdir:'/synthetic',worktreePath:null,branch:null,branchSource:'created',baseRef:null,isolation:'none',runId:null,createdAt:now,updatedAt:now,archivedAt:null,taskType:'task',prUrl:null,fast:false,maxMode:false,references:[],backlog:[],draft:null,plans:[],agentProfileId:null,agentProfile:null,pipelineId:null,pipelineRun:null,pipelineParentId:null,pipelineStepId:null});
+}
+function receipt(id:string,status:Run['status']) {
+ const runId=randomUUID();runs.insert({id:runId,taskId:id,agent:'claude-code',status,startedAt:Date.now(),endedAt:status==='running'?null:Date.now(),exitCode:status==='running'?null:0,tmuxSession:null,claudeSessionId:null,codexSessionId:null,cursorSessionId:null,geminiSessionId:null,fxSessionId:null});tasks.update(id,{runId});return runId;
+}
+test('two represented standalone Finish runners consume both heavy slots without double counting',()=>{
+ const ids=[card('running').id,card('running').id];
+ const claims=Object.fromEntries(ids.map(id=>[id,{taskId:id,runId:receipt(id,'running'),pid:process.pid,at:Date.now(),name:'Finish'}]));
+ preferences.set('dispatch_runner_reservations_v1',JSON.stringify(claims));
+ expect(runnerUse(id=>ids.includes(id))).toEqual({total:2,heavy:2});
+ expect('error'in reserveRunner('third-heavy','Finish',id=>ids.includes(id))).toBe(true);
+ expect(reserveRunner('ordinary','Build',id=>ids.includes(id))).toEqual({ok:true});
+ // Legacy running rows with no claim are still represented heavy workers.
+ preferences.set('dispatch_runner_reservations_v1','{}');expect(runnerUse(id=>ids.includes(id))).toEqual({total:2,heavy:2});
+});
+test('dead issue creator with provably terminal Done card recovers after restart; active or uncertain receipt does not',()=>{
+ const t=card('done');const seed=()=>preferences.set('dispatch_issue_claims_v1',JSON.stringify({'github.com/o/r/issues/12':{taskId:t.id,token:'crashed',pid:2147483647,at:1}}));
+ seed();expect('error'in claimIssue('https://github.com/o/r/issues/12')).toBe(false);
+ seed();expect('error'in claimIssue('https://github.com/o/r/issues/12',id=>id===t.id)).toBe(true);
+ const runId=receipt(t.id,'orphaned');seed();expect('error'in claimIssue('https://github.com/o/r/issues/12')).toBe(true);
+ runs.update(runId,{status:'succeeded'});seed();expect('error'in claimIssue('https://github.com/o/r/issues/12')).toBe(false);
+ tasks.update(t.id,{runId:'missing-receipt'});seed();expect('error'in claimIssue('https://github.com/o/r/issues/12')).toBe(true);
 });

@@ -674,6 +674,9 @@ export interface PipelineBlock {
    *  value as `pending.stepId` here); `arrivals` is the join state (if any)
    *  it would launch with. */
   pending?: { stepId: string; arrivals: PipelineJoinArrival[] };
+  /** Pure input-evidence recheck for a pending launch. No worker or human
+   * question is created while the dependency remains unavailable. */
+  inputRetry?: { at: number; attempt: number };
 }
 
 /**

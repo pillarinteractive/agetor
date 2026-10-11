@@ -1142,6 +1142,19 @@ async function raceSpawnBudget<T>(
  * bounded.
  */
 const startingTaskIds = new Set<string>();
+
+/** Every fresh turn, including an idle REPL paste, reserves before its
+ * first await. Folding input into an already active turn needs no new slot. */
+function reserveTaskRunner(task: Task): { ok: true } | { error: string } {
+  const parent=task.pipelineParentId?tasks.get(task.pipelineParentId):null;
+  const name=parent?.pipelineRun?.snapshot?.graph.steps.find(s=>s.id===task.pipelineStepId)?.name ?? task.title;
+  return reserveRunner(task.id,name,id=>id===task.id
+    ? !!task.runId&&active.has(task.runId)||isTaskHeldByBackgroundAgents(task)
+    : isTaskRunLive(id));
+}
+function insertReservedRun(row: Parameters<typeof runs.insert>[0]): void {
+  db.transaction(()=>{runs.insert(row);bindRunner(row.taskId,row.id);}).immediate();
+}
 /**
  * Runs the user asked to Stop while their spawn was still in flight (the
  * bounded-spawn pending window, CLAUDE.md item 16): the run row exists and
@@ -1383,11 +1396,7 @@ async function startTaskInner(
     return startPipelineRun(task,{validate:opts?.validate});
   }
 
-  const parent=task.pipelineParentId?tasks.get(task.pipelineParentId):null;
-  const stepName=parent?.pipelineRun?.snapshot?.graph.steps.find(s=>s.id===task.pipelineStepId)?.name ?? task.title;
-  const reservation=reserveRunner(taskId,stepName,id=>id===taskId
-    ? !!task.runId&&active.has(task.runId)||isTaskHeldByBackgroundAgents(task)
-    : isTaskRunLive(id));
+  const reservation=reserveTaskRunner(task);
   if('error' in reservation)return reservation;
 
   // Freeze-at-first-run (docs/plans/agent-profiles.md D2): resolve the
@@ -1609,7 +1618,7 @@ async function startTaskInner(
       worktreePath: prepared.worktreePath,
       runId,
     });
-    runs.insert({
+    insertReservedRun({
       id: runId,
       taskId,
       agent: task.agent,
@@ -2609,6 +2618,7 @@ export async function reconcileTaskSession(taskId: string, before: Task, after: 
     cursorTurnQueue.delete(taskId);
     geminiTurnQueue.delete(taskId);
     fxTurnQueue.delete(taskId);
+    clearRunnerQueueRecheck(taskId);
     // Same reasoning for a pending fx auto-resume schedule: it belongs to
     // the old fx session, and the new agent (fx or otherwise) has nothing to
     // resume (plan §3 T2 item 8). Harmless no-op when there was none.
@@ -3419,6 +3429,7 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
   }
   if (kind === "cursor") {
     const result = await sendCursorTurn(row.task_id, line);
+    if(result&&typeof result==='object')return {delivered:false,reason:result.declined};
     return result
       ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
       : {
@@ -3428,6 +3439,7 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
   }
   if (kind === "gemini") {
     const result = await sendGeminiTurn(row.task_id, line);
+    if(result&&typeof result==='object')return {delivered:false,reason:result.declined};
     return result
       ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
       : {
@@ -3437,6 +3449,7 @@ export async function sendInput(runId: string, line: string): Promise<SendInputR
   }
   if (kind === "fx") {
     const result = await sendFxTurn(row.task_id, line);
+    if(result&&typeof result==='object')return {delivered:false,reason:result.declined};
     return result
       ? { delivered: true, runId: result, ...(unresolvedRefs.length ? { unresolvedRefs } : {}) }
       : {
@@ -3481,6 +3494,23 @@ interface QueuedCodexLine {
  */
 interface CodexTurnDecline {
   declined: string;
+  capacity?: true;
+}
+
+function runnerDecline(error: string): CodexTurnDecline {
+  return {declined:error,...(/waiting for (?:a |a verification )?slot|retains a detached command/.test(error)?{capacity:true as const}:{})};
+}
+
+// Existing per-harness FIFOs retain queued messages while the runner cap
+// is full. Coalesce one cheap retry per task; no run or LLM turn is minted.
+const runnerQueueTimers=new Map<string,ReturnType<typeof setTimeout>>();
+function clearRunnerQueueRecheck(taskId:string):void {
+  const timer=runnerQueueTimers.get(taskId);if(timer)clearTimeout(timer);runnerQueueTimers.delete(taskId);
+}
+function recheckRunnerQueue(taskId:string,drain:(id:string)=>Promise<void>):void {
+  if(runnerQueueTimers.has(taskId))return;
+  const timer=setTimeout(()=>{runnerQueueTimers.delete(taskId);void drain(taskId).catch(()=>undefined);},30_000);
+  timer.unref?.();runnerQueueTimers.set(taskId,timer);
 }
 
 /**
@@ -3607,6 +3637,7 @@ async function spawnCodexTurnNow(task: Task, taskId: string, line: string): Prom
   if (startingTaskIds.has(taskId)) return null;
   startingTaskIds.add(taskId);
   try {
+    const reservation=reserveTaskRunner(task);if('error'in reservation)return runnerDecline(reservation.error);
     const priorThreadId = findLastCodexSessionId(taskId);
     const cwd = task.worktreePath ?? task.workdir;
     const harness = resolveHarness(task.agent);
@@ -3622,7 +3653,7 @@ async function spawnCodexTurnNow(task: Task, taskId: string, line: string): Prom
 
     const newRunId = randomUUID();
     const now = Date.now();
-    runs.insert({
+    insertReservedRun({
       id: newRunId,
       taskId,
       agent: task.agent,
@@ -3704,6 +3735,7 @@ async function spawnCodexTurnNow(task: Task, taskId: string, line: string): Prom
     attachDoneHandler(newRunId, taskId, agent);
     return newRunId;
   } finally {
+    releaseUnspawnedRunner(taskId);
     startingTaskIds.delete(taskId);
   }
 }
@@ -3731,6 +3763,10 @@ async function drainCodexQueue(taskId: string): Promise<void> {
   if (q.length === 0) codexTurnQueue.delete(taskId);
   if (next === undefined) return;
   const result = await spawnCodexTurnNow(task, taskId, next.expanded);
+  if(result===null||typeof result==='object'&&result.capacity) {
+    codexTurnQueue.set(taskId,[next,...(codexTurnQueue.get(taskId)??[])]);
+    recheckRunnerQueue(taskId,drainCodexQueue);return;
+  }
   if (result === null || typeof result !== "object") return;
   // Pre-flight 1b refused the queued follow-up (the task's model needs a
   // newer codex CLI — e.g. the model was changed to a GPT-6 row while the
@@ -3785,7 +3821,7 @@ const cursorTurnQueue = new Map<string, string[]>();
  * because `startingTaskIds` was already claimed for this task (see that
  * set's doc, near `startTask`).
  */
-async function sendCursorTurn(taskId: string, line: string): Promise<string | null> {
+async function sendCursorTurn(taskId: string, line: string): Promise<string | CodexTurnDecline | null> {
   const task = tasks.get(taskId);
   if (!task) return null;
   if (task.runId && active.has(task.runId)) {
@@ -3808,7 +3844,7 @@ async function sendCursorTurn(taskId: string, line: string): Promise<string | nu
  * `cursor-agent --resume <session_id>`. New run row, new tmux session (the
  * previous turn's exited), same `session_id` carried forward.
  */
-async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Promise<string | null> {
+async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Promise<string | CodexTurnDecline | null> {
   // Claim the unified "starting" slot before touching the DB — see
   // `startingTaskIds`'s doc (near `startTask`) and the matching comment in
   // `spawnCodexTurnNow` for the double-mint race this closes. `null` is
@@ -3816,13 +3852,14 @@ async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Pro
   if (startingTaskIds.has(taskId)) return null;
   startingTaskIds.add(taskId);
   try {
+    const reservation=reserveTaskRunner(task);if('error'in reservation)return runnerDecline(reservation.error);
     const priorSessionId = findLastCursorSessionId(taskId);
     const cwd = task.worktreePath ?? task.workdir;
     const harness = resolveHarness(task.agent);
 
     const newRunId = randomUUID();
     const now = Date.now();
-    runs.insert({
+    insertReservedRun({
       id: newRunId,
       taskId,
       agent: task.agent,
@@ -3906,6 +3943,7 @@ async function spawnCursorTurnNow(task: Task, taskId: string, line: string): Pro
     attachDoneHandler(newRunId, taskId, agent);
     return newRunId;
   } finally {
+    releaseUnspawnedRunner(taskId);
     startingTaskIds.delete(taskId);
   }
 }
@@ -3931,7 +3969,12 @@ async function drainCursorQueue(taskId: string): Promise<void> {
   if (task.runId && active.has(task.runId)) return;
   const next = q.shift();
   if (q.length === 0) cursorTurnQueue.delete(taskId);
-  if (next !== undefined) await spawnCursorTurnNow(task, taskId, next);
+  if (next !== undefined) {
+    const result=await spawnCursorTurnNow(task,taskId,next);
+    if(result===null||typeof result==='object'&&result.capacity) {
+      cursorTurnQueue.set(taskId,[next,...(cursorTurnQueue.get(taskId)??[])]);recheckRunnerQueue(taskId,drainCursorQueue);
+    }else if(typeof result==='object')restashPasteWithheldText(taskId,next);
+  }
 }
 
 /** Most-recent cursor session id across the task's runs (for `--resume`). */
@@ -3963,7 +4006,7 @@ const geminiTurnQueue = new Map<string, string[]>();
  * because `startingTaskIds` was already claimed for this task (see that
  * set's doc, near `startTask`).
  */
-async function sendGeminiTurn(taskId: string, line: string): Promise<string | null> {
+async function sendGeminiTurn(taskId: string, line: string): Promise<string | CodexTurnDecline | null> {
   const task = tasks.get(taskId);
   if (!task) return null;
   if (task.runId && active.has(task.runId)) {
@@ -3989,7 +4032,7 @@ async function sendGeminiTurn(taskId: string, line: string): Promise<string | nu
  * session id is already known synchronously, so it's stamped on the new run
  * row directly rather than via an `onSessionId` re-stamp.
  */
-async function spawnGeminiTurnNow(task: Task, taskId: string, line: string): Promise<string | null> {
+async function spawnGeminiTurnNow(task: Task, taskId: string, line: string): Promise<string | CodexTurnDecline | null> {
   // Claim the unified "starting" slot before touching the DB — see
   // `startingTaskIds`'s doc (near `startTask`) and the matching comment in
   // `spawnCodexTurnNow` for the double-mint race this closes. `null` is
@@ -3997,13 +4040,14 @@ async function spawnGeminiTurnNow(task: Task, taskId: string, line: string): Pro
   if (startingTaskIds.has(taskId)) return null;
   startingTaskIds.add(taskId);
   try {
+    const reservation=reserveTaskRunner(task);if('error'in reservation)return runnerDecline(reservation.error);
     const priorSessionId = findLastGeminiSessionId(taskId);
     const cwd = task.worktreePath ?? task.workdir;
     const harness = resolveHarness(task.agent);
 
     const newRunId = randomUUID();
     const now = Date.now();
-    runs.insert({
+    insertReservedRun({
       id: newRunId,
       taskId,
       agent: task.agent,
@@ -4085,6 +4129,7 @@ async function spawnGeminiTurnNow(task: Task, taskId: string, line: string): Pro
     attachDoneHandler(newRunId, taskId, agent);
     return newRunId;
   } finally {
+    releaseUnspawnedRunner(taskId);
     startingTaskIds.delete(taskId);
   }
 }
@@ -4109,7 +4154,12 @@ async function drainGeminiQueue(taskId: string): Promise<void> {
   if (task.runId && active.has(task.runId)) return;
   const next = q.shift();
   if (q.length === 0) geminiTurnQueue.delete(taskId);
-  if (next !== undefined) await spawnGeminiTurnNow(task, taskId, next);
+  if (next !== undefined) {
+    const result=await spawnGeminiTurnNow(task,taskId,next);
+    if(result===null||typeof result==='object'&&result.capacity) {
+      geminiTurnQueue.set(taskId,[next,...(geminiTurnQueue.get(taskId)??[])]);recheckRunnerQueue(taskId,drainGeminiQueue);
+    }else if(typeof result==='object')restashPasteWithheldText(taskId,next);
+  }
 }
 
 /** Most-recent gemini session id across the task's runs (for `--resume`). */
@@ -4244,7 +4294,7 @@ function appendFxStatusLine(taskId: string, runId: string, data: string): void {
  * `startingTaskIds` was already claimed for this task (see that set's doc,
  * near `startTask`).
  */
-async function sendFxTurn(taskId: string, line: string): Promise<string | null> {
+async function sendFxTurn(taskId: string, line: string): Promise<string | CodexTurnDecline | null> {
   const task = tasks.get(taskId);
   if (!task) return null;
   // A follow-up message is an implicit cancel of any pending auto-resume
@@ -4275,6 +4325,7 @@ async function sendFxTurn(taskId: string, line: string): Promise<string | null> 
   // keeps returning the bare run id string, mapping `null` (already
   // starting) through unchanged.
   const result = await spawnFxRun(task, taskId, { line });
+  if(result&&!result.runId&&!result.spawned)return runnerDecline(result.error??'runner capacity unavailable');
   return result ? result.runId : null;
 }
 
@@ -4337,13 +4388,15 @@ async function spawnFxRun(
   if (startingTaskIds.has(taskId)) return null;
   startingTaskIds.add(taskId);
   try {
+    const reservation=reserveTaskRunner(task);
+    if('error'in reservation)return {runId:'',spawned:false,error:reservation.error};
     const priorSessionId = findLastFxSessionId(taskId);
     const cwd = task.worktreePath ?? task.workdir;
     const harness = resolveHarness(task.agent);
 
     const newRunId = randomUUID();
     const now = Date.now();
-    runs.insert({
+    insertReservedRun({
       id: newRunId,
       taskId,
       agent: task.agent,
@@ -4458,6 +4511,7 @@ async function spawnFxRun(
     attachDoneHandler(newRunId, taskId, agent);
     return { runId: newRunId, spawned: true };
   } finally {
+    releaseUnspawnedRunner(taskId);
     startingTaskIds.delete(taskId);
   }
 }
@@ -4482,7 +4536,12 @@ async function drainFxQueue(taskId: string): Promise<void> {
   if (task.runId && active.has(task.runId)) return;
   const next = q.shift();
   if (q.length === 0) fxTurnQueue.delete(taskId);
-  if (next !== undefined) await spawnFxRun(task, taskId, { line: next });
+  if (next !== undefined) {
+    const result=await spawnFxRun(task,taskId,{line:next});
+    if(result===null||!result.runId&&!result.spawned&&runnerDecline(result.error??'').capacity) {
+      fxTurnQueue.set(taskId,[next,...(fxTurnQueue.get(taskId)??[])]);recheckRunnerQueue(taskId,drainFxQueue);
+    }else if(!result.spawned&&!result.runId)restashPasteWithheldText(taskId,next);
+  }
 }
 
 /** Most-recent fx session id across the task's runs (for resume). */
@@ -4915,7 +4974,7 @@ export async function resumeFxRecovery(
     if (!result.spawned) {
       return {
         ok: false,
-        status: 500,
+        status: result.runId ? 500 : 409,
         error: result.error ?? "fx could not be started — see the run's status line",
       };
     }
@@ -5124,7 +5183,9 @@ async function sendClaudeTurn(taskId: string, line: string, rawLine?: string): P
   // detached continuation's own `finally` on the slow path, or synchronously
   // before returning on every path that never reaches that continuation
   // (missing harness, a synchronous throw during its own setup).
-  const { runId, pending } = await spawnResumedSession(task, taskId, line);
+  const result = await spawnResumedSession(task, taskId, line);
+  if('declined'in result)return {runId:task.runId??'',delivered:false,withheld:false,reason:result.declined};
+  const { runId, pending } = result;
   return { runId, delivered: true, ...(pending ? { pending: true as const } : {}) };
 }
 
@@ -5195,6 +5256,8 @@ async function sendTurnInExistingSession(
   }
   startingTaskIds.add(taskId);
   try {
+    const reservation=reserveTaskRunner(task);
+    if('error'in reservation)return {runId:task.runId??'',delivered:false,withheld:false,reason:reservation.error};
     // One run row per user turn — the runs list mirrors the conversation
     // history at turn granularity. The race that used to make a fast claude
     // reply land the new row as "succeeded" before the UI ever observed the
@@ -5204,7 +5267,7 @@ async function sendTurnInExistingSession(
     const newRunId = randomUUID();
     const now = Date.now();
     const inheritedSessionId = findLastClaudeSessionId(taskId);
-    runs.insert({
+    insertReservedRun({
       id: newRunId,
       taskId,
       agent: task.agent,
@@ -5244,6 +5307,7 @@ async function sendTurnInExistingSession(
     attachDoneHandler(newRunId, taskId, agent);
     return resolveClaudeTurnOutcome(newRunId, agent.pasteOutcome);
   } finally {
+    releaseUnspawnedRunner(taskId);
     startingTaskIds.delete(taskId);
   }
 }
@@ -5429,7 +5493,7 @@ function startContinuationRun(taskId: string): ContinuationHooks | null {
   const newRunId = randomUUID();
   const now = Date.now();
   const inheritedSessionId = findLastClaudeSessionId(taskId);
-  runs.insert({
+  insertReservedRun({
     id: newRunId,
     taskId,
     agent: task.agent,
@@ -5501,9 +5565,11 @@ async function spawnResumedSession(
   task: Task,
   taskId: string,
   line: string,
-): Promise<{ runId: string; pending?: true }> {
+): Promise<{ runId: string; pending?: true } | CodexTurnDecline> {
   try {
-    return await spawnResumedSessionInner(task, taskId, line);
+    const result=await spawnResumedSessionInner(task, taskId, line);
+    if('declined'in result)startingTaskIds.delete(taskId);
+    return result;
   } catch (err) {
     // A synchronous throw anywhere before the continuation was created
     // (below) means no continuation exists to release the claim in its own
@@ -5516,6 +5582,8 @@ async function spawnResumedSession(
     // for — no double-delete risk.
     startingTaskIds.delete(taskId);
     throw err;
+  } finally {
+    releaseUnspawnedRunner(taskId);
   }
 }
 
@@ -5523,13 +5591,14 @@ async function spawnResumedSessionInner(
   task: Task,
   taskId: string,
   line: string,
-): Promise<{ runId: string; pending?: true }> {
+): Promise<{ runId: string; pending?: true } | CodexTurnDecline> {
+  const reservation=reserveTaskRunner(task);if('error'in reservation)return runnerDecline(reservation.error);
   const priorSessionId = findLastClaudeSessionId(taskId);
   const cwd = task.worktreePath ?? task.workdir;
 
   const newRunId = randomUUID();
   const now = Date.now();
-  runs.insert({
+  insertReservedRun({
     id: newRunId,
     taskId,
     agent: task.agent,
@@ -5773,7 +5842,7 @@ export async function createTask(
   if(identity&&!internal.reservedTaskId) {
     const existing=tasks.list().find(t=>!t.pipelineParentId&&t.archivedAt==null&&canonicalIssue(t.issueUrl)===identity);
     if(existing)return {error:`issue is already owned by card ${existing.id}`};
-    const claimed=claimIssue(input.issueUrl!);if('error'in claimed)return claimed;
+    const claimed=claimIssue(input.issueUrl!,isTaskRunLive);if('error'in claimed)return claimed;
     try{return await createTaskInner(input,{...internal,reservedTaskId:claimed.claim.taskId});}
     finally{releaseIssue(claimed.key,claimed.claim.token);}
   }
@@ -6373,6 +6442,7 @@ export async function archiveTask(
   cursorTurnQueue.delete(taskId);
   geminiTurnQueue.delete(taskId);
   fxTurnQueue.delete(taskId);
+  clearRunnerQueueRecheck(taskId);
   // Same for a pending fx auto-resume schedule — an archived task has
   // nothing left to resume (plan §3 T2 item 8).
   clearFxRecovery(taskId);
@@ -6510,6 +6580,7 @@ export async function deleteTask(taskId: string, opts?: { fromPipeline?: boolean
   cursorTurnQueue.delete(taskId);
   geminiTurnQueue.delete(taskId);
   fxTurnQueue.delete(taskId);
+  clearRunnerQueueRecheck(taskId);
   // Same for a pending fx auto-resume schedule, before the task row itself
   // goes (plan §3 T2 item 8).
   clearFxRecovery(taskId);
@@ -7050,4 +7121,4 @@ export async function worktreeGitStatus(id: string): Promise<WorktreeGitStatus |
 function pendingFxAutoResume(taskId: string): boolean {
   return fxAutoResumeTimers.has(taskId);
 }
-export const __testing = { spawnFxRun, pendingFxAutoResume, noteFxRunSettled };
+export const __testing = { spawnFxRun, pendingFxAutoResume, noteFxRunSettled, drainCodexQueue, drainCursorQueue, drainGeminiQueue, drainFxQueue, pendingRunnerRecheck:(id:string)=>runnerQueueTimers.has(id) };
