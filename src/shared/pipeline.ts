@@ -19,6 +19,7 @@ import type {
   StepResponseKind,
 } from "./types.ts";
 import { PIPELINE_LIMITS } from "./types.ts";
+import { parseWaitingOn } from "./block-wait.ts";
 
 /** The XML-ish tag a step's agent is asked to wrap its final handoff JSON
  *  in — `<handoff>{...}</handoff>`. Single source of truth for both the
@@ -725,6 +726,10 @@ export function normalizeHandoff(input: unknown): Handoff {
     openQuestions: capArray(toStringArray(parsed.openQuestions)),
   };
   if (parsed.status === "done" || parsed.status === "blocked") handoff.status = parsed.status;
+  // What a blocked step says it waits on (src/shared/block-wait.ts). Read
+  // only from a blocked handoff: on a finished one it means nothing.
+  const waitingOn = handoff.status === "blocked" ? parseWaitingOn(parsed) : null;
+  if (waitingOn) handoff.waitingOn = waitingOn;
   fitHandoffToBudget(handoff);
   return handoff;
 }
@@ -1086,7 +1091,14 @@ function blockedRuleText(outgoing: { name: string; label: string }[], transition
   const base =
     'Use "status":"blocked" when this step\'s own work is NOT finished and you cannot finish it now (out of usage, a ' +
     'missing input, a decision only the user can make): say what remains in "reason". The run then stays on this ' +
-    "step — it is resumed here later, or a person steps in — and nothing is handed to a next step.";
+    "step — it is resumed here later, or a person steps in — and nothing is handed to a next step. " +
+    'On a blocked handoff also add "waitingOn", saying what you wait on: "owner" (a decision, an answer, a ' +
+    'credential, a permission — anything only a person can do), "resource" (a shared resource is busy: a lease, a ' +
+    'slot), "dependency" (another issue or PR has to land first, or CI has to run), "environment" (a failure outside ' +
+    'your work that should pass on a retry: network, a registry, a crashed tool), "usage_limit", or "other"; and ' +
+    '"waitingRef" when it has a name (the lease\'s label, "#123"). For anything but "owner" this step is resumed by ' +
+    'itself when that clears, a limited number of times. Put in "openQuestions" only questions the user must ' +
+    "answer: a blocked handoff with open questions waits for the user and is not retried.";
   const hasChoice = transition === "choose" && (outgoing.length > 1 || (canFinish && outgoing.length > 0));
   return hasChoice
     ? `${base} The one exception: if another step is the right one to fix the problem you hit (for example a ` +
@@ -1519,6 +1531,45 @@ export function composeLimitResumeNote(input: {
       "remains, finish the step's work — everything your step instructions require, including any verification and " +
       "commit they ask for — and only then hand off.",
     "End your final message with a NEW handoff block that describes the finished step, in exactly this format:",
+    ...renderHandoffContract(input.outgoing, input.transition, input.canFinish === true),
+  ];
+  return parts.join("\n\n");
+}
+
+/**
+ * The message a step parked in the wait queue is resumed with
+ * (src/shared/block-wait.ts): it handed off `blocked` for a reason that may
+ * have cleared by itself, so it is asked — in its own session, same
+ * worktree — to check, and either finish or say what it still waits on.
+ * `cleared` is what the queue saw change ("the lab is free"), when it saw
+ * anything. The step's own reason is quoted back to it as data.
+ */
+export function composeBlockedResumeNote(input: {
+  stepName: string;
+  reason: string;
+  cleared?: string | null;
+  attempt: number;
+  max: number;
+  outgoing: { name: string; label: string }[];
+  transition: "choose" | "all";
+  canFinish?: boolean;
+}): string {
+  const last = input.attempt >= input.max;
+  const parts: string[] = [
+    `You handed off step "${input.stepName}" as blocked, so it was NOT handed to the next step and that handoff is ` +
+      `void. Your stated reason was: ${JSON.stringify(input.reason.slice(0, 600))}`,
+    input.cleared
+      ? `Since then: ${input.cleared}. Check whether your block still holds.`
+      : "Some time has passed. Check whether that still holds — try again whatever was failing or unavailable.",
+    "If it has cleared, continue this step where you left off, in this same worktree, and finish it: everything " +
+      "your step instructions require, including any verification and commit they ask for.",
+    'If it has not, hand off "blocked" again and say exactly what you are waiting for in "reason" and "waitingOn". ' +
+      'If what you need is the user, say so ("waitingOn":"owner") and put your question in "openQuestions". ' +
+      "Do not work around the block, do not decide for the user, and do not weaken a check to get past it. " +
+      (last
+        ? "This was the last automatic retry: if you are still blocked, the user takes over from your handoff, so make it complete."
+        : `This is automatic retry ${input.attempt} of ${input.max}.`),
+    "End your final message with a NEW handoff block, in exactly this format:",
     ...renderHandoffContract(input.outgoing, input.transition, input.canFinish === true),
   ];
   return parts.join("\n\n");

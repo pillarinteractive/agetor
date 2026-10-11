@@ -546,6 +546,73 @@ export interface Handoff {
    *  signals the step could not complete even though it produced a
    *  (possibly partial) handoff. */
   status?: "done" | "blocked";
+  /** On a `blocked` handoff: what the step says it is waiting on, so the
+   *  runner can tell a block that clears by itself from one that needs the
+   *  owner (src/shared/block-wait.ts). Parsed leniently; absent when the
+   *  step didn't say or wrote something unrecognisable. Never routes the
+   *  run: it only decides between waiting-and-retrying this same step and
+   *  leaving it for the owner, and `owner` always wins. */
+  waitingOn?: HandoffWait;
+}
+
+/** What a blocked step says it waits on. */
+export type HandoffWaitingOn = "owner" | "usage_limit" | "resource" | "dependency" | "environment" | "other";
+export interface HandoffWait {
+  on: HandoffWaitingOn;
+  /** What exactly: a lease label ("lab"), an issue or PR ("#123"), a time. */
+  ref?: string;
+}
+
+/** Why a blocked step sits in the wait queue instead of under Needs you:
+ *  resource    — a shared resource is busy (a watched lease, a slot);
+ *  dependency  — another issue/PR, the base branch's CI, a CI queue;
+ *  environment — a transient failure outside the work (network, registry);
+ *  limit       — the step says it ran out of usage, with no notice from the
+ *                harness to time the retry by;
+ *  unknown     — nothing recognised: a few spaced retries, then the owner. */
+export type BlockWaitCategory = "resource" | "dependency" | "environment" | "limit" | "unknown";
+
+/**
+ * A blocked step parked in the wait queue (`PipelineRunState.wait`, see
+ * `src/shared/block-wait.ts` and `releaseBlockWaits` in
+ * `src/bun/pipeline-runner.ts`): the step handed off `blocked` for a reason
+ * that clears without a person, so it is resumed — the SAME step, in its own
+ * session — when what it waits on changes, or on a backoff, a bounded number
+ * of times; then it is escalated to the owner with what was tried.
+ */
+export interface PipelineBlockWait {
+  stepId: string;
+  /** The blocked execution's step task. */
+  taskId: string;
+  category: BlockWaitCategory;
+  /** How the category was decided: the step's own `waitingOn`, a watcher's
+   *  signal (lease, PR), a pattern in its stated reason, or nothing. */
+  source: "declared" | "signal" | "text" | "none";
+  /** What it waits on, as shown: "the lab", "#123", "GitHub". */
+  what: string;
+  /** A lease label, "#123", "base-ci", "ci" — what the queue watches. */
+  ref: string | null;
+  /** The step's own stated reason, one line. */
+  reason: string;
+  /** waiting  — parked; the queue resumes it.
+   *  resuming — the queue resumed it; its turn is running.
+   *  escalated — out of attempts or time: the owner's now. */
+  state: "waiting" | "resuming" | "escalated";
+  /** When this execution first blocked into the queue. */
+  since: number;
+  /** Automatic resumes made so far. */
+  attempt: number;
+  /** Resumes allowed in this category. */
+  max: number;
+  /** The next timed retry (or re-check), while waiting. */
+  at: number | null;
+  /** Escalate at this time whatever else happened. */
+  deadline: number;
+  /** Each automatic resume: when, and what set it off. */
+  tried: { at: number; trigger: string }[];
+  escalatedAt?: number;
+  /** Why it was given up. */
+  escalation?: string;
 }
 
 /** Lifecycle state of a {@link PipelineRunState}, mirrored by the parent
@@ -732,6 +799,9 @@ export interface PipelineRunState {
    *  `attempt` counts this step's retries of this kind. See
    *  `scheduleAutoRetry` in src/bun/pipeline-runner.ts. */
   autoRetry?: PipelineAutoRetry;
+  /** A step that handed off `blocked` for a reason that clears by itself,
+   *  parked in the wait queue. At most one per run. */
+  wait?: PipelineBlockWait;
 }
 
 /** One step execution with its full final report — a row of `GET

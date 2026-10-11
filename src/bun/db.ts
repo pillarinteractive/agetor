@@ -734,6 +734,42 @@ export const parsePipelineRunState = (raw: string | null): PipelineRunState | nu
       ? Math.min(rec.capExtensions as number, PIPELINE_LIMITS.capExtensionsMax)
       : undefined,
     autoRetry: sanitizeAutoRetry(rec.autoRetry),
+    wait: sanitizeBlockWait(rec.wait),
+  };
+};
+
+const BLOCK_WAIT_CATEGORIES = new Set(["resource", "dependency", "environment", "limit", "unknown"]);
+/** The wait-queue entry (src/shared/block-wait.ts). An unreadable one is
+ *  dropped: the run then reads as plainly blocked, for the owner. */
+const sanitizeBlockWait = (raw: unknown): PipelineRunState["wait"] => {
+  if (!isPlainObject(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.stepId !== "string" || typeof r.taskId !== "string" || typeof r.category !== "string" || !BLOCK_WAIT_CATEGORIES.has(r.category)) return undefined;
+  if (r.state !== "waiting" && r.state !== "resuming" && r.state !== "escalated") return undefined;
+  const count = (x: unknown) => (Number.isSafeInteger(x) && (x as number) >= 0 ? Math.min(x as number, 50) : 0);
+  const since = isFiniteNumber(r.since) ? r.since : Date.now();
+  return {
+    stepId: r.stepId,
+    taskId: r.taskId,
+    category: r.category as NonNullable<PipelineRunState["wait"]>["category"],
+    source: r.source === "declared" || r.source === "signal" || r.source === "text" ? r.source : "none",
+    what: typeof r.what === "string" ? r.what.slice(0, 200) : "",
+    ref: typeof r.ref === "string" ? r.ref.slice(0, 200) : null,
+    reason: typeof r.reason === "string" ? r.reason.slice(0, 500) : "",
+    state: r.state,
+    since,
+    attempt: count(r.attempt),
+    max: count(r.max),
+    at: isFiniteNumber(r.at) ? r.at : null,
+    deadline: isFiniteNumber(r.deadline) ? r.deadline : since + 24 * 3_600_000,
+    tried: Array.isArray(r.tried)
+      ? r.tried
+          .filter((t): t is { at: number; trigger: string } => isPlainObject(t) && isFiniteNumber((t as Record<string, unknown>).at) && typeof (t as Record<string, unknown>).trigger === "string")
+          .slice(-12)
+          .map((t) => ({ at: t.at, trigger: t.trigger.slice(0, 200) }))
+      : [],
+    ...(isFiniteNumber(r.escalatedAt) ? { escalatedAt: r.escalatedAt } : {}),
+    ...(typeof r.escalation === "string" ? { escalation: r.escalation.slice(0, 300) } : {}),
   };
 };
 
