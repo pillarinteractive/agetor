@@ -1125,6 +1125,22 @@ test("cmdPipeline retry: resolves the task and calls retryPipeline", async () =>
   expect(outputs[0]).toContain("retrying pipeline");
 });
 
+test("cmdPipeline refresh-instructions supplies inspected revisions and never starts or retries a task", async () => {
+  const run = pipelineRun();
+  const t = task({ pipelineRun: run });
+  const template = makePipeline({ updatedAt: 123 });
+  const calls: unknown[] = [];
+  currentClient = makeClient({ listTasks: async () => [t], getPipeline: async () => template,
+    refreshPipelineInstructions: async (id, body) => {
+      calls.push({ id, body });
+      return { task: t, stepIds: [] };
+    },
+  });
+  await cmdPipeline(["refresh-instructions", "parent-1"], flags);
+  expect(calls).toEqual([{ id: "parent-1", body: { expectedCapturedAt: run.snapshot!.capturedAt, expectedTemplateUpdatedAt: 123 } }]);
+  expect(outputs).toEqual(["Instructions already match the template."]);
+});
+
 test("cmdPipeline retry --json: prints the raw task", async () => {
   const updated = task({ column: "running" });
   currentClient = makeClient({ listTasks: async () => [task()], retryPipeline: async () => updated });

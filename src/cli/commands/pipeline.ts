@@ -190,6 +190,23 @@ export async function cmdPipeline(args: string[], flags: Flags): Promise<void> {
       return;
     }
 
+    case "refresh-instructions": {
+      const ref = args[1];
+      if (!ref || args.length !== 2 || ref.startsWith("-")) throw usageError("pipeline refresh-instructions");
+      const task = await resolvePipelineTask(client, ref);
+      const snapshot = task.pipelineRun?.snapshot;
+      if (!snapshot) throw new Error("pipeline has no run snapshot — nothing to refresh");
+      const template = await client.getPipeline(task.pipelineId!);
+      const result = await client.refreshPipelineInstructions(task.id, {
+        expectedCapturedAt: snapshot.capturedAt, expectedTemplateUpdatedAt: template.updatedAt,
+      });
+      if (flags.json) return printJson(result);
+      out(result.stepIds.length > 0
+        ? `${c.green("✓")} refreshed instructions for ${result.stepIds.map((id) => stepNameById(snapshot.graph, id)).join(", ")} — holds preserved; no agent started`
+        : "Instructions already match the template.");
+      return;
+    }
+
     case "restart": {
       const ref = args[1];
       if (!ref) throw usageError("pipeline restart");
@@ -239,7 +256,7 @@ export async function cmdPipeline(args: string[], flags: Flags): Promise<void> {
       throw new Error(
         "unknown pipeline subcommand: " +
           sub +
-          " (use ls | show | rm | export | import | retry | advance | restart | status | handoff)",
+          " (use ls | show | rm | export | import | retry | advance | refresh-instructions | restart | status | handoff)",
       );
   }
 }

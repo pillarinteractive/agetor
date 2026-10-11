@@ -201,14 +201,14 @@ export const USAGE: Record<string, string> = {
   Update a profile. --skill appends to the existing skill list unless
   --clear-skills is also given (then the list is replaced).`,
 
-  pipeline: `usage: agetor pipeline <ls | show <ref> | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> [--name <n>] | retry <task> [--from <task>] | advance <task> [--next <step>… | --finish] [--from <task>] | restart <task> | status <task> [--handoffs] | handoff <task> [<step>|--all]>
+  pipeline: `usage: agetor pipeline <ls | show <ref> | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> [--name <n>] | retry <task> [--from <task>] | advance <task> [--next <step>… | --finish] [--from <task>] | refresh-instructions <task> | restart <task> | status <task> [--handoffs] | handoff <task> [<step>|--all]>
 
   Manage pipelines — named graphs of agent-profile-bound steps launched as
   one board task (built in the app's Pipelines editor; the CLI moves them
   around) — and control a pipeline TASK's run.
     ls / show / rm / export / import   take a pipeline <ref> (id, or its
                                         unique case-insensitive name)
-    retry / advance / restart / status / handoff
+    retry / advance / refresh-instructions / restart / status / handoff
                                         take a pipeline TASK <ref> (id or
                                         short-id prefix, like every other
                                         task-targeting command; a hidden
@@ -251,6 +251,13 @@ export const USAGE: Record<string, string> = {
   with no next step. Exactly one of --next / --finish is required. --from targets a
   specific blocked/awaiting execution when more than one is in play (e.g. a
   fan-out); omitted, the sole such execution is used.`,
+
+  "pipeline refresh-instructions": `usage: agetor pipeline refresh-instructions <task-id>
+
+  Apply the current template's step instructions to a blocked or cancelled
+  run without restarting it. Requires unchanged topology and agent assignments,
+  no live execution, pending interaction or automatic recovery. Keeps history,
+  findings, permissions, holds and resource caps; starts no agents.`,
 
   "pipeline restart": `usage: agetor pipeline restart <task-id>
 

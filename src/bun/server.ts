@@ -30,7 +30,7 @@ import {
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
 import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, publishGlobalEvent, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
-import { advancePipeline, cancelPipelineRun, isPipelineStepTask, listBlockWaits, pipelineStepReports, releaseSlotWaits, retryPipelineStep, startPipelineRun } from "./pipeline-runner.ts";
+import { advancePipeline, cancelPipelineRun, isPipelineStepTask, listBlockWaits, pipelineStepReports, refreshPipelineInstructions, releaseSlotWaits, retryPipelineStep, startPipelineRun } from "./pipeline-runner.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
 import { accountUsageDays } from "./account-usage.ts";
@@ -5042,6 +5042,21 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           return "error" in result
             ? json({ error: result.error }, { status: result.status, headers: corsHeaders(req) })
             : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
+        }),
+      },
+
+      "/tasks/:id/pipeline/refresh-instructions": {
+        POST: authed(async (req) => {
+          const body = await req.json().catch(() => null);
+          if (!body || typeof body !== "object" || Array.isArray(body) ||
+              !Number.isSafeInteger(body.expectedCapturedAt) || body.expectedCapturedAt < 0 ||
+              !Number.isSafeInteger(body.expectedTemplateUpdatedAt) || body.expectedTemplateUpdatedAt < 0) {
+            return json({ error: "expectedCapturedAt and expectedTemplateUpdatedAt must be non-negative integer revisions" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await refreshPipelineInstructions(req.params.id, body);
+          return "error" in result
+            ? json({ error: result.error }, { status: result.status, headers: corsHeaders(req) })
+            : json(result, { headers: corsHeaders(req) });
         }),
       },
 

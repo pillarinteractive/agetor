@@ -92,6 +92,23 @@ The command runs in `project` and must print `{"held": false}` or `{"held": true
 (`plab lease --json` does, from Pillar's `feature/plab-worktrees-lease-json`). The holder's card gets a lock badge,
 Blocked cards in that project show who holds it or that it's free, and dropping a blocked pipeline on Running retries it.
 
+## Updating instructions on a stopped run
+
+An edited template does not silently change an existing run. Use
+`agetor pipeline refresh-instructions <parent-id>` to apply its instruction edits
+to a blocked or cancelled run before Retry or Advance. This never starts an agent
+or clears a verdict, permission/dependency hold or resource cap. Topology, agent
+assignments, delegation and frozen profiles must remain compatible. A live step,
+pending interaction or scheduled recovery refuses the update. The command checks
+the run/template revisions and saves the instruction diff under the run's data
+directory. The existing step's generated prompt is updated for Retry too.
+
+Manual Advance now retains the sender's handoff and full report by default.
+Choosing Build does not make a blocked review an approval: Build receives the
+original findings and reproduction/test evidence. Explicit handoff fields still
+replace those fields. Automatic routing never overrides a declared wait, an
+owner question or a permission denial.
+
 ## Follow-ups on finished pipelines (`feat/pipeline-followups`)
 
 A finished run's view has a **Next** box: run a preset or a custom request (any agent) as one more step of the same run,

@@ -298,6 +298,7 @@ test("a step with a real choice still routes a blocked handoff — unless the tu
   // Review may send the work back or on. Blocked + "changes requested" is a
   // decision about who fixes it: Build runs again.
   process.env.AGETOR_FAKE_CLAUDE_BLOCKED_NEXT = "changes requested";
+  process.env.AGETOR_FAKE_CLAUDE_BLOCKED_REASON = "A correctness defect remains; Build should fix the failing scenario.";
   try {
     const routed = await startBuildReview("Review", "blocked-then-Finish");
     await waitFor(() => (tasks.get(routed.parentId)?.pipelineRun?.history.length ?? 0) >= 3);
@@ -315,6 +316,7 @@ test("a step with a real choice still routes a blocked handoff — unless the tu
     expect(activity(limited.parentId).some((l) => l.startsWith("Review stopped at its usage limit before finishing — resuming it at ") && l.endsWith("instead of handing unfinished work to Build"))).toBe(true);
   } finally {
     delete process.env.AGETOR_FAKE_CLAUDE_BLOCKED_NEXT;
+    delete process.env.AGETOR_FAKE_CLAUDE_BLOCKED_REASON;
   }
 });
 

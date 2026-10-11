@@ -1541,7 +1541,7 @@ function makeFakeAgent(
           status: "blocked" as const,
           ...(suffix === "blocked" && process.env.AGETOR_FAKE_CLAUDE_BLOCKED_WAITING ? (JSON.parse(process.env.AGETOR_FAKE_CLAUDE_BLOCKED_WAITING) as Record<string, unknown>) : {}),
         };
-        onChunk("assistant", `Stopping.\n<${HANDOFF_TAG}>\n${JSON.stringify(handoff)}\n</${HANDOFF_TAG}>`);
+        onChunk("assistant", `${process.env.AGETOR_FAKE_CLAUDE_HANDOFF_BODY ?? "Stopping."}\n<${HANDOFF_TAG}>\n${JSON.stringify(handoff)}\n</${HANDOFF_TAG}>`);
         if (suffix === "quota-blocked") onChunk("status", process.env.AGETOR_FAKE_CLAUDE_QUOTA_NOTICE ?? "Usage limit reached · continuing automatically at 11:30pm · esc to cancel");
         // A row on stderr beside a plain block — where codex's own error
         // messages land (a usage limit among them).

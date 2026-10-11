@@ -440,6 +440,11 @@ export class AgetorClient {
   getPipelineReports(taskId: string, seq?: number): Promise<{ reports: PipelineStepReport[] }> {
     return this.req("GET", `/tasks/${encodeURIComponent(taskId)}/pipeline/reports${seq == null ? "" : `?seq=${seq}`}`);
   }
+  /** `POST /tasks/:id/pipeline/refresh-instructions` — adopt compatible
+   *  template instruction edits without starting agents or clearing holds. */
+  refreshPipelineInstructions(taskId: string, body: { expectedCapturedAt: number; expectedTemplateUpdatedAt: number }): Promise<{ task: Task; stepIds: string[] }> {
+    return this.req("POST", `/tasks/${encodeURIComponent(taskId)}/pipeline/refresh-instructions`, body);
+  }
   /** `POST /tasks/:id/pipeline/retry` — retry the current blocked/cancelled
    *  step execution(s). 409 unless the pipeline run is actually blocked or
    *  cancelled. `targetTaskId` narrows the retry to one specific active

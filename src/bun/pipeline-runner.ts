@@ -57,7 +57,7 @@ import {
 } from "../shared/block-wait.ts";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { agentProfiles, backlog, dataDir, harnesses, pipelines, preferences, runs, tasks } from "./db.ts";
+import { agentProfiles, backlog, dataDir, db, harnesses, pipelines, preferences, runs, tasks } from "./db.ts";
 import {
   appendRunStatusLine,
   archiveTask,
@@ -98,6 +98,7 @@ import {
   stepNameById,
   stepReportFromMessages,
   validatePipelineGraph,
+  updatedPipelineInstructions,
 } from "../shared/pipeline.ts";
 import { promptByteOverage } from "../shared/prompt-limits.ts";
 import { appendReferences } from "../shared/refs.ts";
@@ -1323,16 +1324,18 @@ export function executionAssistantText(taskId: string, runId: string, since: num
  * {@link stepReportFromMessages} makes of it. This is what the next step is
  * given in full and what `agetor pipeline handoff` prints — the handoff JSON
  * kept on the run's history is only the block at its end. Null when no run
- * of the step holds a handoff (it failed, was advanced by hand, or its
+ * of the step holds a handoff (it failed without a report, or its
  * events are gone). Exported for tests.
  */
 export function stepFinalReport(
   taskId: string,
   since: number | null,
+  turnStartedAt: number | null = null,
 ): { body: string; final: string; handoff: Handoff; messages: string[] } | null {
+  const from = Math.max(since == null ? 0 : since - 1_000, turnStartedAt ?? 0);
   const candidates = runs
     .listForTask(taskId)
-    .filter((r) => since == null || r.startedAt >= since - 1_000)
+    .filter((r) => r.startedAt >= from)
     .sort((a, b) => b.startedAt - a.startedAt);
   for (const r of candidates) {
     const messages = mainStreamEventsForRun(r.id).filter((e) => e.stream === "assistant").map((e) => e.data);
@@ -1355,7 +1358,7 @@ export function pipelineStepReports(parentId: string, seq?: number): PipelineSte
     .filter((h) => seq == null || h.seq === seq)
     .sort((a, b) => a.seq - b.seq)
     .map((h) => {
-      const report = stepFinalReport(h.taskId, h.startedAt);
+      const report = stepFinalReport(h.taskId, h.startedAt, h.turnStartedAt ?? null);
       return {
         seq: h.seq,
         stepId: h.stepId,
@@ -1698,9 +1701,10 @@ async function launchStep(
       }
       let report: { body: string; filePath: string | null } | null = null;
       const sender = p.handoff && reportSeqs.has(p.seq)
-        ? run.history.find((h) => h.seq === p.seq && h.stepId === p.stepId && h.outcome === "succeeded")
+        ? run.history.find((h) => h.seq === p.seq && h.stepId === p.stepId &&
+          (h.outcome === "succeeded" || h.outcome === "advanced-manually"))
         : undefined;
-      const full = sender ? stepFinalReport(sender.taskId, sender.startedAt) : null;
+      const full = sender ? stepFinalReport(sender.taskId, sender.startedAt, sender.turnStartedAt ?? null) : null;
       if (full && full.body.trim().length > 0) {
         // Keyed by the SENDER's execution, so every step it hands to (a
         // fan-out, a retried launch) names the same file; never part of
@@ -1767,7 +1771,11 @@ async function launchStep(
   // (`pipeline_sync_base`, src/bun/sync-base.ts).
   const syncNote = await syncBaseNote(parent, step.name).catch(() => null);
   const withSync = (prompt: string) => (syncNote ? `${syncNote}\n\n${prompt}` : prompt);
-  let composed = withSync(composeStepPrompt({ ...composeArgs, inlineHandoff: true }));
+  const manuallyRouted = previous.some((p) => run.history.some((h) => h.seq === p.seq && h.stepId === p.stepId && h.outcome === "advanced-manually"));
+  const withRouting = (prompt: string) => manuallyRouted
+    ? `${prompt}\n\nThis step was explicitly selected by manual Advance. The preceding verdict and findings are preserved for you to address. This routing decision is not approval of the change and grants no additional permissions.`
+    : prompt;
+  let composed = withSync(withRouting(composeStepPrompt({ ...composeArgs, inlineHandoff: true })));
   // m12/D10: measure the SAME wrapping `startTaskInner` will actually launch
   // with — `composeLaunchPrompt` (the profile's instructions/skills
   // preamble) then `appendReferences` (the references block) — not the raw
@@ -1776,7 +1784,7 @@ async function launchStep(
   if (profile.harnessKind === "gemini") {
     const fullPrompt = appendReferences(composeLaunchPrompt(profile, composed), references);
     if (promptByteOverage("gemini", fullPrompt)) {
-      composed = withSync(composeStepPrompt({ ...composeArgs, inlineHandoff: false }));
+      composed = withSync(withRouting(composeStepPrompt({ ...composeArgs, inlineHandoff: false })));
     }
   }
 
@@ -2410,13 +2418,20 @@ export async function advancePipeline(
     // matches against), not its id — an explicit `opts.handoff.next` still
     // wins when given.
     const fallbackNextName = nextStepIds.length === 1 ? stepNameById(graph, nextStepIds[0]!) : null;
-    const handoffInput: Record<string, unknown> = { reason: "manually advanced", ...opts.handoff };
+    const historyEntry = run.history.find((h) => h.taskId === targetTaskId && h.seq === activeEntry.seq);
+    // Routing by hand must not erase the findings Build is being sent to fix,
+    // or turn the reviewer's blocked verdict into an approval. Explicit
+    // replacement fields still win, including intentional empty values.
+    const handoffInput: Record<string, unknown> = {
+      ...(historyEntry?.handoff ?? { reason: "manually advanced" }),
+      next: fallbackNextName,
+      ...opts.handoff,
+    };
     if (!(typeof handoffInput.next === "string" && handoffInput.next.trim().length > 0)) {
       handoffInput.next = fallbackNextName;
     }
     const handoff = normalizeHandoff(handoffInput);
 
-    const historyEntry = run.history.find((h) => h.taskId === targetTaskId && h.seq === activeEntry.seq);
     run.active = run.active.filter((a) => a.taskId !== targetTaskId);
     removeBlockedFor(run, targetTaskId);
     if (historyEntry) {
@@ -2468,12 +2483,79 @@ export async function advancePipeline(
   });
 }
 
-/**
- * Retry every currently-blocked (or, for a stopped run, every non-live)
- * active execution — or just `opts.taskId`'s, when given — plus (when no
- * specific `opts.taskId` was given) every run-level pending block (M2).
- * 409 unless the run is `blocked`/`cancelled`, or the parent is archived.
- */
+/** Explicitly adopt a template's instruction edits without restarting the
+ * run. No agent is launched, no verdict/hold is cleared, and profiles/caps
+ * stay frozen. The caller names both revisions it inspected. */
+export async function refreshPipelineInstructions(
+  parentId: string,
+  opts: { expectedCapturedAt: number; expectedTemplateUpdatedAt: number },
+): Promise<{ task: Task; stepIds: string[] } | { error: string; status: 400 | 404 | 409 }> {
+  return runExclusive(parentId, async () => {
+    const parent = tasks.get(parentId);
+    if (!parent?.pipelineId || tombstonedPipelineParents.has(parentId)) {
+      return { error: "not a pipeline task", status: 404 as const };
+    }
+    const run = parent.pipelineRun;
+    if (parent.archivedAt != null || !run?.snapshot || !["blocked", "cancelled"].includes(run.status)) {
+      return { error: "instructions can only be refreshed on a blocked or cancelled, unarchived run", status: 409 as const };
+    }
+    if (run.active.some((a) => isTaskRunLive(a.taskId) || isTaskRunCancelling(a.taskId) || remindersInFlight.has(a.taskId))) {
+      return { error: "a pipeline execution is still live — instructions were not changed", status: 409 as const };
+    }
+    if (run.autoRetry?.at != null || run.wait || run.active.some((a) => listPendingForTask(a.taskId).length > 0)) {
+      return { error: "recovery or an interaction is pending — resolve that hold before refreshing instructions", status: 409 as const };
+    }
+    const template = pipelines.get(parent.pipelineId);
+    if (!template) return { error: "pipeline template no longer exists", status: 404 as const };
+    if (run.snapshot.capturedAt !== opts.expectedCapturedAt || template.updatedAt !== opts.expectedTemplateUpdatedAt) {
+      return { error: "run or template changed — inspect the current instructions before refreshing", status: 409 as const };
+    }
+    const validated = validatePipelineGraph(template.graph);
+    if (!validated.ok) return { error: `pipeline graph is invalid: ${validated.error}`, status: 400 as const };
+    const updated = updatedPipelineInstructions(run.snapshot.graph, validated.graph);
+    if ("error" in updated) return { error: updated.error, status: 409 as const };
+    if (updated.stepIds.length === 0) return { task: parent, stepIds: [] };
+
+    // A retry re-launches the existing step task's prompt. Refresh that
+    // generated instruction section too, preserving its goal/reports and
+    // refusing a hand-edited or ambiguous prompt instead of guessing.
+    const promptUpdates: { taskId: string; prompt: string }[] = [];
+    for (const active of run.active.filter((a) => updated.stepIds.includes(a.stepId))) {
+      const child = tasks.get(active.taskId);
+      const before = run.snapshot.graph.steps.find((s) => s.id === active.stepId)!;
+      const after = updated.graph.steps.find((s) => s.id === active.stepId)!;
+      const needle = `\n\n## Your step\n\n${before.instructions.trim() ? before.instructions : "(no additional instructions)"}\n\n`;
+      if (!child || !child.prompt.includes(needle) || child.prompt.indexOf(needle) !== child.prompt.lastIndexOf(needle)) {
+        return { error: "step prompt was changed or is ambiguous — instructions were not changed", status: 409 as const };
+      }
+      const replacement = `\n\n## Your step\n\n${after.instructions.trim() ? after.instructions : "(no additional instructions)"}\n\n`;
+      promptUpdates.push({ taskId: child.id, prompt: child.prompt.replace(needle, replacement) });
+    }
+    const now = Math.max(Date.now(), run.snapshot.capturedAt + 1);
+    const auditPath = join(pipelineRunsDir(parentId), `instruction-update-${randomUUID()}.json`);
+    mkdirSync(pipelineRunsDir(parentId), { recursive: true });
+    writeFileSync(auditPath, JSON.stringify({
+      updatedAt: now, templateUpdatedAt: template.updatedAt, previousCapturedAt: run.snapshot.capturedAt,
+      steps: updated.stepIds.map((id) => ({ id,
+        before: run.snapshot!.graph.steps.find((s) => s.id === id)!.instructions,
+        after: updated.graph.steps.find((s) => s.id === id)!.instructions,
+      })),
+    }, null, 2));
+    const snapshot = { ...run.snapshot, graph: updated.graph, capturedAt: now };
+    db.transaction(() => {
+      for (const update of promptUpdates) tasks.update(update.taskId, { prompt: update.prompt });
+      tasks.setPipelineRun(parentId, { ...run, snapshot });
+    })();
+    recordActivity(parentId, { kind: "auto", tone: "info",
+      text: `Updated instructions from template for ${updated.stepIds.map((id) => stepNameById(updated.graph, id)).join(", ")}; history and holds preserved. Audit: ${auditPath}` });
+    publishGlobalEvent({ kind: "pipeline", taskId: parentId, status: run.status,
+      activeStepIds: run.active.map((a) => a.stepId), stepCount: run.stepCount, ts: now });
+    return { task: tasks.get(parentId)!, stepIds: updated.stepIds };
+  });
+}
+
+/** Retry currently blocked executions and pending launches. Never starts a
+ * duplicate of a live step; requires a blocked or cancelled run. */
 export async function retryPipelineStep(
   parentId: string,
   opts?: { taskId?: string },

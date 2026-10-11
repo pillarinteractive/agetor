@@ -2671,6 +2671,36 @@ describe("blockedHandoffChoosesNext", () => {
     expect(blockedHandoffChoosesNext(g, "nope", blocked("Build"))).toBe(false);
     expect(blockedHandoffChoosesNext(g, "review", null)).toBe(false);
   });
+
+  test("a next-step choice cannot bypass a declared wait, an owner question or a permission denial", () => {
+    for (const on of ["owner", "dependency", "resource", "environment", "usage_limit", "other"] as const) {
+      expect(blockedHandoffChoosesNext(g, "review", { ...blocked("changes requested"), waitingOn: { on } })).toBe(false);
+    }
+    expect(blockedHandoffChoosesNext(g, "review", { ...blocked("changes requested"), openQuestions: ["May I access production?"] })).toBe(false);
+    expect(blockedHandoffChoosesNext(g, "review", { ...blocked("changes requested"), reason: "Permission was denied by the reviewer." })).toBe(false);
+    expect(blockedHandoffChoosesNext(g, "review", { ...blocked("changes requested"), reason: "Requires owner approval before accessing production." })).toBe(false);
+  });
+});
+
+describe("updatedPipelineInstructions", () => {
+  const { updatedPipelineInstructions } = require("./pipeline.ts") as typeof import("./pipeline.ts");
+  const graph = makeGraph({ steps: [makeStep({ id: "review", instructions: "old" })], startStepId: "review" });
+  test("only instructions change; the run's positions and ordering stay intact", () => {
+    const template = { ...graph, steps: [{ ...graph.steps[0]!, instructions: "new", position: { x: 99, y: 99 } }] };
+    expect(updatedPipelineInstructions(graph, template)).toEqual({
+      graph: { ...graph, steps: [{ ...graph.steps[0]!, instructions: "new" }] }, stepIds: ["review"],
+    });
+    expect(graph.steps[0]!.instructions).toBe("old");
+  });
+  test("agent, delegation, routing, name and finish changes cannot ride an instruction refresh", () => {
+    for (const patch of [
+      { agentProfileId: "another" }, { subagents: { profileIds: ["another"], cap: null } },
+      { transition: "all" as const }, { join: "all" as const }, { name: "Ship" }, { canFinish: true },
+    ]) {
+      expect(updatedPipelineInstructions(graph, { ...graph, steps: [{ ...graph.steps[0]!, ...patch }] })).toHaveProperty("error");
+    }
+    expect(updatedPipelineInstructions(graph, { ...graph, startStepId: null })).toHaveProperty("error");
+  });
 });
 
 describe("the handoff contract says what \"blocked\" does", () => {

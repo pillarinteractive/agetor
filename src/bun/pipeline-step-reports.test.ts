@@ -32,6 +32,7 @@ beforeAll(async () => {
 
 afterEach(async () => {
   delete process.env.AGETOR_FAKE_CLAUDE_HANDOFF_BODY;
+  delete process.env.AGETOR_FAKE_CLAUDE_BLOCKED_REASON;
   const { tasks } = await import("./db.ts");
   const { deleteTask } = await import("./orchestrator.ts");
   for (const id of parents) if (tasks.get(id)) await deleteTask(id).catch(() => {});
@@ -54,7 +55,7 @@ async function waitFor<T>(fn: () => T | null | undefined | false, timeoutMs = 50
 }
 
 /** Review → Build ("changes requested") → Ship, started at Review. */
-async function startReviewBuild() {
+async function startReviewBuild(reviewSuffix = "Build") {
   const { createTask, startTask } = await import("./orchestrator.ts");
   const { agentProfiles, pipelines } = await import("./db.ts");
   const { newStep } = await import("../shared/pipeline.ts");
@@ -64,7 +65,7 @@ async function startReviewBuild() {
   });
   const step = (name: string, suffix: string) =>
     newStep({ name, agentProfileId: profile.id, instructions: `Do it. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:${suffix}` });
-  const review = step("Review", "Build");
+  const review = step("Review", reviewSuffix);
   const build = step("Build", "done");
   const ship = step("Ship", "done");
   const pipeline = pipelines.insert({
@@ -134,6 +135,33 @@ test("Review → Build: Build's prompt holds the reviewer's full findings, the r
   expect(pipelineStepReports("no-such-task")).toBeNull();
 });
 
+test("manual Advance preserves a blocked review's verdict, findings and complete report for Build", async () => {
+  const { tasks } = await import("./db.ts");
+  const { advancePipeline, pipelineStepReports } = await import("./pipeline-runner.ts");
+  process.env.AGETOR_FAKE_CLAUDE_HANDOFF_BODY = FINDINGS;
+  process.env.AGETOR_FAKE_CLAUDE_BLOCKED_REASON = "Owner decision required before another fix round";
+  const { parentId, build } = await startReviewBuild("blocked");
+  const blocked = await waitFor(() => {
+    const run = tasks.get(parentId)?.pipelineRun;
+    return run?.status === "blocked" ? run : undefined;
+  });
+  const original = blocked.history[0]!.handoff!;
+  const result = await advancePipeline(parentId, { nextStepIds: [build.id] });
+  if ("error" in result) throw new Error(result.error);
+  const run = await waitFor(() => tasks.get(parentId)?.pipelineRun?.status === "done" ? tasks.get(parentId)!.pipelineRun : undefined);
+  expect(run.history[0]!.handoff).toEqual({ ...original, next: "Build" });
+  expect(run.history[0]!.handoff!.status).toBe("blocked"); // manual routing is not approval
+  expect(run.history[0]!.outcome).toBe("advanced-manually");
+  const buildTask = tasks.get(run.history[1]!.taskId)!;
+  expect(buildTask.prompt).toContain(FINDINGS);
+  expect(buildTask.prompt).toContain(original.reason);
+  expect(buildTask.prompt).toContain('Full report from "Review"');
+  expect(buildTask.prompt).toContain("not approval of the change and grants no additional permissions");
+  expect(pipelineStepReports(parentId, 1)![0]!.report).toContain(FINDINGS);
+  const reportRef = buildTask.references.find((r) => r.path.includes("report-"))!;
+  expect(readFileSync(reportRef.path, "utf8")).toContain(FINDINGS);
+});
+
 test("a follow-up gets every earlier handoff as background but only the newest step's full report", async () => {
   const { tasks, agentProfiles } = await import("./db.ts");
   const { runPipelineFollowUp } = await import("./pipeline-runner.ts");
@@ -153,4 +181,23 @@ test("a follow-up gets every earlier handoff as background but only the newest s
   expect(prompt).toContain('### From "Build"');
   expect(prompt.match(/Full report from "/g)!.length).toBe(1);
   expect(prompt).toContain('Full report from "Ship"');
+});
+
+test("a report from before the newest turn cannot masquerade as its result", async () => {
+  const { tasks, db, runs } = await import("./db.ts");
+  const { stepFinalReport } = await import("./pipeline-runner.ts");
+  process.env.AGETOR_FAKE_CLAUDE_HANDOFF_BODY = FINDINGS;
+  const { parentId } = await startReviewBuild();
+  const run = await waitFor(() => tasks.get(parentId)?.pipelineRun?.status === "done" ? tasks.get(parentId)!.pipelineRun : undefined);
+  const review = run.history[0]!;
+  const turnStartedAt = Date.now() + 10;
+  const runId = randomUUID();
+  db.run("INSERT INTO runs (id, task_id, agent, status, started_at) VALUES (?, ?, ?, ?, ?)",
+    [runId, review.taskId, "claude-code", "succeeded", turnStartedAt]);
+  runs.appendEvent(runId, "assistant", "The new turn stopped without a handoff.");
+  expect(stepFinalReport(review.taskId, review.startedAt)).not.toBeNull();
+  expect(stepFinalReport(review.taskId, review.startedAt, turnStartedAt)).toBeNull();
+  runs.appendEvent(runId, "assistant", `Fresh findings.\n<handoff>${JSON.stringify({ ...review.handoff, summary: "fresh findings" })}</handoff>`);
+  expect(stepFinalReport(review.taskId, review.startedAt, turnStartedAt)!.body).toContain("Fresh findings.");
+  expect(stepFinalReport(review.taskId, review.startedAt, turnStartedAt)!.body).not.toContain(FINDINGS);
 });

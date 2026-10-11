@@ -554,6 +554,39 @@ test("GET /tasks/:id/pipeline on a plain (non-pipeline) task → 400", async () 
   expect((await res.json()).error).toContain("not a pipeline task");
 });
 
+test("refresh-instructions requires authentication and checked revision fields", async () => {
+  expect((await fetch(`${BASE}/tasks/missing/pipeline/refresh-instructions`, { method: "POST" })).status).toBe(401);
+  for (const body of [null, [], {}, { expectedCapturedAt: "1", expectedTemplateUpdatedAt: 1 }]) {
+    const res = await call("/tasks/missing/pipeline/refresh-instructions", { method: "POST", body: JSON.stringify(body) });
+    expect(res.status).toBe(400);
+  }
+  const res = await call("/tasks/missing/pipeline/refresh-instructions", { method: "POST", body: JSON.stringify({ expectedCapturedAt: 1, expectedTemplateUpdatedAt: 1 }) });
+  expect(res.status).toBe(404);
+});
+
+test("refresh-instructions updates a stopped snapshot without clearing its cap hold or starting a task", async () => {
+  const { tasks, pipelines } = await import("./db.ts");
+  const profile = await createProfile();
+  const pipeline = await createPipeline(profile.id);
+  const task = await createTask({ pipelineId: pipeline.id });
+  const run = { ...task.pipelineRun!, status: "blocked" as const,
+    blocked: [{ taskId: null, stepId: pipeline.graph.steps[0]!.id, kind: "step-cap" as const, message: "resource budget exhausted" }],
+    snapshot: { graph: pipeline.graph, profiles: {}, maxSteps: 14, capturedAt: 100 },
+  };
+  tasks.setPipelineRun(task.id, run);
+  const template = pipelines.update(pipeline.id, { graph: { ...pipeline.graph,
+    steps: pipeline.graph.steps.map((s) => ({ ...s, instructions: "updated instructions" })) } })!;
+  const res = await call(`/tasks/${task.id}/pipeline/refresh-instructions`, { method: "POST", body: JSON.stringify({
+    expectedCapturedAt: 100, expectedTemplateUpdatedAt: template.updatedAt,
+  }) });
+  expect(res.status).toBe(200);
+  const updated = await res.json() as { task: Task; stepIds: string[] };
+  expect(updated.stepIds).toEqual([pipeline.graph.steps[0]!.id]);
+  expect(updated.task.pipelineRun!.blocked).toEqual(run.blocked);
+  expect(updated.task.pipelineRun!.snapshot!.maxSteps).toBe(14);
+  expect(updated.task.pipelineRun!.active).toEqual([]);
+});
+
 test("GET /tasks/:id/pipeline on an unknown task → 404", async () => {
   const res = await call("/tasks/does-not-exist/pipeline");
   expect(res.status).toBe(404);

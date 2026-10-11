@@ -19,7 +19,7 @@ import type {
   StepResponseKind,
 } from "./types.ts";
 import { PIPELINE_LIMITS } from "./types.ts";
-import { parseWaitingOn } from "./block-wait.ts";
+import { asksTheOwner, parseWaitingOn } from "./block-wait.ts";
 
 /** The XML-ish tag a step's agent is asked to wrap its final handoff JSON
  *  in — `<handoff>{...}</handoff>`. Single source of truth for both the
@@ -952,11 +952,36 @@ export function resolveNextSteps(
  */
 export function blockedHandoffChoosesNext(g: PipelineGraph, fromStepId: string, handoff: Handoff | null): boolean {
   if (!handoff?.next?.trim()) return false;
+  // Choosing who should fix a defect is not permission to bypass a hold.
+  // A declared wait or a question still belongs to its recovery/owner path.
+  if (handoff.waitingOn || handoff.openQuestions.some((q) => q.trim())) return false;
+  if (asksTheOwner([handoff.reason, handoff.summary].join("\n"))) return false;
   const fromStep = g.steps.find((s) => s.id === fromStepId);
   if (!fromStep || fromStep.transition !== "choose") return false;
   const outgoing = outgoingSteps(g, fromStepId);
   if (outgoing.length < 2 && !(fromStep.canFinish && outgoing.length > 0)) return false;
   return resolveNextSteps(g, fromStepId, handoff).kind === "steps";
+}
+
+/** Copy only step instructions from a compatible template. Preserve the
+ * run's topology, agent assignments, delegation, positions and resource cap. */
+export function updatedPipelineInstructions(graph: PipelineGraph, template: PipelineGraph):
+  { graph: PipelineGraph; stepIds: string[] } | { error: string } {
+  const shape = (g: PipelineGraph) => JSON.stringify({
+    startStepId: g.startStepId,
+    steps: g.steps.map((s) => ({
+      id: s.id, name: s.name, agentProfileId: s.agentProfileId,
+      subagents: s.subagents, transition: s.transition, join: s.join, canFinish: s.canFinish === true,
+    })).sort((a, b) => a.id.localeCompare(b.id)),
+    edges: g.edges.map((e) => ({ id: e.id, from: e.from, to: e.to, label: e.label }))
+      .sort((a, b) => a.id.localeCompare(b.id)),
+  });
+  if (shape(graph) !== shape(template)) {
+    return { error: "template topology or agent assignments changed — only instructions can be refreshed" };
+  }
+  const instructions = new Map(template.steps.map((s) => [s.id, s.instructions]));
+  const stepIds = graph.steps.filter((s) => s.instructions !== instructions.get(s.id)).map((s) => s.id);
+  return { graph: { ...graph, steps: graph.steps.map((s) => ({ ...s, instructions: instructions.get(s.id)! })) }, stepIds };
 }
 
 /**
@@ -1103,7 +1128,7 @@ function blockedRuleText(outgoing: { name: string; label: string }[], transition
   return hasChoice
     ? `${base} The one exception: if another step is the right one to fix the problem you hit (for example a ` +
       '"changes requested" or "verification failed" option above), name it in "next" and the run goes there; ' +
-      'otherwise set "next" to null.'
+      'this applies only when you have no declared wait, owner question or permission hold. Otherwise set "next" to null.'
     : base;
 }
 
