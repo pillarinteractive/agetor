@@ -66,6 +66,7 @@ import { readBlockLog, summarizeBlocks } from "./block-log.ts";
 import { listPrStatuses } from "./pr-watch.ts";
 import { createTaskFromIssue, listIssueQueue } from "./issue-queue.ts";
 import { listActivity, recordActivity } from "./activity.ts";
+import { VELOCITY_GATE_PREF, velocityAnswerCached } from "./roadmap-velocity.ts";
 import { applySuggestion, listSuggestions } from "./suggestions.ts";
 import { listFollowUps, startFollowUp } from "./pipeline-followups.ts";
 import {
@@ -3343,6 +3344,34 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const r = await applyRoadmapContinue(body.action);
           if ("error" in r) return json({ error: r.error }, { status: 409, headers: corsHeaders(req) });
           return json({ ...r, ...autopilotSnapshot() }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Velocity of the roadmap run (src/bun/roadmap-velocity.ts): throughput,
+      // cycle time, where the time goes, utilisation, bottlenecks and a
+      // forecast range, from the ledger the passes keep. `?scope=roadmap`
+      // widens the progress chart and the bottleneck list from the scope to
+      // the whole roadmap; `?ownerDelayHours=n` sets the time assumed per
+      // owner step in the forecast. Read-only; never reaches GitHub.
+      "/autopilot/roadmap/velocity": {
+        GET: authed((req) => {
+          const url = new URL(req.url);
+          const scope = url.searchParams.get("scope");
+          if (scope != null && scope !== "current" && scope !== "roadmap") {
+            return json({ error: "scope must be current or roadmap" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const raw = url.searchParams.get("ownerDelayHours");
+          const hours = raw == null || raw === "" ? null : Number(raw);
+          if (hours != null && (!Number.isFinite(hours) || hours < 0 || hours > 24 * 365)) {
+            return json({ error: "ownerDelayHours must be a number of hours, 0 or more" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const gate = Number(preferences.get(VELOCITY_GATE_PREF));
+          const answer = velocityAnswerCached(autopilotSnapshot().config, {
+            view: scope === "roadmap" ? "roadmap" : "current",
+            ownerDelayMs: hours == null ? null : hours * 3_600_000,
+            gateIssue: Number.isInteger(gate) && gate > 0 ? gate : null,
+          });
+          return json(answer, { headers: corsHeaders(req) });
         }),
       },
 

@@ -46,7 +46,9 @@ export function recordActivityOnce(taskId: string, entry: Omit<ActivityEntry, "t
   recordActivity(taskId, entry);
 }
 
-function readLogged(taskId: string): ActivityEntry[] {
+/** The events appended to a task's timeline (the last `MAX_READ`), oldest
+ *  first. Also read by the velocity ledger (src/bun/roadmap-velocity.ts). */
+export function readLogged(taskId: string): ActivityEntry[] {
   const file = fileFor(taskId);
   if (!existsSync(file)) return [];
   try {

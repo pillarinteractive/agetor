@@ -38,8 +38,10 @@ import { onCardRemoved, startTask, subscribeGlobal } from "./orchestrator.ts";
 import { holdsAutopilotSlot, neverStarted, PROGRESSING_COLUMNS, waitingOnQuota } from "../shared/autopilot.ts";
 import { formatRetryTime, isQuotaPaused } from "./usage-limit.ts";
 import { loadRoadmapStates, loadRoadmapTracker } from "./roadmap-fetch.ts";
+import { recordVelocityPass, type VelocityPassInput } from "./roadmap-velocity.ts";
 import {
   currentRoadmapStatus,
+  displayText,
   MAX_SCOPE_MILESTONES,
   nextMilestoneText,
   normalizeMilestones,
@@ -837,6 +839,10 @@ export interface RoadmapDeps {
   activity(taskId: string, text: string, tone: "info" | "warning" | "muted"): void;
   /** Ask for another pass in `delayMs`. */
   recheck(delayMs: number): void;
+  /** Record the pass in the velocity ledger (src/bun/roadmap-velocity.ts):
+   *  newly completed steps, a sample of the slots, the roadmap's snapshot.
+   *  Best-effort; a pass works the same without it. */
+  velocity?(input: VelocityPassInput): void;
   now(): number;
 }
 
@@ -1197,6 +1203,55 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
   state.roadmap = status;
   state.lastError = error;
 
+  // Velocity: what completed, and how full the slots are right now.
+  if (deps.velocity) {
+    const exclude = new Set([...stuck.keys(), ...settling]);
+    const agentOpen = scoped.filter((v) => isOpenStep(v) && !v.human);
+    const startedNow = (v: RoadmapStepView) => busyIssues.has(v.issue) || started.has(v.issue);
+    const readyLeft = agentOpen.filter((v) => v.status === "ready" && !startedNow(v) && !exclude.has(v.issue)).length;
+    const used = Math.min(cfg.maxInFlight, Math.max(ownLive, inFlight.length) + started.size);
+    const holding = !!quotaWait && picks.start.length > 0;
+    const liveTasks = new Map<number, Task>();
+    for (const [n, id] of liveCards) {
+      const t = all.find((x) => x.id === id);
+      if (t && openByIssue.has(n) && !neverStarted(t)) liveTasks.set(n, t);
+    }
+    try {
+      deps.velocity({
+        tracker,
+        project: cfg.project,
+        now: deps.now(),
+        maxInFlight: cfg.maxInFlight,
+        steps: views.map((v) => ({
+          step: v.step,
+          issue: v.issue,
+          title: displayText(v.title, 100),
+          stage: v.milestone.trim(),
+          human: v.human,
+          preds: v.predecessors,
+          status: v.status === "complete" ? "complete" : v.status === "declined" ? "declined" : "open",
+          closedAt: states.get(v.issue)?.closedAt ?? null,
+        })),
+        scope: scope ? { label: scopeLabel(scope.milestones), steps: [...scope.steps] } : null,
+        sample: {
+          max: cfg.maxInFlight,
+          used,
+          // Idle slots, and nothing in scope that could fill them.
+          blocked: used < cfg.maxInFlight && readyLeft === 0 && !holding && agentOpen.some((v) => !startedNow(v)),
+          quota: holding,
+          ready: readyLeft,
+          held: heldForUser.size + stuck.size + status.humanReady.length,
+        },
+        live: liveTasks,
+        held: new Set(heldForUser.keys()),
+        quota: new Set([...liveTasks].filter(([, t]) => waitingOnQuota(t.pipelineRun) || deps.quotaPaused(t)).map(([n]) => n)),
+        stuck: new Map(Object.entries(state.roadmapStuck).map(([k, v]) => [Number(k), { at: v.at, cardId: v.cardId ?? null }])),
+      });
+    } catch {
+      // the ledger is a convenience, never a reason for a pass to fail
+    }
+  }
+
   // One notification per `[Human]` step, the first time it's ready.
   for (const h of status.humanReady) {
     if (state.notifiedHuman.includes(h.issue)) continue;
@@ -1505,6 +1560,7 @@ export const ROADMAP_DEPS: RoadmapDeps = {
     }, delayMs);
     recheckTimer.unref?.();
   },
+  velocity: (input) => void recordVelocityPass(input),
   now: () => Date.now(),
 };
 
