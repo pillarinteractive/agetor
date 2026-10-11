@@ -134,6 +134,44 @@ test("a stale timer (rescheduled, or Stopped) never fires", async () => {
   expect(tasks.get(parentId)!.pipelineRun!.status).toBe("blocked");
 });
 
+test("an interrupted step retries after boot without becoming running before a worker starts", async () => {
+  const { tasks, runs } = await import("./db.ts");
+  const { fireAutoRetry, stopPipelineAutoRetryTimers } = await import("./pipeline-runner.ts");
+  process.env.AGETOR_FAKE_CLAUDE_API_ERROR = "1";
+  const { parentId } = await startOneStep("done");
+  const blocked = await waitFor(() => {
+    const t = tasks.get(parentId);
+    return t?.pipelineRun?.status === "blocked" && t.pipelineRun.autoRetry ? t : undefined;
+  });
+  stopPipelineAutoRetryTimers();
+  const run = blocked.pipelineRun!;
+  const execution = run.active[0]!;
+  const previous = runs.listForTask(execution.taskId)[0]!;
+  // Boot reconciles a missing worker this way: the execution remains for
+  // retry, but its run is orphaned and there is no ordinary blocked entry.
+  runs.update(previous.id, { status: "orphaned", endedAt: Date.now(), exitCode: -1 });
+  tasks.update(execution.taskId, { column: "ready", runId: null });
+  run.status = "cancelled";
+  run.blocked = [];
+  run.endedAt = Date.now();
+  run.history.at(-1)!.outcome = "cancelled";
+  run.history.at(-1)!.endedAt = run.endedAt;
+  run.autoRetry = { ...run.autoRetry!, reason: "lost its session" };
+  tasks.setPipelineRun(parentId, run);
+  const at = run.autoRetry.at!;
+  for (const k of ERROR_ENV) delete process.env[k];
+
+  expect(await fireAutoRetry(parentId, at)).toBe(true);
+  const done = await waitFor(() => {
+    const t = tasks.get(parentId);
+    return t?.pipelineRun?.status === "done" ? t : undefined;
+  });
+  expect(runs.listForTask(execution.taskId).length).toBe(2);
+  expect(tasks.stepsForParent(parentId).map((t) => t.id)).toEqual([execution.taskId]);
+  expect(done.pipelineRun!.stepCount).toBe(run.stepCount);
+  expect(done.pipelineRun!.autoRetry).toBeUndefined();
+});
+
 test("transient failures retry with backoff up to 4 times, then stay blocked for the user", async () => {
   const { tasks } = await import("./db.ts");
   const { fireAutoRetry } = await import("./pipeline-runner.ts");

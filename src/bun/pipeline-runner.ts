@@ -381,7 +381,10 @@ export async function fireAutoRetry(parentId: string, at: number): Promise<boole
     const r = run?.autoRetry;
     if (!parent || !run || !r || r.at !== at || recoveriesInFlight.has(parentId)) return null;
     run.autoRetry = { ...r, at: null };
-    persist(parentId, run);
+    // Consuming a timer is bookkeeping, not a worker start. In particular,
+    // a cancelled/orphaned execution has no block; deriving its status here
+    // would label it running and make the eligibility check skip recovery.
+    persist(parentId, run, { preserveStatus: true });
     if (parent.archivedAt != null || (run.status !== "blocked" && run.status !== "cancelled")) return null;
     const target = run.active.find((a) => a.stepId === r.stepId && !isTaskRunLive(a.taskId));
     if (!target) return null;
