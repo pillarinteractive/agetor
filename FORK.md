@@ -158,7 +158,8 @@ applied with `agetor suggestions apply <taskId> <suggestionId>` / `POST /suggest
 and each suggestion is recomputed at apply time.
 Rules: step blocked on a lease that's free → Retry; PR behind its base whose failing checks pass on the base → Update
 branch (only when `pr_autoupdate` is off); finished run with commits and no PR → Open PR preset; blocked step with
-open questions → show the first one (not appliable: open the card). A card waiting on another card gets none.
+open questions → show the first one (not appliable: open the card). A card waiting on another card gets none, and
+neither does one parked in the blocked-step wait queue for a lease.
 The PR watcher also records `behindBy` and `passesOnBase`, so a failure the base has since fixed isn't treated as the
 PR's own (no Fix CI / auto-fix).
 - **Worktree setup** (`worktree_setup` preference, `src/bun/worktree.ts`): a per-project command run once in each newly
@@ -182,7 +183,7 @@ preferences. What it was built on stays:
 - `GET /board/digest` (`src/bun/board-digest.ts`; `?format=text` for a readable form): every live card with its status
   line, PR, leases and live progress, plus the pending suggestions.
 - CLI commands in `src/cli/commands/board.ts`: `agetor board`, `suggestions [apply <taskId> <suggestionId>]`,
-  `activity <id>`, `followups <id>`, `followup <id> <actionId> [--request <text>]`, `blocks [--days N]`,
+  `activity <id>`, `followups <id>`, `followup <id> <actionId> [--request <text>]`, `blocks [--days N]`, `waiting`,
   `depends <id> [<dep>…|--clear]`. `install:local` compiles the CLI to `~/.agetor/bin/agetor`.
 - `src/bun/auto-issue.ts` still skips the card named by a `conductor_task_id` preference; nothing sets it any more.
 - Testing without touching the board: a throwaway daemon with its own data dir, port and tmux socket —
@@ -196,6 +197,7 @@ preferences. What it was built on stays:
 - **Lab queue** (`src/bun/lease-watch.ts`): each `LeaseStatus` carries `queue` — the cards blocked on that lease,
   longest waiting first. Cards show "2nd of 3 in line". When the lease is free the first in line is retried
   automatically (one every 5 min per lease, once per block; activity entry). Off: `agetor config lease_autoretry false`.
+  A card the blocked-step wait queue has parked for the lease is resumed by that queue instead (see below).
 - **Quiet cards** (`src/bun/activity-clock.ts`): running cards carry `lastActivityAt` (newest run event; for a pipeline
   the quietest active step — any harness). After 20 min quiet the card's status line warns "quiet 25m" and marks it as
   needing you — unless a lab/E2E run on it is reporting live progress.
@@ -220,7 +222,8 @@ suggestion rules are gone.
   `src/bun/usage-limit.ts`): a step that crashed, lost its session or hit an API overload/5xx is retried up to 4×
   (1 → 5 → 15 → 30 min apart), then left for a person. A step stopped by a usage limit waits for the reset and is
   retried then, without giving up (see "Usage limits, retries and keepalive"). A "blocked" handoff for a real reason
-  or a user Stop never is. The schedule is stored on the run (`autoRetry`) and re-armed when the core restarts.
+  or a user Stop never is (a blocked handoff that clears by itself is resumed by the wait queue instead — see
+  "The blocked-step wait queue"). The schedule is stored on the run (`autoRetry`) and re-armed when the core restarts.
   A step the limit stopped part-way is continued in its own session rather than restarted (see "Unfinished steps
   stay put").
 - **Pipelines own their PRs**: auto Fix CI is on by default for pipeline cards (`pr_autofix` true/false overrides;
@@ -401,7 +404,8 @@ Two things a run got wrong, both in `settleStepRun` / `launchStep` (`src/bun/pip
     (`composeLimitResumeNote`, sent through `sendInput` like the await wake-up) telling it to finish and write a new
     handoff. A limit that fails a turn mid-work (any tool call already made) resumes the same way; one hit before any
     work relaunches the step as before. If the note can't be delivered the step is relaunched.
-  - **Blocked for another reason**: the run blocks on that step (Needs you), as it did before that rule existed.
+  - **Blocked for another reason**: the run stays on that step. Whether it then waits for a person or is retried
+    by itself is decided by the wait queue (next section).
   - The timeline says which: "Build stopped at its usage limit before finishing — resuming it at 7:25 PM instead of
     handing unfinished work to Review" / "Build handed off "blocked" with its work unfinished — holding the run on
     Build instead of starting Review".
@@ -420,6 +424,81 @@ Two things a run got wrong, both in `settleStepRun` / `launchStep` (`src/bun/pip
 - **Reading them yourself**: `agetor pipeline status <card> --handoffs` prints each step's whole handoff;
   `agetor pipeline handoff <card> [<step number> | <step name> | --all]` prints a step's full final message
   (`GET /tasks/:id/pipeline/reports`).
+
+## The blocked-step wait queue (`feat/roadmap-autopilot`)
+
+A step that hands off `blocked` and stays put (previous section) used to wait for a person whatever it was blocked
+on. Now the block is classified, and one that clears by itself parks the card in a queue: the **same step** is
+resumed in its own session when what it waits on changes, or on a backoff, a bounded number of times; then it goes to
+the owner with what was tried. Nothing in the queue ever starts a different step.
+
+- **Classifying** (`classifyBlock`, `src/shared/block-wait.ts` — every regular expression that reads a step's prose
+  is in that file). Strongest evidence first:
+  1. a usage limit the harness itself reported in that turn → resumed at the reset (as before; not the queue);
+  2. the step declared `waitingOn: "owner"` → the owner;
+  3. a watched lease is held by another checkout and the block names it → resource (what the card always showed
+     as "Waiting for lab");
+  4. the handoff has open questions, or its reason asks for a decision, a credential, a permission or a manual
+     action → the owner, at once;
+  5. the step's declared `waitingOn` → that category;
+  6. patterns in its reason: "waiting for #41 to merge", base-branch CI red (the PR watcher's `alsoOnBase`), a busy
+     slot or lease, a queued CI run, a network / registry / crashed-tool failure;
+  7. nothing recognised → unknown.
+- **The handoff says what it waits on.** The contract asks a blocked step for `"waitingOn"`: `owner`, `resource`,
+  `dependency`, `environment`, `usage_limit` or `other`, and `"waitingRef"` (a lease's label, `#123`). It is read
+  leniently (`parseWaitingOn`: other spellings, an object with `kind`/`ref`/`issue`, or absent) and kept only on a
+  blocked handoff. It cannot move the run on, and it cannot talk past the owner: a declared `owner`, an open
+  question or a request in the reason wins over any other declaration. The contract tells steps to keep
+  `openQuestions` for questions the user must answer.
+- **Schedules** (`planWait`; minutes before each automatic resume — the list's length is the number allowed):
+
+  | Category | Resumed when | Timed retries | Then |
+  | --- | --- | --- | --- |
+  | resource | the watched lease frees (one card per lease every 5 min, as the lab queue did) | 10, 20, 30, 60, 60, 60 | owner |
+  | dependency | the issue/PR it names is closed (`gh api`, cached 2 min), or the base's checks stop failing | 30, 60, 120, 240 | owner |
+  | environment | — | 1, 5, 15, 30 (the transient backoff) | owner |
+  | limit (the step says so; the harness didn't) | — | 15, 30, 60 | owner |
+  | unknown | — | 15, 45, 120 | owner |
+
+  When the timer comes due and a watcher says what it waits on has **not** changed (lease still held, issue still
+  open), the card is looked at again later and no resume is spent. Bounds on top: 8 resumes per blocked execution
+  whatever it waits on, 24 h in the queue, each wait stretched by up to 10% so cards don't come back together.
+  Attempts carry over when a resumed step comes back blocked on something else; a manual retry starts the count
+  again.
+- **The resume** (`resumeBlockedStep`, `composeBlockedResumeNote`): a follow-up turn in the step's own session —
+  "you handed off blocked because: …; check whether that still holds; if it has cleared, finish; if not, say what
+  you are waiting for; do not work around it or decide for the user" — with the handoff contract. If the note
+  can't be delivered the step is started again (still the same step).
+- **The queue** is the persisted `run.wait` on each blocked run (no timers, no migration: it lives in the run's
+  JSON; an older build ignores it and shows a plain block). `releaseBlockWaits` runs every 30 s: at most
+  `maxPerPass` (2) resumes a pass, oldest first, priority cards ahead; none while any card waits on a usage limit;
+  none over the step-slot limits. A restart loses nothing; a resume that was recorded but never sent goes back in
+  line after 10 min.
+- **While it waits** the run is `blocked`: it holds no Autopilot slot and no step slot, its issue stays busy (no
+  second card), and the Mac is kept awake. For the roadmap it is in flight, not the owner's; for the
+  next-milestone "blocked" trigger it occupies no slot.
+- **A person always wins**: Retry, a message to the step, an answer, Advance or a follow-up clear the entry; Stop on
+  a parked card takes it out of the queue and leaves the block for the owner.
+- **Seeing it**: the card says `Build waiting for the lab — retrying when it frees or at 3:40 PM · attempt 2 of 6`
+  (muted, no ⓘ); given up, `Build still blocked after 3 automatic retries: <its reason>` with what was tried under
+  ⓘ. The timeline records each park, resume and escalation. `agetor waiting` (`GET /waiting`) lists the queue and
+  what it gave up on. `agetor roadmap status` says `3 in flight (1 blocked — needs you, 1 waiting in the queue)` and
+  lists both. Velocity has a `waiting` state beside `blocked`: time in the queue counts as "other", not the owner's.
+- **Settings**: `agetor config blocked_wait '{"unknownBackoffMin":[15,45,120],"maxPerPass":2,"maxResumes":8,"maxWaitHours":24}'`
+  (also `resourceBackoffMin`, `dependencyBackoffMin`, `environmentBackoffMin`, `limitBackoffMin`, `jitter`;
+  `[]` for a category sends it straight to the owner; `{"enabled":false}` turns the queue off).
+  `"declaredOutranksQuestions": true` lets a step that declares a non-owner `waitingOn` be queued although its
+  handoff has open questions, as long as none reads as a request to a person. Off by default: in a week of this
+  board's history 25 of 29 blocked handoffs had open questions, most of them notes rather than questions — so until
+  steps follow the new contract, most blocks still go to the owner.
+- **Codex limits**: a codex usage limit ends the turn as `turn.failed`, whose message lands on stderr and fails the
+  run — already retried at the reset. New: such a row beside a turn that still handed off `blocked` counts as the
+  limit notice too (`harnessQuotaNotice`: only when the row *is* the message, since codex's stderr also quotes the
+  agent's commands). No codex limit has occurred on this board yet (1,407 codex runs); the strings are from the
+  codex-cli binary.
+- **Not changed**: cards already blocked when this build is installed are not queued (they have no entry) — Retry
+  them. The lease watcher's own retry still handles blocks the queue left to the owner that name a free lease, but
+  no longer a step that declares `owner`. An escalation does not send a notification.
 
 ## Milestone Autopilot (`feat/milestone-autopilot`, `feat/autopilot-events`, `feat/autopilot-run-last`)
 
