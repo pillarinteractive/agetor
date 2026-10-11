@@ -3,7 +3,7 @@ import { parseStatesResponse, statesQuery } from "./roadmap-fetch.ts";
 
 test("statesQuery aliases one issue field per number", () => {
   const q = statesQuery([12, 345]);
-  expect(q).toContain("i12: issue(number: 12) { number state stateReason url milestone { number title } }");
+  expect(q).toContain("i12: issue(number: 12) { number state stateReason closedAt url milestone { number title } }");
   expect(q).toContain("i345: issue(number: 345)");
   expect(q).toContain("repository(owner: $owner, name: $name)");
 });

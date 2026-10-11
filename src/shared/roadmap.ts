@@ -225,6 +225,8 @@ export interface RoadmapIssueState {
   /** COMPLETED | NOT_PLANNED | DUPLICATE | REOPENED | null */
   stateReason: string | null;
   url?: string | null;
+  /** When it was closed (ms); absent while open or when the reader didn't ask. */
+  closedAt?: number | null;
   /** The issue's GitHub milestone; null when it has none, undefined when the
    *  reader didn't ask. */
   milestone?: { number: number; title: string } | null;
