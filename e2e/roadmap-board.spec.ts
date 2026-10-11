@@ -1,8 +1,9 @@
-import { mkdirSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { test, expect, type APIRequestContext, type E2EBackend, type Page } from "./fixtures";
 import { getPreferences, gotoApp, putPreference } from "./helpers";
+import { velocityKey, type VelocityGraphStep, type VelocityOpenStep, type VelocityPhase, type VelocityStepFacts } from "../src/shared/velocity.ts";
 import { parseRoadmap, roadmapContinuation, roadmapFinished, roadmapScope, roadmapStatus, summarizeRoadmap, type RoadmapIssueState, type RoadmapStatus } from "../src/shared/roadmap.ts";
 
 /**
@@ -15,6 +16,9 @@ import { parseRoadmap, roadmapContinuation, roadmapFinished, roadmapScope, roadm
  *   - the next-milestone prompt — rendered from `state.roadmap.nextMilestone`
  *     and answered through `POST /autopilot/roadmap/continue`
  *     (NextMilestonePrompt.tsx).
+ *
+ *   - the Velocity view — the summary beside the rocket and the dialog it
+ *     opens, drawn from a seeded synthetic history (VelocityDialog.tsx).
  *
  * Nothing here reaches GitHub. The cards are plain tasks made through the
  * API (never started), and Autopilot's status is the one `roadmapPass` would
@@ -367,5 +371,210 @@ test.describe("next-milestone prompt", () => {
     await expect(page.getByTestId("autopilot-scope-list")).toContainText("M01 — Widget foundations + M02 — Gadget dock");
     await expect(page.getByTestId("autopilot-auto-continue")).toBeChecked();
     await shot(page, "11-autopilot-dialog-scope.png", info);
+  });
+});
+
+// ── Velocity ──────────────────────────────────────────────────────────────
+
+const HOUR = 3_600_000;
+const MIN = 60_000;
+
+/**
+ * A synthetic run, three days old, written the way the passes write it
+ * (src/bun/roadmap-velocity.ts): the ledger and the snapshot of a 44-step
+ * roadmap — M01 finished, M02 and M03 in scope and under way, M04 and the
+ * release gate ahead, a few of the owner's steps. `completed` cuts it down
+ * to the first few completions for the low-data state.
+ */
+function seedVelocity(backend: E2EBackend, opts: { completed?: number } = {}): void {
+  const now = Date.now();
+  const began = now - 68 * HOUR;
+  // A small fixed generator: the same picture every run.
+  let seed = 20260105;
+  const rand = () => {
+    seed = (seed * 1664525 + 1013904223) >>> 0;
+    return seed / 4294967296;
+  };
+  const steps: VelocityGraphStep[] = [];
+  const add = (stage: string, title: string, preds: string[], human = false) => {
+    const step = String(steps.length + 1);
+    steps.push({ step, issue: 100 + steps.length, title, stage, human, preds, status: "open", closedAt: null });
+    return step;
+  };
+  const NOUN = ["inventory", "store", "API", "page", "guide", "importer", "index", "export", "audit", "dock"];
+  const device = add("H", "[Human] Provide the sample device", [], true);
+  const names = add("H", "[Human] Agree the widget names", [], true);
+  const pricing = add("H", "[Human] Decide the gadget pricing", [], true);
+  const stage = (code: string, n: number, first: string[]) => {
+    const ids: string[] = [];
+    for (let i = 0; i < n; i++) ids.push(add(code, `${i % 2 ? "Wire" : "Build"} the ${code === "M01" || code === "M03" ? "widget" : "gadget"} ${NOUN[i % NOUN.length]}`, i === 0 ? first : i < 3 ? [ids[0]!] : [ids[i - 2]!, ids[i - 3]!]));
+    return ids;
+  };
+  const m1 = stage("M01", 8, [names]);
+  const m2 = stage("M02", 10, [m1[7]!]);
+  const m3 = stage("M03", 10, [m1[6]!, device]);
+  const approve = add("H", "[Human] Approve the gadget dock", [m2[9]!], true);
+  const m4 = stage("M04", 10, [m3[9]!, pricing, approve]);
+  add("H", "[Human] Publish the main release", [m4[9]!, m4[8]!], true);
+
+  // What is complete, in the order it closed.
+  const order = [names, ...m1, device, m2[0]!, m2[1]!, m3[0]!, m2[2]!, m3[1]!, m2[3]!, pricing, m2[4]!, m2[5]!, m3[2]!].slice(0, opts.completed ?? 99);
+  const byStep = new Map(steps.map((s) => [s.step, s]));
+  const facts: VelocityStepFacts[] = [];
+  order.forEach((id, i) => {
+    const s = byStep.get(id)!;
+    const closedAt = Math.round(began + ((i + 1) / (order.length + 1)) * (now - began - 2 * HOUR) + (rand() - 0.5) * HOUR);
+    s.status = "complete";
+    s.closedAt = closedAt;
+    const readyAt = Math.max(began, ...s.preds.map((p) => byStep.get(p)!.closedAt ?? began));
+    const base = { step: s.step, issue: s.issue, stage: s.stage, human: s.human, closedAt, closedFrom: "github" as const, readyAt, prOpenedAt: null, mergedAt: null };
+    if (s.human) return void facts.push({ ...base, how: "no-card", cardId: null, cards: 0, startedAt: null, phases: null, reviewRounds: null, finishBounces: null, fixCi: null, quotaHits: null });
+    const rounds = 1 + Math.floor(rand() * 3);
+    const phases: Partial<Record<VelocityPhase, number>> = { slot: Math.round(rand() * 6 * MIN), understand: Math.round((6 + rand() * 6) * MIN), build: Math.round((35 + rand() * 50) * MIN * (0.6 + rounds * 0.4)), review: Math.round((4 + rand() * 8) * MIN * rounds), finish: Math.round((2 + rand() * 6) * MIN), merge: Math.round((18 + rand() * 30) * MIN) };
+    if (i % 5 === 2) phases.owner = Math.round((25 + rand() * 60) * MIN);
+    if (i % 6 === 4) phases.fixup = Math.round((8 + rand() * 10) * MIN);
+    if (i % 7 === 5) phases.quota = Math.round((20 + rand() * 25) * MIN);
+    const cycle = Object.values(phases).reduce((a, b) => a + (b ?? 0), 0);
+    facts.push({ ...base, how: "card", cardId: `card-${s.issue}`, cards: 1, startedAt: Math.max(readyAt, closedAt - cycle), phases, reviewRounds: rounds, finishBounces: i % 9 === 3 ? 1 : 0, fixCi: phases.fixup ? 1 : 0, quotaHits: phases.quota ? 1 : 0 });
+  });
+
+  // In flight: what is ready among M02 and M03, as far as there are slots.
+  const ready = steps.filter((s) => s.status === "open" && !s.human && (s.stage === "M02" || s.stage === "M03") && s.preds.every((p) => byStep.get(p)!.status === "complete"));
+  const open: VelocityOpenStep[] = ready.slice(0, 4).map((s, i) => ({ issue: s.issue, state: i === 1 ? "held" : i === 3 ? "merging" : "building", cardId: `card-${s.issue}`, startedAt: now - (0.6 + i * 0.9) * HOUR, since: i === 1 ? now - 55 * MIN : null }));
+
+  // One sample every five minutes; the app was closed for eight hours.
+  const lines: string[] = [JSON.stringify({ k: "run", t: began, began }), ...facts.map((f) => JSON.stringify({ k: "step", ...f }))];
+  for (let t = Math.max(began, now - 50 * HOUR); t <= now; t += 5 * MIN) {
+    const back = (now - t) / HOUR;
+    if (back > 22 && back < 30) continue;
+    const blocked = (back > 34 && back < 37) || (back > 9 && back < 10.5);
+    const used = blocked ? 0 : Math.max(0, Math.min(3, Math.round(1.2 + 1.1 * Math.sin(back / 3) + rand())));
+    lines.push(JSON.stringify({ k: "s", t: Math.round(t), max: 3, used, blocked: blocked ? 1 : 0, quota: back > 15 && back < 15.7 ? 1 : 0, ready: 0, held: 1 }));
+  }
+  const dir = path.join(backend.dataDir, "roadmap-velocity");
+  mkdirSync(dir, { recursive: true });
+  const key = velocityKey(600, project);
+  writeFileSync(path.join(dir, `${key}.jsonl`), `${lines.join("\n")}\n`);
+  const scope = steps.filter((s) => s.stage === "M02" || s.stage === "M03").map((s) => s.step);
+  writeFileSync(path.join(dir, `${key}.json`), JSON.stringify({ t: now - 2 * MIN, tracker: 600, project, maxInFlight: 3, scope: { label: "M02 and M03", steps: scope }, steps, open }));
+}
+
+test.describe("velocity", () => {
+  const wide = { width: 1500, height: 900 };
+  /** Tall enough that the whole dialog is on screen for the picture. */
+  const tall = { width: 1500, height: 2300 };
+
+  test.beforeEach(async ({ page, request, backend }) => {
+    await putPreference(request, backend, "theme", "light");
+    await seedAutopilot(request, backend, { maxInFlight: 3, offer: false });
+    await page.setViewportSize(wide);
+  });
+  test.afterAll(async ({ backend }) => {
+    rmSync(path.join(backend.dataDir, "roadmap-velocity"), { recursive: true, force: true });
+  });
+
+  test("the summary beside the rocket opens the view: progress with its forecast range, where the time goes, cycle time, rework, slots, bottlenecks", async ({ page, backend }, info) => {
+    seedVelocity(backend);
+    await openApp(page, backend.bootBase);
+    const summary = page.getByTestId("velocity-summary");
+    await expect(summary).toBeVisible();
+    // Completed · rate · the scope's range — a span of time, never a date.
+    await expect(summary).toHaveText(/^20 done · [\d.]+\/day · M02 and M03 ≈ [\d.<–]+ (hours|days)$/);
+    await shot(page, "20-velocity-summary.png", info);
+
+    await summary.click();
+    const dialog = page.getByTestId("velocity-dialog");
+    await expect(dialog).toBeVisible();
+    await expect(dialog.getByTestId("velocity-subtitle")).toContainText("Roadmap #600 · M02 and M03");
+    await expect(dialog.getByTestId("velocity-tiles")).toContainText("Completed");
+    await expect(dialog.getByTestId("velocity-tiles")).toContainText("of 3"); // slots in use
+    // The burn-up carries the forecast as a shaded range, and says it in words.
+    await expect(dialog.getByTestId("velocity-cone")).toBeVisible();
+    await expect(dialog.getByTestId("velocity-burnup-caption")).toContainText(/M02 and M03: .+ from now at the pace so far/);
+    await expect(dialog.getByTestId("velocity-phase-build")).toBeVisible();
+    await expect(dialog.getByTestId("velocity-phase-merge")).toContainText("CI and merge queue");
+    await expect(dialog.getByTestId("velocity-phase-owner")).toContainText("Held for you");
+    await expect(dialog.getByTestId("velocity-time")).toContainText("Agents working");
+    await expect(dialog.getByTestId("velocity-cycle")).toContainText(/median .+ · p75 .+ · p90 /);
+    await expect(dialog.getByTestId("velocity-rework")).toContainText("review rounds per step");
+    await expect(dialog.getByTestId("velocity-slots")).toContainText("unknown (the app was closed or Autopilot paused)");
+    await expect(dialog.getByTestId("velocity-bottleneck").first()).toContainText("behind it");
+    await expect(dialog.getByTestId("velocity-bottlenecks")).toContainText("held for your sign-off");
+    // The forecast: the scope, the release gate, the whole roadmap — ranges, with what they rest on.
+    await expect(dialog.getByTestId("velocity-forecast-scope")).toContainText("M02 and M03");
+    await expect(dialog.getByTestId("velocity-forecast-gate")).toContainText("the main-release gate");
+    await expect(dialog.getByTestId("velocity-forecast-gate")).toContainText("of yours on the path");
+    await expect(dialog.getByTestId("velocity-forecast-roadmap")).toContainText("the whole roadmap");
+    await expect(dialog.getByTestId("velocity-forecast-notes")).toContainText("An estimate, not a date");
+    await shot(page, "21-velocity-top-light.png", info);
+    await page.setViewportSize(tall);
+    await shot(page, "22-velocity-full-light.png", info);
+
+    // Every chart has its numbers as a table.
+    await dialog.getByTestId("velocity-burnup").getByText("Show as a table").click();
+    await expect(dialog.getByRole("table", { name: "Steps completed over time" })).toBeVisible();
+    await expect(dialog.getByRole("table", { name: "Time per phase" })).toBeVisible();
+    await expect(dialog.getByRole("img", { name: /of \d+ steps complete/ })).toBeVisible();
+  });
+
+  test("the owner's steps: an assumed time per step changes the forecast; the whole roadmap is one click away", async ({ page, backend }, info) => {
+    seedVelocity(backend);
+    await openApp(page, backend.bootBase);
+    await page.getByTestId("velocity-summary").click();
+    const dialog = page.getByTestId("velocity-dialog");
+    // Three of the owner's steps are finished: their median is the default.
+    await expect(dialog.getByTestId("velocity-forecast")).toContainText("the median of the 3 you have finished");
+    const before = await dialog.getByTestId("velocity-forecast-gate").innerText();
+    await dialog.getByTestId("velocity-owner-delay").fill("72");
+    await dialog.getByTestId("velocity-owner-apply").click();
+    await expect(dialog.getByTestId("velocity-forecast")).toContainText("With 3.0d per step of yours");
+    await expect(dialog.getByTestId("velocity-forecast")).toContainText("Your assumption.");
+    expect(await dialog.getByTestId("velocity-forecast-gate").innerText()).not.toBe(before);
+
+    await dialog.getByTestId("velocity-view-roadmap").click();
+    await expect(dialog.getByTestId("velocity-subtitle")).toContainText("the whole roadmap");
+    await expect(dialog.getByTestId("velocity-burnup-caption")).toContainText("the whole roadmap:");
+    await page.setViewportSize(tall);
+    await shot(page, "23-velocity-roadmap-owner-delay.png", info);
+  });
+
+  test("dark theme uses the same tokens", async ({ page, request, backend }, info) => {
+    seedVelocity(backend);
+    await putPreference(request, backend, "theme", "dark");
+    await openApp(page, `${backend.bootBase}&theme=dark`);
+    await expect(page.locator("html")).toHaveClass(/dark/);
+    await page.getByTestId("velocity-summary").click();
+    await expect(page.getByTestId("velocity-cone")).toBeVisible();
+    await shot(page, "24-velocity-top-dark.png", info);
+    await page.setViewportSize(tall);
+    await shot(page, "25-velocity-full-dark.png", info);
+  });
+
+  test("three steps completed: the numbers there are, and no forecast", async ({ page, backend }, info) => {
+    seedVelocity(backend, { completed: 4 }); // the owner's step and three agent steps
+    await openApp(page, backend.bootBase);
+    const summary = page.getByTestId("velocity-summary");
+    await expect(summary).toHaveText(/^4 done · [\d.]+\/day$/);
+    await summary.click();
+    const dialog = page.getByTestId("velocity-dialog");
+    await expect(dialog.getByTestId("velocity-forecast-none")).toHaveText("3 steps completed with a measured cycle time — not enough for a forecast (it needs 5)");
+    await expect(dialog.getByTestId("velocity-cone")).toHaveCount(0);
+    await expect(dialog.getByTestId("velocity-burnup-caption")).toContainText("not enough for a forecast");
+    await expect(dialog.getByTestId("velocity-cycle")).toContainText("(3 steps)");
+    await page.setViewportSize(tall);
+    await shot(page, "26-velocity-low-data.png", info);
+  });
+
+  test("no data yet: no summary on the board, and the view says why", async ({ page, backend }, info) => {
+    rmSync(path.join(backend.dataDir, "roadmap-velocity"), { recursive: true, force: true });
+    await openApp(page, backend.bootBase);
+    await expect(card(page, 15)).toBeVisible();
+    await expect(page.getByTestId("velocity-summary")).toHaveCount(0);
+    // Still reachable, from the Autopilot dialog.
+    await page.getByTestId("autopilot-button").click();
+    await page.getByTestId("autopilot-velocity").click();
+    await expect(page.getByTestId("autopilot-dialog")).toHaveCount(0);
+    await expect(page.getByTestId("velocity-empty")).toHaveText("No velocity data yet — it is collected from the first Autopilot pass on");
+    await shot(page, "27-velocity-empty.png", info);
   });
 });
