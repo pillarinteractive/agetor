@@ -59,8 +59,10 @@ import { prepareWorkdir } from "./worktree.ts";
 import { composeLaunchPrompt, snapshotFromProfile } from "../shared/agent-profile.ts";
 import {
   parseHandoff,
+  blockedHandoffChoosesNext,
   classifyStepResponse,
   composeHandoffReminder,
+  composeLimitResumeNote,
   composeStepPrompt,
   deriveRunStatus,
   effectiveStepCap,
@@ -270,7 +272,20 @@ function quotaNoticeFrom(events: MainStreamEvent[]): FailureClass | null {
   return classifyFailure(status.slice(Math.max(0, lastQuota - 5), lastQuota + 1).join("\n"));
 }
 
-function scheduleAutoRetry(parentId: string, run: PipelineRunState, stepId: string, failure: FailureClass | null, why: string, now = Date.now()): void {
+function scheduleAutoRetry(
+  parentId: string,
+  run: PipelineRunState,
+  stepId: string,
+  failure: FailureClass | null,
+  why: string,
+  opts?: {
+    /** Continue the step's own session instead of relaunching it (quota only). */
+    resume?: "handoff" | "cut-off";
+    /** The step(s) the unfinished work would otherwise have gone to. */
+    insteadOf?: string[];
+  },
+  now = Date.now(),
+): void {
   const kind = failure?.kind ?? "transient";
   const prev = run.autoRetry;
   // Already pending for this step: a second settle of the same turn (the
@@ -280,18 +295,27 @@ function scheduleAutoRetry(parentId: string, run: PipelineRunState, stepId: stri
   const stepName = run.snapshot ? stepNameById(run.snapshot.graph, stepId) : stepId;
   const reason = (failure?.detail ?? why).slice(0, 300);
   const at = nextRetryAt(kind, attempt, failure?.resetAt ?? null, now);
-  run.autoRetry = { stepId, kind, attempt, at, reason };
+  const resume = kind === "quota" ? opts?.resume : undefined;
+  run.autoRetry = { stepId, kind, attempt, at, reason, ...(resume ? { resume } : {}) };
   if (at == null) {
     recordActivity(parentId, { kind: "step", text: `${stepName} ${why} again — left for you after ${TRANSIENT_RETRY_MAX} automatic retries`, tone: "danger" });
     return;
   }
   const when = formatRetryTime(at, now);
+  const noTime = failure?.resetAt ? "" : ` (no reset time given; attempt ${attempt})`;
+  const instead = opts?.insteadOf?.length ? ` instead of handing unfinished work to ${opts.insteadOf.join(", ")}` : "";
   recordActivity(parentId, kind === "quota"
-    ? {
-      kind: "step",
-      text: `${stepName} is waiting on a usage limit (${reason}) — retrying automatically at ${when}${failure?.resetAt ? "" : ` (no reset time given; attempt ${attempt})`}`,
-      tone: "info",
-    }
+    ? resume
+      ? {
+        kind: "step",
+        text: `${stepName} stopped at its usage limit before finishing — resuming it at ${when}${instead}${noTime}`,
+        tone: "info",
+      }
+      : {
+        kind: "step",
+        text: `${stepName} is waiting on a usage limit (${reason}) — retrying automatically at ${when}${noTime}`,
+        tone: "info",
+      }
     : { kind: "step", text: `${stepName} ${why} — retrying automatically at ${when} (${attempt} of ${TRANSIENT_RETRY_MAX})`, tone: "warning" });
   armAutoRetryTimer(parentId, at);
 }
@@ -319,19 +343,78 @@ export async function fireAutoRetry(parentId: string, at: number): Promise<boole
     const parent = tasks.get(parentId);
     const run = parent?.pipelineRun;
     const r = run?.autoRetry;
-    if (!parent || !run || !r || r.at !== at) return false;
+    if (!parent || !run || !r || r.at !== at) return null;
     run.autoRetry = { ...r, at: null };
     persist(parentId, run);
-    if (parent.archivedAt != null || (run.status !== "blocked" && run.status !== "cancelled")) return false;
-    return run.active.some((a) => a.stepId === r.stepId && !isTaskRunLive(a.taskId));
-  }).catch(() => false);
+    if (parent.archivedAt != null || (run.status !== "blocked" && run.status !== "cancelled")) return null;
+    const target = run.active.find((a) => a.stepId === r.stepId && !isTaskRunLive(a.taskId));
+    if (!target) return null;
+    return { taskId: target.taskId, stepId: r.stepId, resume: r.kind === "quota" ? r.resume : undefined };
+  }).catch(() => null);
   if (!go) return false;
+  if (go.resume && (await resumeStepAfterLimit(parentId, go.taskId, go.stepId, go.resume))) return true;
   const result = await retryPipelineStep(parentId).catch((e: unknown) => ({ error: String(e) }));
   if ("error" in result) {
     recordActivity(parentId, { kind: "step", text: `The automatic retry didn't start: ${result.error}`, tone: "warning" });
     return false;
   }
   return true;
+}
+
+/**
+ * Continue a step that a usage limit stopped part-way, in its own session:
+ * a follow-up turn carrying {@link composeLimitResumeNote} (claude: pasted
+ * into the live session, or `--resume` when it's gone; codex and the other
+ * one-shot harnesses: a fresh turn resuming the same thread) — the same
+ * `sendInput` path the await wake-up and the handoff reminder use. The
+ * step task going back to `running` clears its block and re-opens its
+ * history record (`handleColumnChange`); the turn then settles like any
+ * other, so a still-unfinished step blocks again rather than advancing.
+ * Sent with no lock held (L-R7). False when the note couldn't be delivered —
+ * the caller falls back to relaunching the step.
+ */
+async function resumeStepAfterLimit(parentId: string, taskId: string, stepId: string, how: "handoff" | "cut-off"): Promise<boolean> {
+  const graph = tasks.get(parentId)?.pipelineRun?.snapshot?.graph;
+  const step = graph?.steps.find((s) => s.id === stepId);
+  const runId = tasks.get(taskId)?.runId;
+  if (!graph || !step || !runId) return false;
+  const note = composeLimitResumeNote({
+    stepName: step.name,
+    handedOffBlocked: how === "handoff",
+    outgoing: outgoingSteps(graph, stepId).map((o) => ({ name: o.step.name, label: o.edge.label })),
+    transition: step.transition,
+    canFinish: step.canFinish === true,
+  });
+  let sent: Awaited<ReturnType<typeof sendInput>>;
+  try {
+    sent = await sendInput(runId, note);
+  } catch (err) {
+    sent = { delivered: false, reason: err instanceof Error ? err.message : String(err) };
+  }
+  if (sent.delivered) {
+    recordActivity(parentId, {
+      kind: "step",
+      text: `${step.name}'s usage limit has reset — resumed it in the same session to finish its work before handing off`,
+      tone: "info",
+    });
+    return true;
+  }
+  // A claude modal-guard withhold parks the note in the step's backlog tray:
+  // take it back out, the relaunch below replaces it.
+  if (sent.withheld && sent.savedToBacklog) {
+    try {
+      const item = tasks.get(taskId)?.backlog.find((b) => b.text === note);
+      if (item) backlog.remove(taskId, item.id);
+    } catch {
+      // best-effort
+    }
+  }
+  recordActivity(parentId, {
+    kind: "step",
+    text: `Couldn't resume ${step.name} in its own session (${sent.reason.slice(0, 120)}) — starting the step again instead`,
+    tone: "warning",
+  });
+  return false;
 }
 
 /** Re-arm every persisted automatic retry after a core restart (a timer never
@@ -2474,36 +2557,56 @@ async function settleStepRun(
       // …unless it also chose where the work goes next ("verification
       // failed" → Fix): the step routed it, so follow that choice instead of
       // stopping the run on a person.
-      const blockedButRouted =
-        classified.kind === "handoff-blocked" &&
-        !!classified.handoff?.next?.trim() &&
-        resolveNextSteps(graph, activeEntry.stepId, classified.handoff).kind === "steps";
+      // The exceptions are narrow (`blockedHandoffChoosesNext`): the step had
+      // a real choice of next step and made one. A step with a single way
+      // forward did not choose it — the contract dictates its `next` — so
+      // its "blocked" keeps the run here; and a turn that ran into a usage
+      // limit is never routed anywhere, whatever it wrote: it is resumed
+      // when the limit resets.
+      const blockedHandoff = classified.kind === "handoff-blocked" ? classified.handoff! : null;
+      // Claude's usage-limit grace window told the agent to stop and say so.
+      const limitNotice = blockedHandoff ? quotaNoticeFrom(mainStreamEventsForRun(runId)) : null;
+      const blockedButRouted = !!blockedHandoff && !limitNotice && blockedHandoffChoosesNext(graph, activeEntry.stepId, blockedHandoff);
       if (blockedButRouted) {
         recordActivity(parentId, {
           kind: "step",
-          text: `${stepName} reported a problem and handed it to "${classified.handoff!.next}" — following its choice`,
+          text: `${stepName} reported a problem and handed it to "${blockedHandoff!.next}" — following its choice`,
           tone: "warning",
         });
       }
-      if (classified.kind === "handoff-blocked" && !blockedButRouted) {
-        const handoff = classified.handoff!;
+      if (blockedHandoff && !blockedButRouted) {
+        const handoff = blockedHandoff;
         const oq = handoff.openQuestions.length > 0
           ? ` (open questions: ${handoff.openQuestions.join("; ")})`
           : "";
         const reasonText = handoff.reason.trim().length > 0 ? handoff.reason : "no reason given";
+        // Where the unfinished work would have gone had `next` been followed.
+        const wouldGoTo = resolveNextSteps(graph, activeEntry.stepId, handoff);
+        const insteadOf = handoff.next?.trim() && wouldGoTo.kind === "steps" ? wouldGoTo.stepIds.map((id) => stepNameById(graph, id)) : [];
+        // The column and run-status events both settle one turn: say it once.
+        const alreadyHeld = run.blocked.some((b) => b.taskId === taskId && b.kind === "step-blocked");
         upsertBlocked(run, {
           taskId,
           stepId: activeEntry.stepId,
           kind: "step-blocked",
-          message: `step "${stepName}" reported it is blocked: ${reasonText}${oq}`,
+          message: limitNotice
+            ? `step "${stepName}" stopped at its usage limit before finishing — it resumes here when the limit resets: ${reasonText}`
+            : `step "${stepName}" reported it is blocked: ${reasonText}${oq}`,
         });
         if (historyEntry) historyEntry.handoff = handoff;
-        // Claude's usage-limit grace window told the agent to stop and say
-        // so: that's not a decision for the user — retry once the limit
-        // resets (claude may also continue the turn by itself at the reset;
-        // the retry then finds the step running and stands down).
-        const quota = quotaNoticeFrom(mainStreamEventsForRun(runId));
-        if (quota) scheduleAutoRetry(parentId, run, activeEntry.stepId, quota, "hit a usage limit");
+        if (limitNotice) {
+          // Not a decision for the user: continue the same session once the
+          // limit resets (claude may also continue the turn by itself at
+          // the reset; the retry then finds the step running and stands
+          // down).
+          scheduleAutoRetry(parentId, run, activeEntry.stepId, limitNotice, "hit a usage limit", { resume: "handoff", insteadOf });
+        } else if (insteadOf.length > 0 && !alreadyHeld) {
+          recordActivity(parentId, {
+            kind: "step",
+            text: `${stepName} handed off "blocked" with its work unfinished — holding the run on ${stepName} instead of starting ${insteadOf.join(", ")}`,
+            tone: "warning",
+          });
+        }
         checkJoinIncomplete(run);
         persist(parentId, run);
         return null;
@@ -2720,7 +2823,11 @@ async function settleStepRun(
         historyEntry.outcome = "failed";
       }
       const why = failure ? `failed (${failure.detail.slice(0, 80)})` : tail ? `crashed (${tail.slice(0, 80)})` : "crashed";
-      scheduleAutoRetry(parentId, run, activeEntry.stepId, failure, why);
+      // A limit that cut the turn off after it had started working (any tool
+      // call) continues that session at the reset; one hit before any work
+      // just relaunches, as does every other failure.
+      const midWork = failure?.kind === "quota" && events.some((e) => e.stream === "tool_use");
+      scheduleAutoRetry(parentId, run, activeEntry.stepId, failure, why, midWork ? { resume: "cut-off" } : undefined);
       persist(parentId, run);
       return null;
     }

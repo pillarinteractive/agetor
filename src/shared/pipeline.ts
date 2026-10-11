@@ -932,6 +932,29 @@ export function resolveNextSteps(
 }
 
 /**
+ * Whether a `"status":"blocked"` handoff still routes the run: only when the
+ * step had a real choice of where to send the work and made one — several
+ * outgoing edges (Review: "changes requested" / "approved") or a step that
+ * may also finish (Finish: `next: null` / "verification failed") — and its
+ * `next` resolves. A step with ONE outgoing edge and no way to finish has no
+ * choice to make: the contract tells it to write that step's name in `next`,
+ * and {@link resolveNextSteps} takes the edge whatever `next` says, so a
+ * `next` there says nothing about intent. Such a blocked handoff keeps the
+ * run on the step (a Build cut short by a usage limit wrote `next: "Review"`
+ * as instructed and was reviewed half-done). `transition: "all"` never
+ * routes a blocked handoff either. The caller additionally refuses to route
+ * when the turn hit a usage limit.
+ */
+export function blockedHandoffChoosesNext(g: PipelineGraph, fromStepId: string, handoff: Handoff | null): boolean {
+  if (!handoff?.next?.trim()) return false;
+  const fromStep = g.steps.find((s) => s.id === fromStepId);
+  if (!fromStep || fromStep.transition !== "choose") return false;
+  const outgoing = outgoingSteps(g, fromStepId);
+  if (outgoing.length < 2 && !(fromStep.canFinish && outgoing.length > 0)) return false;
+  return resolveNextSteps(g, fromStepId, handoff).kind === "steps";
+}
+
+/**
  * Derive a run's overall status from its live progress: any blocked
  * execution wins outright (`"blocked"`), else any active execution means
  * `"running"`, else the run is either a terminal state it already recorded
@@ -1049,8 +1072,27 @@ function renderHandoffContract(outgoing: { name: string; label: string }[], tran
     'Write "summary" and "reason" as short Markdown — one point per line or bullet (use \\n line breaks inside the ' +
       "JSON string), not one long paragraph; the run view renders them for the user.",
     nextRuleText(outgoing, transition, canFinish),
+    blockedRuleText(outgoing, transition, canFinish),
     `Do not put anything after the closing </${HANDOFF_TAG}> tag.`,
   ];
+}
+
+/** What `"status":"blocked"` does to the run — the routing half of the
+ *  contract. Without it an agent stopped by a usage limit obeyed the `next`
+ *  rule ("set next to Review"), reported `blocked`, and expected the run to
+ *  stay put; see {@link blockedHandoffChoosesNext} for the rule this
+ *  describes. */
+function blockedRuleText(outgoing: { name: string; label: string }[], transition: "choose" | "all", canFinish = false): string {
+  const base =
+    'Use "status":"blocked" when this step\'s own work is NOT finished and you cannot finish it now (out of usage, a ' +
+    'missing input, a decision only the user can make): say what remains in "reason". The run then stays on this ' +
+    "step — it is resumed here later, or a person steps in — and nothing is handed to a next step.";
+  const hasChoice = transition === "choose" && (outgoing.length > 1 || (canFinish && outgoing.length > 0));
+  return hasChoice
+    ? `${base} The one exception: if another step is the right one to fix the problem you hit (for example a ` +
+      '"changes requested" or "verification failed" option above), name it in "next" and the run goes there; ' +
+      'otherwise set "next" to null.'
+    : base;
 }
 
 function nextRuleText(outgoing: { name: string; label: string }[], transition: "choose" | "all", canFinish = false): string {
@@ -1317,6 +1359,37 @@ export function composeHandoffReminder(input: {
   parts.push(...renderHandoffContract(input.outgoing, input.transition, input.canFinish === true));
   parts.push("If you are blocked or need the user's input, say so in the handoff's status/openQuestions instead of asking a question.");
 
+  return parts.join("\n\n");
+}
+
+/**
+ * The message a step is resumed with once the usage limit that stopped it has
+ * reset — sent as a follow-up turn into the step's own session (same
+ * conversation, same worktree), instead of handing its unfinished work to
+ * the next step or starting the step over from its original prompt.
+ * `handedOffBlocked`: the step wrote a `blocked` handoff inside the limit's
+ * grace window (that handoff is void); otherwise the turn was cut off with
+ * no handoff at all. Repeats the handoff contract, like {@link
+ * composeHandoffReminder}.
+ */
+export function composeLimitResumeNote(input: {
+  stepName: string;
+  handedOffBlocked: boolean;
+  outgoing: { name: string; label: string }[];
+  transition: "choose" | "all";
+  canFinish?: boolean;
+}): string {
+  const parts: string[] = [
+    input.handedOffBlocked
+      ? `The usage limit that stopped you has reset. Your step "${input.stepName}" was not finished, so it was NOT ` +
+        "handed to the next step and your earlier blocked handoff is void."
+      : `The usage limit that cut off your turn on step "${input.stepName}" has reset. Nothing was handed to the next step.`,
+    "Continue this step where you left off, in this same worktree: check `git status` and your notes above for what " +
+      "remains, finish the step's work — everything your step instructions require, including any verification and " +
+      "commit they ask for — and only then hand off.",
+    "End your final message with a NEW handoff block that describes the finished step, in exactly this format:",
+    ...renderHandoffContract(input.outgoing, input.transition, input.canFinish === true),
+  ];
   return parts.join("\n\n");
 }
 

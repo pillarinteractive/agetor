@@ -2622,3 +2622,95 @@ describe("delegation runs subagents on their persona's model", () => {
     expect(compose("codex")).toContain("Do not spawn subagents for this step.");
   });
 });
+
+// ---------------------------------------------------------------------------
+// A blocked handoff and where the run goes
+// ---------------------------------------------------------------------------
+
+describe("blockedHandoffChoosesNext", () => {
+  const { blockedHandoffChoosesNext } = require("./pipeline.ts") as typeof import("./pipeline.ts");
+  // Understand → Build → Review ⇄ Build, Review → Finish, Finish → Build.
+  const g = makeGraph({
+    steps: [
+      makeStep({ id: "build", name: "Build" }),
+      makeStep({ id: "review", name: "Review" }),
+      makeStep({ id: "finish", name: "Finish", canFinish: true }),
+      makeStep({ id: "fan", name: "Fan", transition: "all" }),
+    ],
+    edges: [
+      makeEdge({ id: "e1", from: "build", to: "review" }),
+      makeEdge({ id: "e2", from: "review", to: "build", label: "changes requested" }),
+      makeEdge({ id: "e3", from: "review", to: "finish", label: "approved" }),
+      makeEdge({ id: "e4", from: "finish", to: "build", label: "verification failed" }),
+      makeEdge({ id: "e5", from: "fan", to: "build" }),
+      makeEdge({ id: "e6", from: "fan", to: "review" }),
+    ],
+  });
+  const blocked = (next: string | null) => fullHandoffJsonObj({ status: "blocked", next });
+
+  test("a step's ONLY edge is not a choice: naming it never routes a blocked handoff", () => {
+    // The live shape: Build's contract says `set "next" to "Review"`, and a
+    // Build cut short by a usage limit wrote exactly that.
+    expect(blockedHandoffChoosesNext(g, "build", blocked("Review"))).toBe(false);
+    expect(blockedHandoffChoosesNext(g, "build", blocked(null))).toBe(false);
+  });
+
+  test("a step with several ways on, or one that may also finish, routes by its choice", () => {
+    expect(blockedHandoffChoosesNext(g, "review", blocked("changes requested"))).toBe(true);
+    expect(blockedHandoffChoosesNext(g, "review", blocked("Build (changes requested)"))).toBe(true);
+    expect(blockedHandoffChoosesNext(g, "finish", blocked("verification failed"))).toBe(true);
+  });
+
+  test("no choice made, an unknown choice, or a fan-out: the run stays on the step", () => {
+    expect(blockedHandoffChoosesNext(g, "review", blocked(null))).toBe(false);
+    expect(blockedHandoffChoosesNext(g, "review", blocked("  "))).toBe(false);
+    expect(blockedHandoffChoosesNext(g, "review", blocked("Ship it"))).toBe(false);
+    expect(blockedHandoffChoosesNext(g, "finish", blocked(null))).toBe(false);
+    expect(blockedHandoffChoosesNext(g, "fan", blocked("Build"))).toBe(false);
+    expect(blockedHandoffChoosesNext(g, "nope", blocked("Build"))).toBe(false);
+    expect(blockedHandoffChoosesNext(g, "review", null)).toBe(false);
+  });
+});
+
+describe("the handoff contract says what \"blocked\" does", () => {
+  const { composeLimitResumeNote } = require("./pipeline.ts") as typeof import("./pipeline.ts");
+  const compose = (outgoing: { name: string; label: string }[], canFinish = false) =>
+    composeStepPrompt({
+      pipelineName: "P", step: makeStep({ name: "Build", canFinish }), stepIndex: 2, stepCap: 25, goal: "g", previous: [],
+      outgoing, transition: "choose", subagentProfiles: [], subagentCap: null, inlineHandoff: true, parallelSiblings: [],
+    });
+
+  test("a single next step: blocked keeps the run here, with no way to route around it", () => {
+    const text = compose([{ name: "Review", label: "" }]);
+    expect(text).toContain('The next step is "Review"; set "next" to "Review".');
+    expect(text).toContain("The run then stays on this step — it is resumed here later, or a person steps in — and nothing is handed to a next step.");
+    expect(text).not.toContain("The one exception");
+  });
+
+  test("a step with a choice is told a blocked handoff may still name who fixes it", () => {
+    const text = compose([{ name: "Build", label: "changes requested" }, { name: "Finish", label: "approved" }]);
+    expect(text).toContain('The one exception: if another step is the right one to fix the problem you hit');
+    expect(compose([{ name: "Build", label: "verification failed" }], true)).toContain("The one exception");
+  });
+
+  test("the reminder repeats the same rule", () => {
+    const text = composeHandoffReminder({ stepName: "Build", reason: "handoff-missing", detail: null, outgoing: [{ name: "Review", label: "" }], transition: "choose" });
+    expect(text).toContain("The run then stays on this step");
+  });
+
+  test("composeLimitResumeNote: continue and finish before handing off; the earlier handoff is void", () => {
+    const outgoing = [{ name: "Review", label: "" }];
+    const after = composeLimitResumeNote({ stepName: "Build", handedOffBlocked: true, outgoing, transition: "choose" });
+    expect(after.startsWith('The usage limit that stopped you has reset. Your step "Build" was not finished, so it was NOT handed to the next step and your earlier blocked handoff is void.')).toBe(true);
+    expect(after).toContain("Continue this step where you left off, in this same worktree");
+    expect(after).toContain("and only then hand off");
+    expect(after).toContain('The next step is "Review"; set "next" to "Review".');
+    expect(after).toContain(`<${HANDOFF_TAG}>`);
+    // Nothing the runner injects names the product.
+    expect(after.toLowerCase()).not.toContain("agetor");
+
+    const cut = composeLimitResumeNote({ stepName: "Build", handedOffBlocked: false, outgoing, transition: "choose" });
+    expect(cut.startsWith('The usage limit that cut off your turn on step "Build" has reset. Nothing was handed to the next step.')).toBe(true);
+    expect(cut).not.toContain("blocked handoff is void");
+  });
+});

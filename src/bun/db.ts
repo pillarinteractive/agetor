@@ -747,6 +747,7 @@ const sanitizeAutoRetry = (raw: unknown): PipelineRunState["autoRetry"] => {
     attempt: Number.isSafeInteger(r.attempt) && (r.attempt as number) > 0 ? (r.attempt as number) : 1,
     at: isFiniteNumber(r.at) ? r.at : null,
     reason: typeof r.reason === "string" ? r.reason.slice(0, 500) : "",
+    ...(r.resume === "handoff" || r.resume === "cut-off" ? { resume: r.resume } : {}),
   };
 };
 

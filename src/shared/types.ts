@@ -741,6 +741,13 @@ export interface PipelineAutoRetry {
   at: number | null;
   /** The limit/failure line that triggered it. */
   reason: string;
+  /** A usage limit stopped a step that was already part-way through its
+   *  work: the retry continues the step's own session with a note
+   *  (`composeLimitResumeNote`) instead of relaunching it from its original
+   *  prompt. `"handoff"`: it wrote a `blocked` handoff inside the limit's
+   *  grace window; `"cut-off"`: the turn died mid-work with none. Absent:
+   *  relaunch (a limit hit before any work, a crash, a lost session). */
+  resume?: "handoff" | "cut-off";
 }
 
 /** Field length/count caps enforced by both the server routes and the

@@ -1005,7 +1005,7 @@ function bumpFakeHandoffTurn(taskId: string): number {
  * `missing-then-done`, `invalid-then-done`, and `missing-then-<StepName>`
  * alike — `<token>` is used verbatim, same as a plain suffix would be.
  */
-const FAKE_HANDOFF_TWO_TURN_RE = /^(missing|invalid)-then-(.+)$/;
+const FAKE_HANDOFF_TWO_TURN_RE = /^(missing|invalid|quota-blocked|blocked)-then-(.+)$/;
 /**
  * Resolve the raw suffix (from `lastFakeHandoffSuffix`) plus the current
  * turn number into the EFFECTIVE suffix `makeFakeAgent`'s handoff branch
@@ -1371,6 +1371,11 @@ function makeFakeAgent(
     const errorText = process.env.AGETOR_FAKE_CLAUDE_API_ERROR_TEXT ?? "API Error: 529 Overloaded. This is a server-side issue, usually temporary.";
     const errorStatus = process.env.AGETOR_FAKE_CLAUDE_API_ERROR_STATUS ?? "529";
     after(5, () => {
+      // `AGETOR_FAKE_CLAUDE_API_ERROR_AFTER_WORK=1`: the error cuts off a turn
+      // that had already started working (a tool call), not one at its start.
+      if (process.env.AGETOR_FAKE_CLAUDE_API_ERROR_AFTER_WORK === "1") {
+        onChunk("tool_use", JSON.stringify({ id: "fake-work-1", name: "Edit", input: { file_path: "a.ts" }, serverSide: false }), "fake-work-1-tu");
+      }
       onChunk("assistant", errorText);
       onChunk("status", `${CLAUDE_API_ERROR_STATUS_PREFIX}HTTP ${errorStatus} — turn aborted; blocked for manual retry`);
     });
@@ -1512,7 +1517,10 @@ function makeFakeAgent(
           purpose: "fake purpose",
           summary: "stopped early",
           reason: suffix === "quota-blocked" ? "Your usage limit was reached, so I stopped." : "needs a product decision",
-          next: null,
+          // A real agent obeys the contract's `next` rule even when it
+          // stops early ("set next to Review"): `AGETOR_FAKE_CLAUDE_BLOCKED_NEXT`
+          // names that step.
+          next: process.env.AGETOR_FAKE_CLAUDE_BLOCKED_NEXT ?? null,
           artifacts: [] as string[],
           openQuestions: [] as string[],
           status: "blocked" as const,

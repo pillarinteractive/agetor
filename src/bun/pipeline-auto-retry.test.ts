@@ -15,7 +15,7 @@ process.env.AGETOR_CLAUDE_BIN = "/bin/echo";
 process.env.AGETOR_CLAUDE_ARGS = "";
 process.env.AGETOR_TMUX_BIN = "/bin/echo";
 
-const ERROR_ENV = ["AGETOR_FAKE_CLAUDE_API_ERROR", "AGETOR_FAKE_CLAUDE_API_ERROR_TEXT", "AGETOR_FAKE_CLAUDE_API_ERROR_STATUS"];
+const ERROR_ENV = ["AGETOR_FAKE_CLAUDE_API_ERROR", "AGETOR_FAKE_CLAUDE_API_ERROR_TEXT", "AGETOR_FAKE_CLAUDE_API_ERROR_STATUS", "AGETOR_FAKE_CLAUDE_API_ERROR_AFTER_WORK"];
 let parents: string[] = [];
 
 beforeAll(async () => {
@@ -176,4 +176,181 @@ test("a step that stopped for claude's usage-limit grace window retries at the r
   });
   expect(b.pipelineRun!.blocked[0]!.kind).toBe("step-blocked");
   expect(b.pipelineRun!.autoRetry).toBeUndefined();
+});
+
+// --- An unfinished step is never handed to the next one ---------------------
+//
+// The live shape (four cards, one evening): Build → Review is Build's only
+// edge, so its contract says `set "next" to "Review"`. Claude's usage-limit
+// grace note arrives mid-work; Build stops, hands off `blocked` WITH
+// `next: "Review"` as instructed, and claude prints when it will continue.
+// The run used to read that `next` as a routing choice and start Review on
+// half-done work. Fixture text is synthetic.
+
+/** Build → Review (Build's sole, unlabeled edge); Review → Build "changes
+ *  requested" / → Finish "approved". Started. */
+async function startBuildReview(buildSuffix: string, reviewSuffix = "Finish") {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { agentProfiles, pipelines } = await import("./db.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+  const profile = agentProfiles.insert({
+    name: `auto-retry-${randomUUID()}`, harness: "claude-code", model: "fake-model", effort: null, mode: null, fast: false, maxMode: false, instructions: "", skills: [],
+  });
+  const step = (name: string, suffix: string) =>
+    newStep({ name, agentProfileId: profile.id, instructions: `Do it. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:${suffix}` });
+  const build = step("Build", buildSuffix);
+  const review = step("Review", reviewSuffix);
+  const finish = step("Finish", "done");
+  const pipeline = pipelines.insert({
+    name: `auto-retry-${randomUUID()}`,
+    graph: {
+      steps: [build, review, finish],
+      edges: [
+        { id: "e1", from: build.id, to: review.id, label: "" },
+        { id: "e2", from: review.id, to: build.id, label: "changes requested" },
+        { id: "e3", from: review.id, to: finish.id, label: "approved" },
+      ],
+      startStepId: build.id,
+    },
+    maxSteps: 25,
+  });
+  const created = await createTask({ title: "unfinished build", prompt: "goal", workdir: mkdtempSync(path.join(tmpdir(), "agetor-auto-retry-wd-")), isolation: "none", pipelineId: pipeline.id });
+  if ("error" in created) throw new Error(created.error);
+  parents.push(created.task.id);
+  const started = await startTask(created.task.id);
+  if ("error" in started) throw new Error(started.error);
+  return { parentId: created.task.id, build, review, finish };
+}
+
+const blockedRun = async (parentId: string) => {
+  const { tasks } = await import("./db.ts");
+  return waitFor(() => {
+    const t = tasks.get(parentId);
+    return t?.pipelineRun?.status === "blocked" ? t.pipelineRun : undefined;
+  });
+};
+
+test("Build stopped by a usage limit with next: \"Review\" resumes Build in its own session and never starts Review on unfinished work", async () => {
+  const { tasks, runs } = await import("./db.ts");
+  const { fireAutoRetry } = await import("./pipeline-runner.ts");
+  process.env.AGETOR_FAKE_CLAUDE_BLOCKED_NEXT = "Review";
+  try {
+    const { parentId, build, review } = await startBuildReview("quota-blocked-then-Review");
+    const run = await blockedRun(parentId);
+
+    // Parked on Build: Review was never launched.
+    expect(run.active.map((a) => a.stepId)).toEqual([build.id]);
+    expect(run.history.map((h) => h.stepId)).toEqual([build.id]);
+    expect(run.history[0]).toMatchObject({ responseKind: "handoff-blocked", outcome: null, nextStepIds: [] });
+    expect(run.history[0]!.handoff).toMatchObject({ status: "blocked", next: "Review" });
+    expect(run.blocked[0]).toMatchObject({ kind: "step-blocked", stepId: build.id });
+    expect(run.blocked[0]!.message).toContain("stopped at its usage limit before finishing");
+    // The quota wait applies to that same step, as a resume.
+    expect(run.autoRetry).toMatchObject({ stepId: build.id, kind: "quota", attempt: 1, resume: "handoff" });
+    const reset = new Date(run.autoRetry!.at! - 5 * 60_000);
+    expect([reset.getHours(), reset.getMinutes()]).toEqual([23, 30]);
+    // The timeline says what happened.
+    const lines = activity(parentId);
+    expect(lines.some((l) => /^Build stopped at its usage limit before finishing — resuming it at .+ instead of handing unfinished work to Review$/.test(l))).toBe(true);
+    expect(lines.some((l) => l.includes("following its choice"))).toBe(false);
+
+    // The limit resets: Build continues in the SAME step task, as a follow-up
+    // turn carrying the resume note — not a relaunch from its first prompt.
+    const buildTaskId = run.active[0]!.taskId;
+    expect(await fireAutoRetry(parentId, run.autoRetry!.at!)).toBe(true);
+    const done = await waitFor(() => {
+      const t = tasks.get(parentId);
+      return t?.pipelineRun?.status === "done" ? t.pipelineRun : undefined;
+    });
+    // Build finished on its second turn, and only then did Review run.
+    expect(done.history.map((h) => h.stepId)).toEqual([build.id, review.id, done.history[2]!.stepId]);
+    expect(done.history[0]).toMatchObject({ taskId: buildTaskId, outcome: "succeeded", responseKind: "handoff", nextStepIds: [review.id] });
+    expect(done.history[0]!.handoff!.status).toBe("done");
+    expect(done.autoRetry).toBeUndefined();
+    const buildRuns = runs.listForTask(buildTaskId);
+    const userTurns = buildRuns.flatMap((r) => runs.events(r.id)).filter((e) => e.stream === "user").map((e) => e.data);
+    expect(userTurns.some((u) => u.includes("The usage limit that stopped you has reset") && u.includes("your earlier blocked handoff is void"))).toBe(true);
+    expect(activity(parentId).some((l) => l.includes("Build's usage limit has reset — resumed it in the same session"))).toBe(true);
+  } finally {
+    delete process.env.AGETOR_FAKE_CLAUDE_BLOCKED_NEXT;
+  }
+});
+
+test("a blocked handoff on a step's only edge holds the run on that step (Needs you), even though it names the next step", async () => {
+  process.env.AGETOR_FAKE_CLAUDE_BLOCKED_NEXT = "Review";
+  try {
+    const { parentId, build } = await startBuildReview("blocked");
+    const run = await blockedRun(parentId);
+    expect(run.active.map((a) => a.stepId)).toEqual([build.id]);
+    expect(run.history.length).toBe(1);
+    expect(run.blocked[0]).toMatchObject({ kind: "step-blocked", stepId: build.id });
+    expect(run.blocked[0]!.message).toContain('step "Build" reported it is blocked: needs a product decision');
+    expect(run.autoRetry).toBeUndefined(); // a real block is a person's call, not a retry
+    expect(activity(parentId)).toContain('Build handed off "blocked" with its work unfinished — holding the run on Build instead of starting Review');
+  } finally {
+    delete process.env.AGETOR_FAKE_CLAUDE_BLOCKED_NEXT;
+  }
+});
+
+test("a step with a real choice still routes a blocked handoff — unless the turn hit a usage limit", async () => {
+  const { tasks } = await import("./db.ts");
+  // Review may send the work back or on. Blocked + "changes requested" is a
+  // decision about who fixes it: Build runs again.
+  process.env.AGETOR_FAKE_CLAUDE_BLOCKED_NEXT = "changes requested";
+  try {
+    const routed = await startBuildReview("Review", "blocked-then-Finish");
+    await waitFor(() => (tasks.get(routed.parentId)?.pipelineRun?.history.length ?? 0) >= 3);
+    const h = tasks.get(routed.parentId)!.pipelineRun!.history;
+    expect(h.slice(0, 3).map((x) => x.stepId)).toEqual([routed.build.id, routed.review.id, routed.build.id]);
+    expect(h[1]).toMatchObject({ responseKind: "handoff-blocked", outcome: "succeeded", nextStepIds: [routed.build.id] });
+    expect(activity(routed.parentId)).toContain('Review reported a problem and handed it to "changes requested" — following its choice');
+
+    // The same handoff from a Review that ran out of usage is not a decision.
+    const limited = await startBuildReview("Review", "quota-blocked");
+    const run = await blockedRun(limited.parentId);
+    expect(run.active.map((a) => a.stepId)).toEqual([limited.review.id]);
+    expect(run.history.map((x) => x.stepId)).toEqual([limited.build.id, limited.review.id]);
+    expect(run.autoRetry).toMatchObject({ stepId: limited.review.id, kind: "quota", resume: "handoff" });
+    expect(activity(limited.parentId).some((l) => l.startsWith("Review stopped at its usage limit before finishing — resuming it at ") && l.endsWith("instead of handing unfinished work to Build"))).toBe(true);
+  } finally {
+    delete process.env.AGETOR_FAKE_CLAUDE_BLOCKED_NEXT;
+  }
+});
+
+test("a usage limit that cuts a turn off mid-work resumes that session; one hit before any work relaunches", async () => {
+  const { tasks, runs } = await import("./db.ts");
+  const { fireAutoRetry } = await import("./pipeline-runner.ts");
+  process.env.AGETOR_FAKE_CLAUDE_API_ERROR = "1";
+  process.env.AGETOR_FAKE_CLAUDE_API_ERROR_TEXT = "You've hit your usage limit. Try again at 11:30 PM.";
+  process.env.AGETOR_FAKE_CLAUDE_API_ERROR_STATUS = "429";
+  process.env.AGETOR_FAKE_CLAUDE_API_ERROR_AFTER_WORK = "1";
+  const { parentId, build, review } = await startBuildReview("Review");
+  const run = await blockedRun(parentId);
+  expect(run.history.map((h) => h.stepId)).toEqual([build.id]);
+  expect(run.history[0]).toMatchObject({ outcome: "failed", responseKind: "error" });
+  expect(run.autoRetry).toMatchObject({ stepId: build.id, kind: "quota", resume: "cut-off" });
+  expect(activity(parentId).some((l) => l.startsWith("Build stopped at its usage limit before finishing — resuming it at "))).toBe(true);
+
+  for (const k of ERROR_ENV) delete process.env[k];
+  const buildTaskId = run.active[0]!.taskId;
+  expect(await fireAutoRetry(parentId, run.autoRetry!.at!)).toBe(true);
+  const done = await waitFor(() => {
+    const t = tasks.get(parentId);
+    return t?.pipelineRun?.status === "done" ? t.pipelineRun : undefined;
+  });
+  expect(done.history.slice(0, 2).map((h) => [h.stepId, h.taskId === buildTaskId])).toEqual([[build.id, true], [review.id, false]]);
+  const userTurns = runs.listForTask(buildTaskId).flatMap((r) => runs.events(r.id)).filter((e) => e.stream === "user").map((e) => e.data);
+  expect(userTurns.some((u) => u.startsWith('The usage limit that cut off your turn on step "Build" has reset.'))).toBe(true);
+
+  // Hit at the very start of the turn (nothing done yet): no `resume` — the
+  // step is simply started again, as before.
+  process.env.AGETOR_FAKE_CLAUDE_API_ERROR = "1";
+  process.env.AGETOR_FAKE_CLAUDE_API_ERROR_TEXT = "You've hit your usage limit. Try again at 11:30 PM.";
+  process.env.AGETOR_FAKE_CLAUDE_API_ERROR_STATUS = "429";
+  const fresh = await startBuildReview("Review");
+  const atStart = await blockedRun(fresh.parentId);
+  expect(atStart.autoRetry).toMatchObject({ kind: "quota" });
+  expect(atStart.autoRetry!.resume).toBeUndefined();
+  expect(activity(fresh.parentId).some((l) => l.includes("Build is waiting on a usage limit") && l.includes("retrying automatically at"))).toBe(true);
 });
