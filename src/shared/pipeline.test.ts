@@ -12,6 +12,7 @@ import {
   classifyStepResponse,
   composeHandoffReminder,
   composeStepPrompt,
+  STEP_ECONOMY_GUIDANCE,
   deriveRunStatus,
   effectiveStepCap,
   incomingSteps,
@@ -2852,4 +2853,28 @@ describe("a step's final report", () => {
     expect(prompt).toContain("(handoff saved to /data/handoff.json)");
     expect(prompt).toContain('The full report from "Review" (its findings in full, not just the handoff summary) is saved to /data/report-x-3.md — read it before you start.');
   });
+});
+
+test("every step's prompt carries the usage guidance, between its instructions and the handoff contract", () => {
+  const prompt = composeStepPrompt({
+    pipelineName: "P",
+    step: newStep({ name: "Build", instructions: "Do the work." }),
+    stepIndex: 2,
+    stepCap: 10,
+    goal: "goal",
+    previous: [],
+    outgoing: [],
+    transition: "choose",
+    subagentProfiles: [],
+    subagentCap: null,
+    inlineHandoff: true,
+    parallelSiblings: [],
+  });
+  const at = prompt.indexOf("## Working economically");
+  expect(at).toBeGreaterThan(prompt.indexOf("## Your step"));
+  expect(at).toBeLessThan(prompt.indexOf("## Handoff (required)"));
+  expect(prompt).toContain(STEP_ECONOMY_GUIDANCE);
+  // Short enough to cost nothing next to what it saves, and project-agnostic.
+  expect(STEP_ECONOMY_GUIDANCE.length).toBeLessThan(1200);
+  expect(STEP_ECONOMY_GUIDANCE).not.toMatch(/pnpm|bun |npm|\.github/);
 });

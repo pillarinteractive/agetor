@@ -1231,6 +1231,27 @@ export function truncateMiddleUtf8(
 }
 
 /**
+ * The usage half of the step contract, the same for every step and harness.
+ * Each tool call re-sends the whole session, so what a call brings in is paid
+ * for again on every later call: on this board (2026-10-10) command output
+ * and file reads were 30% of a step's cost and a third of that sat in
+ * results over 12 KB (whole large files, unfiltered logs). Project-specific
+ * advice (which files are big, which commands are noisy) belongs in the
+ * agent profiles, not here.
+ */
+export const STEP_ECONOMY_GUIDANCE = [
+  "Every tool call re-sends this whole conversation, and everything a call returns is sent again with each later " +
+    "call. Keep what you bring in small:",
+  "- Find the lines first (search with line numbers), then read that range — not the whole of a large file. Never " +
+    "print lockfiles, generated files or large JSON/CSV documents: query them for the fields you need.",
+  "- Keep command output short: send a long command's output to a file and print the failing part or the last " +
+    "lines, not the whole log. Do not re-run a command only to see its output again.",
+  "- Put independent lookups in one call rather than one call each.",
+  "- The handoffs and reports quoted above are complete unless marked as shortened; do not read their files again.",
+  "None of this replaces checking your work: read what you need to be right, and run the checks your step requires.",
+].join("\n");
+
+/**
  * Compose the (pre-`composeLaunchPrompt`) prompt text for one step's launch,
  * deterministically: pipeline/step header, the overall goal, the previous
  * step(s)' handoff context (several entries after a join), this step's own
@@ -1411,6 +1432,9 @@ export function composeStepPrompt(input: {
   } else {
     parts.push("Do not spawn subagents for this step.");
   }
+
+  parts.push("## Working economically");
+  parts.push(STEP_ECONOMY_GUIDANCE);
 
   parts.push("## Handoff (required)");
   parts.push(
