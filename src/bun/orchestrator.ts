@@ -1150,7 +1150,7 @@ function reserveTaskRunner(task: Task): { ok: true } | { error: string } {
   const name=parent?.pipelineRun?.snapshot?.graph.steps.find(s=>s.id===task.pipelineStepId)?.name ?? task.title;
   return reserveRunner(task.id,name,id=>id===task.id
     ? !!task.runId&&active.has(task.runId)||isTaskHeldByBackgroundAgents(task)
-    : isTaskRunLive(id));
+    : isTaskRunLive(id),task.pipelineParentId??task.id);
 }
 function insertReservedRun(row: Parameters<typeof runs.insert>[0]): void {
   db.transaction(()=>{runs.insert(row);bindRunner(row.taskId,row.id);}).immediate();

@@ -26,7 +26,7 @@
  * Config: `autopilot` preference. State: `autopilot_state` preference.
  */
 import type { Task, TaskPrStatus } from "../shared/types.ts";
-import { preferences, tasks } from "./db.ts";
+import { preferences, tasks, isSqliteBusy } from "./db.ts";
 import { recordActivity } from "./activity.ts";
 import { run } from "./github.ts";
 import { askThread, taggedJson, type ThreadAnswer } from "./codex-thread.ts";
@@ -35,7 +35,7 @@ import { setMergeQueued } from "./merge-intent.ts";
 import { describeRiskyFiles, parseRiskyRules, riskyFiles, RISKY_PATHS_PREF, type RiskyRules } from "../shared/risky-paths.ts";
 import { hasConfirmedNoPr, prStatusForTask } from "./pr-watch.ts";
 import { onCardRemoved, startTask, subscribeGlobal, isTaskRunLive } from "./orchestrator.ts";
-import { runnerUse } from './dispatch-claims.ts';
+import { runnerUse, activeCardOwners } from './dispatch-claims.ts';
 import { beginQueueCycle, completeQueueCycle, restoredQueueDelay } from './queue-cycle.ts';
 import { currentSlots } from './step-slots.ts';
 import { freezeCardInputs, queueValidator } from './queue-validation.ts';
@@ -123,6 +123,9 @@ export interface AutopilotConfig {
   /** Tracker mode with a milestone scope: when the scope can no longer fill
    *  its slots, add the next milestone without asking. */
   autoContinue: boolean;
+  /** Explicit project authorization for newly finished reviewed pipelines. */
+  autoMergePipelines?:boolean;
+  autoMergeSince?:number;
 }
 
 export interface AutopilotState {
@@ -255,6 +258,7 @@ export function parseConfig(raw: string | null | undefined): AutopilotConfig {
     pipelineId: typeof o.pipelineId === "string" && o.pipelineId ? o.pipelineId : null,
     roadmap: typeof r?.issue === "number" && Number.isInteger(r.issue) && r.issue > 0 ? { issue: r.issue } : null,
     autoContinue: o.autoContinue === true,
+    ...(o.autoMergePipelines===true&&typeof o.autoMergeSince==='number'&&Number.isFinite(o.autoMergeSince)&&o.autoMergeSince>0?{autoMergePipelines:true,autoMergeSince:o.autoMergeSince}:{}),
   };
 }
 
@@ -314,10 +318,10 @@ function passOutdated(): boolean {
  * carried over — a pass that outlived its run must not mark the new one
  * "done" or bring the old status back.
  */
-function savePassState(state: AutopilotState): void {
-  if (!passRun || passRun.epoch === runEpoch) return writeState(state);
+function savePassState(state: AutopilotState, pass=passRun): void {
+  if (!pass || pass.epoch === runEpoch) return writeState(state);
   const fresh = readState();
-  const sameProject = parseConfig(preferences.get(AUTOPILOT_PREF)).project === passRun.project;
+  const sameProject = parseConfig(preferences.get(AUTOPILOT_PREF)).project === pass.project;
   writeState({ ...fresh, cards: state.cards, roadmapBacklog: sameProject ? state.roadmapBacklog : fresh.roadmapBacklog });
 }
 
@@ -437,7 +441,8 @@ export function readHandsOff(): string[] {
  * Autopilot doesn't sign it off again, whatever its PR looks like later.
  */
 export function noteSignOffWithdrawn(taskId: string): void {
-  if (!readState().cards.includes(taskId)) return;
+  const cfg=parseConfig(preferences.get(AUTOPILOT_PREF)),task=tasks.get(taskId);
+  if (!readState().cards.includes(taskId)&&!(cfg.autoMergePipelines&&task?.pipelineId&&sameDir(task.workdir,cfg.project))) return;
   const cur = readHandsOff();
   if (!cur.includes(taskId)) preferences.set(HANDS_OFF_PREF, JSON.stringify([...cur, taskId].slice(-500)));
 }
@@ -469,7 +474,23 @@ export interface SignOffDeps {
  *
  * Mutates `state`. Exported for tests.
  */
-export async function signOffPass(state: AutopilotState, mine: Task[], deps: SignOffDeps): Promise<void> {
+export function reviewedPillarPipeline(t:Task,cfg:AutopilotConfig,pr:TaskPrStatus|null):boolean {
+  const run=t.pipelineRun,graph=run?.snapshot?.graph;
+  if(!cfg.autoMergePipelines||!cfg.autoMergeSince||cfg.roadmap?.issue!==639||!sameDir(t.workdir,cfg.project)
+    ||!t.pipelineId||t.pipelineParentId||!run||run.status!=='done'||(run.endedAt??0)<cfg.autoMergeSince
+    ||!/^https:\/\/github\.com\/pillar-interactive\/pillar\/issues\/\d+\/?$/i.test(t.issueUrl??'')
+    ||!/^https:\/\/github\.com\/pillar-interactive\/pillar\/pull\/\d+\/?$/i.test(t.prUrl??'')
+    ||pr?.url!==t.prUrl||pr.state!=='open'||pr.draft||pr.baseRef!=='develop'||!pr.headSha)return false;
+  const review=graph?.steps.find(s=>s.name==='Review'),finish=graph?.steps.find(s=>s.name==='Finish');
+  const profile=review?.agentProfileId?run.snapshot?.profiles[review.agentProfileId]:null;
+  if(!review||!finish||profile?.model!=='gpt-6.1-sol')return false;
+  const lastReview=run.history.filter(h=>h.stepId===review.id).at(-1),last=run.history.at(-1);
+  return lastReview?.outcome==='succeeded'&&lastReview.handoff?.status==='done'
+    &&lastReview.handoff.openQuestions.length===0&&lastReview===run.history.at(-2)
+    &&lastReview.nextStepIds.includes(finish.id)&&last?.stepId===finish.id&&last.outcome==='succeeded'
+    &&last.handoff?.status==='done'&&last.handoff.openQuestions.length===0&&last.handoff.artifacts.includes(t.prUrl!);
+}
+export async function signOffPass(state: AutopilotState, mine: Task[], deps: SignOffDeps, cfg?:AutopilotConfig): Promise<void> {
   const rules = deps.rules();
   const handsOff = deps.handsOff();
   const ids = new Set(mine.map((t) => t.id));
@@ -487,8 +508,10 @@ export async function signOffPass(state: AutopilotState, mine: Task[], deps: Sig
     if (t.column !== "review" || t.pipelineRun?.status !== "done" || handsOff.has(t.id)) continue;
     const pr = deps.prStatus(t.id);
     if (pr?.state !== "open") continue;
+    const authorized=!!cfg&&reviewedPillarPipeline(t,cfg,pr);
+    if(cfg?.autoMergePipelines&&cfg.roadmap?.issue===639&&sameDir(t.workdir,cfg.project)&&!authorized)continue;
     const hold = state.holds[t.id];
-    if (wasHeld && hold && hold.pr === pr.number && hold.headSha != null && hold.headSha === pr.headSha && hold.rules === rules.signature) continue;
+    if (!authorized&&wasHeld && hold && hold.pr === pr.number && hold.headSha != null && hold.headSha === pr.headSha && hold.rules === rules.signature) continue;
 
     const files = await deps.prFiles(t, pr.number);
     if (files == null) {
@@ -502,7 +525,7 @@ export async function signOffPass(state: AutopilotState, mine: Task[], deps: Sig
     }
     delete state.unread[t.id];
     const risky = riskyFiles(files, rules);
-    if (risky.length > 0) {
+    if (risky.length > 0&&!authorized) {
       const next: CardHold = { pr: pr.number, url: pr.url ?? null, headSha: pr.headSha ?? null, rules: rules.signature, files: risky.slice(0, 5), count: risky.length };
       const changed = !wasHeld || !hold || hold.count !== next.count || hold.files.join("\n") !== next.files.join("\n");
       if (!wasHeld) state.held.push(t.id);
@@ -815,6 +838,7 @@ const BACKLOG_PER_PASS = 60;
 export interface RoadmapDeps {
   loadQueue?(project:string,issue:number):Promise<(CanonicalQueue & {states:Map<number,RoadmapIssueState>;body:string;url:string|null})|{error:string}>;
   runnerFree?():number;
+  cardFree?():number;
   validator?(project:string,tracker:number,queue:CanonicalQueue,issue:number,cardId?:string):()=>Promise<string|null>;
   freeze?(project:string,tracker:number,queue:CanonicalQueue,issue:number,taskId:string):void;
   loadTracker(project: string, issue: number): Promise<{ body: string; url: string | null } | { error: string }>;
@@ -1088,7 +1112,8 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
   }
   const scoped = scope ? views.filter((v) => scope!.steps.has(v.step)) : views;
 
-  const free = Math.min(cfg.maxInFlight - Math.max(ownLive, inFlight.length),fullQueue?(deps.runnerFree?.()??Infinity):Infinity);
+  const free = fullQueue ? Math.min(deps.cardFree?.()??cfg.maxInFlight-Math.max(ownLive,inFlight.length),deps.runnerFree?.()??Infinity)
+    : cfg.maxInFlight - Math.max(ownLive, inFlight.length);
   // The started live card of each issue, for the status' links.
   const liveCards = new Map<number, string>();
   for (const t of all) {
@@ -1114,7 +1139,7 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
     else {
       for (const v of picks.start) {
         if (deps.outdated()) break;
-        if(started.size>=free || (fullQueue&&(deps.runnerFree?.()??Infinity)<=0))break;
+        if(started.size>=free || (fullQueue&&((deps.runnerFree?.()??Infinity)<=0||(deps.cardFree?.()??Infinity)<=0)))break;
         const basePrompt = roadmapStepPrompt(tracker, v, parsed.steps, { prior: priorOf(v.issue) });
         const dispatchRecord=queue?.records.find(r=>r.issue===v.issue);
         const stepPrompt=queue?`${basePrompt}\n\nDispatch graph ${queue.version}; owning contract revision ${dispatchRecord?.updatedAt}; SHA-256 ${dispatchRecord?.bodyHash}. The attached earlier issue snapshot is historical if it differs. Current controlling contract at dispatch:\n\n${states.get(v.issue)?.body??''}`:basePrompt;
@@ -1544,6 +1569,7 @@ let recheckTimer: ReturnType<typeof setTimeout> | null = null;
 export const ROADMAP_DEPS: RoadmapDeps = {
   loadQueue:loadCanonicalQueue,
   runnerFree:()=>Math.max(0,currentSlots().max-runnerUse(isTaskRunLive).total),
+  cardFree:()=>Math.max(0,Math.min(parseConfig(preferences.get(AUTOPILOT_PREF)).maxInFlight,currentSlots().max)-activeCardOwners(isTaskRunLive).size),
   validator:queueValidator,
   freeze:freezeCardInputs,
   loadTracker: loadRoadmapTracker,
@@ -1616,11 +1642,11 @@ let busy = false;
 /** One pass. Exported for tests and the "run now" button. */
 export async function autopilotTick(): Promise<void> {
   const cfg = parseConfig(preferences.get(AUTOPILOT_PREF));
-  if (!cfg.enabled || !cfg.project || busy) return;
+  if ((!cfg.enabled&&!cfg.autoMergePipelines) || !cfg.project || busy) return;
   // Tracker mode needs neither a milestone nor the thread.
   if (!cfg.roadmap && (!cfg.threadId || !cfg.milestone)) return;
-  const cycle=cfg.roadmap?.issue===639?beginQueueCycle(cfg.project,639):null;
-  if(cfg.roadmap?.issue===639&&!cycle)return;
+  const cycle=cfg.enabled&&cfg.roadmap?.issue===639?beginQueueCycle(cfg.project,639):null;
+  if(cfg.enabled&&cfg.roadmap?.issue===639&&!cycle)return;
   busy = true;
   passRun = { epoch: runEpoch, project: cfg.project };
   const state = readState();
@@ -1638,7 +1664,9 @@ export async function autopilotTick(): Promise<void> {
     const withdrawn = readHandsOff();
     const stillThere = withdrawn.filter((id) => all.some((t) => t.id === id && t.archivedAt == null && t.column !== "done"));
     if (stillThere.length !== withdrawn.length) preferences.set(HANDS_OFF_PREF, JSON.stringify(stillThere));
-    await signOffPass(state, mine, SIGN_OFF_DEPS);
+    const reviewed=cfg.autoMergePipelines?all.filter(t=>reviewedPillarPipeline(t,cfg,SIGN_OFF_DEPS.prStatus(t.id))):[];
+    await signOffPass(state,[...new Map([...mine,...reviewed].map(t=>[t.id,t])).values()],SIGN_OFF_DEPS,cfg);
+    if(!cfg.enabled)return; // lifecycle sign-off never enables new admissions
 
     if (cfg.roadmap) {
       await roadmapPass(cfg, state, all, mine, ROADMAP_DEPS);
@@ -1745,13 +1773,20 @@ export async function autopilotTick(): Promise<void> {
       state.lastError = null;
     }
   } finally {
-    savePassState(state);
-    passRun = null;
+    // Cleanup cannot depend on a final write succeeding. A bounded busy
+    // failure retains durable wake intent, not a permanently busy process.
+    const finishingPass=passRun;passRun = null;
     busy = false;
+    let saveError:unknown=null;
+    try{savePassState(state,finishingPass);}catch(error){saveError=error;}
     if(cycle) {
-      const outcome=state.lastError?'error':state.cards.length>cardsBefore?'progress':(ROADMAP_DEPS.runnerFree?.()??0)<=0?'full':'empty';
-      ROADMAP_DEPS.recheck(completeQueueCycle(cycle,outcome));
+      let outcome:'error'|'progress'|'full'|'empty'=state.lastError||saveError?'error':state.cards.length>cardsBefore?'progress':'empty';
+      try{if(outcome==='empty'&&(ROADMAP_DEPS.runnerFree?.()??0)<=0)outcome='full';}catch(error){if(!isSqliteBusy(error))saveError??=error;outcome='error';}
+      let delay=30_000;
+      try{delay=completeQueueCycle(cycle,outcome);}catch(error){if(!isSqliteBusy(error))throw error;}
+      ROADMAP_DEPS.recheck(saveError?30_000:delay);
     }
+    if(saveError&&!isSqliteBusy(saveError))throw saveError;
   }
 }
 
@@ -1790,7 +1825,9 @@ export function applyAutopilotPatch(body: Record<string, unknown>): AutopilotCon
       : "milestone" in body
         ? { milestones: [] }
         : {};
-  const next = parseConfig(JSON.stringify({ ...cur, ...body, ...scopePatch }));
+  const mergePolicy=body.autoMergePipelines===true?{autoMergePipelines:true,autoMergeSince:cur.autoMergePipelines?cur.autoMergeSince:Date.now()}
+    :body.autoMergePipelines===false?{autoMergePipelines:false,autoMergeSince:undefined}: {autoMergePipelines:cur.autoMergePipelines,autoMergeSince:cur.autoMergeSince};
+  const next = parseConfig(JSON.stringify({ ...cur, ...body, ...scopePatch,...mergePolicy }));
   preferences.set(AUTOPILOT_PREF, JSON.stringify(next));
   if (typeof body.defaultTracker === "number" && Number.isInteger(body.defaultTracker) && body.defaultTracker > 0) {
     preferences.set(DEFAULT_TRACKER_PREF, String(body.defaultTracker));
@@ -1870,9 +1907,8 @@ async function runPass(): Promise<void> {
   try {
     await autopilotTick();
   } catch (e) {
-    const s = readState();
-    s.lastError = (e as Error).message;
-    writeState(s);
+    try{const s=readState();s.lastError=(e as Error).message;writeState(s);}catch(error){if(!isSqliteBusy(error))throw error;}
+    if(isSqliteBusy(e))requestAutopilotPass(30_000);
   }
   // Events that arrived during a (long) thread request get one more pass.
   if (pending) {
@@ -1912,6 +1948,7 @@ export function startAutopilot(): void {
   const enabled = () => parseConfig(preferences.get(AUTOPILOT_PREF)).enabled;
   subscribeGlobal((e) => {
     if (freesSlot(e as never) && enabled()) requestAutopilotPass();
+    if(e.kind==='pipeline'&&e.status==='done'&&parseConfig(preferences.get(AUTOPILOT_PREF)).autoMergePipelines)requestAutopilotPass();
   });
   // Deleting or archiving a card can free a slot too.
   onCardRemoved(() => {

@@ -1006,6 +1006,43 @@ function signOffDeps(files: Record<string, string[] | null>, prs: Record<string,
   return { deps, log };
 }
 
+test('explicit Pillar lifecycle sign-off includes fresh manually created reviewed pipelines; holds, old plans and main stay untouched',async()=>{
+ const {signOffPass,reviewedPillarPipeline}=await import('./autopilot.ts');
+ const {newStep}=await import('../shared/pipeline.ts');
+ const review=newStep({name:'Review',agentProfileId:'reviewer'}),finish=newStep({name:'Finish',agentProfileId:'finisher'});
+ const url='https://github.com/pillar-interactive/pillar/pull/1342';
+ const handoff={schemaVersion:1,purpose:'test',summary:'approved',reason:'all required criteria met',next:'Finish',artifacts:[],openQuestions:[],status:'done'};
+ const pipeline={status:'done',endedAt:200,active:[],blocked:[],joins:{},snapshot:{graph:{steps:[review,finish],edges:[],startStepId:review.id},profiles:{reviewer:{model:'gpt-6.1-sol'}},capturedAt:100},history:[{seq:1,stepId:review.id,taskId:'review-child',outcome:'succeeded',handoff,nextStepIds:[finish.id]},{seq:2,stepId:finish.id,taskId:'finish-child',outcome:'succeeded',handoff:{...handoff,next:null,artifacts:[url]},nextStepIds:[]}]};
+ const t=reviewCard('manual-pillar',1314,{workdir:'/pillar',pipelineId:'p',issueUrl:'https://github.com/pillar-interactive/pillar/issues/1314',prUrl:url,pipelineRun:pipeline});
+ const pr={...prOf(1342,'fresh-head'),url};
+ const policy={...cfg,enabled:false,project:'/pillar',roadmap:{issue:639},autoMergePipelines:true,autoMergeSince:150};
+ expect(reviewedPillarPipeline(t,policy,pr)).toBe(true);
+ const state=await roadmapState();const pass=signOffDeps({[t.id]:['apps/web/src/db/schema.ts']},{[t.id]:pr});
+ await signOffPass(state,[t],pass.deps,policy);expect(pass.log.signedOff).toEqual([t.id]);
+ const held=signOffDeps({[t.id]:['x.ts']},{[t.id]:pr},{handsOff:()=>new Set([t.id])});
+ await signOffPass(await roadmapState(),[t],held.deps,policy);expect(held.log.signedOff).toEqual([]);
+ for(const bad of [{...pr,baseRef:'main'},{...pr,draft:true},{...pr,state:'closed' as const},{...pr,url:url+'/wrong'}])expect(reviewedPillarPipeline(t,policy,bad)).toBe(false);
+ expect(reviewedPillarPipeline(t,{...policy,autoMergePipelines:false},pr)).toBe(false);
+ expect(reviewedPillarPipeline(t,{...policy,autoMergeSince:300},pr)).toBe(false);
+ expect(reviewedPillarPipeline({...t,pipelineRun:{...t.pipelineRun!,history:t.pipelineRun!.history.map((h,i)=>i===0?{...h,outcome:'advanced-manually'}:h)}},policy,pr)).toBe(false);
+ const old=reviewCard('old-plan',12,{workdir:'/pillar',pipelineId:'p',prUrl:url,pipelineRun:pipeline});
+ const ignored=signOffDeps({[old.id]:['x.ts']},{[old.id]:pr});await signOffPass(await roadmapState(),[old],ignored.deps,policy);expect(ignored.log.signedOff).toEqual([]);
+ // Lifecycle sign-off queues the native merger; it never makes a failed CI
+ // or unresolved thread green. Native merge-queue regressions cover repair.
+ const failing={...pr,checks:'failure' as const,unresolvedThreads:1};expect(reviewedPillarPipeline(t,policy,failing)).toBe(true);expect(failing.checks).toBe('failure');
+});
+
+test('merge policy opt-in is independent from new admissions and fixes its activation boundary once',async()=>{
+ const {applyAutopilotPatch,AUTOPILOT_PREF}=await import('./autopilot.ts');const {preferences}=await import('./db.ts');
+ const before=preferences.get(AUTOPILOT_PREF);
+ try{
+  preferences.set(AUTOPILOT_PREF,JSON.stringify({...cfg,enabled:false,project:'/pillar',roadmap:{issue:639}}));
+  const started=applyAutopilotPatch({autoMergePipelines:true,autoMergeSince:1});expect(started.enabled).toBe(false);expect(started.autoMergeSince!).toBeGreaterThan(1);
+  expect(applyAutopilotPatch({autoMergePipelines:true,autoMergeSince:2}).autoMergeSince).toBe(started.autoMergeSince);
+  expect(applyAutopilotPatch({autoMergePipelines:false}).autoMergePipelines).toBeUndefined();
+ }finally{preferences.set(AUTOPILOT_PREF,before??'{}');}
+});
+
 test("sign-off: fixture folders named like sensitive areas don't hold a card; real billing code does, and the note names the files", async () => {
   const { signOffPass } = await import("./autopilot.ts");
   const state = await roadmapState();

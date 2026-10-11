@@ -14,6 +14,7 @@ import {
   type SpawnedAgent,
 } from "./claude-tmux.ts";
 import { spawnCodexViaTmux } from "./codex-tmux.ts";
+import {managedHeavyEnv} from './heavy-jobs.ts';
 import { spawnCursorViaTmux } from "./cursor-tmux.ts";
 import { dataDir, subagents as subagentsDb, tasks } from "./db.ts";
 import { spawnFxViaAcp, type FxMode } from "./fx-acp.ts";
@@ -2326,7 +2327,7 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
     return await spawnClaudeViaTmux({
       taskId,
       argv: built.cmd,
-      env: built.env ?? {},
+      env: managedHeavyEnv(cwd,built.env),
       cwd,
       onChunk,
       sessionId,
@@ -2357,7 +2358,7 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
       taskId,
       runId,
       argv: built.cmd,
-      env: built.env ?? {},
+      env: managedHeavyEnv(cwd,built.env),
       cwd,
       promptText: prompt,
       onChunk,
@@ -2389,7 +2390,7 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
       taskId,
       runId,
       argv: built.cmd,
-      env: built.env ?? {},
+      env: managedHeavyEnv(cwd,built.env),
       cwd,
       onChunk,
     });
@@ -2425,7 +2426,7 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
       taskId,
       runId,
       argv: built.cmd,
-      env: built.env ?? {},
+      env: managedHeavyEnv(cwd,built.env),
       cwd,
       promptText: prompt,
       mode: (opts.mode ?? defaultModeFor(harness.kind)) as FxMode,
@@ -2459,7 +2460,7 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
     taskId,
     runId,
     argv: built.cmd,
-    env: built.env ?? {},
+    env: managedHeavyEnv(cwd,built.env),
     cwd,
     promptText: prompt,
     onChunk,

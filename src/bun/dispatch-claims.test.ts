@@ -2,7 +2,7 @@ import {test,expect,beforeEach,afterEach} from 'bun:test';
 import {preferences,tasks,runs} from './db.ts';
 import {randomUUID} from 'node:crypto';
 import type {Task,Run} from '../shared/types.ts';
-import {claimIssue,releaseIssue,reserveRunner,releaseUnspawnedRunner,runnerUse,bindRunner} from './dispatch-claims.ts';
+import {claimIssue,releaseIssue,reserveRunner,releaseUnspawnedRunner,runnerUse,bindRunner,activeCardOwners,type OwnerEvidence} from './dispatch-claims.ts';
 import {beginQueueCycle,completeQueueCycle,QUEUE_WAKE_PREF} from './queue-cycle.ts';
 
 const keys=['step_slots','dispatch_issue_claims_v1','dispatch_runner_reservations_v1',QUEUE_WAKE_PREF];
@@ -36,9 +36,9 @@ test('fresh cycles serialize, complete and back off without accumulating context
  const state=JSON.parse(preferences.get(QUEUE_WAKE_PREF)!);expect(state.recent).toHaveLength(25);expect(state.cursor).toBe(101);expect(state.token).toBeUndefined();expect(JSON.stringify(state).length).toBeLessThan(2500);
 });
 
-function card(column:Task['column'],title='Finish') {
+function card(column:Task['column'],title='Finish',extra:Partial<Task>={}) {
  const id=randomUUID(),now=Date.now();created.push(id);
- return tasks.insert({id,title,prompt:'synthetic',column,agent:'claude-code',model:'sonnet-5.5',effort:null,mode:'auto',workdir:'/synthetic',worktreePath:null,branch:null,branchSource:'created',baseRef:null,isolation:'none',runId:null,createdAt:now,updatedAt:now,archivedAt:null,taskType:'task',prUrl:null,fast:false,maxMode:false,references:[],backlog:[],draft:null,plans:[],agentProfileId:null,agentProfile:null,pipelineId:null,pipelineRun:null,pipelineParentId:null,pipelineStepId:null,hasOpenableRun:false,pendingInteractionCount:0,openTerminalCount:0});
+ return tasks.insert({id,title,prompt:'synthetic',column,agent:'claude-code',model:'sonnet-5.5',effort:null,mode:'auto',workdir:'/synthetic',worktreePath:null,branch:null,branchSource:'created',baseRef:null,isolation:'none',runId:null,createdAt:now,updatedAt:now,archivedAt:null,taskType:'task',prUrl:null,fast:false,maxMode:false,references:[],backlog:[],draft:null,plans:[],agentProfileId:null,agentProfile:null,pipelineId:null,pipelineRun:null,pipelineParentId:null,pipelineStepId:null,hasOpenableRun:false,pendingInteractionCount:0,openTerminalCount:0,...extra});
 }
 function receipt(id:string,status:Run['status']) {
  const runId=randomUUID();runs.insert({id:runId,taskId:id,agent:'claude-code',status,startedAt:Date.now(),endedAt:status==='running'?null:Date.now(),exitCode:status==='running'?null:0,tmuxSession:null,claudeSessionId:null,codexSessionId:null,cursorSessionId:null,geminiSessionId:null,fxSessionId:null});tasks.update(id,{runId});return runId;
@@ -60,4 +60,38 @@ test('dead issue creator with provably terminal Done card recovers after restart
  const runId=receipt(t.id,'orphaned');seed();expect('error'in claimIssue('https://github.com/o/r/issues/12')).toBe(true);
  runs.update(runId,{status:'succeeded'});seed();expect('error'in claimIssue('https://github.com/o/r/issues/12')).toBe(false);
  tasks.update(t.id,{runId:'missing-receipt'});seed();expect('error'in claimIssue('https://github.com/o/r/issues/12')).toBe(true);
+});
+
+test('exact top-level owner deduplicates live child plus two detached jobs but keeps two actual job slots',()=>{
+ const parent=card('review','Build',{worktreePath:'/synthetic/parent'}),child=card('running','Build',{pipelineParentId:parent.id,worktreePath:'/synthetic/parent'});
+ const run=receipt(child.id,'running');preferences.set('dispatch_runner_reservations_v1',JSON.stringify({[child.id]:{taskId:child.id,ownerId:parent.id,runId:run,pid:process.pid,at:1,name:'Build'}}));
+ const ev:OwnerEvidence={cards:tasks.listLive(),awaits:[],jobs:[{pid:process.pid,cwd:'/synthetic/parent',slot:0},{pid:process.pid,cwd:'/synthetic/parent',slot:1}]};
+ expect([...activeCardOwners(id=>id===child.id,ev)]).toEqual([parent.id]);
+ expect(runnerUse(id=>id===child.id,ev)).toEqual({total:1,heavy:2});
+});
+
+test('queued detached verifier is not executing and keeps its exact durable receipt',()=>{
+ const t=card('review');tasks.update(t.id,{worktreePath:'/synthetic/queued'});
+ const run=receipt(t.id,'succeeded');preferences.set('dispatch_runner_reservations_v1',JSON.stringify({[t.id]:{taskId:t.id,runId:run,pid:process.pid,at:1,name:'Finish'}}));
+ const ev:OwnerEvidence={cards:tasks.listLive(),jobs:[],awaits:[{id:'queued',dir:'/synthetic/await',label:'verify',cwd:'/synthetic/queued',cmd:'agetor-heavy -- pnpm test',startedAt:2,pid:process.pid,exitCode:null,finished:false,notified:false,resourceState:'waiting'}]};
+ expect(activeCardOwners(()=>false,ev).size).toBe(0);expect(runnerUse(()=>false,ev)).toEqual({total:0,heavy:0});
+ expect(JSON.parse(preferences.get('dispatch_runner_reservations_v1')!)[t.id].runId).toBe(run);
+});
+
+test('old terminal claim cannot release a newer active or missing receipt; foreign live unbound ownership is not reused',()=>{
+ const t=card('review','Build'),old=receipt(t.id,'succeeded');
+ preferences.set('dispatch_runner_reservations_v1',JSON.stringify({[t.id]:{taskId:t.id,runId:old,pid:process.pid,at:1,name:'Build'}}));
+ receipt(t.id,'running');expect('error'in reserveRunner(t.id,'Build',()=>false)).toBe(true);expect(runnerUse(()=>false).total).toBe(1);
+ tasks.update(t.id,{runId:'new-missing-receipt'});expect('error'in reserveRunner(t.id,'Build',()=>false)).toBe(true);expect(runnerUse(()=>false).total).toBe(1);
+ preferences.set('dispatch_runner_reservations_v1',JSON.stringify({foreign:{taskId:'foreign',runId:null,pid:process.ppid,at:1,name:'Build'}}));
+ expect('error'in reserveRunner('foreign','Build',()=>false)).toBe(true);
+});
+
+test('two occupied unknown job slots remain distinct owners; fresh child transfers only its own exact pending parent booking',()=>{
+ const ev:OwnerEvidence={cards:[],awaits:[],jobs:[{pid:0,cwd:'',slot:0},{pid:0,cwd:'',slot:1}]};
+ expect(activeCardOwners(()=>false,ev).size).toBe(2);expect(runnerUse(()=>false,ev)).toEqual({total:2,heavy:2});
+ preferences.set('dispatch_runner_reservations_v1','{}');
+ expect(reserveRunner('parent','Build',()=>false,'parent')).toEqual({ok:true});
+ expect(reserveRunner('child','Build',()=>false,'parent')).toEqual({ok:true});
+ const claims=JSON.parse(preferences.get('dispatch_runner_reservations_v1')!);expect(claims.parent).toBeUndefined();expect(claims.child.ownerId).toBe('parent');expect(activeCardOwners(()=>false).size).toBe(1);
 });

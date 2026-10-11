@@ -60,6 +60,9 @@ export const pidFilePath = path.join(DATA_DIR, "agetor.pid");
 export const credsFilePath = coreCredsPath(DATA_DIR);
 
 export const db = new Database(path.join(DATA_DIR, "agetor.sqlite"));
+// Multiple core/CLI writers share this database. Wait briefly for a writer,
+// then fail safely; never remove SQLite locks or replay an uncertain commit.
+db.exec("PRAGMA busy_timeout = 1000;");
 db.exec("PRAGMA journal_mode = WAL;");
 // WAL + NORMAL is SQLite's documented sweet spot for a local single-writer
 // app. WAL already makes every transaction atomic and the database consistent
@@ -72,6 +75,21 @@ db.exec("PRAGMA journal_mode = WAL;");
 // up is that a kernel panic mid-stream may roll back the final commit(s).
 db.exec("PRAGMA synchronous = NORMAL;");
 db.exec("PRAGMA foreign_keys = ON;");
+
+export function isSqliteBusy(error: unknown): boolean {
+  return !!error && typeof error === 'object'
+    && ['SQLITE_BUSY', 'SQLITE_LOCKED'].includes(String((error as {code?:unknown}).code));
+}
+/** Retry only rolled-back synchronous transactions, with a finite bound. */
+export function reservationTransaction<T>(fn:()=>T):T {
+  for(let attempt=0;;attempt++) {
+    try{return db.transaction(fn).immediate();}
+    catch(error) {
+      if(!isSqliteBusy(error)||attempt===2)throw error;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,25*(attempt+1));
+    }
+  }
+}
 
 const applied = migrate(db, migrations);
 if (applied.length) console.log(`[agetor] applied migrations: ${applied.join(", ")}`);

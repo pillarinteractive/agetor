@@ -28,6 +28,7 @@
  * `headless.ts` call it explicitly, once, right before `reconcileOrphans()`.
  */
 import { randomUUID } from "node:crypto";
+import path from 'node:path';
 import { recordActivity } from "./activity.ts";
 import { syncBaseNote } from "./sync-base.ts";
 import { logBlocks, newBlocks } from "./block-log.ts";
@@ -37,6 +38,7 @@ import { reserveRunner, releaseUnspawnedRunner } from './dispatch-claims.ts';
 import { reconcileCardInputs } from './queue-validation.ts';
 import { isPriority, priorityFirst } from "./priority.ts";
 import { awaitsFor } from "./awaits.ts";
+import {HEAVY_INSTRUCTIONS} from './heavy-jobs.ts';
 import { classifyFailure, formatRetryTime, harnessQuotaNotice, isQuotaPaused, nextRetryAt, TRANSIENT_RETRY_MAX, type FailureClass } from "./usage-limit.ts";
 import { listLeases } from "./lease-watch.ts";
 import { ownFailures, prStatusForTask } from "./pr-watch.ts";
@@ -1725,7 +1727,7 @@ async function launchStep(
   // Reserve before syncBaseNote or any other awaited preparation. Priority
   // changes queue order, never the global runner or verification cap.
   const childId = randomUUID();
-  const reservation=reserveRunner(childId,step.name,isTaskRunLive);
+  const reservation=reserveRunner(childId,step.name,isTaskRunLive,parent.id);
   if('error' in reservation) {
     upsertBlocked(run,{taskId:null,stepId:step.id,kind:'slot-wait',message:`${step.name} is ${reservation.error}`,pending:{stepId:step.id,arrivals:pendingArrivals}});
     persist(parent.id,run);return {ok:false};
@@ -1848,7 +1850,9 @@ async function launchStep(
     : prompt;
   const withDecisions = (prompt: string) => snapshot.decisionPolicy === "planner-recommendation"
     ? `${prompt}\n\n${plannerDecisionInstructions(parent.id, snapshot.capturedAt)}` : prompt;
-  let composed = withSync(withRouting(withDecisions(composeStepPrompt({ ...composeArgs, inlineHandoff: true }))));
+  const withMachineCapacity=(prompt:string)=>existsSync(path.join(parent.workdir,'.github/scripts/verify_changed.py'))
+    ? `${prompt}\n\n## Machine test capacity\n${HEAVY_INSTRUCTIONS}`:prompt;
+  let composed = withMachineCapacity(withSync(withRouting(withDecisions(composeStepPrompt({ ...composeArgs, inlineHandoff: true })))));
   if(inputReconciliation.note)composed+=`\n\n${inputReconciliation.note}`;
   // m12/D10: measure the SAME wrapping `startTaskInner` will actually launch
   // with — `composeLaunchPrompt` (the profile's instructions/skills
@@ -1858,7 +1862,7 @@ async function launchStep(
   if (profile.harnessKind === "gemini") {
     const fullPrompt = appendReferences(composeLaunchPrompt(profile, composed), references);
     if (promptByteOverage("gemini", fullPrompt)) {
-      composed = withSync(withRouting(withDecisions(composeStepPrompt({ ...composeArgs, inlineHandoff: false }))));
+      composed = withMachineCapacity(withSync(withRouting(withDecisions(composeStepPrompt({ ...composeArgs, inlineHandoff: false })))));
     }
   }
 
@@ -2262,6 +2266,19 @@ export async function startPipelineRun(
 
     const startStep = resolveStartStep(snapshot.graph);
     if (!startStep) return { error: "pipeline has no resolvable start step" };
+    // Book global ownership before awaited preparation, for manual/API
+    // starts as well as Autopilot. The first child atomically takes over.
+    const booking=reserveRunner(fresh.id,startStep.name,isTaskRunLive,fresh.id);
+    if('error'in booking) {
+      // A fresh manual/API start queues without preparing a worktree or
+      // starting an agent. Existing/restarted executions retain their state.
+      if(!opts?.restart&&run.history.length===0&&run.active.length===0) {
+        run={pipelineId:fresh.pipelineId,pipelineName:pipeline?.name??run.pipelineName,snapshot,status:'running',active:[],joins:{},blocked:[{taskId:null,stepId:startStep.id,kind:'slot-wait',message:`${startStep.name} is ${booking.error}`,pending:{stepId:startStep.id,arrivals:[]}}],history:[],stepCount:0,startedAt:Date.now(),endedAt:null};
+        persist(fresh.id,run,{preserveStatus:true});return {runId:'',pending:true as const};
+      }
+      return booking;
+    }
+    try {
 
     // Materialize the shared worktree ONCE, here — every step task inserted
     // below copies `branch`/`worktreePath`/`baseRef` straight from the
@@ -2342,6 +2359,7 @@ export async function startPipelineRun(
       return { error: "pipeline failed to start — see the run's blocked step for details" };
     }
     return { runId: result.runId, ...(result.pending ? { pending: true as const } : {}) };
+    }finally{releaseUnspawnedRunner(fresh.id);}
   });
 }
 
@@ -3053,12 +3071,23 @@ async function deliverHandoffReminder(p: PendingReminder): Promise<void> {
     const step = tasks.get(p.taskId);
     if (deferred && step?.column === "review" && !isTaskRunLive(p.taskId)) {
       const entry = tasks.get(p.parentId)?.pipelineRun?.history.find((h) => h.taskId === p.taskId && h.seq === p.seq);
-      if (entry?.reminder && entry.outcome == null) void handleRunStatus(p.taskId, deferred.runId, deferred.status);
+      if (entry && entry.outcome == null && step.runId===deferred.runId) void handleRunStatus(p.taskId, deferred.runId, deferred.status);
     }
   }
 }
 
 async function deliverHandoffReminderInner(p: PendingReminder): Promise<void> {
+  // A resumed Claude turn can start between preparation and delivery.
+  // Its exact current receipt owns the continuation; a stale reminder
+  // neither sends to it nor turns a refused no-growth replay into a block.
+  const newerActive=()=>{
+    const step=tasks.get(p.taskId),current=step?.runId?runs.get(step.runId):null;
+    return !!step?.runId&&step.runId!==p.runId&&(isTaskRunLive(p.taskId)||current?.status==='running'||current?.status==='orphaned');
+  };
+  if(newerActive()) {
+    await runExclusive(p.parentId,async()=>{remindersInFlight.delete(p.taskId);});
+    return;
+  }
   let sent: Awaited<ReturnType<typeof sendInput>>;
   try {
     sent = await sendInput(p.runId, p.reminderText);
@@ -3118,7 +3147,7 @@ async function deliverHandoffReminderInner(p: PendingReminder): Promise<void> {
       // a Retry/Advance that landed while the send was in flight already
       // decided its fate.
       const stillActive = run.active.some((a) => a.taskId === p.taskId && a.seq === p.seq);
-      if (!stillActive) return;
+      if (!stillActive||newerActive()) return;
       upsertBlocked(run, {
         taskId: p.taskId,
         stepId: p.stepId,
@@ -3945,4 +3974,5 @@ export const __forTest = {
   },
   handleRunStatus,
   handleColumnChange,
+  deliverHandoffReminder,
 };

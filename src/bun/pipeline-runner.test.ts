@@ -2280,6 +2280,25 @@ test("Major 2: a step that finished with a bad handoff while the whole run is be
   }
 }, 15000);
 
+test('stale handoff reminder leaves a newer exact continuation running and never duplicates its run',async()=>{
+ const {createTask,startTask}=await import('./orchestrator.ts');const {tasks,pipelines,runs}=await import('./db.ts');const {newStep}=await import('../shared/pipeline.ts');const {FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}=await import('./agents.ts');const {__forTest}=await import('./pipeline-runner.ts');
+ const profile=await makeProfile('newer-continuation');const step=newStep({name:'Build',agentProfileId:profile.id,instructions:FAKE_CLAUDE_HANDOFF_PROMPT_MARKER+':missing'});
+ const pipeline=pipelines.insert({name:uniqueName('newer-continuation'),graph:{steps:[step],edges:[],startStepId:step.id},maxSteps:25});
+ const created=await createTask({title:'newer continuation',prompt:'goal',workdir:freshWorkdir(),isolation:'none',pipelineId:pipeline.id});if('error'in created)throw new Error(created.error);const parentId=created.task.id;liveParentIds.push(parentId);
+ __forTest.setListenerEnabled(false);
+ try{
+  const started=await startTask(parentId);if('error'in started)throw new Error(started.error);
+  const child=await waitFor(()=>tasks.stepsForParent(parentId)[0]);
+  const old=await waitFor(()=>{const r=runs.listForTask(child.id)[0];return r?.status==='succeeded'?r:null;});
+  const next=runs.insert({...old,id:randomUUID(),status:'running',startedAt:Date.now(),endedAt:null,exitCode:null});tasks.update(child.id,{runId:next.id,column:'running'});
+  const active=tasks.get(parentId)!.pipelineRun!.active[0]!;
+  await __forTest.deliverHandoffReminder({parentId,taskId:child.id,runId:old.id,seq:active.seq,stepId:step.id,reason:'handoff-missing',detail:'old settle',baseMessage:'missing handoff',reminderText:'stale reminder'});
+  expect(runs.listForTask(child.id)).toHaveLength(2);expect(tasks.get(child.id)!.runId).toBe(next.id);expect(runs.get(next.id)!.status).toBe('running');expect(tasks.get(parentId)!.pipelineRun!.blocked).toEqual([]);
+  expect(tasks.get(parentId)!.pipelineRun!.history[0]!.reminder??null).toBeNull();
+  runs.update(next.id,{status:'cancelled',endedAt:Date.now()});tasks.update(child.id,{column:'review'});
+ }finally{__forTest.setListenerEnabled(true);}
+});
+
 test("Medium 3: a reminder that fails to deliver records nothing on `reminder` (so the next settle may try again) and folds the failure into the block message", async () => {
   const { createTask, startTask } = await import("./orchestrator.ts");
   const { tasks, pipelines, runs, db } = await import("./db.ts");

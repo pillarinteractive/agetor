@@ -26,6 +26,7 @@ import { recordActivity } from "./activity.ts";
 import { isTaskRunLive, sendInput } from "./orchestrator.ts";
 import { currentSlots, slotDecision, slotUse } from "./step-slots.ts";
 import { isPriority } from "./priority.ts";
+import {installHeavyHelper} from './heavy-jobs.ts';
 
 export const AWAITS_DIR = path.join(dataDir, "awaits");
 export const AWAIT_BIN = path.join(dataDir, "bin", "agetor-await");
@@ -52,7 +53,7 @@ printf '%s' "$label" > "$d/label"
 printf '%s' "$root" > "$d/cwd"
 printf '%s ' "$@" > "$d/cmd"
 date +%s > "$d/started"
-perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' /bin/sh -c '"$@" > "$0/log" 2>&1; echo $? > "$0/exit.tmp"; mv "$0/exit.tmp" "$0/exit"' "$d" "$@" </dev/null >/dev/null 2>&1 &
+perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' /bin/sh -c 'AGETOR_AWAIT_RECORD="$0" "$@" > "$0/log" 2>&1; echo $? > "$0/exit.tmp"; mv "$0/exit.tmp" "$0/exit"' "$d" "$@" </dev/null >/dev/null 2>&1 &
 echo $! > "$d/pid"
 echo "Started \\"$label\\" in the background — log: $d/log"
 echo "Now end your turn with a one-line note (no <handoff> yet). Do not poll, tail or sleep:"
@@ -61,6 +62,7 @@ echo "Agetor messages you with the exit code and the log's tail when it finishes
 
 /** Write the helper where agents can run it. Idempotent. */
 export function installAwaitHelper(): void {
+  installHeavyHelper();
   const body = AWAIT_SCRIPT;
   try {
     mkdirSync(path.dirname(AWAIT_BIN), { recursive: true });
@@ -83,6 +85,7 @@ export interface AwaitRecord {
   exitCode: number | null;
   finished: boolean;
   notified: boolean;
+  resourceState?: 'waiting'|'running'|'finished';
 }
 
 const read = (f: string): string | null => {
@@ -176,6 +179,7 @@ export function listAwaits(root = AWAITS_DIR): AwaitRecord[] {
       exitCode: exit != null && exit !== "" && Number.isFinite(Number(exit)) ? Number(exit) : null,
       finished,
       notified: existsSync(path.join(dir, "notified")),
+      ...(()=>{const phase=read(path.join(dir,'resource-state'))??read(path.join(dir,'phase'));return phase==='executing'?{resourceState:'running' as const}:['waiting','running','finished'].includes(phase??'')?{resourceState:phase as AwaitRecord['resourceState']}:{};})(),
     });
   }
   for (const dir of awaitCache.keys()) if (path.dirname(dir) === root && !seen.has(dir)) awaitCache.delete(dir);
