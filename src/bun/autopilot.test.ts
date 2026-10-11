@@ -1129,6 +1129,56 @@ test("sign-off: a card the user moved is left alone — signed off by hand, or t
   }
 });
 
+// ── Roadmap: a blocked step in the wait queue is in flight, not the owner's ─
+
+test("roadmap: a card parked in the blocked-step wait queue is in flight — no second card, no slot, not under Needs you; a block that is the owner's is counted apart", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  const blockedRun = (extra: Record<string, unknown> = {}) => ({
+    pipelineId: "p", pipelineName: "Change", status: "blocked", joins: {}, stepCount: 1, startedAt: NOW - 3_600_000, endedAt: null,
+    snapshot: { graph: { steps: [{ id: "build", name: "Build" }], edges: [], startStepId: "build" }, maxSteps: 25, profiles: {}, capturedAt: 0 },
+    active: [{ stepId: "build", taskId: "s12", seq: 1 }],
+    blocked: [{ taskId: "s12", stepId: "build", kind: "step-blocked", message: 'step "Build" reported it is blocked: the fixture service did not come up' }],
+    history: [{ seq: 1, stepId: "build", taskId: "s12", startedAt: NOW - 3_600_000, endedAt: null, outcome: null, nextStepIds: [], handoff: { schemaVersion: 1, purpose: "", summary: "", reason: "the fixture service did not come up", next: null, artifacts: [], openQuestions: [], status: "blocked" } }],
+    ...extra,
+  });
+  const wait = { stepId: "build", taskId: "s12", category: "resource", source: "declared", what: "the rig", ref: "rig", reason: "the rig is busy", state: "waiting", since: NOW - 600_000, attempt: 1, max: 6, at: NOW + 600_000, deadline: NOW + 86_400_000, tried: [{ at: NOW - 300_000, trigger: "the rig is free" }] };
+
+  // Parked: step 2's card waits for the rig.
+  const parkedCard = roadmapCard("c12", 12, "blocked", { runId: "r", pipelineRun: blockedRun({ wait }) });
+  const state = await roadmapState();
+  state.notifiedHuman = [11];
+  const a = roadmapDeps({}, { leaseLabels: () => ["rig"] });
+  await roadmapPass(roadmapCfg, state, [parkedCard], [parkedCard], a.deps);
+  expect(a.log.started).toEqual([]); // step 2 has its card; everything else waits on it
+  expect(state.roadmap!.counts).toMatchObject({ inFlight: 1, queued: 1, ready: 1 });
+  expect(state.roadmap!.counts.blocked).toBeUndefined();
+  expect(state.roadmap!.blockedCards).toEqual([
+    { step: "2", issue: 12, title: "Inventory the widgets", url: "https://github.com/o/r/issues/12", taskId: "c12", queued: true, line: `Build waiting for the rig — retrying when it frees or at ${new Date(NOW + 600_000).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" })} · attempt 2 of 6` },
+  ]);
+  expect(state.roadmap!.needsUser).toEqual([]);
+  expect(state.phase).toBe("running"); // in flight: the run is not idle, and not waiting on the owner
+
+  // The same card with no queue entry is blocked on the owner.
+  const mine = roadmapCard("c12", 12, "blocked", { runId: "r", pipelineRun: blockedRun() });
+  const state2 = await roadmapState();
+  state2.notifiedHuman = [11];
+  const b = roadmapDeps({});
+  await roadmapPass(roadmapCfg, state2, [mine], [mine], b.deps);
+  expect(b.log.started).toEqual([]);
+  expect(state2.roadmap!.counts).toMatchObject({ inFlight: 1, blocked: 1 });
+  expect(state2.roadmap!.counts.queued).toBeUndefined();
+  expect(state2.roadmap!.blockedCards).toMatchObject([{ issue: 12, queued: false, line: "Build stopped: the fixture service did not come up" }]);
+
+  // One the queue gave up on says what was tried.
+  const gaveUp = roadmapCard("c12", 12, "blocked", { runId: "r", pipelineRun: blockedRun({ wait: { ...wait, state: "escalated", at: null, attempt: 6, escalation: "still blocked after 6 automatic retries", escalatedAt: NOW } }) });
+  const state3 = await roadmapState();
+  state3.notifiedHuman = [11];
+  const c = roadmapDeps({});
+  await roadmapPass(roadmapCfg, state3, [gaveUp], [gaveUp], c.deps);
+  expect(state3.roadmap!.blockedCards![0]).toMatchObject({ queued: false });
+  expect(state3.roadmap!.blockedCards![0]!.line).toMatch(/^Build still blocked after 6 automatic retries — retried once \(.+\); it says: the rig is busy$/);
+});
+
 // ── Roadmap: held cards need you; why a merged step is still open ──────────
 
 test("roadmap: a step whose card is held in In Review shows under Needs you with its PR — still in flight, counted once", async () => {

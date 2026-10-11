@@ -190,6 +190,28 @@ describe("summarizeRoadmap", () => {
   const sum = (o: Record<number, RoadmapIssueState>, busy: number[] = [], needsUser: [number, string][] = []) =>
     summarizeRoadmap({ issue: 639, url: "u", parsed, views: roadmapStatus(parsed, states(o)), busy: new Set(busy), needsUser: new Map(needsUser), now: 5 });
 
+  test("a started card stopped on a block is in flight either way — parked in the wait queue, or the owner's", () => {
+    const blocked = new Map([
+      [103, { taskId: "c103", queued: true, line: "Build waiting on #41 — retrying when it lands or at 3:30 PM · attempt 1 of 4" }],
+      [104, { taskId: "c104", queued: false, line: "Build asks: which port?" }],
+    ]);
+    const views = roadmapStatus(parsed, states({ 102: DONE }));
+    const s = summarizeRoadmap({ issue: 639, url: "u", parsed, views, busy: new Set([103, 104]), needsUser: new Map(), blocked, now: 5 });
+    expect(s.counts).toMatchObject({ inFlight: 2, queued: 1, blocked: 1, held: 0 });
+    expect(s.blockedCards!.map((b) => [b.issue, b.taskId, b.queued, b.line])).toEqual([
+      [103, "c103", true, "Build waiting on #41 — retrying when it lands or at 3:30 PM · attempt 1 of 4"],
+      [104, "c104", false, "Build asks: which port?"],
+    ]);
+    // Neither is among the steps Autopilot gave up on, and the run isn't idle because of them.
+    expect(s.needsUser).toEqual([]);
+    expect(s.idleReason).toBeNull();
+    // A card that isn't in flight has no entry, whatever the map says.
+    const one = summarizeRoadmap({ issue: 639, url: "u", parsed, views, busy: new Set([103]), needsUser: new Map(), blocked, now: 5 });
+    expect(one.counts).toMatchObject({ inFlight: 1, queued: 1 });
+    expect(one.counts.blocked).toBeUndefined();
+    expect(one.blockedCards!.length).toBe(1);
+  });
+
   test("every step is counted once", () => {
     const s = sum({ 102: DONE, 110: NO_GO }, [103]);
     expect(s.counts).toEqual({ total: 7, complete: 1, declined: 1, inFlight: 1, ready: 1, waiting: 3, backlog: 0, held: 0 });
@@ -820,6 +842,10 @@ test("the next milestone is offered when the scope is blocked: idle slots, nothi
   expect(nextMilestoneText(blocked!).question).toContain("waiting on unfinished steps");
   // Every slot busy: nothing to fill.
   expect(run(["M01"], [301], 1)).toMatchObject({ reason: null });
+  // …unless the card in that slot is parked in the blocked-step wait queue:
+  // it is in flight (not started twice) but occupies nothing while it waits.
+  const parked = roadmapContinuation({ views, states: st, milestones: [ms.M01], steps: new Set([...roadmapScope(p.steps, st, ms.M01)]), busy: new Set([301]), parked: new Set([301]), maxInFlight: 1, finished: false });
+  expect(parked).toMatchObject({ stage: "M02", reason: "blocked", startable: 1, idleSlots: 1, left: 3 });
   // With M02 in scope too and its free step running, M03 has nothing startable: adding it wouldn't help.
   expect(run(["M01", "M02"], [301, 305], 3)).toMatchObject({ stage: "M03", startable: 0, reason: null });
 });

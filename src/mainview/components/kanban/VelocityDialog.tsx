@@ -43,6 +43,7 @@ const STATE: Record<string, string> = {
   blocked: "blocked — needs you",
   quota: "waiting for a usage limit",
   retry: "retrying after a failure",
+  waiting: "waiting in the retry queue",
   ready: "ready, waiting for a slot",
   yours: "yours to do",
   outside: "open in another milestone",

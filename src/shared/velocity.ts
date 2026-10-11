@@ -75,7 +75,7 @@ export interface VelocityCard {
    *  stretch blocked on the owner, waiting on a usage limit, or in an
    *  automatic retry. The run's history can't show these — a step that is
    *  retried keeps its record open — so they take precedence over it. */
-  observed?: { from: number; to: number; state: "blocked" | "quota" | "retry" }[];
+  observed?: { from: number; to: number; state: "blocked" | "quota" | "retry" | "waiting" }[];
 }
 
 /** How a completed step got done:
@@ -211,7 +211,8 @@ export function cardWindow(card: VelocityCard, until: number): CardWindow | null
   const retries = acts.filter((a) => RE.retry.test(a.text) && !RE.quota.test(a.text)).map((a) => a.ts);
   const within = (xs: [number, number][], t: number) => xs.some(([a, b]) => t >= a && t < b);
 
-  const OBSERVED = { blocked: "owner", quota: "quota", retry: "other" } as const;
+  // "waiting": parked in the blocked-step wait queue — not the owner's time.
+  const OBSERVED = { blocked: "owner", quota: "quota", retry: "other", waiting: "other" } as const;
   const seen = (card.observed ?? []).filter((o) => o.to > start && o.from < until);
   const label = (t: number): VelocityPhase => {
     const o = seen.find((x) => t >= x.from && t < x.to);
@@ -451,8 +452,10 @@ export interface VelocityOpenStep {
    *  in CI or the merge queue; held — in In Review for the owner's sign-off;
    *  stuck — its card finished and the issue is still open (needs you);
    *  blocked — its run stopped on a block; quota — it waits for a usage
-   *  limit to reset; retry — an automatic retry is pending. */
-  state: "building" | "merging" | "held" | "stuck" | "blocked" | "quota" | "retry";
+   *  limit to reset; retry — an automatic retry is pending; waiting — its
+   *  blocked step is parked in the wait queue and is retried by itself
+   *  (src/shared/block-wait.ts). `blocked` is the owner's; `waiting` isn't. */
+  state: "building" | "merging" | "held" | "stuck" | "blocked" | "quota" | "retry" | "waiting";
   cardId: string | null;
   startedAt: number | null;
   /** Since when it has been waiting on the owner (held, stuck, blocked). */

@@ -40,7 +40,7 @@ const dist = (d: Distribution) => `median ${fmtDuration(d.median)} · p75 ${fmtD
 const steps = (n: number) => `${n} step${n === 1 ? "" : "s"}`;
 const bar = (share: number, width = 20) => "█".repeat(Math.round(share * width));
 const WINDOW: Record<string, string> = { "24h": "last 24 hours", "3d": "last 3 days", "7d": "last 7 days", all: "since the run began" };
-const STATE: Record<string, string> = { building: "in flight", merging: "in CI / the merge queue", held: "held for your sign-off", stuck: "finished with the issue still open — needs you", blocked: "blocked — needs you", quota: "waiting for a usage limit", retry: "retrying after a failure", ready: "ready, waiting for a slot", yours: "yours to do", outside: "open in another milestone" };
+const STATE: Record<string, string> = { building: "in flight", merging: "in CI / the merge queue", held: "held for your sign-off", stuck: "finished with the issue still open — needs you", blocked: "blocked — needs you", quota: "waiting for a usage limit", retry: "retrying after a failure", waiting: "waiting in the retry queue", ready: "ready, waiting for a slot", yours: "yours to do", outside: "open in another milestone" };
 
 function forecastLines(t: ForecastTarget, r: VelocityReport): string[] {
   const f = r.forecast;

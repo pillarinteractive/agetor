@@ -37,6 +37,8 @@ import { hasConfirmedNoPr, prStatusForTask } from "./pr-watch.ts";
 import { onCardRemoved, startTask, subscribeGlobal } from "./orchestrator.ts";
 import { holdsAutopilotSlot, neverStarted, PROGRESSING_COLUMNS, waitingOnQuota } from "../shared/autopilot.ts";
 import { formatRetryTime, isQuotaPaused } from "./usage-limit.ts";
+import { listLeases } from "./lease-watch.ts";
+import { blockedCardLine } from "../shared/block-reason.ts";
 import { loadRoadmapStates, loadRoadmapTracker } from "./roadmap-fetch.ts";
 import { recordVelocityPass, type VelocityPassInput } from "./roadmap-velocity.ts";
 import {
@@ -61,6 +63,7 @@ import {
   summarizeRoadmap,
   withRoadmapStepPrompt,
   type PrIssueMentionKind,
+  type RoadmapBlockedCard,
   type RoadmapContinued,
   type RoadmapIssueState,
   type RoadmapMilestone,
@@ -816,6 +819,8 @@ export interface RoadmapDeps {
   /** Cards whose sign-off the user withdrew. */
   handsOff(): ReadonlySet<string>;
   quotaPaused(t: Pick<Task, "pipelineRun">): boolean;
+  /** Labels of the project's watched leases (for the wait queue's lines). */
+  leaseLabels?(project: string): string[];
   pipelineId(cfg: AutopilotConfig): string | null;
   /** Create a card for the issue and start it. */
   startCard(input: { dir: string; number: number; pipelineId: string; extraPrompt: string }): Promise<{ task: Task } | { error: string }>;
@@ -1033,8 +1038,20 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
   // continue", added here and now. Adding never replaces: what is left of
   // the current milestones keeps running.
   let next: RoadmapNextMilestone | null = null;
+  // Started cards that stopped on a block, by issue: parked in the
+  // blocked-step wait queue (retried by itself — in flight, but filling no
+  // slot) or the owner's.
+  const leaseLabels = deps.leaseLabels?.(cfg.project) ?? [];
+  const blockedCards = new Map<number, RoadmapBlockedCard>();
+  for (const t of all) {
+    if (t.pipelineParentId || !live(t) || exempt.has(t.id) || !sameDir(t.workdir, cfg.project)) continue;
+    const n = issueOf(t);
+    const b = n != null && !blockedCards.has(n) ? blockedCardLine(t, deps.now(), leaseLabels) : null;
+    if (n != null && b) blockedCards.set(n, { taskId: t.id, ...b });
+  }
+  const parked = new Set([...blockedCards].filter(([, b]) => b.queued).map(([n]) => n));
   const offerFor = (list: RoadmapMilestone[], sc: { steps: ReadonlySet<string> }, busyNow: ReadonlySet<number> = busyIssues) =>
-    roadmapContinuation({ views, states, milestones: list, steps: sc.steps, busy: busyNow, exclude: new Set([...stuck.keys(), ...settling]), maxInFlight: cfg.maxInFlight, finished: finishedIn(sc.steps), dismissal: state.roadmapOffer });
+    roadmapContinuation({ views, states, milestones: list, steps: sc.steps, busy: busyNow, exclude: new Set([...stuck.keys(), ...settling]), parked, maxInFlight: cfg.maxInFlight, finished: finishedIn(sc.steps), dismissal: state.roadmapOffer });
   if (scope) {
     let active = wanted.filter((m) => stepsOf(m).size > 0 && !finishedIn(stepsOf(m)));
     let list = active.length > 0 ? active : wanted;
@@ -1171,6 +1188,7 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
     needsUser: stuck,
     held: heldForUser,
     cards: new Map([...liveCards, ...startedIds]),
+    blocked: blockedCards,
     nextMilestone: next,
     continued: state.roadmapContinued.slice(-3),
     now: deps.now(),
@@ -1514,6 +1532,7 @@ export const ROADMAP_DEPS: RoadmapDeps = {
   },
   handsOff: () => new Set(readHandsOff()),
   quotaPaused: quotaPausedCard,
+  leaseLabels: (project) => listLeases().filter((l) => sameDir(l.project, project)).map((l) => l.label),
   pipelineId: (cfg) => cfg.pipelineId ?? preferences.get("default_pipeline") ?? null,
   async startCard(input) {
     const r = await createTaskFromIssue({ ...input, allowAfterDone: true });

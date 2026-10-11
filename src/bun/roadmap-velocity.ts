@@ -20,7 +20,8 @@
  *                             told from one where nothing changed.
  *     {"k":"c", t, issue, state}
  *                             a card's state as a pass saw it change:
- *                             building, merging, held, blocked, quota, retry.
+ *                             building, merging, held, blocked, quota, retry,
+ *                             waiting (parked in the blocked-step wait queue).
  *                             The run's history can't tell a step that sat
  *                             blocked or waiting on a usage limit from one
  *                             that worked all along; these can (to within a
@@ -52,6 +53,7 @@ import {
   type VelocityStepFacts,
 } from "../shared/velocity.ts";
 import { readLogged } from "./activity.ts";
+import { waitingInQueue } from "../shared/block-wait.ts";
 import { dataDir, db, tasks } from "./db.ts";
 
 /** The issue number of the step that is the main-release gate, when the
@@ -283,7 +285,7 @@ export function recordVelocityPass(input: VelocityPassInput, io: VelocityIo = VE
       // A card from before the run isn't this run's work on a step the run
       // completed — unless a pass saw it in flight, or its timeline names the roadmap.
       const seen = ledger.cards.get(s.issue) ?? [];
-      const observed = seen.flatMap((e, i) => (e.state === "blocked" || e.state === "quota" || e.state === "retry" ? [{ from: e.t, to: seen[i + 1]?.t ?? closed ?? now, state: e.state }] : []));
+      const observed = seen.flatMap((e, i) => (e.state === "blocked" || e.state === "quota" || e.state === "retry" || e.state === "waiting" ? [{ from: e.t, to: seen[i + 1]?.t ?? closed ?? now, state: e.state }] : []));
       const mine = (cards.get(s.issue) ?? [])
         .filter((c) => closed == null || closed < began || (cardStartedAt(c) ?? 0) >= began || seen.length > 0 || c.activity.some((a) => said.test(a.text)))
         .map((c) => ({ ...c, observed }));
@@ -331,7 +333,8 @@ export function recordVelocityPass(input: VelocityPassInput, io: VelocityIo = VE
     const w = startedAt != null ? cardWindow(card, Math.max(now, startedAt + 1)) : null;
     const lastEnd = Math.max(0, ...card.records.map((r) => r.endedAt ?? 0)) || null;
     const run = t.pipelineRun;
-    const retrying = run?.status === "blocked" && run.autoRetry?.at != null ? (run.autoRetry.kind === "quota" ? "quota" : "retry") : null;
+    // Parked in the blocked-step wait queue: waiting, but not on the owner.
+    const retrying = waitingInQueue(run) ? "waiting" : run?.status === "blocked" && run.autoRetry?.at != null ? (run.autoRetry.kind === "quota" ? "quota" : "retry") : null;
     const state: VelocityOpenStep["state"] = input.held.has(issue)
       ? "held"
       : input.quota?.has(issue)

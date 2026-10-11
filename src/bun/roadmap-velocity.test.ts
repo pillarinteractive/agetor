@@ -222,6 +222,38 @@ test("what the passes saw a card doing ends up in its step's facts: blocked on t
   expect(readLedger(files.ledger).facts.get(11)).toMatchObject({ phases: { build: 45 * MIN, owner: 30 * MIN, quota: 15 * MIN, merge: 10 * MIN } });
 });
 
+test("a card parked in the blocked-step wait queue is waiting, not blocked on the owner: its time isn't the owner's", async () => {
+  const { recordVelocityPass, velocityFiles, readLedger, velocityAnswer } = await import("./roadmap-velocity.ts");
+  const { io, cards, dir } = setup("queued");
+  const steps = [g("1", 11, []), g("2", 12, ["1"])];
+  const wait = (state: string) => ({ stepId: "build", taskId: "s", category: "unknown", source: "none", what: "its own stated reason", ref: null, reason: "the fixture service did not come up", state, since: at(20), attempt: 0, max: 3, at: at(35), deadline: at(2000), tried: [] });
+  const task = (status: string, extra: Record<string, unknown> = {}) =>
+    ({ id: "c-11", column: status === "blocked" ? "blocked" : "running", pendingInteractionCount: 0, runId: "r", createdAt: at(0), pipelineRun: { status, startedAt: at(0), history: [{ seq: 1, stepId: "build", taskId: "s", startedAt: at(0), endedAt: null, outcome: null, handoff: null, nextStepIds: [] }], snapshot: null, active: [], blocked: [], ...extra } }) as never as Task;
+  const live = (t: Task) => ({ live: new Map([[11, t]]) });
+  recordVelocityPass(pass(steps, at(1), live(task("running"))), io);
+  recordVelocityPass(pass(steps, at(20), live(task("blocked", { wait: wait("waiting") }))), io); // parked
+  // While parked it shows as waiting — and not among what waits on the owner.
+  const mid = velocityAnswer({ roadmap: { issue: TRACKER }, project: PROJECT, maxInFlight: 4 }, { dir, now: at(30) });
+  if (!mid.available) throw new Error(mid.reason);
+  expect(mid.bottlenecks.owner).toEqual([]);
+  expect(mid.bottlenecks.critical.map((b) => [b.step, b.state, b.waitingOnYouMs])).toEqual([["1", "waiting", null]]);
+  recordVelocityPass(pass(steps, at(35), live(task("running", { wait: wait("resuming") }))), io); // resumed
+  recordVelocityPass(pass(steps, at(50), live(task("blocked", { wait: wait("escalated") }))), io); // gave up: the owner's
+  recordVelocityPass(pass(steps, at(80), live(task("running"))), io);
+  const files = velocityFiles(TRACKER, PROJECT, dir);
+  expect(lines(files.ledger).filter((l) => l.k === "c").map((l) => [l.t, l.state])).toEqual([
+    [at(1), "building"],
+    [at(20), "waiting"],
+    [at(35), "building"],
+    [at(50), "blocked"],
+    [at(80), "building"],
+  ]);
+  cards.set(11, [{ cardId: "c-11", runStartedAt: at(0), records: [{ stepId: "build", name: "Build", startedAt: at(0), endedAt: at(90), outcome: "succeeded", blocked: false, next: [] }], activity: [{ ts: at(99), text: "PR #9 merged" }] }]);
+  recordVelocityPass(pass([closedAt(steps[0]!, 100), steps[1]!], at(101)), io);
+  // 15 minutes in the queue are "other"; the 30 after it gave up are the owner's.
+  expect(readLedger(files.ledger).facts.get(11)).toMatchObject({ phases: { build: 45 * MIN, other: 15 * MIN, owner: 30 * MIN, merge: 10 * MIN } });
+});
+
 test("the snapshot lists what is in flight and what waits on the owner", async () => {
   const { recordVelocityPass, velocityAnswer } = await import("./roadmap-velocity.ts");
   const { io, dir } = setup("open");

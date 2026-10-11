@@ -197,6 +197,31 @@ test("status: a merged-but-open step shows what its PR said and how to resolve i
   expect(text).not.toContain("agetor roadmap resolve 13");
 });
 
+test("status tells cards waiting in the queue from cards that need you", () => {
+  const a = dto();
+  a.state.roadmap = {
+    ...status,
+    counts: { ...status.counts, inFlight: 3, held: 0, queued: 1, blocked: 1 },
+    blockedCards: [
+      { step: "2", issue: 12, title: "Inventory the widgets", url: null, taskId: "c12aaaaaaaa", queued: true, line: "Build waiting on #41 — retrying when it lands or at 3:30 PM · attempt 1 of 4" },
+      { step: "3", issue: 13, title: "Build the widget store", url: null, taskId: "c13bbbbbbbb", queued: false, line: "Build asks: which \u001b[31mport?" },
+    ],
+  } as never;
+  const text = roadmapStatusLines(a).join("\n");
+  expect(text).toContain("3 in flight (1 blocked — needs you, 1 waiting in the queue)");
+  expect(text.indexOf("Blocked — needs you:")).toBeGreaterThan(0);
+  expect(text.indexOf("Waiting in the queue (retried by itself):")).toBeGreaterThan(text.indexOf("Blocked — needs you:"));
+  expect(text).toContain("3  #13 Build the widget store");
+  expect(text).toContain("Build asks: which");
+  expect(text).not.toContain("\u001b[31m");
+  expect(text).toContain("agetor pipeline status c13bbbbb --handoffs");
+  expect(text).toContain("Build waiting on #41 — retrying when it lands or at 3:30 PM · attempt 1 of 4");
+  // A status saved by an older build has neither.
+  const old = dto();
+  old.state.roadmap = { ...status, counts: { ...status.counts, inFlight: 2 } } as never;
+  expect(roadmapStatusLines(old).join("\n")).not.toContain("queue");
+});
+
 test("status prints text from a PR without its control characters or escapes", () => {
   const a = dto();
   a.state.roadmap = { ...status, needsUser: [{ step: "2", issue: 12, title: "Inventory the widgets", url: null, kind: "stuck", reason: "PR #77 merged", detail: "says \u001b[2J\u001b[31mcleared\u0007\nsecond line" }] } as never;

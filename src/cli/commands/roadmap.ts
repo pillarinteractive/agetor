@@ -206,6 +206,16 @@ export function roadmapWhyLines(a: AutopilotDto, ref: string): string[] {
   return lines;
 }
 
+/** What part of the in-flight steps isn't progressing, and whose it is. */
+function inFlightNote(n: { held?: number; queued?: number; blocked?: number }): string {
+  const parts = [
+    n.held ? `${n.held} held for your sign-off` : "",
+    n.blocked ? `${n.blocked} blocked — needs you` : "",
+    n.queued ? `${n.queued} waiting in the queue` : "",
+  ].filter(Boolean);
+  return parts.length ? ` (${parts.join(", ")})` : "";
+}
+
 /** The human-readable status. Pure; exported for tests. */
 export function roadmapStatusLines(a: AutopilotDto): string[] {
   const { config, state } = a;
@@ -227,7 +237,7 @@ export function roadmapStatusLines(a: AutopilotDto): string[] {
   if (!s) return state.lastError ? lines : [...lines, c.dim("  no status yet — the first pass hasn't finished")];
   const n = s.counts;
   lines.push(
-    `  ${n.complete}/${n.total} complete · ${n.inFlight} in flight${n.held ? ` (${n.held} held for your sign-off)` : ""} · ${n.ready} ready · ${n.waiting} waiting · ${n.declined} declined · ${n.backlog ?? 0} in the backlog` +
+    `  ${n.complete}/${n.total} complete · ${n.inFlight} in flight${inFlightNote(n)} · ${n.ready} ready · ${n.waiting} waiting · ${n.declined} declined · ${n.backlog ?? 0} in the backlog` +
       c.dim(`  (as of ${new Date(s.fetchedAt).toLocaleTimeString()})`),
   );
   if (s.idleReason) lines.push(c.yellow(`  ${s.idleReason}`));
@@ -258,6 +268,20 @@ export function roadmapStatusLines(a: AutopilotDto): string[] {
       if (u.kind === "held") lines.push(c.dim("      review the PR, then move its card to Ready to Merge"));
       else lines.push(c.dim(`      agetor roadmap resolve ${u.issue} --close   accept the step: close the issue as completed`), c.dim(`      agetor roadmap resolve ${u.issue} --redo    have the step done again`));
     }
+  }
+  // Started cards that stopped on a block: the ones parked in the wait
+  // queue need nothing from the owner; the others do (their lines quote the
+  // steps' own words — printed with control characters removed).
+  const stopped = s.blockedCards ?? [];
+  const mine = stopped.filter((b) => !b.queued);
+  const parkedCards = stopped.filter((b) => b.queued);
+  if (mine.length) {
+    lines.push("", c.bold("Blocked — needs you:"));
+    for (const b of mine) lines.push(`  ${b.step}  #${b.issue} ${b.title}`, c.yellow(`      ${plain(b.line)}`), c.dim(`      agetor pipeline status ${b.taskId.slice(0, 8)} --handoffs`));
+  }
+  if (parkedCards.length) {
+    lines.push("", c.bold("Waiting in the queue (retried by itself):"));
+    for (const b of parkedCards) lines.push(`  ${b.step}  #${b.issue} ${b.title}`, c.dim(`      ${plain(b.line)}`));
   }
   const outside = s.blockedOutside ?? [];
   if (outside.length) {

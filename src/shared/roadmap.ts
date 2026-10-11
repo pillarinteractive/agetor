@@ -449,6 +449,10 @@ export function roadmapContinuation(input: {
   busy: ReadonlySet<number>;
   /** Issues Autopilot won't start by itself (needs the owner, settling). */
   exclude?: ReadonlySet<number>;
+  /** Busy issues whose card is parked in the blocked-step wait queue: it
+   *  is in flight (never started twice) but occupies no slot while it
+   *  waits. */
+  parked?: ReadonlySet<number>;
   maxInFlight: number;
   /** Every step in scope is complete or declined. */
   finished: boolean;
@@ -467,7 +471,9 @@ export function roadmapContinuation(input: {
   // that can start now. A next milestone with nothing startable wouldn't
   // help, so it isn't offered for this reason.
   const inScope = views.filter((v) => steps.has(v.step) && isOpenView(v) && !v.human);
-  const inFlight = inScope.filter((v) => input.busy.has(v.issue)).length;
+  // A card parked in the wait queue fills no slot: with only parked cards
+  // in flight the slots are idle, and the next milestone can fill them.
+  const inFlight = inScope.filter((v) => input.busy.has(v.issue) && !input.parked?.has(v.issue)).length;
   const readyLeft = inScope.filter((v) => v.status === "ready" && !input.busy.has(v.issue) && !input.exclude?.has(v.issue)).length;
   const blocked = readyLeft === 0 && inFlight < input.maxInFlight && startable > 0;
   const reason: RoadmapOfferReason | null = input.finished ? "finished" : left === 0 ? "nothing-left" : left < input.maxInFlight ? "nearly-done" : blocked ? "blocked" : null;
@@ -823,6 +829,16 @@ export function findRoadmapLinks(links: readonly RoadmapStepLinks[], ref: string
 }
 
 /** A milestone Autopilot continued into. */
+/** A started card that stopped on a block (src/shared/block-wait.ts). */
+export interface RoadmapBlockedCard {
+  taskId: string;
+  /** Parked in the wait queue (true) or waiting on the owner (false). */
+  queued: boolean;
+  /** What it waits on and when it is retried — or why it needs the owner
+   *  and what was tried. Plain text; may quote the step's own words. */
+  line: string;
+}
+
 export interface RoadmapContinued extends RoadmapMilestone {
   stage: string;
   at: number;
@@ -856,6 +872,13 @@ export interface RoadmapStatus {
     backlog: number;
     /** Of `inFlight`: steps whose card waits in In Review for the owner. */
     held?: number;
+    /** Of `inFlight`: steps whose card is parked in the blocked-step wait
+     *  queue — retried by itself, nothing for the owner to do. Absent when
+     *  none (as is `blocked`). */
+    queued?: number;
+    /** Of `inFlight`: steps whose card is blocked on the owner (a question,
+     *  a decision, or a block the queue gave up on). */
+    blocked?: number;
   };
   /** Ready owner steps: only the owner can do them. With a scope: the ones
    *  in it, and the ones outside it that a step in it waits on. */
@@ -867,6 +890,10 @@ export interface RoadmapStatus {
    *  scope wait on (directly or through other steps). This run never starts
    *  them. */
   blockedOutside: (RoadmapStepRef & { milestone: string })[];
+  /** Steps in flight whose card stopped on a block: `queued` — parked in the
+   *  wait queue and retried by itself; otherwise the owner's. `line` is the
+   *  card's own status line. Absent in a status saved by an older build. */
+  blockedCards?: (RoadmapStepRef & RoadmapBlockedCard)[];
   /** The first few steps that can't start yet, and why. */
   nextWaiting: (RoadmapStepRef & { waitingOn: string[]; reason: string | null })[];
   /** The never-started backlog cards of open steps. */
@@ -923,6 +950,8 @@ export function summarizeRoadmap(input: {
   held?: ReadonlyMap<number, RoadmapNeedsUser>;
   /** Issues with a started live card on the board: issue → card id. */
   cards?: ReadonlyMap<number, string>;
+  /** Issues whose started card stopped on a block: issue → where it stands. */
+  blocked?: ReadonlyMap<number, RoadmapBlockedCard>;
   nextMilestone?: RoadmapNextMilestone | null;
   continued?: RoadmapContinued[];
   now: number;
@@ -936,6 +965,11 @@ export function summarizeRoadmap(input: {
   // In flight, but going nowhere until the owner signs off.
   const heldForUser = inFlight.filter((v) => input.held?.has(v.issue));
   const progressing = inFlight.filter((v) => !input.held?.has(v.issue));
+  // Stopped on a block: parked in the wait queue (still the run's to move),
+  // or the owner's.
+  const blockedCards = inFlight.filter((v) => input.blocked?.has(v.issue) && !input.held?.has(v.issue));
+  const queuedCards = blockedCards.filter((v) => input.blocked!.get(v.issue)!.queued);
+  const ownerCards = blockedCards.filter((v) => !input.blocked!.get(v.issue)!.queued);
   const idle = open.filter((v) => !busy.has(v.issue));
   const stuck = idle.filter((v) => needsUser.has(v.issue));
   const ready = idle.filter((v) => v.status === "ready" && !needsUser.has(v.issue));
@@ -1036,7 +1070,7 @@ export function summarizeRoadmap(input: {
           milestones: scoped.map((m) => ({ number: m.number, title: m.title, total: m.total ?? (scoped.length === 1 ? views.length : 0) })),
         }
       : null,
-    counts: { total: views.length, complete, declined: declined.length, inFlight: inFlight.length, ready: ready.length, waiting: waiting.length + stuck.length, backlog: carded.length, held: heldForUser.length },
+    counts: { total: views.length, complete, declined: declined.length, inFlight: inFlight.length, ready: ready.length, waiting: waiting.length + stuck.length, backlog: carded.length, held: heldForUser.length, ...(queuedCards.length ? { queued: queuedCards.length } : {}), ...(ownerCards.length ? { blocked: ownerCards.length } : {}) },
     humanReady: humanReady.map(ref),
     needsUser: [
       ...stuck.map((v) => {
@@ -1046,6 +1080,7 @@ export function summarizeRoadmap(input: {
       ...heldForUser.map((v) => ({ ...ref(v), kind: "held" as const, ...input.held!.get(v.issue)! })),
     ],
     blockedOutside: outside.map((v) => ({ ...ref(v), milestone: v.milestone })),
+    ...(blockedCards.length === 0 ? {} : { blockedCards: blockedCards.map((v) => ({ ...ref(v), ...input.blocked!.get(v.issue)!, line: displayText(input.blocked!.get(v.issue)!.line, 300) })) }),
     nextWaiting: waiting.slice(0, input.nextWaiting ?? 8).map((v) => ({ ...ref(v), waitingOn: v.waitingOn, reason: v.reason })),
     cards: carded.map((v) => ({ taskId: input.backlog!.get(v.issue)!, step: v.step, issue: v.issue, human: v.human, ...roadmapCardLine(v, input.views) })),
     problems: input.parsed.problems,

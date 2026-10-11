@@ -4,6 +4,8 @@
  * the lab and a card blocked on something else never get the same label.
  */
 import type { Task } from "./types.ts";
+import { blockReasonLine } from "./pipeline.ts";
+import { escalatedWait, escalationLine, waitHasTrigger, waitingInQueue, waitLine } from "./block-wait.ts";
 
 export interface BlockInfo {
   /** The blocked step's task, when there is one. */
@@ -58,4 +60,28 @@ export function leaseQueue(list: Task[], lease: { project: string; label: string
 export function ordinal(n: number): string {
   const s = n % 100 >= 11 && n % 100 <= 13 ? "th" : ({ 1: "st", 2: "nd", 3: "rd" } as Record<number, string>)[n % 10] ?? "th";
   return `${n}${s}`;
+}
+
+/**
+ * Where a started card that stopped on a block stands, in one line: parked
+ * in the blocked-step wait queue (`queued` — what it waits on and when it is
+ * retried), or the owner's (why, and for a block the queue gave up on, what
+ * was tried). Null when the card isn't blocked. `leaseLabels`: the watched
+ * leases of its project. Pure.
+ */
+export function blockedCardLine(task: Task, now: number, leaseLabels: string[] = []): { queued: boolean; line: string } | null {
+  const run = task.pipelineRun;
+  if ((task.pendingInteractionCount ?? 0) > 0) return { queued: false, line: "asked you a question" };
+  if (!run || run.status !== "blocked") return null;
+  const nameOf = (stepId: string | null | undefined) => run.snapshot?.graph.steps.find((s) => s.id === stepId)?.name ?? stepId ?? "a step";
+  if (waitingInQueue(run)) return { queued: true, line: waitLine(nameOf(run.wait!.stepId), run.wait!, now, waitHasTrigger(run.wait!, leaseLabels)) };
+  const gaveUp = escalatedWait(run);
+  if (gaveUp) return { queued: false, line: escalationLine(nameOf(gaveUp.stepId), gaveUp, now).reason };
+  // A pending automatic retry (usage limit, transient failure) isn't the owner's.
+  if (run.autoRetry?.at != null) return null;
+  const block = run.blocked[0];
+  const handoff = [...run.history].reverse().find((r) => r.taskId === block?.taskId)?.handoff;
+  const question = handoff?.openQuestions?.find((q) => q.trim());
+  const why = blockReasonLine(handoff, block?.message) || "blocked";
+  return { queued: false, line: question ? `${nameOf(block?.stepId)} asks: ${question}` : `${nameOf(block?.stepId)} stopped: ${why}` };
 }
