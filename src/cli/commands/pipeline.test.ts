@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { AgetorClient } from "../api-client.ts";
-import type { AgentProfile, Pipeline, PipelineGraph, PipelineInput, PipelineRunState, Task } from "../../shared/types.ts";
+import type { AgentProfile, Pipeline, PipelineGraph, PipelineInput, PipelineRunState, PipelineStepReport, Task } from "../../shared/types.ts";
 import { newStep } from "../../shared/pipeline.ts";
 import { makeTask } from "../test-fixtures.ts";
 
@@ -76,6 +76,10 @@ const {
   resolveImportProfiles,
   withProfileHints,
   colorRunStatus,
+  handoffLines,
+  parseHandoffFlags,
+  pickStepReports,
+  pipelineReportLines,
 } = await import("./pipeline.ts");
 
 const flags = { json: false, plain: true, noDaemon: true } as unknown as Parameters<typeof cmdPipeline>[1];
@@ -1400,4 +1404,152 @@ test("cmdPipeline status --json: prints { task, steps }", async () => {
   });
   await cmdPipeline(["status", "parent-1"], jsonFlags);
   expect(jsonOutputs).toEqual([{ task: t, steps }]);
+});
+
+// ── status --handoffs / pipeline handoff ─────────────────────────────────
+// Synthetic fixtures: a reviewer whose handoff summary is one line per
+// finding while its final message carries each finding in full.
+
+const REVIEW_HANDOFF = {
+  schemaVersion: 1 as const,
+  purpose: "Fix the login bug",
+  summary: "- F1: the cache key ignores the tenant.\n- F2: the retry loop never backs off.",
+  reason: "Return to Build to fix F1 and F2.",
+  next: "changes requested",
+  artifacts: ["src/cache/key.ts"],
+  openQuestions: ["Should F2 also cap total attempts?"],
+  status: "blocked" as const,
+};
+const REVIEW_MESSAGE =
+  "## Findings\n**F1 (blocker) — src/cache/key.ts:42.** cacheKey(user) omits tenantId.\n\n<handoff>\n" +
+  JSON.stringify(REVIEW_HANDOFF) + "\n</handoff>";
+
+function report(over: Partial<PipelineStepReport> = {}): PipelineStepReport {
+  return {
+    seq: 1, stepId: "s1", stepName: "Investigate", taskId: "step-task-0", outcome: "succeeded", responseKind: "handoff",
+    startedAt: 0, endedAt: 1, handoff: null, report: null, ...over,
+  };
+}
+
+test("handoffLines: every field in full — status/next, purpose, multi-line summary and reason, artifacts, open questions", () => {
+  expect(handoffLines(REVIEW_HANDOFF)).toEqual([
+    "status: blocked   next: changes requested",
+    "purpose:",
+    "  Fix the login bug",
+    "summary:",
+    "  - F1: the cache key ignores the tenant.",
+    "  - F2: the retry loop never backs off.",
+    "reason:",
+    "  Return to Build to fix F1 and F2.",
+    "artifacts:",
+    "  - src/cache/key.ts",
+    "open questions:",
+    "  - Should F2 also cap total attempts?",
+  ]);
+  expect(handoffLines({ ...REVIEW_HANDOFF, status: "done", next: null, purpose: "", artifacts: [], openQuestions: [] })[0]).toBe("status: done   next: (none)");
+});
+
+test("pipelineStatusLines --handoffs: each history row is followed by its whole handoff; without the flag, none of it", () => {
+  const run = pipelineRun();
+  run.history[0]!.handoff = REVIEW_HANDOFF;
+  run.history.push({ seq: 2, stepId: "s2", taskId: "step-task-1", startedAt: 2, endedAt: null, outcome: null, handoff: null, nextStepIds: [] });
+  const t = task({ pipelineRun: run });
+  const plain = pipelineStatusLines(t, []).join("\n");
+  expect(plain).not.toContain("the retry loop never backs off");
+  const lines = pipelineStatusLines(t, [], { handoffs: true });
+  const text = lines.join("\n");
+  const row = lines.findIndex((l) => l.includes("1. Investigate"));
+  expect(lines[row + 1]).toBe("       status: blocked   next: changes requested");
+  expect(text).toContain("         - F2: the retry loop never backs off.");
+  expect(text).toContain("         - Should F2 also cap total attempts?");
+  // A step with no handoff says so rather than printing nothing.
+  expect(text).toContain("(no handoff recorded)");
+  expect(text).toContain("agetor pipeline handoff parent-1 <step number>");
+});
+
+test("cmdPipeline status --handoffs prints the handoffs; an unknown flag is a usage error", async () => {
+  const run = pipelineRun();
+  run.history[0]!.handoff = REVIEW_HANDOFF;
+  const t = task({ pipelineRun: run });
+  currentClient = makeClient({ listTasks: async () => [t], getPipelineRun: async () => ({ task: t, steps: [] }) });
+  await cmdPipeline(["status", "parent-1", "--handoffs"], flags);
+  expect(outputs).toEqual(pipelineStatusLines(t, [], { handoffs: true }));
+  expect(outputs.join("\n")).toContain("Return to Build to fix F1 and F2.");
+  await expect(cmdPipeline(["status", "parent-1", "--nope"], flags)).rejects.toThrow("usage: agetor pipeline status");
+});
+
+test("parseHandoffFlags: one optional step, or --all; anything else is a usage error", () => {
+  expect(parseHandoffFlags([])).toEqual({});
+  expect(parseHandoffFlags(["3"])).toEqual({ step: "3" });
+  expect(parseHandoffFlags(["--all"])).toEqual({ all: true });
+  expect(() => parseHandoffFlags(["3", "4"])).toThrow("usage: agetor pipeline handoff");
+  expect(() => parseHandoffFlags(["--all", "3"])).toThrow("usage: agetor pipeline handoff");
+  expect(() => parseHandoffFlags(["--what"])).toThrow("usage: agetor pipeline handoff");
+});
+
+test("pickStepReports: latest that handed off by default; by step number; by step name (its latest run); --all", () => {
+  const reports = [
+    report({ seq: 1, stepName: "Build", handoff: REVIEW_HANDOFF, report: "b1" }),
+    report({ seq: 2, stepName: "Review", handoff: REVIEW_HANDOFF, report: REVIEW_MESSAGE }),
+    report({ seq: 3, stepName: "Build", handoff: REVIEW_HANDOFF, report: "b2" }),
+    report({ seq: 4, stepName: "Review", outcome: null, responseKind: null }), // still running
+  ];
+  expect(pickStepReports(reports, {}).map((r) => r.seq)).toEqual([3]);
+  expect(pickStepReports(reports, { step: "2" }).map((r) => r.seq)).toEqual([2]);
+  expect(pickStepReports(reports, { step: "build" }).map((r) => r.seq)).toEqual([3]);
+  expect(pickStepReports(reports, { all: true }).map((r) => r.seq)).toEqual([1, 2, 3, 4]);
+  expect(() => pickStepReports(reports, { step: "9" })).toThrow('no step "9" in this run — steps: 1. Build, 2. Review, 3. Build, 4. Review');
+  expect(() => pickStepReports(reports, { step: "Ship" })).toThrow('no step "Ship"');
+  expect(() => pickStepReports([], {})).toThrow("has not run any step yet");
+  expect(() => pickStepReports([report({ outcome: null })], {})).toThrow("no step of this run has handed off yet");
+});
+
+test("pipelineReportLines: the step's whole final message, verbatim; falls back to the recorded handoff, then to a note", () => {
+  const lines = pipelineReportLines([
+    report({ seq: 2, stepName: "Review", responseKind: "handoff-blocked", handoff: REVIEW_HANDOFF, report: REVIEW_MESSAGE }),
+    report({ seq: 3, stepName: "Build", outcome: "advanced-manually", responseKind: null, handoff: REVIEW_HANDOFF }),
+    report({ seq: 4, stepName: "Review", outcome: null, responseKind: null }),
+  ]);
+  const text = lines.join("\n");
+  expect(lines[0]).toBe("2. Review  succeeded  [handoff-blocked]  step-tas");
+  expect(text).toContain(REVIEW_MESSAGE); // findings AND the handoff block, untouched
+  expect(text).toContain("3. Build  advanced-manually  step-tas");
+  expect(text).toContain("(no final message found for this step — the handoff recorded on the run:)");
+  expect(text).toContain("  - F2: the retry loop never backs off.");
+  expect(text).toContain("(this step has not handed off)");
+});
+
+test("cmdPipeline handoff: prints the picked step's full report; --json returns the rows; a step task ref is refused", async () => {
+  const t = task({ pipelineRun: pipelineRun() });
+  const reports = [
+    report({ seq: 1, stepName: "Build", handoff: REVIEW_HANDOFF, report: "build report" }),
+    report({ seq: 2, stepName: "Review", handoff: REVIEW_HANDOFF, report: REVIEW_MESSAGE }),
+  ];
+  const asked: string[] = [];
+  currentClient = makeClient({
+    listTasks: async () => [t],
+    getPipelineReports: async (id: string) => {
+      asked.push(id);
+      return { reports };
+    },
+  });
+  await cmdPipeline(["handoff", "parent-1"], flags);
+  expect(asked).toEqual(["parent-1"]);
+  expect(outputs).toEqual(pipelineReportLines([reports[1]!]));
+  expect(outputs.join("\n")).toContain("src/cache/key.ts:42");
+
+  outputs.length = 0;
+  await cmdPipeline(["handoff", "parent-1", "Build"], flags);
+  expect(outputs.join("\n")).toContain("build report");
+  outputs.length = 0;
+  await cmdPipeline(["handoff", "parent-1", "--all"], flags);
+  expect(outputs).toEqual(pipelineReportLines(reports));
+
+  await cmdPipeline(["handoff", "parent-1", "1"], jsonFlags);
+  expect(jsonOutputs).toEqual([{ reports: [reports[0]] }]);
+  await expect(cmdPipeline(["handoff"], flags)).rejects.toThrow("usage: agetor pipeline handoff");
+
+  const stepTask = task({ id: "step-task-9", pipelineId: undefined, pipelineParentId: "parent-1" });
+  currentClient = makeClient({ listTasks: async () => [stepTask] });
+  await expect(cmdPipeline(["handoff", "step-task-9"], flags)).rejects.toThrow("target that id instead");
 });

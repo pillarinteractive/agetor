@@ -16,6 +16,7 @@ import type {
   BranchInfo,
   Pipeline,
   PipelineInput,
+  PipelineStepReport,
   Handoff,
   TaskReference,
   TaskDiff,
@@ -433,6 +434,11 @@ export class AgetorClient {
    *  (`pipelineParentId === id`) it has launched so far. */
   getPipelineRun(taskId: string): Promise<{ task: Task; steps: Task[] }> {
     return this.req("GET", `/tasks/${encodeURIComponent(taskId)}/pipeline`);
+  }
+  /** `GET /tasks/:id/pipeline/reports` — every step execution with its
+   *  handoff and the full text of its final report; `seq` narrows it to one. */
+  getPipelineReports(taskId: string, seq?: number): Promise<{ reports: PipelineStepReport[] }> {
+    return this.req("GET", `/tasks/${encodeURIComponent(taskId)}/pipeline/reports${seq == null ? "" : `?seq=${seq}`}`);
   }
   /** `POST /tasks/:id/pipeline/retry` — retry the current blocked/cancelled
    *  step execution(s). 409 unless the pipeline run is actually blocked or

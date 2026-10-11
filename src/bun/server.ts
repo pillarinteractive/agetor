@@ -30,7 +30,7 @@ import {
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
 import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, publishGlobalEvent, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
-import { advancePipeline, cancelPipelineRun, isPipelineStepTask, releaseSlotWaits, retryPipelineStep, startPipelineRun } from "./pipeline-runner.ts";
+import { advancePipeline, cancelPipelineRun, isPipelineStepTask, pipelineStepReports, releaseSlotWaits, retryPipelineStep, startPipelineRun } from "./pipeline-runner.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
 import { accountUsageDays } from "./account-usage.ts";
@@ -4955,6 +4955,27 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             { task: withRunningSubagents(task), steps: steps.map(withRunningSubagents) },
             { headers: corsHeaders(req) },
           );
+        }),
+      },
+
+      // Every step execution of a pipeline task's run with its handoff and
+      // the full text of its final report (`?seq=N` for one) — read from the
+      // step's recorded turns on demand; the run state itself only keeps
+      // the handoff block. `agetor pipeline handoff`.
+      "/tasks/:id/pipeline/reports": {
+        GET: authed((req) => {
+          const raw = new URL(req.url).searchParams.get("seq");
+          const seq = raw == null ? undefined : Number(raw);
+          if (seq !== undefined && (!Number.isSafeInteger(seq) || seq < 1)) {
+            return json({ error: "seq must be a positive integer" }, { status: 400, headers: corsHeaders(req) });
+          }
+          if (!tasks.get(req.params.id)) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          const reports = pipelineStepReports(req.params.id, seq);
+          return reports === null
+            ? json({ error: "task is not a pipeline task" }, { status: 400, headers: corsHeaders(req) })
+            : json({ reports }, { headers: corsHeaders(req) });
         }),
       },
 

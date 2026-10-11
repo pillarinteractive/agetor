@@ -69,7 +69,7 @@ test("pipeline: 'pipelines' aliases to 'pipeline', with export/import subcommand
   expect(canonical("pipelines")).toBe("pipeline");
   expect(USAGE["pipeline"]).toBeDefined();
   expect(USAGE["pipeline"]!.split("\n", 1)[0]).toBe(
-    "usage: agetor pipeline <ls | show <ref> | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> [--name <n>] | retry <task> [--from <task>] | advance <task> [--next <step>… | --finish] [--from <task>] | restart <task> | status <task>>",
+    "usage: agetor pipeline <ls | show <ref> | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> [--name <n>] | retry <task> [--from <task>] | advance <task> [--next <step>… | --finish] [--from <task>] | restart <task> | status <task> [--handoffs] | handoff <task> [<step>|--all]>",
   );
   expect(helpFor("pipelines", "export")).toBe(USAGE["pipeline export"]);
   expect(helpFor("pipeline", "import")).toBe(USAGE["pipeline import"]);
@@ -82,7 +82,7 @@ test("pipeline: 'pipelines' aliases to 'pipeline', with export/import subcommand
 // subcommands above — each gets its own USAGE block, same shape as
 // "pipeline export"/"pipeline import".
 test("pipeline: retry/advance/restart/status each have their own subcommand block", () => {
-  for (const sub of ["retry", "advance", "restart", "status"]) {
+  for (const sub of ["retry", "advance", "restart", "status", "handoff"]) {
     const block = USAGE[`pipeline ${sub}`];
     expect(block, sub).toBeDefined();
     expect(block!.split("\n", 1)[0]!.startsWith(`usage: agetor pipeline ${sub} <task-id>`), sub).toBe(true);

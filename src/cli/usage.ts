@@ -201,14 +201,15 @@ export const USAGE: Record<string, string> = {
   Update a profile. --skill appends to the existing skill list unless
   --clear-skills is also given (then the list is replaced).`,
 
-  pipeline: `usage: agetor pipeline <ls | show <ref> | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> [--name <n>] | retry <task> [--from <task>] | advance <task> [--next <step>… | --finish] [--from <task>] | restart <task> | status <task>>
+  pipeline: `usage: agetor pipeline <ls | show <ref> | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> [--name <n>] | retry <task> [--from <task>] | advance <task> [--next <step>… | --finish] [--from <task>] | restart <task> | status <task> [--handoffs] | handoff <task> [<step>|--all]>
 
   Manage pipelines — named graphs of agent-profile-bound steps launched as
   one board task (built in the app's Pipelines editor; the CLI moves them
   around) — and control a pipeline TASK's run.
     ls / show / rm / export / import   take a pipeline <ref> (id, or its
                                         unique case-insensitive name)
-    retry / advance / restart / status take a pipeline TASK <ref> (id or
+    retry / advance / restart / status / handoff
+                                        take a pipeline TASK <ref> (id or
                                         short-id prefix, like every other
                                         task-targeting command; a hidden
                                         step task's id is refused — target
@@ -255,10 +256,21 @@ export const USAGE: Record<string, string> = {
 
   Restart the pipeline run from its start step, discarding current progress.`,
 
-  "pipeline status": `usage: agetor pipeline status <task-id>
+  "pipeline status": `usage: agetor pipeline status <task-id> [--handoffs]
 
   Print the pipeline task's run status, blocked entries, active step
-  executions, and full step history.`,
+  executions, and full step history. --handoffs also prints every step's
+  whole handoff (status, next, purpose, summary, reason, artifacts, open
+  questions) under its history row.`,
+
+  "pipeline handoff": `usage: agetor pipeline handoff <task-id> [<step-number> | <step-name> | --all]
+
+  Print a step's full final report: the whole last message it wrote — its
+  findings, with the handoff block that ends it — not just the handoff
+  summary. With no step, the latest step that handed off; a step number is
+  the one 'agetor pipeline status' lists; a step name picks that step's
+  latest run; --all prints every step, oldest first. --json prints
+  { reports: [{ seq, stepName, outcome, handoff, report, … }] }.`,
 
   daemon: `usage: agetor daemon <status | start | stop>
 

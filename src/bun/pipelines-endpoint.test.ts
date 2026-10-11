@@ -559,6 +559,25 @@ test("GET /tasks/:id/pipeline on an unknown task → 404", async () => {
   expect(res.status).toBe(404);
 });
 
+test("GET /tasks/:id/pipeline/reports: [] before a run; 400 for a plain task or a bad seq; 404 unknown", async () => {
+  const profile = await createProfile();
+  const pipeline = await createPipeline(profile.id);
+  const task = await createTask({ pipelineId: pipeline.id });
+
+  const res = await call(`/tasks/${task.id}/pipeline/reports`);
+  expect(res.status).toBe(200);
+  expect(await res.json()).toEqual({ reports: [] });
+  expect((await call(`/tasks/${task.id}/pipeline/reports?seq=1`)).status).toBe(200);
+  for (const bad of ["0", "-1", "abc", "1.5"]) {
+    expect((await call(`/tasks/${task.id}/pipeline/reports?seq=${bad}`)).status).toBe(400);
+  }
+  const plain = await createTask();
+  const notPipeline = await call(`/tasks/${plain.id}/pipeline/reports`);
+  expect(notPipeline.status).toBe(400);
+  expect((await notPipeline.json()).error).toContain("not a pipeline task");
+  expect((await call("/tasks/does-not-exist/pipeline/reports")).status).toBe(404);
+});
+
 // ---------------------------------------------------------------------------
 // Step-task guards: create+start a real pipeline run, then assert the
 // delete/archive/column-PATCH guards on its step task(s).

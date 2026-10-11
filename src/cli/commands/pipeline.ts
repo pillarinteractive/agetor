@@ -16,10 +16,12 @@ import {
 } from "../../shared/pipeline.ts";
 import type {
   AgentProfile,
+  Handoff,
   Pipeline,
   PipelineGraph,
   PipelineInput,
   PipelineRunState,
+  PipelineStepReport,
   Task,
 } from "../../shared/types.ts";
 
@@ -210,11 +212,26 @@ export async function cmdPipeline(args: string[], flags: Flags): Promise<void> {
 
     case "status": {
       const ref = args[1];
-      if (!ref) throw usageError("pipeline status");
+      if (!ref || ref.startsWith("-")) throw usageError("pipeline status");
+      const rest = args.slice(2);
+      if (rest.some((a) => a !== "--handoffs")) throw usageError("pipeline status");
       const task = await resolvePipelineTask(client, ref);
       const { task: fresh, steps } = await client.getPipelineRun(task.id);
       if (flags.json) return printJson({ task: fresh, steps });
-      for (const line of pipelineStatusLines(fresh, steps)) out(line);
+      for (const line of pipelineStatusLines(fresh, steps, { handoffs: rest.includes("--handoffs") })) out(line);
+      return;
+    }
+
+    case "handoff":
+    case "report": {
+      const ref = args[1];
+      if (!ref || ref.startsWith("-")) throw usageError("pipeline handoff");
+      const f = parseHandoffFlags(args.slice(2));
+      const task = await resolvePipelineTask(client, ref);
+      const { reports } = await client.getPipelineReports(task.id);
+      const picked = pickStepReports(reports, f);
+      if (flags.json) return printJson({ reports: picked });
+      for (const line of pipelineReportLines(picked)) out(line);
       return;
     }
 
@@ -222,7 +239,7 @@ export async function cmdPipeline(args: string[], flags: Flags): Promise<void> {
       throw new Error(
         "unknown pipeline subcommand: " +
           sub +
-          " (use ls | show | rm | export | import | retry | advance | restart | status)",
+          " (use ls | show | rm | export | import | retry | advance | restart | status | handoff)",
       );
   }
 }
@@ -505,7 +522,7 @@ export function pipelineShowLines(p: Pipeline, profiles: AgentProfile[] | null =
  * live column — history rows show just the recorded outcome, since a
  * settled step task's own column may have moved on (e.g. archived).
  */
-export function pipelineStatusLines(task: Task, steps: Task[]): string[] {
+export function pipelineStatusLines(task: Task, steps: Task[], opts?: { handoffs?: boolean }): string[] {
   const lines: string[] = [];
   lines.push(`${c.bold(task.title)}  ${c.dim(task.id)}`);
   const run = task.pipelineRun;
@@ -555,9 +572,104 @@ export function pipelineStatusLines(task: Task, steps: Task[]): string[] {
       lines.push(
         `    ${h.seq}. ${stepName}  ${historyGlyph(h.outcome)}${kindNote}${remindedNote}  ${c.dim(h.taskId.slice(0, 8))}`,
       );
+      // `--handoffs`: the step's whole handoff under its row.
+      if (opts?.handoffs) {
+        for (const l of h.handoff ? handoffLines(h.handoff) : [c.dim("(no handoff recorded)")]) lines.push(`       ${l}`);
+        lines.push("");
+      }
+    }
+    if (opts?.handoffs) {
+      lines.push(`  ${c.dim(`a step's full final report (its findings, not just the handoff): agetor pipeline handoff ${task.id.slice(0, 8)} <step number>`)}`);
     }
   }
 
+  return lines;
+}
+
+/** Every field of a handoff, in full: `status`/`next` on one line, then
+ *  `purpose`, `summary` and `reason` (multi-line Markdown kept as written,
+ *  continuation lines indented), then `artifacts` and `openQuestions` as
+ *  bullets. Nothing is truncated. */
+export function handoffLines(h: Handoff): string[] {
+  const status = h.status ?? "done";
+  const lines = [`${label("status")} ${status === "blocked" ? c.yellow(status) : c.green(status)}   ${label("next")} ${h.next ?? c.dim("(none)")}`];
+  const block = (name: string, text: string) => {
+    if (text.trim().length === 0) return;
+    lines.push(`${label(name)}`);
+    for (const l of text.trim().split("\n")) lines.push(`  ${l}`);
+  };
+  block("purpose", h.purpose);
+  block("summary", h.summary);
+  block("reason", h.reason);
+  const list = (name: string, items: string[]) => {
+    if (items.length === 0) return;
+    lines.push(`${label(name)}`);
+    for (const i of items) lines.push(`  - ${i}`);
+  };
+  list("artifacts", h.artifacts);
+  list("open questions", h.openQuestions);
+  return lines;
+}
+
+export interface HandoffFlags {
+  /** A step number (`seq`), or a step name — its latest execution. */
+  step?: string;
+  all?: boolean;
+}
+
+/** Pure flag parser for `agetor pipeline handoff <task> [<step>] [--all]`. */
+export function parseHandoffFlags(args: string[]): HandoffFlags {
+  const f: HandoffFlags = {};
+  for (const a of args) {
+    if (a === "--all") f.all = true;
+    else if (a.startsWith("-") || f.step !== undefined) throw usageError("pipeline handoff");
+    else f.step = a;
+  }
+  if (f.all && f.step !== undefined) throw usageError("pipeline handoff");
+  return f;
+}
+
+/** Which executions `agetor pipeline handoff` prints: `--all` → every one;
+ *  a number → that step number; a name → the latest execution of that step
+ *  (case-insensitive); nothing → the latest execution that handed off. */
+export function pickStepReports(reports: PipelineStepReport[], f: HandoffFlags): PipelineStepReport[] {
+  if (reports.length === 0) throw new Error("this pipeline has not run any step yet");
+  if (f.all) return reports;
+  if (f.step === undefined) {
+    const latest = reports.findLast((r) => r.handoff !== null || r.report !== null);
+    if (!latest) throw new Error("no step of this run has handed off yet");
+    return [latest];
+  }
+  const want = f.step;
+  const hit = /^\d+$/.test(want)
+    ? reports.find((r) => r.seq === Number(want))
+    : reports.findLast((r) => r.stepName.trim().toLowerCase() === want.trim().toLowerCase());
+  if (!hit) {
+    throw new Error(
+      `no step "${want}" in this run — steps: ${reports.map((r) => `${r.seq}. ${r.stepName}`).join(", ")}`,
+    );
+  }
+  return [hit];
+}
+
+/** Pure renderer for `agetor pipeline handoff`: per execution, a header row,
+ *  then the step's whole final message exactly as it wrote it (its findings
+ *  and the handoff block that ends it). A step whose turns hold no handoff
+ *  falls back to the handoff recorded on the run (a manual advance), or says
+ *  there is none. */
+export function pipelineReportLines(reports: PipelineStepReport[]): string[] {
+  const lines: string[] = [];
+  for (const r of reports) {
+    if (lines.length > 0) lines.push("");
+    const kind = r.responseKind ? `  ${c.dim(`[${r.responseKind}]`)}` : "";
+    lines.push(`${c.bold(`${r.seq}. ${r.stepName}`)}  ${historyGlyph(r.outcome)}${kind}  ${c.dim(r.taskId.slice(0, 8))}`);
+    lines.push("");
+    if (r.report !== null) lines.push(...r.report.trim().split("\n"));
+    else if (r.handoff !== null) {
+      lines.push(c.dim("(no final message found for this step — the handoff recorded on the run:)"));
+      lines.push(...handoffLines(r.handoff));
+    } else lines.push(c.dim("(this step has not handed off)"));
+  }
   return lines;
 }
 
