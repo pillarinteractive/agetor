@@ -3,6 +3,7 @@ import path from "node:path";import { cursorModelArg, defaultModeFor, FX_PROVIDE
 import { fxRecoverySummaryLine } from "../shared/fx-recovery.ts";
 import { HANDOFF_TAG } from "../shared/pipeline.ts";
 import { GEMINI_PROMPT_ARGV_MAX_BYTES } from "../shared/prompt-limits.ts";
+import { claudeStepArgsForTask } from "./claude-step-launch.ts";
 import { settleSubagentById } from "./claude-subagents.ts";
 import {
   CLAUDE_API_ERROR_STATUS_PREFIX,
@@ -111,6 +112,13 @@ export interface AgentRunOptions {
    * Ignored by codex.
    */
   sessionId?: string | null;
+  /**
+   * For claude-code: extra argv placed before the prompt — the launch flags
+   * of a pipeline step's session (`claudeStepArgsForTask`,
+   * claude-step-launch.ts). `spawnAgent` fills it in from the task when the
+   * caller leaves it unset. Used on a fresh launch and on `--resume` alike.
+   */
+  claudeExtraArgs?: string[];
   /**
    * Git directories that live OUTSIDE the codex run's cwd — the source repo's
    * `.git` common dir when a task runs in a linked worktree (or a repo-subdir
@@ -525,6 +533,7 @@ export function buildCommand(
       args.push("--permission-mode", toClaudeModeString(mode));
     }
 
+    args.push(...(opts.claudeExtraArgs ?? []));
     args.push(...extra);
 
     // Initial prompt as the final argv element — claude's documented form is
@@ -2305,6 +2314,10 @@ export async function spawnAgent(args: SpawnAgentArgs): Promise<SpawnedAgent> {
     const built = buildCommand(harness, prompt, {
       ...opts,
       sessionId: opts.resumeSessionId ? null : sessionId,
+      // A pipeline step's session leaves out tools it never uses (and takes
+      // its step's context settings) — on `--resume` too, so the tool set
+      // of a session never changes under it.
+      claudeExtraArgs: opts.claudeExtraArgs ?? claudeStepArgsForTask(taskId),
     });
     onSessionId?.(sessionId);
     return await spawnClaudeViaTmux({
