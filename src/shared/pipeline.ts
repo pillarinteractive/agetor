@@ -739,9 +739,17 @@ export function normalizeHandoff(input: unknown): Handoff {
     handoff.status = "blocked";
   }
   if (waitingOn) handoff.waitingOn = waitingOn;
-  else if (handoff.openQuestions.some((q) => q.trim())) handoff.waitingOn = { on: "owner" };
+  else if (invalidQuestions) handoff.waitingOn = { on: "owner" };
   else if (invalidWait) handoff.waitingOn = { on: "other" };
+  const hadQuestions = handoff.openQuestions.some((q) => q.trim());
   fitHandoffToBudget(handoff);
+  // Budget trimming must not erase the last signal that input is needed.
+  // Ordinarily retain question classification (including observed resource
+  // waits); only synthesize a hold when every question was lost to the cap.
+  if (hadQuestions && !handoff.openQuestions.some((q) => q.trim()) && !handoff.waitingOn) {
+    handoff.waitingOn = { on: "owner" };
+    fitHandoffToBudget(handoff);
+  }
   return handoff;
 }
 

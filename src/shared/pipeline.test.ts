@@ -2207,8 +2207,9 @@ describe("classifyStepResponse", () => {
       const result = classifyStepResponse({ runStatus: "succeeded", assistantText: `<handoff>${JSON.stringify(raw)}</handoff>`, pendingInteractions: 0 });
       expect(result.kind).toBe("handoff-blocked");
     }
-    const capped = normalizeHandoff({ status: "done", next: "approved", purpose: "x".repeat(8000), summary: "x".repeat(8000),
-      reason: "x".repeat(8000), openQuestions: Array(40).fill("May I access production?" + "x".repeat(8000)) });
+    const largeField = "\u0000".repeat(8000); // JSON escaping exceeds the byte budget before the question
+    const capped = normalizeHandoff({ status: "done", next: largeField, purpose: largeField, summary: largeField,
+      reason: largeField, openQuestions: ["May I access production?"] });
     expect(capped.status).toBe("blocked");
     expect(capped.waitingOn).toEqual({ on: "owner" });
   });
