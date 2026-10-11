@@ -18,6 +18,8 @@ import {
   type RoadmapStatus,
 } from "../../shared/roadmap.ts";
 import type { GitHubRepoMilestone } from "../../shared/types.ts";
+import type { VelocityAnswer } from "../../shared/velocity.ts";
+import { parseVelocityArgs, velocityLines, velocityPath } from "./roadmap-velocity.ts";
 
 /**
  * Autopilot's tracker mode (src/bun/autopilot.ts, src/shared/roadmap.ts):
@@ -28,6 +30,13 @@ import type { GitHubRepoMilestone } from "../../shared/types.ts";
  *   agetor roadmap resolve <issue> --close | --redo
  *   agetor roadmap why <issue|step>
  *   agetor roadmap continue [--always | --off | --not-now]
+ *   agetor roadmap velocity [--scope current|roadmap] [--owner-delay <hours>]
+ *
+ * `velocity` reports how fast the run is going (roadmap-velocity.ts):
+ * throughput, cycle time, where the time goes, rework, slot utilisation,
+ * bottlenecks and a forecast range. `--scope roadmap` widens the progress
+ * and the bottlenecks from the milestones in scope to the whole roadmap;
+ * `--owner-delay` is the time assumed for each step of the owner's.
  *
  * `why` prints what a step waits on and what it blocks (`#12` is an issue,
  * `2.1` a step, a bare number a step when one has that id). `continue`
@@ -48,7 +57,7 @@ import type { GitHubRepoMilestone } from "../../shared/types.ts";
  * whole roadmap. Everything goes through GET/PUT /autopilot.
  */
 const USAGE =
-  "usage: agetor roadmap status | start --project <dir> [--issue <n>] [--milestone <number|title-prefix|all>] [--max <n>] [--pipeline <id|name>] [--auto-continue] | pause | resolve <issue> --close|--redo | why <issue|step> | continue [--always|--off|--not-now]";
+  "usage: agetor roadmap status | start --project <dir> [--issue <n>] [--milestone <number|title-prefix|all>] [--max <n>] [--pipeline <id|name>] [--auto-continue] | pause | resolve <issue> --close|--redo | why <issue|step> | continue [--always|--off|--not-now] | velocity [--scope current|roadmap] [--owner-delay <hours>]";
 
 interface AutopilotDto {
   config: {
@@ -303,6 +312,10 @@ export async function runRoadmap(client: Client, args: string[]): Promise<{ data
     const a = await client.call<AutopilotDto>("GET", "/autopilot");
     const s = a.config.roadmap ? currentRoadmapStatus(a.config, a.state.roadmap) : null;
     return { data: { ref: rest[0], step: s?.links ? findRoadmapLinks(s.links, rest[0]!).entry : null }, lines: roadmapWhyLines(a, rest[0]!) };
+  }
+  if (sub === "velocity") {
+    const a = await client.call<VelocityAnswer>("GET", velocityPath(parseVelocityArgs(rest, USAGE)));
+    return { data: a, lines: velocityLines(a) };
   }
   if (sub === "continue") {
     const action = parseRoadmapContinueArgs(rest);
