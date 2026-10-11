@@ -2,6 +2,7 @@ import { getClient, type Flags } from "../context.ts";
 import { c, out, printJson } from "../output.ts";
 import { resolveTask } from "../resolve.ts";
 import type { FollowUpAction } from "../../shared/types.ts";
+import { fmtSpan, type WaitingRow } from "../../shared/block-wait.ts";
 
 /**
  * The fork's board-level commands — what the Conductor agent (and anyone at a
@@ -116,6 +117,42 @@ export async function cmdBlocks(args: string[], flags: Flags): Promise<void> {
     out(`${c.bold(String(r.count).padStart(3))}  ${r.pipeline} › ${r.step}  ${c.dim(r.kind)}  ${c.dim(`last ${new Date(r.lastAt).toLocaleString()}`)}`);
     for (const e of r.examples) out(`       ${c.dim(e.title.slice(0, 60))}: ${e.message.replace(/\s+/g, " ").slice(0, 140)}`);
   }
+}
+
+/** `agetor waiting` — the blocked-step wait queue: every card parked for an
+ *  automatic retry (what it waits on, which attempt, when it is retried
+ *  next), then the ones the queue gave up on, which need you. */
+export async function cmdWaiting(_args: string[], flags: Flags): Promise<void> {
+  const client = await getClient(flags);
+  const rows = await client.call<WaitingRow[]>("GET", "/waiting");
+  if (flags.json) return printJson(rows);
+  out(waitingLines(rows, Date.now()).join("\n"));
+}
+
+/** Pure; exported for tests. Text from a step's handoff is printed with
+ *  control characters removed. */
+export function waitingLines(rows: WaitingRow[], now: number): string[] {
+  if (rows.length === 0) return [c.dim("nothing is waiting in the queue")];
+  const plain = (s: string) => s.replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
+  const at = (ts: number) => new Date(ts).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+  const lines: string[] = [];
+  const queued = rows.filter((r) => r.state !== "escalated");
+  const gaveUp = rows.filter((r) => r.state === "escalated");
+  if (queued.length) lines.push(c.bold(`Waiting in the queue (${queued.length}) — retried by itself:`));
+  for (const r of queued) {
+    lines.push(`  ${plain(r.title).slice(0, 70)} ${c.dim(`[${r.taskId.slice(0, 8)}]`)}`);
+    lines.push(`      ${plain(r.line)}`);
+    lines.push(c.dim(`      ${r.category} (${r.source === "none" ? "no known reason matched" : r.source}) · waiting ${fmtSpan(now - r.since)} · gives up ${at(r.deadline)}${r.tried.length ? ` · retried ${r.tried.map((t) => at(t.at)).join(", ")}` : ""}`));
+    lines.push(c.dim(`      it says: ${plain(r.reason)}`));
+  }
+  if (gaveUp.length) lines.push(...(queued.length ? [""] : []), c.bold(`Gave up — needs you (${gaveUp.length}):`));
+  for (const r of gaveUp) {
+    lines.push(`  ${plain(r.title).slice(0, 70)} ${c.dim(`[${r.taskId.slice(0, 8)}]`)}`);
+    lines.push(c.yellow(`      ${plain(r.line)}`));
+    lines.push(c.dim(`      ${r.tried.length ? `retried ${r.tried.map((t) => `${at(t.at)} (${plain(t.trigger)})`).join(", ")}` : "nothing was retried"}`));
+  }
+  if (queued.length) lines.push("", c.dim("  agetor pipeline retry <id> retries one now; Stop on the card takes it out of the queue"));
+  return lines;
 }
 
 /** `agetor depends <id> <dep…>` — <id> is blocked by those cards (replaces

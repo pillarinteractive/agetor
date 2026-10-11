@@ -30,7 +30,7 @@ import {
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
 import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, publishGlobalEvent, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
-import { advancePipeline, cancelPipelineRun, isPipelineStepTask, pipelineStepReports, releaseSlotWaits, retryPipelineStep, startPipelineRun } from "./pipeline-runner.ts";
+import { advancePipeline, cancelPipelineRun, isPipelineStepTask, listBlockWaits, pipelineStepReports, releaseSlotWaits, retryPipelineStep, startPipelineRun } from "./pipeline-runner.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
 import { accountUsageDays } from "./account-usage.ts";
@@ -3288,6 +3288,12 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const since = Date.now() - (Number.isFinite(days) && days > 0 ? days : 14) * 86_400_000;
           return json(summarizeBlocks(readBlockLog(since)), { headers: corsHeaders(req) });
         }),
+      },
+
+      // The blocked-step wait queue (src/shared/block-wait.ts): every card
+      // parked for an automatic retry, and those the queue gave up on.
+      "/waiting": {
+        GET: authed((req) => json(listBlockWaits(), { headers: corsHeaders(req) })),
       },
 
       "/board/digest": {

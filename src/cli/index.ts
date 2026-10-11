@@ -25,7 +25,7 @@ import { cmdCommit } from "./commands/commit.ts";
 import { cmdConfig } from "./commands/config.ts";
 import { cmdShell } from "./commands/shell.ts";
 import { cmdCommands } from "./commands/discovery.ts";
-import { cmdBoard, cmdSuggestions, cmdActivity, cmdFollowUps, cmdFollowUp, cmdBlocks, cmdDepends } from "./commands/board.ts";
+import { cmdBoard, cmdSuggestions, cmdActivity, cmdFollowUps, cmdFollowUp, cmdBlocks, cmdDepends, cmdWaiting } from "./commands/board.ts";
 import { cmdRoadmap } from "./commands/roadmap.ts";
 import { cmdKeepalive } from "./commands/keepalive.ts";
 import { helpFor } from "./usage.ts";
@@ -73,6 +73,7 @@ Commands:
   followups <id>      follow-ups a finished pipeline offers
   followup <id> <action> [--request <text>]  start a follow-up
   blocks [--days N]   what pipelines block on, most frequent first
+  waiting             blocked steps waiting for an automatic retry: why, attempt, next retry
   depends <id> [<dep>…|--clear]  card <id> is blocked by those cards
   roadmap <sub>       status | start --project <dir> [--issue <n>] [--milestone <n|title|all>]
                       [--max <n>] [--pipeline <p>] [--auto-continue] | pause
@@ -237,6 +238,8 @@ async function main(): Promise<void> {
       return cmdFollowUp(args, flags);
     case "blocks":
       return cmdBlocks(args, flags);
+    case "waiting":
+      return cmdWaiting(args, flags);
     case "depends":
       return cmdDepends(args, flags);
     case "roadmap":
