@@ -594,6 +594,8 @@ const sanitizeStepRecord = (raw: unknown): PipelineStepRecord | null => {
     responseKind: sanitizeResponseKind(rec.responseKind),
     reminder: sanitizeStepReminder(rec.reminder),
     ...(isFiniteNumber(rec.turnStartedAt) ? { turnStartedAt: rec.turnStartedAt } : {}),
+    ...(Number.isSafeInteger(rec.reportThroughEventId) && (rec.reportThroughEventId as number) >= 0
+      ? { reportThroughEventId: rec.reportThroughEventId as number } : {}),
   };
 };
 
@@ -2489,16 +2491,18 @@ export const runs = {
    *  the argument — included on every row so the shape matches
    *  `eventsForTask`, keeping the two helpers interchangeable to a
    *  caller that just wants `{ runId, stream, data, ts }`. */
-  events(runId: string) {
+  events(runId: string, opts?: { throughEventId?: number; throughTs?: number }) {
+    const through = opts?.throughEventId ?? opts?.throughTs ?? null;
+    const boundary = opts?.throughEventId != null ? "id" : "ts";
     return db.query<
       { runId: string; stream: string; data: string; ts: number; subagentId: string | null },
-      [string]
+      [string, number | null, number | null]
     >(
       `SELECT run_id as runId, stream, data, ts, subagent_id as subagentId
        FROM run_events
-       WHERE run_id = ?
+       WHERE run_id = ? AND (? IS NULL OR ${boundary} <= ?)
        ORDER BY id ASC`,
-    ).all(runId);
+    ).all(runId, through, through);
   },
   /** The most recently persisted MAIN-stream event's raw `data` for a run
    *  (`subagent_id IS NULL`, like `seenLineUuidsForTask`), or `null` if the

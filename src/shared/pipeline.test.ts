@@ -708,7 +708,7 @@ function fullHandoffJson(overrides: Partial<Handoff> = {}): string {
     reason: "Done, handing off",
     next: "Step 2",
     artifacts: ["src/foo.ts"],
-    openQuestions: ["Any edge cases?"],
+    openQuestions: [],
     status: "done",
     ...overrides,
   });
@@ -856,11 +856,11 @@ describe("parseHandoff", () => {
     if (result.ok) expect(result.handoff.artifacts).toHaveLength(50);
   });
 
-  test("an unparseable status is simply omitted, not an error", () => {
+  test("an unparseable status fails closed instead of becoming implicit success", () => {
     const text = `<${HANDOFF_TAG}>${JSON.stringify({ status: "weird" })}</${HANDOFF_TAG}>`;
     const result = parseHandoff(text);
     expect(result.ok).toBe(true);
-    if (result.ok) expect(result.handoff.status).toBeUndefined();
+    if (result.ok) expect(result.handoff.status).toBe("blocked");
   });
 
   // ---- H2: linear scanner semantics + performance ----------------------
@@ -2193,6 +2193,25 @@ describe("pipelineStepProgress", () => {
 });
 
 describe("classifyStepResponse", () => {
+  test("malformed status/schema and contradictory success retain declared owner permission holds", () => {
+    for (const status of ["Blocked", "BLOCKED", "done", "unexpected", false, {}, null]) {
+      const text = `<handoff>${JSON.stringify({ status, next: "approved", waitingOn: "owner",
+        openQuestions: ["May I access production?"], reason: "Requires owner permission before continuing." })}</handoff>`;
+      const result = classifyStepResponse({ runStatus: "succeeded", assistantText: text, pendingInteractions: 0 });
+      expect(result.kind).toBe("handoff-blocked");
+      expect(result.handoff!.waitingOn).toEqual({ on: "owner" });
+      expect(result.handoff!.openQuestions).toEqual(["May I access production?"]);
+    }
+    for (const raw of [{ status: "done", schemaVersion: 2 }, { status: "done", waitingOn: "invalid" },
+      { status: "done", openQuestions: "May I access production?" }, { status: "done", openQuestions: ["May I access production?"] }]) {
+      const result = classifyStepResponse({ runStatus: "succeeded", assistantText: `<handoff>${JSON.stringify(raw)}</handoff>`, pendingInteractions: 0 });
+      expect(result.kind).toBe("handoff-blocked");
+    }
+    const capped = normalizeHandoff({ status: "done", next: "approved", purpose: "x".repeat(8000), summary: "x".repeat(8000),
+      reason: "x".repeat(8000), openQuestions: Array(40).fill("May I access production?" + "x".repeat(8000)) });
+    expect(capped.status).toBe("blocked");
+    expect(capped.waitingOn).toEqual({ on: "owner" });
+  });
   test("cancelled run -> cancelled, regardless of text", () => {
     const result = classifyStepResponse({ runStatus: "cancelled", assistantText: "whatever", pendingInteractions: 0 });
     expect(result).toEqual({ kind: "cancelled", handoff: null, error: null });
@@ -2671,6 +2690,12 @@ describe("blockedHandoffChoosesNext", () => {
     expect(blockedHandoffChoosesNext(g, "nope", blocked("Build"))).toBe(false);
     expect(blockedHandoffChoosesNext(g, "review", null)).toBe(false);
   });
+  test("a blocked verdict cannot choose an approval or shipping edge", () => {
+    for (const next of ["approved", "Finish", "Finish (approved)"]) {
+      expect(blockedHandoffChoosesNext(g, "review", { ...blocked(next), reason: "AC1 fails; the tenant-isolation defect is unresolved." })).toBe(false);
+    }
+    expect(blockedHandoffChoosesNext(g, "review", blocked("changes requested"))).toBe(true);
+  });
 
   test("a next-step choice cannot bypass a declared wait, an owner question or a permission denial", () => {
     for (const on of ["owner", "dependency", "resource", "environment", "usage_limit", "other"] as const) {
@@ -2679,6 +2704,24 @@ describe("blockedHandoffChoosesNext", () => {
     expect(blockedHandoffChoosesNext(g, "review", { ...blocked("changes requested"), openQuestions: ["May I access production?"] })).toBe(false);
     expect(blockedHandoffChoosesNext(g, "review", { ...blocked("changes requested"), reason: "Permission was denied by the reviewer." })).toBe(false);
     expect(blockedHandoffChoosesNext(g, "review", { ...blocked("changes requested"), reason: "Requires owner approval before accessing production." })).toBe(false);
+    for (const reason of [
+      "I am not authorized to access production.", "We're not allowed to write that directory.",
+      "This agent isn't permitted to run that command.", "The tool is not authorized to use this account.",
+      "Callers are not authorized yet access succeeds. Permission was denied by the reviewer.",
+      "Not authorized to access production.", "The request is not authorized by the service.",
+      "Callers are not authorized yet access succeeds. I am not authorized to run the required production test.",
+    ]) {
+      expect(blockedHandoffChoosesNext(g, "review", { ...blocked("changes requested"), reason })).toBe(false);
+    }
+  });
+  test("security findings about target callers route to Build without creating an execution permission hold", () => {
+    for (const reason of [
+      "Changes requested: callers are not authorized yet access succeeds.",
+      "I found callers are not permitted to read this tenant yet the handler returns its data.",
+      "The request is not allowed by the contract but the endpoint returns 200.",
+    ]) {
+      expect(blockedHandoffChoosesNext(g, "review", { ...blocked("changes requested"), reason })).toBe(true);
+    }
   });
 });
 

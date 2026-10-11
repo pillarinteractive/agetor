@@ -105,9 +105,17 @@ directory. The existing step's generated prompt is updated for Retry too.
 
 Manual Advance now retains the sender's handoff and full report by default.
 Choosing Build does not make a blocked review an approval: Build receives the
-original findings and reproduction/test evidence. Explicit handoff fields still
-replace those fields. Automatic routing never overrides a declared wait, an
-owner question or a permission denial.
+original findings and reproduction/test evidence, including raw output from a
+turn with no valid handoff. Raw output grants no approval. Completed reports
+retain their event boundary so a later explanation cannot replace the reviewed
+execution. Explicit handoff fields still replace those fields.
+
+Automatic routing accepts blocked findings only on a corrective edge, such as
+"changes requested" or "verification failed"; blocked never means approved.
+Malformed status/schema and contradictory questions/waits fail closed, retaining
+owner holds. A security finding about unauthorized callers is distinct from the
+executing agent being denied permission. Instruction refresh also refuses an
+automatic recovery while its unlocked send or relaunch is in flight.
 
 ## Follow-ups on finished pipelines (`feat/pipeline-followups`)
 

@@ -766,6 +766,9 @@ export interface PipelineStepRecord {
    *  before it are earlier turns: a handoff in them is void and never read
    *  again (`executionAssistantText`). Optional/additive. */
   turnStartedAt?: number | null;
+  /** Last persisted main-stream event belonging to this completed execution.
+   * Later explanation turns cannot rewrite its report. Optional on old runs. */
+  reportThroughEventId?: number;
 }
 
 /**

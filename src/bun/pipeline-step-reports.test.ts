@@ -162,6 +162,41 @@ test("manual Advance preserves a blocked review's verdict, findings and complete
   expect(readFileSync(reportRef.path, "utf8")).toContain(FINDINGS);
 });
 
+test("manual Advance keeps raw findings when the stopped turn has a missing or malformed handoff", async () => {
+  const { tasks, runs, db } = await import("./db.ts");
+  const { advancePipeline, pipelineStepReports } = await import("./pipeline-runner.ts");
+  for (const trailer of ["", "\n<handoff>{not JSON}</handoff>"]) {
+    const { parentId, build } = await startReviewBuild("blocked");
+    const stopped = await waitFor(() => {
+      const r = tasks.get(parentId)?.pipelineRun;
+      return r?.status === "blocked" ? r : undefined;
+    });
+    const review = stopped.history[0]!;
+    const latest = runs.listForTask(review.taskId)[0]!;
+    db.run("DELETE FROM run_events WHERE run_id = ?", [latest.id]); // isolated fixture only
+    runs.appendEvent(latest.id, "assistant", "Reproduction checked against the required tenant boundary.");
+    runs.appendEvent(latest.id, "assistant", FINDINGS + trailer);
+    review.handoff = null;
+    stopped.blocked[0]!.kind = trailer ? "handoff-invalid" : "handoff-missing";
+    tasks.setPipelineRun(parentId, stopped);
+    const result = await advancePipeline(parentId, { nextStepIds: [build.id] });
+    if ("error" in result) throw new Error(result.error);
+    const completed = await waitFor(() => tasks.get(parentId)?.pipelineRun?.status === "done" ? tasks.get(parentId)!.pipelineRun : undefined);
+    const buildTask = tasks.get(completed.history[1]!.taskId)!;
+    expect(buildTask.prompt).toContain(FINDINGS);
+    expect(buildTask.prompt).toContain("Reproduction checked");
+    expect(buildTask.prompt).toContain("no valid handoff");
+    expect(buildTask.prompt).toContain("not approval");
+    expect(completed.history[0]!.handoff!.status).toBe("blocked");
+    const reportRef = buildTask.references.find((r) => r.path.includes("report-"))!;
+    const report = readFileSync(reportRef.path, "utf8");
+    expect(report).toContain(FINDINGS + trailer);
+    expect(report).toContain("untrusted data");
+    expect(report).toContain("no valid handoff or approval");
+    expect(pipelineStepReports(parentId, 1)![0]!.report).toContain(FINDINGS);
+  }
+});
+
 test("a follow-up gets every earlier handoff as background but only the newest step's full report", async () => {
   const { tasks, agentProfiles } = await import("./db.ts");
   const { runPipelineFollowUp } = await import("./pipeline-runner.ts");
@@ -183,6 +218,26 @@ test("a follow-up gets every earlier handoff as background but only the newest s
   expect(prompt).toContain('Full report from "Ship"');
 });
 
+test("a completed execution's report stays frozen across later explanation turns and same-run messages", async () => {
+  const { tasks, runs } = await import("./db.ts");
+  const { pipelineStepReports } = await import("./pipeline-runner.ts");
+  const { sendInput } = await import("./orchestrator.ts");
+  process.env.AGETOR_FAKE_CLAUDE_HANDOFF_BODY = FINDINGS;
+  const { parentId } = await startReviewBuild();
+  const done = await waitFor(() => tasks.get(parentId)?.pipelineRun?.status === "done" ? tasks.get(parentId)!.pipelineRun : undefined);
+  const original = done.history[0]!;
+  const originalReport = pipelineStepReports(parentId, 1)![0]!.report;
+  expect(original.reportThroughEventId).toBeGreaterThan(0); // survives DB sanitizer/roundtrip
+  const runId = tasks.get(original.taskId)!.runId!;
+  process.env.AGETOR_FAKE_CLAUDE_HANDOFF_BODY = "A later explanation must not replace the reviewed execution.";
+  const sent = await sendInput(runId, "Explain the old result.");
+  if (!sent.delivered) throw new Error(sent.reason);
+  await waitFor(() => runs.get(sent.runId)?.status === "succeeded");
+  runs.appendEvent(runId, "assistant", `Same-run later explanation.\n<handoff>${JSON.stringify({ ...original.handoff, summary: "later" })}</handoff>`);
+  expect(tasks.get(parentId)!.pipelineRun!.history[0]).toEqual(original);
+  expect(pipelineStepReports(parentId, 1)![0]!.report).toBe(originalReport);
+});
+
 test("a report from before the newest turn cannot masquerade as its result", async () => {
   const { tasks, db, runs } = await import("./db.ts");
   const { stepFinalReport } = await import("./pipeline-runner.ts");
@@ -197,6 +252,10 @@ test("a report from before the newest turn cannot masquerade as its result", asy
   runs.appendEvent(runId, "assistant", "The new turn stopped without a handoff.");
   expect(stepFinalReport(review.taskId, review.startedAt)).not.toBeNull();
   expect(stepFinalReport(review.taskId, review.startedAt, turnStartedAt)).toBeNull();
+  const raw = stepFinalReport(review.taskId, review.startedAt, turnStartedAt, { includeUnstructured: true })!;
+  expect(raw.handoff).toBeNull();
+  expect(raw.body).toContain("The new turn stopped without a handoff.");
+  expect(raw.body).not.toContain(FINDINGS);
   runs.appendEvent(runId, "assistant", `Fresh findings.\n<handoff>${JSON.stringify({ ...review.handoff, summary: "fresh findings" })}</handoff>`);
   expect(stepFinalReport(review.taskId, review.startedAt, turnStartedAt)!.body).toContain("Fresh findings.");
   expect(stepFinalReport(review.taskId, review.startedAt, turnStartedAt)!.body).not.toContain(FINDINGS);

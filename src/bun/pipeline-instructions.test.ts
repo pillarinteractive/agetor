@@ -16,6 +16,8 @@ const parents: string[] = [];
 beforeAll(async () => (await import("./pipeline-runner.ts")).initPipelineRunner());
 afterEach(async () => {
   delete process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS;
+  const { stopPipelineAutoRetryTimers } = await import("./pipeline-runner.ts");
+  stopPipelineAutoRetryTimers();
   const { deleteTask } = await import("./orchestrator.ts");
   for (const id of parents.splice(0)) await deleteTask(id);
 });
@@ -32,7 +34,7 @@ async function until<T>(fn: () => T | undefined | false): Promise<T> {
     await Bun.sleep(15);
   }
 }
-async function fixture(slow = false) {
+async function fixture(slow = false, suffix = "blocked") {
   const { agentProfiles, pipelines, tasks } = await import("./db.ts");
   const { createTask, startTask } = await import("./orchestrator.ts");
   const { newStep } = await import("../shared/pipeline.ts");
@@ -40,7 +42,7 @@ async function fixture(slow = false) {
   const profile = agentProfiles.insert({ name: randomUUID(), harness: "claude-code", model: "fake-model", effort: null,
     mode: null, fast: false, maxMode: false, instructions: "Original profile permissions", skills: [] });
   const step = newStep({ name: "Review", agentProfileId: profile.id,
-    instructions: `Old owner checkpoint. ${marker}:blocked` });
+    instructions: `Old owner checkpoint. ${marker}:${suffix}` });
   const pipeline = pipelines.insert({ name: randomUUID(), graph: { steps: [step], edges: [], startStepId: step.id }, maxSteps: 14 });
   const created = await createTask({ title: "instruction update", prompt: "Preserve every acceptance criterion", isolation: "none",
     workdir: mkdtempSync(path.join(tmpdir(), "agetor-instructions-wd-")), pipelineId: pipeline.id });
@@ -95,6 +97,36 @@ test("refresh refuses a live execution and leaves its instructions untouched", a
   });
   expect(result).toMatchObject({ status: 409 });
   expect(tasks.get(parent.id)!.pipelineRun!.snapshot).toEqual(parent.pipelineRun!.snapshot);
+});
+
+test("refresh refuses quota recovery after its timer is claimed and before the unlocked resumed turn finishes", async () => {
+  const { tasks } = await import("./db.ts");
+  const { fireAutoRetry, refreshPipelineInstructions } = await import("./pipeline-runner.ts");
+  const { parent, template } = await fixture(false, "quota-blocked");
+  const before = parent.pipelineRun!;
+  const [recovery, refresh] = await Promise.all([
+    fireAutoRetry(parent.id, before.autoRetry!.at!),
+    refreshPipelineInstructions(parent.id, { expectedCapturedAt: before.snapshot!.capturedAt, expectedTemplateUpdatedAt: template.updatedAt }),
+  ]);
+  expect(recovery).toBe(true);
+  expect(refresh).toMatchObject({ status: 409, error: expect.stringContaining("recovery") });
+  expect(tasks.get(parent.id)!.pipelineRun!.snapshot).toEqual(before.snapshot);
+});
+
+test("instruction refresh preserves literal dollar replacement syntax in both snapshot and stopped prompt", async () => {
+  const { tasks, pipelines } = await import("./db.ts");
+  const { refreshPipelineInstructions } = await import("./pipeline-runner.ts");
+  const { parent, template, step } = await fixture();
+  const instructions = "Use replacements literally: $$ | $& | $` | $' | $1 | $99 | $<name>\n\n" + step.instructions;
+  const latest = pipelines.update(template.id, { graph: { ...template.graph, steps: [{ ...step, instructions }] } })!;
+  const childId = parent.pipelineRun!.active[0]!.taskId;
+  const before = tasks.get(childId)!.prompt;
+  const result = await refreshPipelineInstructions(parent.id, {
+    expectedCapturedAt: parent.pipelineRun!.snapshot!.capturedAt, expectedTemplateUpdatedAt: latest.updatedAt,
+  });
+  if ("error" in result) throw new Error(result.error);
+  expect(tasks.get(childId)!.prompt).toBe(before.replace(step.instructions, () => instructions));
+  expect(result.task.pipelineRun!.snapshot!.graph.steps[0]!.instructions).toBe(instructions);
 });
 
 test("refresh rejects stale revisions, changed topology/agents, scheduled recovery and modified step prompts", async () => {

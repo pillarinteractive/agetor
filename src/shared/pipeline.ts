@@ -704,8 +704,9 @@ function normalizeNext(x: unknown): string | null {
  * whole object's JSON bounded by `PIPELINE_LIMITS.handoffTotalBytes` (arrays
  * trimmed first, then fields — see `fitHandoffToBudget`), so what lands in
  * a persisted run state has a hard size bound. Missing fields default to
- * `""` / `null` / `[]`, and `status` is kept only when it's exactly `"done"`
- * or `"blocked"`. Only own, known keys are read (a `__proto__` or
+ * `""` / `null` / `[]`. Invalid status/schema or a declared hold/question
+ * fails closed to `"blocked"`; it never becomes implicit success. Only
+ * own, known keys are read (a `__proto__` or
  * `constructor` key in the input is ignored, never assigned — the result is
  * always a fresh plain object). A non-object `input` (including `null`/arrays/primitives)
  * normalizes to the same all-defaults shape with `status` left `undefined` —
@@ -726,10 +727,20 @@ export function normalizeHandoff(input: unknown): Handoff {
     openQuestions: capArray(toStringArray(parsed.openQuestions)),
   };
   if (parsed.status === "done" || parsed.status === "blocked") handoff.status = parsed.status;
-  // What a blocked step says it waits on (src/shared/block-wait.ts). Read
-  // only from a blocked handoff: on a finished one it means nothing.
-  const waitingOn = handoff.status === "blocked" ? parseWaitingOn(parsed) : null;
+  // Preserve authorization/dependency holds even when an agent misspells
+  // status or contradicts them with "done". Never discard a question to
+  // repair an invalid success-shaped response.
+  const waitingOn = parseWaitingOn(parsed);
+  const invalidStatus = parsed.status !== undefined && parsed.status !== "done" && parsed.status !== "blocked";
+  const invalidSchema = parsed.schemaVersion !== undefined && parsed.schemaVersion !== 1;
+  const invalidQuestions = parsed.openQuestions !== undefined && !Array.isArray(parsed.openQuestions);
+  const invalidWait = parsed.waitingOn != null && !waitingOn;
+  if (invalidStatus || invalidSchema || invalidQuestions || invalidWait || waitingOn || handoff.openQuestions.some((q) => q.trim())) {
+    handoff.status = "blocked";
+  }
   if (waitingOn) handoff.waitingOn = waitingOn;
+  else if (handoff.openQuestions.some((q) => q.trim())) handoff.waitingOn = { on: "owner" };
+  else if (invalidWait) handoff.waitingOn = { on: "other" };
   fitHandoffToBudget(handoff);
   return handoff;
 }
@@ -955,12 +966,30 @@ export function blockedHandoffChoosesNext(g: PipelineGraph, fromStepId: string, 
   // Choosing who should fix a defect is not permission to bypass a hold.
   // A declared wait or a question still belongs to its recovery/owner path.
   if (handoff.waitingOn || handoff.openQuestions.some((q) => q.trim())) return false;
-  if (asksTheOwner([handoff.reason, handoff.summary].join("\n"))) return false;
+  const prose = [handoff.reason, handoff.summary].join("\n");
+  // A review may describe callers that are not authorized yet receive data.
+  // Ignore that target-code subject for this execution-hold check, keeping
+  // every other owner signal (including a denial elsewhere in the report).
+  // Unqualified and executing-agent denials retain the conservative default.
+  const holdProse = prose.replace(/\b(?:not|isn['’]t|aren['’]t)\s+(?:authori[sz]ed|permitted|allowed)\b/gi, (phrase, offset: number) => {
+    const before = prose.slice(0, offset);
+    const codeSubject = /\b(?:callers?|clients?|tenants?|application users?)\s+(?:(?:is|are|was|were|remain|remains)\s+)?$/i.test(before);
+    const requestSubject = /\b(?:request|endpoint|handler)\s+(?:(?:is|are|was|were)\s+)?$/i.test(before);
+    const failingBehavior = /^[^.\n]{0,160}\b(?:yet|but|despite)\b[^.\n]{0,100}\b(?:succeeds?|returns?|grants?|allows?)\b/i.test(prose.slice(offset + phrase.length));
+    return codeSubject || (requestSubject && failingBehavior) ? "" : phrase;
+  });
+  if (asksTheOwner(holdProse)) return false;
   const fromStep = g.steps.find((s) => s.id === fromStepId);
   if (!fromStep || fromStep.transition !== "choose") return false;
   const outgoing = outgoingSteps(g, fromStepId);
   if (outgoing.length < 2 && !(fromStep.canFinish && outgoing.length > 0)) return false;
-  return resolveNextSteps(g, fromStepId, handoff).kind === "steps";
+  const resolved = resolveNextSteps(g, fromStepId, handoff);
+  if (resolved.kind !== "steps") return false;
+  // "blocked" may ask another step to repair a defect, never approve or
+  // ship it. Require an explicitly corrective edge; a merely resolvable
+  // route is not evidence that this blocked verdict cleared a quality gate.
+  return outgoing.filter((o) => resolved.stepIds.includes(o.step.id)).every((o) =>
+    /^(?:changes requested|verification failed|needs work|fix|repair|rework|retry)$/i.test(o.edge.label.trim()));
 }
 
 /** Copy only step instructions from a compatible template. Preserve the
@@ -1128,7 +1157,7 @@ function blockedRuleText(outgoing: { name: string; label: string }[], transition
   return hasChoice
     ? `${base} The one exception: if another step is the right one to fix the problem you hit (for example a ` +
       '"changes requested" or "verification failed" option above), name it in "next" and the run goes there; ' +
-      'this applies only when you have no declared wait, owner question or permission hold. Otherwise set "next" to null.'
+      'this applies only to a corrective option, never approval or shipping, and only when you have no declared wait, owner question or permission hold. Otherwise set "next" to null.'
     : base;
 }
 
@@ -1204,7 +1233,7 @@ export function stepReportFromMessages(messages: string[]): { body: string; fina
  *  (and anyone opening it): never truncated, headed by {@link
  *  REPORT_FILE_UNTRUSTED_WARNING}. `messages` as in {@link
  *  stepReportFromMessages}. */
-export function renderReportFile(input: { fromStepName: string; seq: number; messages: string[] }): string {
+export function renderReportFile(input: { fromStepName: string; seq: number; messages: string[]; hasValidHandoff?: boolean }): string {
   const parts = [
     `# Report from "${input.fromStepName}" (step ${input.seq})`,
     REPORT_FILE_UNTRUSTED_WARNING,
@@ -1212,7 +1241,9 @@ export function renderReportFile(input: { fromStepName: string; seq: number; mes
   ];
   input.messages.forEach((m, i) => {
     const last = i === input.messages.length - 1;
-    parts.push(last ? "## Final message (ends with the handoff)" : `## Earlier message ${i + 1} of ${input.messages.length - 1}`);
+    parts.push(last
+      ? input.hasValidHandoff === false ? "## Final recorded message (no valid handoff or approval)" : "## Final message (ends with the handoff)"
+      : `## Earlier message ${i + 1} of ${input.messages.length - 1}`);
     parts.push(m.trim());
   });
   return `${parts.join("\n\n")}\n`;

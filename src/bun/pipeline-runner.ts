@@ -174,6 +174,9 @@ export function initialPipelineRunState(p: Pipeline): PipelineRunState {
  * on a rejection — the next queued `fn` still runs.
  */
 const parentChains = new Map<string, Promise<unknown>>();
+// Recovery deliberately sends outside the parent lock. Keep its claim until
+// that send/relaunch finishes so instruction edits cannot slip into the gap.
+const recoveriesInFlight = new Set<string>();
 function runExclusive<T>(parentId: string, fn: () => Promise<T>): Promise<T> {
   const prev = (parentChains.get(parentId) ?? Promise.resolve()) as Promise<unknown>;
   const chained = prev.then(fn, fn);
@@ -376,22 +379,27 @@ export async function fireAutoRetry(parentId: string, at: number): Promise<boole
     const parent = tasks.get(parentId);
     const run = parent?.pipelineRun;
     const r = run?.autoRetry;
-    if (!parent || !run || !r || r.at !== at) return null;
+    if (!parent || !run || !r || r.at !== at || recoveriesInFlight.has(parentId)) return null;
     run.autoRetry = { ...r, at: null };
     persist(parentId, run);
     if (parent.archivedAt != null || (run.status !== "blocked" && run.status !== "cancelled")) return null;
     const target = run.active.find((a) => a.stepId === r.stepId && !isTaskRunLive(a.taskId));
     if (!target) return null;
+    recoveriesInFlight.add(parentId);
     return { taskId: target.taskId, stepId: r.stepId, resume: r.kind === "quota" ? r.resume : undefined };
   }).catch(() => null);
   if (!go) return false;
-  if (go.resume && (await resumeStepAfterLimit(parentId, go.taskId, go.stepId, go.resume))) return true;
-  const result = await retryPipelineStep(parentId).catch((e: unknown) => ({ error: String(e) }));
-  if ("error" in result) {
-    recordActivity(parentId, { kind: "step", text: `The automatic retry didn't start: ${result.error}`, tone: "warning" });
-    return false;
+  try {
+    if (go.resume && (await resumeStepAfterLimit(parentId, go.taskId, go.stepId, go.resume))) return true;
+    const result = await retryPipelineStep(parentId).catch((e: unknown) => ({ error: String(e) }));
+    if ("error" in result) {
+      recordActivity(parentId, { kind: "step", text: `The automatic retry didn't start: ${result.error}`, tone: "warning" });
+      return false;
+    }
+    return true;
+  } finally {
+    recoveriesInFlight.delete(parentId);
   }
-  return true;
 }
 
 /**
@@ -1275,8 +1283,8 @@ function persistReconcileFailure(parentId: string, taskId: string, err: unknown)
  *  a `stream IN (…)` variant there would be the real fix), so the filter is
  *  applied here, after the single load. */
 type MainStreamEvent = { stream: string; data: string };
-function mainStreamEventsForRun(runId: string): MainStreamEvent[] {
-  return runs.events(runId).filter((e) => e.subagentId == null);
+function mainStreamEventsForRun(runId: string, bounds?: { throughEventId?: number; throughTs?: number }): MainStreamEvent[] {
+  return runs.events(runId, bounds).filter((e) => e.subagentId == null);
 }
 
 /** Concatenate the `assistant` rows of {@link mainStreamEventsForRun}'s
@@ -1325,24 +1333,53 @@ export function executionAssistantText(taskId: string, runId: string, since: num
  * given in full and what `agetor pipeline handoff` prints — the handoff JSON
  * kept on the run's history is only the block at its end. Null when no run
  * of the step holds a handoff (it failed without a report, or its
- * events are gone). Exported for tests.
+ * events are gone). Explicit manual routing may opt into raw output when
+ * there is no valid handoff; that output is context, never a verdict.
+ * Exported for tests.
  */
 export function stepFinalReport(
   taskId: string,
   since: number | null,
   turnStartedAt: number | null = null,
-): { body: string; final: string; handoff: Handoff; messages: string[] } | null {
+  opts?: { includeUnstructured?: boolean; endedAt?: number | null; throughEventId?: number },
+): { body: string; final: string; handoff: Handoff | null; messages: string[] } | null {
   const from = Math.max(since == null ? 0 : since - 1_000, turnStartedAt ?? 0);
   const candidates = runs
     .listForTask(taskId)
-    .filter((r) => r.startedAt >= from)
+    .filter((r) => r.startedAt >= from && (opts?.endedAt == null || r.startedAt <= opts.endedAt))
     .sort((a, b) => b.startedAt - a.startedAt);
+  const messagesFor = (runId: string) => mainStreamEventsForRun(runId,
+    { throughEventId: opts?.throughEventId, throughTs: opts?.throughEventId != null ? undefined : opts?.endedAt ?? undefined })
+    .filter((e) => e.stream === "assistant")
+    .map((e) => e.data);
   for (const r of candidates) {
-    const messages = mainStreamEventsForRun(r.id).filter((e) => e.stream === "assistant").map((e) => e.data);
+    const messages = messagesFor(r.id);
     const report = stepReportFromMessages(messages);
     if (report) return { ...report, messages: messages.slice(0, messages.lastIndexOf(report.final) + 1) };
   }
+  if (opts?.includeUnstructured) {
+    // Keep all assistant output from this execution's current turn, including
+    // split-run siblings. The same lower bound above excludes old verdicts.
+    const messages = candidates.slice().reverse().flatMap((r) => messagesFor(r.id).filter((m) => m.trim()));
+    if (messages.length > 0) {
+      const final = messages.join("\n\n");
+      return { body: `The stopped turn produced no valid handoff. This raw output is findings/context, not approval.\n\n${final}`,
+        final, handoff: null, messages };
+    }
+  }
   return null;
+}
+
+/** Freeze the event boundary, including same-millisecond and same-run later
+ * messages. The report remains in the event log; no duplicate blob or DB
+ * migration is needed. Old completed records use their endedAt as fallback. */
+function freezeStepReport(record: PipelineStepRecord): void {
+  if (record.reportThroughEventId != null) return;
+  const from = Math.max(record.startedAt - 1_000, record.turnStartedAt ?? 0);
+  const row = db.query<{ id: number | null }, [string, number]>(
+    "SELECT MAX(e.id) AS id FROM run_events e JOIN runs r ON r.id=e.run_id WHERE r.task_id=? AND r.started_at>=? AND e.subagent_id IS NULL",
+  ).get(record.taskId, from);
+  record.reportThroughEventId = row?.id ?? 0;
 }
 
 /** One row per step execution of a pipeline task's run, oldest first, with
@@ -1358,7 +1395,8 @@ export function pipelineStepReports(parentId: string, seq?: number): PipelineSte
     .filter((h) => seq == null || h.seq === seq)
     .sort((a, b) => a.seq - b.seq)
     .map((h) => {
-      const report = stepFinalReport(h.taskId, h.startedAt, h.turnStartedAt ?? null);
+      const report = stepFinalReport(h.taskId, h.startedAt, h.turnStartedAt ?? null,
+        { includeUnstructured: h.outcome === "advanced-manually", endedAt: h.endedAt, throughEventId: h.reportThroughEventId });
       return {
         seq: h.seq,
         stepId: h.stepId,
@@ -1700,18 +1738,20 @@ async function launchStep(
         handoffRefs.push({ path: filePath, isDirectory: false });
       }
       let report: { body: string; filePath: string | null } | null = null;
-      const sender = p.handoff && reportSeqs.has(p.seq)
+      const sender = reportSeqs.has(p.seq)
         ? run.history.find((h) => h.seq === p.seq && h.stepId === p.stepId &&
           (h.outcome === "succeeded" || h.outcome === "advanced-manually"))
         : undefined;
-      const full = sender ? stepFinalReport(sender.taskId, sender.startedAt, sender.turnStartedAt ?? null) : null;
+      const full = sender ? stepFinalReport(sender.taskId, sender.startedAt, sender.turnStartedAt ?? null,
+        { includeUnstructured: sender.outcome === "advanced-manually", endedAt: sender.endedAt, throughEventId: sender.reportThroughEventId }) : null;
       if (full && full.body.trim().length > 0) {
         // Keyed by the SENDER's execution, so every step it hands to (a
         // fan-out, a retried launch) names the same file; never part of
         // `written` — a failed launch must not delete a sibling's copy.
         let reportPath: string | null = join(runDir, `report-${generation}-${p.seq}.md`);
         try {
-          writeFileSync(reportPath, renderReportFile({ fromStepName: stepName, seq: p.seq, messages: full.messages }));
+          writeFileSync(reportPath, renderReportFile({ fromStepName: stepName, seq: p.seq, messages: full.messages,
+            hasValidHandoff: full.handoff !== null }));
           handoffRefs.push({ path: reportPath, isDirectory: false });
         } catch {
           reportPath = null; // the inline copy still goes out
@@ -2423,7 +2463,7 @@ export async function advancePipeline(
     // or turn the reviewer's blocked verdict into an approval. Explicit
     // replacement fields still win, including intentional empty values.
     const handoffInput: Record<string, unknown> = {
-      ...(historyEntry?.handoff ?? { reason: "manually advanced" }),
+      ...(historyEntry?.handoff ?? { status: "blocked", reason: "manually advanced; previous turn had no valid handoff" }),
       next: fallbackNextName,
       ...opts.handoff,
     };
@@ -2436,6 +2476,7 @@ export async function advancePipeline(
     removeBlockedFor(run, targetTaskId);
     if (historyEntry) {
       historyEntry.endedAt = Date.now();
+      freezeStepReport(historyEntry);
       historyEntry.outcome = "advanced-manually";
       historyEntry.handoff = handoff;
       historyEntry.nextStepIds = nextStepIds;
@@ -2499,6 +2540,9 @@ export async function refreshPipelineInstructions(
     if (parent.archivedAt != null || !run?.snapshot || !["blocked", "cancelled"].includes(run.status)) {
       return { error: "instructions can only be refreshed on a blocked or cancelled, unarchived run", status: 409 as const };
     }
+    if (recoveriesInFlight.has(parentId)) {
+      return { error: "automatic recovery is still in flight — instructions were not changed", status: 409 as const };
+    }
     if (run.active.some((a) => isTaskRunLive(a.taskId) || isTaskRunCancelling(a.taskId) || remindersInFlight.has(a.taskId))) {
       return { error: "a pipeline execution is still live — instructions were not changed", status: 409 as const };
     }
@@ -2529,7 +2573,7 @@ export async function refreshPipelineInstructions(
         return { error: "step prompt was changed or is ambiguous — instructions were not changed", status: 409 as const };
       }
       const replacement = `\n\n## Your step\n\n${after.instructions.trim() ? after.instructions : "(no additional instructions)"}\n\n`;
-      promptUpdates.push({ taskId: child.id, prompt: child.prompt.replace(needle, replacement) });
+      promptUpdates.push({ taskId: child.id, prompt: child.prompt.replace(needle, () => replacement) });
     }
     const now = Math.max(Date.now(), run.snapshot.capturedAt + 1);
     const auditPath = join(pipelineRunsDir(parentId), `instruction-update-${randomUUID()}.json`);
@@ -3337,6 +3381,7 @@ async function settleStepRun(
       const nextStepIds = resolved.kind === "steps" ? resolved.stepIds : [];
       if (historyEntry) {
         historyEntry.endedAt = Date.now();
+        freezeStepReport(historyEntry);
         historyEntry.outcome = "succeeded";
         historyEntry.handoff = parsedHandoff;
         historyEntry.nextStepIds = nextStepIds;
@@ -3486,6 +3531,7 @@ async function settleStepRun(
       });
       if (historyEntry) {
         historyEntry.endedAt = Date.now();
+        freezeStepReport(historyEntry);
         historyEntry.outcome = "failed";
       }
       const why = failure ? `failed (${failure.detail.slice(0, 80)})` : tail ? `crashed (${tail.slice(0, 80)})` : "crashed";
@@ -3515,6 +3561,7 @@ async function settleStepRun(
     if (run.wait?.taskId === taskId) delete run.wait;
     if (historyEntry) {
       historyEntry.endedAt = Date.now();
+      freezeStepReport(historyEntry);
       historyEntry.outcome = "cancelled";
       historyEntry.responseKind = classifyStepResponse({
         runStatus: status,
@@ -3665,6 +3712,7 @@ async function handleColumnChange(
         if (historyEntry && (historyEntry.outcome !== null || historyEntry.endedAt !== null || (historyEntry.responseKind ?? null) !== null)) {
           historyEntry.outcome = null;
           historyEntry.endedAt = null;
+          delete historyEntry.reportThroughEventId;
           historyEntry.responseKind = null;
           changed = true;
         }
@@ -3736,6 +3784,7 @@ function markStepNeverStarted(parentId: string, taskId: string): void {
   const h = run.history.find((x) => x.taskId === taskId && x.seq === entry.seq);
   if (h) {
     h.endedAt = Date.now();
+    freezeStepReport(h);
     h.outcome = "failed";
   }
   checkJoinIncomplete(run);

@@ -320,6 +320,39 @@ test("a step with a real choice still routes a blocked handoff — unless the tu
   }
 });
 
+test("a target-code security finding automatically returns Review to Build without treating it as an agent permission hold", async () => {
+  const { tasks } = await import("./db.ts");
+  process.env.AGETOR_FAKE_CLAUDE_BLOCKED_NEXT = "changes requested";
+  process.env.AGETOR_FAKE_CLAUDE_BLOCKED_REASON = "Changes requested: callers are not authorized yet access succeeds.";
+  try {
+    const routed = await startBuildReview("Review", "blocked-then-Finish");
+    await waitFor(() => (tasks.get(routed.parentId)?.pipelineRun?.history.length ?? 0) >= 3);
+    const run = tasks.get(routed.parentId)!.pipelineRun!;
+    expect(run.history.slice(0, 3).map((h) => h.stepId)).toEqual([routed.build.id, routed.review.id, routed.build.id]);
+    expect(run.history[1]).toMatchObject({ outcome: "succeeded", nextStepIds: [routed.build.id] });
+    expect(run.wait ?? null).toBeNull();
+  } finally {
+    delete process.env.AGETOR_FAKE_CLAUDE_BLOCKED_NEXT;
+    delete process.env.AGETOR_FAKE_CLAUDE_BLOCKED_REASON;
+  }
+});
+
+test("a contradictory blocked approval never starts Finish with unresolved acceptance findings", async () => {
+  const { tasks } = await import("./db.ts");
+  process.env.AGETOR_FAKE_CLAUDE_BLOCKED_NEXT = "approved";
+  process.env.AGETOR_FAKE_CLAUDE_BLOCKED_REASON = "Critical tenant-isolation failure remains; AC1 fails.";
+  try {
+    const { parentId, review, finish } = await startBuildReview("Review", "blocked");
+    const run = await blockedRun(parentId);
+    expect(run.history.some((h) => h.stepId === finish.id)).toBe(false);
+    expect(run.active.map((a) => a.stepId)).toEqual([review.id]);
+    expect(run.history[1]!.handoff).toMatchObject({ status: "blocked", next: "approved" });
+  } finally {
+    delete process.env.AGETOR_FAKE_CLAUDE_BLOCKED_NEXT;
+    delete process.env.AGETOR_FAKE_CLAUDE_BLOCKED_REASON;
+  }
+});
+
 test("a usage limit that cuts a turn off mid-work resumes that session; one hit before any work relaunches", async () => {
   const { tasks, runs } = await import("./db.ts");
   const { fireAutoRetry } = await import("./pipeline-runner.ts");
