@@ -131,6 +131,14 @@ previous revisions per question instead of silently overwriting the audit.
 Repository lookup failures before a write can retry the same record without
 duplicating it. Follow-up creates and updates carry the verified repository
 identity through the mutation, even if a worktree's remote changes meanwhile.
+The ledger freezes the source issue at its first record and the verified
+repository before its first remote write. Every later update uses that stored
+ownership and validates the existing follow-up URL and number. A changed source
+issue, incomplete legacy ownership, or inconsistent remote response requires
+explicit reconciliation; it never rebinds the old issue number to new task
+metadata. A temporary remote mismatch can retry only after the original source,
+repository and authentication host match again. Pending or uncertain writes
+remain protected from replay.
 
 Confirmed-dead tmux sessions cancel only the questions captured for that
 session as undelivered and emit a removal event for the open UI. Changed runs,

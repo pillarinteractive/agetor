@@ -1,5 +1,5 @@
 import { test, expect, beforeAll, afterEach, afterAll } from "bun:test";
-import { mkdtempSync, readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -232,4 +232,160 @@ test("real create and update stay bound to the verified owning repository after 
       { url: "https://api.github.com/repos/acme/widget/issues/91", method: "PATCH" },
     ]);
   } finally { globalThis.fetch = previousFetch; if (previousToken === undefined) delete process.env.GITHUB_TOKEN; else process.env.GITHUB_TOKEN = previousToken; }
+});
+
+test("published ownership and source issue remain immutable after task scope changes, including within the same repository", async () => {
+  for (const issueUrl of ["https://github.com/unrelated/widget/issues/13", "https://github.com/acme/widget/issues/13"]) {
+    const { id, parent } = await fixture(); const api = await adapters(); const at = parent.pipelineRun!.snapshot!.capturedAt;
+    const initial = await api.call(id, record(at)); const { tasks } = await import("./db.ts");
+    tasks.update(id, { issueUrl });
+    const changed = await api.call(id, record(at, "Changed scope choice?"));
+    expect(changed).toHaveProperty("error"); expect(changed.recorded).toBe(false); expect(changed.reconciliationRequired).toContain("source issue changed");
+    const ledger = JSON.parse(readFileSync(initial.path as string, "utf8"));
+    expect(ledger.sourceIssue).toBe("https://github.com/acme/widget/issues/12");
+    expect(ledger.repository).toEqual({ owner: "acme", name: "widget", remoteHost: "github.com" });
+    expect(ledger.issueUrl).toBe("https://github.com/acme/widget/issues/91"); expect(ledger.records).toHaveLength(1);
+    tasks.update(id, { issueUrl: parent.issueUrl });
+    expect(await api.call(id, record(at, "Restored scope?"))).toHaveProperty("error"); // Explicit reconciliation is still required.
+    expect(api.counts()).toEqual({ created: 1, updated: 0 });
+  }
+});
+
+test("a lookup failure pins source ownership before an identical retry can see changed task metadata", async () => {
+  const { id, parent } = await fixture(); const api = await adapters(); const at = parent.pipelineRun!.snapshot!.capturedAt;
+  api.deps.repo = async () => { throw new Error("lookup failed before create"); };
+  const initial = await api.call(id, record(at));
+  const ledger = JSON.parse(readFileSync(initial.path as string, "utf8")); expect(ledger.sourceIssue).toBe("https://github.com/acme/widget/issues/12");
+  (await import("./db.ts")).tasks.update(id, { issueUrl: "https://github.com/unrelated/widget/issues/12" });
+  api.deps.repo = async () => ({ owner: "unrelated", name: "widget", remoteHost: "github.com" });
+  expect(await api.call(id, record(at))).toHaveProperty("error"); expect(api.counts()).toEqual({ created: 0, updated: 0 });
+});
+
+test("source changes during awaited repository lookup prevent both create and update", async () => {
+  for (const published of [false, true]) {
+    const { id, parent } = await fixture(); const api = await adapters(); const at = parent.pipelineRun!.snapshot!.capturedAt;
+    if (published) await api.call(id, record(at));
+    api.deps.repo = async () => {
+      (await import("./db.ts")).tasks.update(id, { issueUrl: "https://github.com/acme/widget/issues/13" });
+      return { owner: "acme", name: "widget", remoteHost: "github.com" };
+    };
+    const result = await api.call(id, record(at, "Choice before scope changed?"));
+    expect(result).toHaveProperty("error"); expect(result.recorded).toBe(true); expect(result.reconciliationRequired).toContain("during repository lookup");
+    expect(api.counts()).toEqual({ created: published ? 1 : 0, updated: 0 });
+    expect(JSON.parse(readFileSync(result.path as string, "utf8")).sourceIssue).toBe("https://github.com/acme/widget/issues/12");
+  }
+});
+
+test("a new run during repository lookup cannot inherit the old run's publication claim", async () => {
+  const { id, parent } = await fixture(); const api = await adapters(); const at = parent.pipelineRun!.snapshot!.capturedAt;
+  api.deps.repo = async () => {
+    const { tasks } = await import("./db.ts"); const run = tasks.get(id)!.pipelineRun!;
+    run.startedAt = (run.startedAt ?? at) + 1; run.snapshot!.capturedAt = at + 1; tasks.setPipelineRun(id, run);
+    return { owner: "acme", name: "widget", remoteHost: "github.com" };
+  };
+  const result = await api.call(id, record(at)); expect(result.error).toContain("run changed");
+  expect(result.publication).toBe("not-attempted"); expect(api.counts()).toEqual({ created: 0, updated: 0 });
+});
+
+test("an in-flight create stays bound to original ownership and records a concurrent scope change for reconciliation", async () => {
+  const { id, parent } = await fixture(); const api = await adapters(); const at = parent.pipelineRun!.snapshot!.capturedAt;
+  let mutations = 0; let bound: unknown;
+  (api.deps as unknown as { create: (...args: unknown[]) => unknown }).create = async (_input: unknown, repo: unknown) => {
+    bound = repo; mutations++;
+    (await import("./db.ts")).tasks.update(id, { issueUrl: "https://github.com/unrelated/widget/issues/13" });
+    return { ok: true, item: { number: 91, htmlUrl: "https://github.com/acme/widget/issues/91" } };
+  };
+  const result = await api.call(id, record(at)); expect(result.error).toContain("during publication");
+  expect(bound).toEqual({ owner: "acme", name: "widget", remoteHost: "github.com" });
+  const ledger = JSON.parse(readFileSync(result.path as string, "utf8")); expect(ledger.publication).toBe("published");
+  expect(ledger.sourceIssue).toBe("https://github.com/acme/widget/issues/12"); expect(ledger.issueUrl).toBe("https://github.com/acme/widget/issues/91");
+  await api.call(id, record(at)); expect(mutations).toBe(1);
+});
+
+test("untrusted response identities cannot rebind a create or update, and uncertain mutations never replay", async () => {
+  for (const published of [false, true]) {
+    const { id, parent } = await fixture(); const api = await adapters(); const at = parent.pipelineRun!.snapshot!.capturedAt;
+    if (published) await api.call(id, record(at));
+    let attempts = 0;
+    const wrong = async () => { attempts++; return { ok: true, item: { number: 99, htmlUrl: "https://github.com/unrelated/widget/issues/99" } }; };
+    api.deps.create = wrong; api.deps.update = wrong;
+    const result = await api.call(id, record(at, "Choice with inconsistent response?"));
+    expect(result).toHaveProperty("error"); expect(result.publication).toBe("uncertain");
+    const ledger = JSON.parse(readFileSync(result.path as string, "utf8"));
+    expect(ledger.repository.owner).toBe("acme"); expect(ledger.issueUrl).toBe(published ? "https://github.com/acme/widget/issues/91" : undefined);
+    expect(ledger.issueNumber).toBe(published ? 91 : undefined);
+    await api.call(id, record(at, "Choice with inconsistent response?")); expect(attempts).toBe(1);
+  }
+});
+
+test("an update response cannot substitute another issue number in the same repository", async () => {
+  const { id, parent } = await fixture(); const api = await adapters(); const at = parent.pipelineRun!.snapshot!.capturedAt;
+  await api.call(id, record(at));
+  api.deps.update = async () => ({ ok: true, item: { number: 92, htmlUrl: "https://github.com/acme/widget/issues/92" } });
+  const result = await api.call(id, record(at, "Different issue response?")); expect(result.publication).toBe("uncertain");
+  expect(JSON.parse(readFileSync(result.path as string, "utf8")).issueNumber).toBe(91);
+});
+
+test("legacy published and unpublished ledgers without proven source ownership require reconciliation", async () => {
+  for (const published of [false, true]) {
+    const { id, parent } = await fixture(); const api = await adapters(); const at = parent.pipelineRun!.snapshot!.capturedAt;
+    if (!published) api.deps.repo = async () => { throw new Error("pre-create lookup failed"); };
+    const initial = await api.call(id, record(at));
+    const ledger = JSON.parse(readFileSync(initial.path as string, "utf8")); delete ledger.sourceIssue; delete ledger.repository;
+    writeFileSync(initial.path as string, JSON.stringify(ledger));
+    api.deps.repo = async () => ({ owner: "acme", name: "widget", remoteHost: "github.com" });
+    expect((await api.call(id, record(at, "Legacy choice?"))).reconciliationRequired).toContain("ownership is missing");
+    expect(api.counts()).toEqual({ created: published ? 1 : 0, updated: 0 });
+  }
+});
+
+test("inconsistent persisted follow-up ownership cannot target a remote update", async () => {
+  const { id, parent } = await fixture(); const api = await adapters(); const at = parent.pipelineRun!.snapshot!.capturedAt;
+  const initial = await api.call(id, record(at));
+  const ledger = JSON.parse(readFileSync(initial.path as string, "utf8")); ledger.issueUrl = "https://github.com/unrelated/widget/issues/91";
+  writeFileSync(initial.path as string, JSON.stringify(ledger));
+  expect((await api.call(id, record(at, "Tampered follow-up?"))).reconciliationRequired).toContain("follow-up identity");
+  expect(api.counts()).toEqual({ created: 1, updated: 0 });
+});
+
+test("an authentication-host change cannot silently rebind an existing follow-up", async () => {
+  const { id, parent } = await fixture(); const api = await adapters(); const at = parent.pipelineRun!.snapshot!.capturedAt;
+  await api.call(id, record(at));
+  api.deps.repo = async () => ({ owner: "acme", name: "widget", remoteHost: "github-other-account" });
+  const result = await api.call(id, record(at, "Another host?")); expect(result.publication).toBe("unavailable");
+  expect(JSON.parse(readFileSync(result.path as string, "utf8")).repository.remoteHost).toBe("github.com");
+  expect(api.counts()).toEqual({ created: 1, updated: 0 });
+});
+
+test("ledger run and publication identity inconsistencies cannot create or update a follow-up", async () => {
+  for (const corrupt of [
+    (ledger: Record<string, unknown>) => { ledger.runStartedAt = Number(ledger.runStartedAt) + 1; },
+    (ledger: Record<string, unknown>) => { delete ledger.issueNumber; },
+    (ledger: Record<string, unknown>) => { ledger.publication = "not-attempted"; },
+  ]) {
+    const { id, parent } = await fixture(); const api = await adapters(); const at = parent.pipelineRun!.snapshot!.capturedAt;
+    const initial = await api.call(id, record(at)); const ledger = JSON.parse(readFileSync(initial.path as string, "utf8"));
+    corrupt(ledger); writeFileSync(initial.path as string, JSON.stringify(ledger));
+    expect(await api.call(id, record(at, "Inconsistent ledger?"))).toHaveProperty("error");
+    expect(api.counts()).toEqual({ created: 1, updated: 0 });
+  }
+});
+
+test("concurrent records cannot race a pending update; a concurrent scope change retains the original follow-up", async () => {
+  const { id, parent } = await fixture(); const api = await adapters(); const at = parent.pipelineRun!.snapshot!.capturedAt;
+  await api.call(id, record(at)); let release!: () => void; let started!: () => void; const entered = new Promise<void>((r) => { started = r; });
+  let calls = 0; let bound: unknown;
+  (api.deps as unknown as { update: (...args: unknown[]) => unknown }).update = async (_input: unknown, repo: unknown) => {
+    bound = repo; calls++; started(); await new Promise<void>((r) => { release = r; });
+    return { ok: true, item: { number: 91, htmlUrl: "https://github.com/acme/widget/issues/91" } };
+  };
+  const updating = api.call(id, record(at, "Before concurrent change?")); await entered;
+  expect(await api.call(id, record(at, "Second concurrent record?"))).toHaveProperty("error");
+  (await import("./db.ts")).tasks.update(id, { issueUrl: "https://github.com/unrelated/widget/issues/91" });
+  release(); const result = await updating;
+  expect(result.reconciliationRequired).toContain("during publication"); expect(calls).toBe(1);
+  expect(bound).toEqual({ owner: "acme", name: "widget", remoteHost: "github.com" });
+  const ledger = JSON.parse(readFileSync(result.path as string, "utf8"));
+  expect(ledger.records).toHaveLength(2); expect(ledger.issueNumber).toBe(91); expect(ledger.issueUrl).toBe("https://github.com/acme/widget/issues/91");
+  expect(ledger.sourceIssue).toBe("https://github.com/acme/widget/issues/12");
 });
