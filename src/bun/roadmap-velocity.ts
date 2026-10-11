@@ -56,7 +56,7 @@ import { dataDir, db, tasks } from "./db.ts";
 
 /** The issue number of the step that is the main-release gate, when the
  *  title heuristic (src/shared/velocity.ts) doesn't find the right one:
- *  `agetor config autopilot_velocity_gate 799`. */
+ *  `agetor config autopilot_velocity_gate 123`. */
 export const VELOCITY_GATE_PREF = "autopilot_velocity_gate";
 
 /** The ledger is compacted past this size… */
