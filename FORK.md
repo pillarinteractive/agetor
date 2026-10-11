@@ -672,3 +672,94 @@ nothing-to-build decision and no audit: the table decides the order.
   *contained* a sensitive word, or because its file list couldn't be read, is signed off and moves to Ready to
   Merge; and each `roadmapStuck` entry gets its PR's stated reason filled in (one `gh pr view` per entry) with a
   timeline note. Nothing is closed and no card is started by the upgrade itself.
+
+## Velocity: how fast the roadmap run is going (`feat/roadmap-autopilot`)
+
+Tracker order keeps a record of the run and reports on it: the one-line summary beside the rocket ("20 done · 6.0/day ·
+M02 and M03 ≈ 8–20 hours") opens the Velocity view (`VelocityDialog.tsx`; also the **Velocity** button in the Autopilot
+dialog), `agetor roadmap velocity [--json] [--scope current|roadmap] [--owner-delay <hours>]` prints the same, and
+both read `GET /autopilot/roadmap/velocity[?scope=current|roadmap][&ownerDelayHours=n]`. The metrics are pure
+(`src/shared/velocity.ts`); the core keeps the ledger (`src/bun/roadmap-velocity.ts`). No table, no migration.
+
+- **What is measured**
+  - **Throughput** — steps whose issue closed as completed since the run began, per day: last 24 hours, 3 days, 7 days
+    and the whole run (a window longer than the run is clipped to the run's age), per hour over the last 24, agent steps
+    and the owner's separately, and complete/total per stage (the table's milestone column). The run *began* at the
+    earliest "…of roadmap #T" entry in a card's timeline (else the first pass with this build); steps closed before that
+    are the burn-up's starting height, not throughput.
+  - **Cycle time** — card start (its pipeline run's start) → issue closed, for agent steps a card worked: median, p75,
+    p90 (linear interpolation between order statistics), min, max; overall and per stage.
+  - **Lead time** — the step became ready → issue closed. Ready is when its last predecessor's issue closed, never
+    earlier than the run began (a step with no predecessors was ready when the run began). It includes waiting for a
+    slot and waiting for the step's milestone to be in scope. The owner's steps have a lead time and no cycle time.
+  - **Where the time goes** — every instant between card start and issue closed gets one label, so the parts sum to the
+    cycle time. *Active*: inside a pipeline step — Understand, Build, Review, Finish (all visits summed), follow-ups
+    (Fix CI, resolving conflicts, opening the PR), any other step. *Waiting*: **CI and merge queue** (from the run's
+    last step finishing to the issue closing, less the holds), **held for you** (a sensitive-code hold until the
+    sign-off or the card reaching the merge queue; a merged PR whose issue stayed open, from the note that says so; a
+    step that blocked or failed with no automatic retry), **usage-limit waits**, **waiting for a step slot** (between
+    one step handing off and the next starting), **automatic retries**. **Flow efficiency** = active ÷ (active + waiting).
+  - **Rework** — review visits per step (1 = approved first time) with their distribution, Finish handing back to
+    Build, automatic Fix CI runs.
+  - **Slots** — from the samples: slots in use on average and by hour (48 hours), the share of time *blocked* (slots
+    idle, no agent step in scope able to start, not holding for a usage limit), and the share spent holding new starts
+    for a usage limit.
+  - **Bottlenecks now** — the open steps whose predecessors are all complete (in flight, ready, yours, needing you),
+    ranked by how many open steps wait behind them, followed all the way; how long each card has been going; and the
+    steps waiting on you, with for how long.
+- **The ledger** — `<dataDir>/roadmap-velocity/<tracker>-<project hash>.jsonl`, append-only, written by each roadmap
+  pass (`RoadmapDeps.velocity` → `recordVelocityPass`): `run` (once: when the run began), `step` (the facts of a step
+  the first time a pass sees it complete — start, close, ready, phases, rounds — taken from its card's run history and
+  `<dataDir>/activity/<id>.jsonl` at that moment, so they outlive the card being archived or deleted), `s` (a sample:
+  `max`, slots `used`, `blocked`, `quota`, ready and held counts — on a change, and every 4 minutes as a heartbeat),
+  `c` (a card's state when it changes: building, merging, held, blocked, quota, retry), `h` (an hour of older samples).
+  Beside it `<same>.json`, rewritten each pass: every step with its predecessors, state and closing time, and what is
+  in flight. The API reads these two files and nothing else; it never reaches GitHub.
+  - **Bounded**: past 1 MB the ledger is rewritten — each step's latest facts, the newest 2,000 samples (a week),
+    older samples folded into hours (180 days kept), card states only of steps still open.
+  - **Gaps**: two samples more than 20 minutes apart mean nothing was watching (the app was closed, Autopilot
+    paused). That stretch is *unknown* — not idle, not blocked — and is reported as such.
+  - **Closing time** is GitHub's `closedAt` (added to the batched state query in `roadmap-fetch.ts`); failing that
+    the card's "Closed issue" entry, failing that the pass that first saw it closed. The report says how many were not
+    GitHub's.
+  - **Backfill**: the first pass with this build writes the facts of every step already complete, from the cards
+    that still exist (archived ones included). What can't be reconstructed stays unknown: a step with no card (closed
+    by hand, done outside Agetor, or its card deleted) counts for throughput and has no cycle time; slot samples start
+    with that pass; and time a step spent blocked on a question or paused on a usage limit *inside* a running step
+    is counted as that step's time for steps finished before then — the run's history keeps a retried step's record
+    open, so only the passes' `c` events can tell, and they start now (to within a pass, 5 minutes at most).
+  - A card from before the run isn't counted as the run's work on a step unless its timeline names the roadmap or a
+    pass saw it in flight. A different tracker or project is a different ledger.
+- **Forecast** — an estimate, shown as a range and never as a date, with the sample it rests on. Three targets: the
+  scope, the main-release gate (the first step whose title reads like "Publish … main release"; set
+  `agetor config autopilot_velocity_gate <issue>` when that guesses wrong) and the whole roadmap. Each counts its open
+  steps *and every unfinished step they wait on*.
+  - **Minimum sample**: 5 agent steps completed in the run with a measured cycle time, and 6 hours of history. Below
+    that: "3 steps completed with a measured cycle time — not enough for a forecast (it needs 5)".
+  - **Naive**: remaining agent steps ÷ recent throughput — the 3-day and 7-day rates, each widened by its counting
+    noise (±√n); with 7 full days of history, daily completions of the last 14 days resampled instead (10th–90th
+    percentile). It ignores dependencies.
+  - **Simulated** (`simulateOnce`): 200 seeded runs of the dependency graph forward from now. Steps start in table
+    order when every predecessor is complete and a slot is free; an agent step takes a cycle time drawn from the
+    observed ones and holds its slot for that step's observed time out of CI, the merge queue and holds; a step
+    already in flight needs what is left of a longer observed cycle. It is run twice — with all `maxInFlight` slots,
+    and with as many as have actually been busy on average (from the samples once there are 6 hours of them, before
+    that from the time cards spent building; rounded down) — and the range runs from the 10th percentile of the first
+    to the 90th of the second. The seed comes from the roadmap's state, so the same state gives the same answer.
+  - **Your steps** have no measured duration. The forecast says how many lie on the path and shows the range twice:
+    with them taking no time, and with each taking an assumed time once it is ready — yours to set (the view's input,
+    `--owner-delay`), by default the median lead time of the owner's steps finished so far once there are 3.
+  - **Limits**: it assumes Autopilot stays on, that every ready step may start whatever milestone it is in (the real
+    run only starts steps of milestones in scope), and that later steps take as long as the ones finished so far. It
+    doesn't model usage limits, the merge queue backing up, or steps declined later; steps behind a declined step are
+    left out and counted.
+- **`?scope`**: the speed figures (throughput, cycle time, the breakdown, rework, slots) are always the whole run's —
+  finished milestones leave the scope, and their history shouldn't go with them. `scope` chooses what the progress
+  chart and the bottleneck list cover: the milestones in scope (`current`, the default) or the whole roadmap.
+- **The view**: inline SVG and the app's own tokens (`--info` for agents working, `--warning` for waiting, both also
+  said in words); each chart has its numbers as a table ("Show as a table") and a text alternative.
+- **Upgrading**: no migration. The first pass after installing (30 s after the core starts) reads every card made from
+  a step's issue once, writes the backfill and the first sample, and the summary appears beside the rocket. Going back
+  to an older build leaves the two files unread.
+- **Rendered checks**: `e2e/roadmap-board.spec.ts` ("velocity") seeds a synthetic three-day run and draws the view in
+  light and dark, with too little data, and with none.
