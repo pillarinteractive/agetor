@@ -394,7 +394,9 @@ export async function fireAutoRetry(parentId: string, at: number): Promise<boole
   if (!go) return false;
   try {
     if (go.resume && (await resumeStepAfterLimit(parentId, go.taskId, go.stepId, go.resume))) return true;
-    const result = await retryPipelineStep(parentId).catch((e: unknown) => ({ error: String(e) }));
+    // A timer belongs to this execution only. Sibling approvals, resource
+    // waits and pending capped launches need their own disposition.
+    const result = await retryPipelineStep(parentId, { taskId: go.taskId }).catch((e: unknown) => ({ error: String(e) }));
     if ("error" in result) {
       recordActivity(parentId, { kind: "step", text: `The automatic retry didn't start: ${result.error}`, tone: "warning" });
       return false;
@@ -3702,6 +3704,13 @@ async function handleColumnChange(
         const beforeLen = run.blocked.length;
         run.blocked = run.blocked.filter((b) => b.taskId !== taskId);
         let changed = run.blocked.length !== beforeLen;
+        // A real new worker supersedes this execution's earlier timer. If
+        // that turn reaches an owner hold, the old timer must not answer it
+        // by restarting the execution. Retain the bounded attempt count.
+        if (run.autoRetry?.stepId === activeEntry.stepId && run.autoRetry.at != null) {
+          run.autoRetry = { ...run.autoRetry, at: null };
+          changed = true;
+        }
         // A follow-up running again (resumed by a message) has taken over
         // from any earlier block, same as when it launched.
         if (isFollowUpStepId(activeEntry.stepId)) {

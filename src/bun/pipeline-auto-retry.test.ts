@@ -15,7 +15,7 @@ process.env.AGETOR_CLAUDE_BIN = "/bin/echo";
 process.env.AGETOR_CLAUDE_ARGS = "";
 process.env.AGETOR_TMUX_BIN = "/bin/echo";
 
-const ERROR_ENV = ["AGETOR_FAKE_CLAUDE_API_ERROR", "AGETOR_FAKE_CLAUDE_API_ERROR_TEXT", "AGETOR_FAKE_CLAUDE_API_ERROR_STATUS", "AGETOR_FAKE_CLAUDE_API_ERROR_AFTER_WORK"];
+const ERROR_ENV = ["AGETOR_FAKE_CLAUDE_API_ERROR", "AGETOR_FAKE_CLAUDE_API_ERROR_TEXT", "AGETOR_FAKE_CLAUDE_API_ERROR_STATUS", "AGETOR_FAKE_CLAUDE_API_ERROR_AFTER_WORK", "AGETOR_FAKE_CLAUDE_BLOCKED_REASON", "AGETOR_FAKE_CLAUDE_BLOCKED_QUESTIONS"];
 let parents: string[] = [];
 
 beforeAll(async () => {
@@ -170,6 +170,105 @@ test("an interrupted step retries after boot without becoming running before a w
   expect(tasks.stepsForParent(parentId).map((t) => t.id)).toEqual([execution.taskId]);
   expect(done.pipelineRun!.stepCount).toBe(run.stepCount);
   expect(done.pipelineRun!.autoRetry).toBeUndefined();
+});
+
+test.each(["owner", "permission", "dependency", "resource"] as const)("automatic recovery preserves a parallel sibling's %s hold and pending cap", async (category) => {
+  const { tasks, runs, agentProfiles, pipelines } = await import("./db.ts");
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { fireAutoRetry, stopPipelineAutoRetryTimers, retryPipelineStep } = await import("./pipeline-runner.ts");
+  const { registerScrapedAskQuestions, listPendingForTask } = await import("./interactions.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER: marker } = await import("./agents.ts");
+  const profile = agentProfiles.insert({ name: randomUUID(), harness: "claude-code", model: "fake-model", effort: null, mode: null, fast: false, maxMode: false, instructions: "", skills: [] });
+  const step = (name: string, suffix: string) => newStep({ name, agentProfileId: profile.id, instructions: `${marker}:${suffix}` });
+  const start = step("Start", "done");
+  start.transition = "all";
+  const recovery = step("Recover", "blocked-then-done");
+  const held = step("Held", "blocked");
+  const deferred = step("Deferred", "done");
+  const pipeline = pipelines.insert({ name: randomUUID(), graph: { steps: [start, recovery, held, deferred], edges: [{ id: "a", from: start.id, to: recovery.id, label: "" }, { id: "b", from: start.id, to: held.id, label: "" }], startStepId: start.id }, maxSteps: 14 });
+  process.env.AGETOR_FAKE_CLAUDE_BLOCKED_REASON = "Waiting for owner approval";
+  process.env.AGETOR_FAKE_CLAUDE_BLOCKED_QUESTIONS = JSON.stringify(["May I perform the owner-only operation?"]);
+  const created = await createTask({ title: "scoped automatic recovery", prompt: "goal", workdir: mkdtempSync(path.join(tmpdir(), "agetor-recovery-siblings-")), isolation: "none", pipelineId: pipeline.id });
+  if ("error" in created) throw new Error(created.error);
+  const parentId = created.task.id;
+  parents.push(parentId);
+  const started = await startTask(parentId);
+  if ("error" in started) throw new Error(started.error);
+  const run = await waitFor(() => {
+    const r = tasks.get(parentId)?.pipelineRun;
+    return r?.blocked.length === 2 ? r : undefined;
+  });
+  const recovering = run.active.find((a) => a.stepId === recovery.id)!;
+  const waiting = run.active.find((a) => a.stepId === held.id)!;
+  const oldRecover = runs.listForTask(recovering.taskId)[0]!;
+  const heldRun = runs.listForTask(waiting.taskId)[0]!;
+  const heldHistory = run.history.find((h) => h.taskId === waiting.taskId)!;
+  heldHistory.handoff!.waitingOn = { on: category === "permission" ? "owner" : category, ref: category === "dependency" ? "#99" : "required prerequisite" };
+  heldHistory.handoff!.reason = category === "permission" ? "Automatic approval review denied the operation" : `Waiting for ${category}`;
+  if (category === "dependency" || category === "resource") heldHistory.handoff!.openQuestions = [];
+  run.blocked.find((b) => b.taskId === waiting.taskId)!.message = heldHistory.handoff!.reason;
+  if (category === "owner" || category === "permission") {
+    registerScrapedAskQuestions({ taskId: waiting.taskId, runId: heldRun.id, fingerprint: "sibling-approval", questions: [{ question: "May I perform the owner-only operation?", options: [{ label: "Allow" }, { label: "Deny" }] }] });
+  }
+  // Only Recover lost its worker; the parallel sibling's hold remains.
+  runs.update(oldRecover.id, { status: "orphaned", endedAt: Date.now(), exitCode: -1 });
+  tasks.update(recovering.taskId, { column: "ready", runId: null });
+  run.blocked = run.blocked.filter((b) => b.taskId !== recovering.taskId);
+  const history = run.history.find((h) => h.taskId === recovering.taskId)!;
+  history.outcome = "cancelled";
+  history.endedAt = Date.now();
+  // A separate capped launch is also outside this timer's authority.
+  run.snapshot!.maxSteps = run.stepCount;
+  run.blocked.push({ taskId: null, stepId: deferred.id, kind: "step-cap", message: "step cap exhausted", pending: { stepId: deferred.id, arrivals: [] } });
+  const at = Date.now() + 60_000;
+  run.autoRetry = { stepId: recovery.id, kind: "transient", attempt: 1, at, reason: "lost its session" };
+  tasks.setPipelineRun(parentId, run);
+  stopPipelineAutoRetryTimers();
+  const heldBefore = structuredClone(heldHistory);
+  const blocksBefore = structuredClone(run.blocked);
+  const pendingBefore = listPendingForTask(waiting.taskId);
+
+  expect(await Promise.all([fireAutoRetry(parentId, at), fireAutoRetry(parentId, at)])).toEqual([true, false]);
+  // A targeted manual retry racing the timer must not mint another worker.
+  await retryPipelineStep(parentId, { taskId: recovering.taskId });
+  await waitFor(() => tasks.get(parentId)?.pipelineRun?.history.find((h) => h.taskId === recovering.taskId)?.outcome === "succeeded");
+  const after = tasks.get(parentId)!.pipelineRun!;
+  expect(runs.listForTask(recovering.taskId)).toHaveLength(2);
+  expect(runs.listForTask(waiting.taskId)).toHaveLength(1);
+  expect(after.history.find((h) => h.taskId === waiting.taskId)).toEqual(heldBefore);
+  expect(after.blocked).toEqual(blocksBefore);
+  expect(listPendingForTask(waiting.taskId)).toEqual(pendingBefore);
+  expect(after.capExtensions ?? 0).toBe(0);
+  expect(after.stepCount).toBe(run.stepCount);
+  expect(tasks.stepsForParent(parentId)).toHaveLength(3);
+});
+
+test("a manual retry that reaches an owner hold invalidates its earlier automatic timer", async () => {
+  const { tasks, runs } = await import("./db.ts");
+  const { fireAutoRetry, stopPipelineAutoRetryTimers, retryPipelineStep } = await import("./pipeline-runner.ts");
+  process.env.AGETOR_FAKE_CLAUDE_API_ERROR = "1";
+  const { parentId } = await startOneStep("blocked");
+  const failed = await waitFor(() => {
+    const t = tasks.get(parentId);
+    return t?.pipelineRun?.autoRetry?.at ? t : undefined;
+  });
+  const at = failed.pipelineRun!.autoRetry!.at!;
+  const taskId = failed.pipelineRun!.active[0]!.taskId;
+  stopPipelineAutoRetryTimers();
+  for (const k of ERROR_ENV) delete process.env[k];
+  process.env.AGETOR_FAKE_CLAUDE_BLOCKED_REASON = "Waiting for owner approval";
+  process.env.AGETOR_FAKE_CLAUDE_BLOCKED_QUESTIONS = JSON.stringify(["May I perform the owner-only operation?"]);
+  expect(await retryPipelineStep(parentId, { taskId })).not.toHaveProperty("error");
+  const held = await waitFor(() => {
+    const r = tasks.get(parentId)?.pipelineRun;
+    return r?.blocked.some((b) => b.kind === "step-blocked") ? r : undefined;
+  });
+  expect(held.autoRetry!.at).toBeNull();
+  expect(await fireAutoRetry(parentId, at)).toBe(false);
+  expect(runs.listForTask(taskId)).toHaveLength(2);
+  expect(tasks.get(parentId)!.pipelineRun!.blocked).toEqual(held.blocked);
+  expect(tasks.get(parentId)!.pipelineRun!.history.at(-1)!.handoff!.openQuestions).toEqual(["May I perform the owner-only operation?"]);
 });
 
 test("transient failures retry with backoff up to 4 times, then stay blocked for the user", async () => {
