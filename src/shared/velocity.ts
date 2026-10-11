@@ -683,6 +683,13 @@ function hash(n: number, s: string): number {
   return h;
 }
 
+/** The name of a tracker's ledger files: the tracker and a short hash of
+ *  the project's path (issue #600 of another repository is another run). */
+export function velocityKey(tracker: number, project: string): string {
+  const dir = project.length > 1 ? project.replace(/\/+$/, "") : project;
+  return `${tracker}-${hash(tracker, dir).toString(16).padStart(8, "0")}`;
+}
+
 // ── The report ────────────────────────────────────────────────────────────
 
 export interface ThroughputWindow {
@@ -1266,4 +1273,12 @@ export function velocitySummary(r: VelocityReport): string {
   const range = t ? targetRange(t) : null;
   if (t && range) parts.push(`${t.key === "roadmap" ? "roadmap" : t.key === "gate" ? "release gate" : t.label} ≈ ${fmtRange(range.low, range.high).replace(/^about /, "")}`);
   return parts.join(" · ");
+}
+
+/** "in flight for 2.0h", "held for your sign-off for 95m · card started 3.1h ago". */
+export function bottleneckLine(b: Pick<VelocityBottleneck, "state" | "inFlightMs" | "waitingOnYouMs">, state: string): string {
+  const card = b.inFlightMs != null ? `card started ${fmtDuration(b.inFlightMs)} ago` : null;
+  if (b.waitingOnYouMs != null) return [`${state} for ${fmtDuration(b.waitingOnYouMs)}`, card].filter(Boolean).join(" · ");
+  if (b.state === "building" && b.inFlightMs != null) return `${state} for ${fmtDuration(b.inFlightMs)}`;
+  return [state, card].filter(Boolean).join(" · ");
 }

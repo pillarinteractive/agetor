@@ -32,7 +32,6 @@
  *
  * Everything is best-effort: a pass never fails because of the ledger.
  */
-import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type { Task } from "../shared/types.ts";
@@ -43,6 +42,7 @@ import {
   foldSamples,
   mergeHours,
   stepFacts,
+  velocityKey,
   type VelocityAnswer,
   type VelocityCard,
   type VelocityGraphStep,
@@ -81,7 +81,7 @@ const LIMITS: VelocityLimits = { maxBytes: LEDGER_MAX_BYTES, keepSamples: LEDGER
 const trimDir = (p: string) => (p.length > 1 ? p.replace(/\/+$/, "") : p);
 
 export function velocityFiles(tracker: number, project: string, dir = path.join(dataDir, "roadmap-velocity")): { ledger: string; snapshot: string } {
-  const key = `${tracker}-${createHash("sha1").update(trimDir(project)).digest("hex").slice(0, 8)}`;
+  const key = velocityKey(tracker, project);
   return { ledger: path.join(dir, `${key}.jsonl`), snapshot: path.join(dir, `${key}.json`) };
 }
 

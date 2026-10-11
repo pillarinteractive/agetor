@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { Rocket, X } from "lucide-react";
+import { Gauge, Rocket, X } from "lucide-react";
 import { Dialog } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -37,7 +37,7 @@ const SCOPED_PHASE: Record<AutopilotStateDto["phase"], string> = {
  *  the Backlog, started when its predecessors are complete. No milestone =
  *  the whole roadmap. With no tracker, the milestone-manager Codex thread
  *  picks the order instead, and audits the milestone when it empties. */
-export function AutopilotDialog({ open, projects, tasks, onClose }: { open: boolean; projects: Project[]; tasks: Task[]; onClose: () => void }) {
+export function AutopilotDialog({ open, projects, tasks, onClose, onVelocity }: { open: boolean; projects: Project[]; tasks: Task[]; onClose: () => void; onVelocity?: () => void }) {
   const [config, setConfig] = useState<AutopilotConfigDto | null>(null);
   const [state, setState] = useState<AutopilotStateDto | null>(null);
   const [milestones, setMilestones] = useState<GitHubRepoMilestone[]>([]);
@@ -274,6 +274,12 @@ export function AutopilotDialog({ open, projects, tasks, onClose }: { open: bool
                     {roadmap.counts.declined > 0 && ` · ${roadmap.counts.declined} declined`}
                     {(roadmap.counts.backlog ?? 0) > 0 && ` · ${roadmap.counts.backlog} card${roadmap.counts.backlog === 1 ? "" : "s"} in the backlog`}
                   </div>
+                  {onVelocity && (
+                    <Button size="sm" variant="outline" className="mt-1 h-6 px-2 text-[11px]" data-testid="autopilot-velocity" onClick={onVelocity}>
+                      <Gauge className="mr-1 size-3" aria-hidden />
+                      Velocity — how fast it's going
+                    </Button>
+                  )}
                   {roadmap.idleReason && <div className="mt-1 text-warning">{roadmap.idleReason}</div>}
                   {(roadmap.continued ?? []).map((k) => (
                     <div key={`${k.number}:${k.at}`} className="mt-1 text-muted-foreground">

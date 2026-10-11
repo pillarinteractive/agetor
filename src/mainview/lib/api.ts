@@ -131,6 +131,7 @@ export interface AutopilotStateDto {
 }
 import { TASK_EVENTS_REPLAY_META_EVENT } from "../../shared/types.ts";
 import type { RoadmapStatus } from "../../shared/roadmap.ts";
+import type { VelocityAnswer } from "../../shared/velocity.ts";
 import { fetchWithRecovery } from "./net-retry.ts";
 
 export interface UpdateSnapshot {
@@ -525,6 +526,9 @@ export const api = {
    *  closing its issue: close the issue as completed, or do the step again. */
   resolveRoadmapStep: (issue: number, action: "close" | "redo") =>
     j<AutopilotDto & { ok: true; message: string }>("/autopilot/roadmap/resolve", { method: "POST", body: JSON.stringify({ issue, action }) }, { retry: false }),
+  /** Velocity of the roadmap run (src/bun/roadmap-velocity.ts). */
+  getVelocity: (opts: { scope?: "current" | "roadmap"; ownerDelayHours?: number | null } = {}) =>
+    j<VelocityAnswer>(`/autopilot/roadmap/velocity?scope=${opts.scope ?? "current"}${opts.ownerDelayHours != null ? `&ownerDelayHours=${opts.ownerDelayHours}` : ""}`),
   /** The owner's answer to the next-milestone offer (src/bun/autopilot.ts
    *  `continueRoadmap`). */
   continueRoadmap: (action: "accept" | "always" | "dismiss") =>

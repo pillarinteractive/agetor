@@ -1,5 +1,5 @@
 import { c } from "../output.ts";
-import { DAY, fmtDuration, fmtPct, fmtRange, fmtRate, type Distribution, type ForecastTarget, type VelocityAnswer, type VelocityReport } from "../../shared/velocity.ts";
+import { bottleneckLine, DAY, fmtDuration, fmtPct, fmtRange, fmtRate, type Distribution, type ForecastTarget, type VelocityAnswer, type VelocityReport } from "../../shared/velocity.ts";
 
 /**
  * `agetor roadmap velocity [--scope current|roadmap] [--owner-delay <hours>]`:
@@ -40,7 +40,7 @@ const dist = (d: Distribution) => `median ${fmtDuration(d.median)} · p75 ${fmtD
 const steps = (n: number) => `${n} step${n === 1 ? "" : "s"}`;
 const bar = (share: number, width = 20) => "█".repeat(Math.round(share * width));
 const WINDOW: Record<string, string> = { "24h": "last 24 hours", "3d": "last 3 days", "7d": "last 7 days", all: "since the run began" };
-const STATE: Record<string, string> = { building: "in flight", merging: "in CI / the merge queue", held: "held for your sign-off", stuck: "needs you — finished, issue still open", blocked: "blocked — needs you", quota: "waiting for a usage limit", retry: "retrying after a failure", ready: "ready, waiting for a slot", yours: "yours to do", outside: "open in another milestone" };
+const STATE: Record<string, string> = { building: "in flight", merging: "in CI / the merge queue", held: "held for your sign-off", stuck: "finished with the issue still open — needs you", blocked: "blocked — needs you", quota: "waiting for a usage limit", retry: "retrying after a failure", ready: "ready, waiting for a slot", yours: "yours to do", outside: "open in another milestone" };
 
 function forecastLines(t: ForecastTarget, r: VelocityReport): string[] {
   const f = r.forecast;
@@ -85,7 +85,7 @@ export function velocityLines(a: VelocityAnswer, now = Date.now()): string[] {
   for (const w of windows) {
     lines.push(`  ${pad(WINDOW[w.key]!, 20)} ${padL(fmtRate(w.agentPerDay), 5)}/day agents ${c.dim(`(${w.agent} in ${w.days < 1 ? fmtDuration(w.days * DAY) : `${w.days.toFixed(1)}d`})`)}${w.owner ? `   ${fmtRate(w.ownerPerDay)}/day yours ${c.dim(`(${w.owner})`)}` : ""}`);
   }
-  if (r.throughput.agentPerHour24 != null) lines.push(c.dim(`  ${fmtRate(r.throughput.agentPerHour24)} per hour over the last 24 hours`));
+  if (r.throughput.agentPerHour24 != null) lines.push(c.dim(`  ${r.throughput.agentPerHour24.toFixed(2)} per hour over the last 24 hours`));
   if (r.throughput.byStage.length) lines.push(c.dim(`  by stage: ${r.throughput.byStage.map((s) => `${s.stage || "none"} ${s.complete}/${s.total}`).join(" · ")}`));
 
   lines.push("", c.bold("Cycle time") + c.dim("  (card start → issue closed, agent steps)"));
@@ -124,11 +124,11 @@ export function velocityLines(a: VelocityAnswer, now = Date.now()): string[] {
 
   if (r.bottlenecks.critical.length || r.bottlenecks.owner.length) lines.push("", c.bold("Bottlenecks now"));
   for (const b of r.bottlenecks.critical.slice(0, 6)) {
-    lines.push(`  ${pad(b.step, 5)} #${b.issue} ${b.title}`, c.dim(`        ${steps(b.successors)} wait behind it · ${STATE[b.state] ?? b.state}${b.inFlightMs != null ? ` for ${fmtDuration(b.inFlightMs)}` : ""}${b.waitingOnYouMs != null ? ` · waiting on you ${fmtDuration(b.waitingOnYouMs)}` : ""}`));
+    lines.push(`  ${pad(b.step, 5)} #${b.issue} ${b.title}`, c.dim(`        ${steps(b.successors)} wait behind it · ${bottleneckLine(b, STATE[b.state] ?? b.state)}`));
   }
   const yours = r.bottlenecks.owner.filter((o) => !r.bottlenecks.critical.slice(0, 6).some((b) => b.issue === o.issue));
   if (yours.length) lines.push(c.dim("  Also waiting on you:"));
-  for (const b of yours.slice(0, 6)) lines.push(`  ${pad(b.step, 5)} #${b.issue} ${b.title}${c.dim(` — ${STATE[b.state] ?? b.state}${b.waitingOnYouMs != null ? ` for ${fmtDuration(b.waitingOnYouMs)}` : ""}`)}`);
+  for (const b of yours.slice(0, 6)) lines.push(`  ${pad(b.step, 5)} #${b.issue} ${b.title}${c.dim(` — ${bottleneckLine(b, STATE[b.state] ?? b.state)}`)}`);
 
   lines.push("", c.bold("Forecast") + c.dim("  (an estimate — a range, not a date)"));
   const f = r.forecast;

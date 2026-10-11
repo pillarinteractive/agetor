@@ -43,8 +43,10 @@ import { roadmapCardInfo, roadmapLinkInfo } from "@/lib/card-status";
 import { BlockerLines } from "@/components/kanban/BlockerLines";
 import { NextMilestonePrompt } from "@/components/kanban/NextMilestonePrompt";
 import { autopilotLabel } from "../shared/autopilot.ts";
+import { velocitySummary, type VelocityAnswer } from "../shared/velocity.ts";
 import { IssuesPage } from "@/components/issues/IssuesPage";
 import { AutopilotDialog } from "@/components/kanban/AutopilotDialog";
+import { VelocityDialog } from "@/components/kanban/VelocityDialog";
 import { NeedsYouBar } from "@/components/kanban/NeedsYouBar";
 import { BlockedByDialog } from "@/components/kanban/BlockedByDialog";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
@@ -1599,6 +1601,23 @@ function AppInner() {
       clearInterval(timer);
     };
   }, [autopilotKey, autopilotOpen]);
+  // How fast the roadmap run is going (VelocityDialog.tsx): one line beside
+  // the rocket, refreshed with the status it sits next to.
+  const [velocityOpen, setVelocityOpen] = useState(false);
+  const [velocity, setVelocity] = useState<VelocityAnswer | null>(null);
+  const roadmapTracker = autopilot?.config.roadmap?.issue ?? null;
+  const roadmapFetchedAt = autopilot?.state.roadmap?.fetchedAt ?? 0;
+  useEffect(() => {
+    if (roadmapTracker == null) return setVelocity(null);
+    let alive = true;
+    const load = () => void api.getVelocity().then((v) => alive && setVelocity(v)).catch(() => {});
+    load();
+    const timer = setInterval(load, 5 * 60_000);
+    return () => {
+      alive = false;
+      clearInterval(timer);
+    };
+  }, [roadmapTracker, roadmapFetchedAt, velocityOpen]);
   const roadmapCards = useMemo(() => roadmapCardInfo(autopilot), [autopilot]);
   // What each roadmap step's card waits on and blocks: the lines drawn when
   // a card is hovered (BlockerLines.tsx).
@@ -2220,6 +2239,17 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
           >
             <GitPullRequest className="size-4" />
           </Button>
+          {velocity?.available && (
+            <button
+              type="button"
+              data-testid="velocity-summary"
+              onClick={() => setVelocityOpen(true)}
+              title="Velocity of the roadmap run — throughput, where the time goes, forecast"
+              className="hidden max-w-[22rem] truncate rounded-md px-2 py-1 text-xs tabular-nums text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:block"
+            >
+              {velocitySummary(velocity)}
+            </button>
+          )}
           <Button
             variant={autopilotOpen ? "secondary" : "ghost"}
             size="icon"
@@ -2516,7 +2546,17 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         </ProgressContext.Provider>
       </div>
       <BlockedByDialog task={blockedByTask} tasks={tasks} onClose={() => setBlockedByTask(null)} />
-      <AutopilotDialog open={autopilotOpen} projects={projects} tasks={tasks} onClose={() => setAutopilotOpen(false)} />
+      <AutopilotDialog
+        open={autopilotOpen}
+        projects={projects}
+        tasks={tasks}
+        onClose={() => setAutopilotOpen(false)}
+        onVelocity={() => {
+          setAutopilotOpen(false);
+          setVelocityOpen(true);
+        }}
+      />
+      <VelocityDialog open={velocityOpen} onClose={() => setVelocityOpen(false)} />
       <RunPanel
         task={selected}
         stickyUserMessages={stickyUserMessages}
