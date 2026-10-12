@@ -546,6 +546,15 @@ export interface Handoff {
    *  signals the step could not complete even though it produced a
    *  (possibly partial) handoff. */
   status?: "done" | "blocked";
+  /** Explicit independent review of this exact head and issue acceptance.
+   * A finished turn or selected Finish edge is not approval. */
+  reviewApproval?: {
+    verdict: "approved" | "changes-requested";
+    headSha: string;
+    issueUrl: string;
+    acceptanceComplete: boolean;
+    findings: string[];
+  };
   /** On a `blocked` handoff: what the step says it is waiting on, so the
    *  runner can tell a block that clears by itself from one that needs the
    *  owner (src/shared/block-wait.ts). Parsed leniently; absent when the

@@ -9,6 +9,7 @@ const {HEAVY_BIN,HEAVY_SLOTS,HEAVY_TOOLS,installHeavyHelper,heavyJobs,managedHea
 installHeavyHelper();
 const cwd=path.join(fixture,'work'),bin=path.join(fixture,'tools');
 mkdirSync(path.join(cwd,'.github/scripts'),{recursive:true});mkdirSync(bin);
+if(Bun.spawnSync(['git','init','-q',cwd],{stdout:'pipe',stderr:'pipe'}).exitCode!==0)throw new Error('fixture git init failed');
 const log=path.join(fixture,'commands.jsonl');
 const tool=`#!/usr/bin/env python3\nimport json,os,pathlib,sys\nwith open(os.environ['TEST_LOG'],'a') as f: f.write(json.dumps({'name':pathlib.Path(sys.argv[0]).name,'args':sys.argv[1:],'ci':os.environ.get('CI'),'slots':os.environ.get('PILLAR_VERIFY_SLOTS'),'dir':os.environ.get('PILLAR_VERIFY_SLOT_DIR')})+'\\n')\nraise SystemExit(int(os.environ.get('TEST_EXIT','0')))\n`;
 for(const name of ['pnpm','node'])writeFileSync(path.join(bin,name),tool,{mode:0o755});
@@ -68,4 +69,12 @@ test('forged unrelated parent identity fails closed; unlocked stale PID markers 
 test('only managed Pillar workdirs receive routing; custom and absolute commands have an explicit boundary',()=>{
  expect(managedHeavyEnv('/not-a-pillar-workdir',{EXAMPLE:'same'})).toEqual({EXAMPLE:'same'});
  expect(managedHeavyEnv(cwd,{EXAMPLE:'same',PATH:bin})).toEqual({EXAMPLE:'same',PATH:HEAVY_TOOLS+path.delimiter+bin});
+});
+
+test('managed repository subdirectories receive the same routing; an unrelated nested repository is excluded',()=>{
+ const sub=path.join(cwd,'apps/web');mkdirSync(sub,{recursive:true});
+ expect(managedHeavyEnv(sub,{PATH:bin})).toEqual(managedHeavyEnv(cwd,{PATH:bin}));
+ const unrelated=path.join(cwd,'other-repository');mkdirSync(unrelated);
+ expect(Bun.spawnSync(['git','init','-q',unrelated],{stdout:'pipe',stderr:'pipe'}).exitCode).toBe(0);
+ expect(managedHeavyEnv(unrelated,{PATH:bin})).toEqual({PATH:bin});
 });

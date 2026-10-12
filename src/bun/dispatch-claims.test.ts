@@ -95,3 +95,14 @@ test('two occupied unknown job slots remain distinct owners; fresh child transfe
  expect(reserveRunner('child','Build',()=>false,'parent')).toEqual({ok:true});
  const claims=JSON.parse(preferences.get('dispatch_runner_reservations_v1')!);expect(claims.parent).toBeUndefined();expect(claims.child.ownerId).toBe('parent');expect(activeCardOwners(()=>false).size).toBe(1);
 });
+
+test('two other occupied jobs never erase an explicit running or unresolved legacy detached owner',()=>{
+ const t=card('review','Build',{worktreePath:'/synthetic/executing'});
+ const base:OwnerEvidence={cards:tasks.listLive(),jobs:[{pid:111,cwd:'/other-one',slot:0},{pid:222,cwd:'/other-two',slot:1}],awaits:[{id:'executing',dir:'/synthetic/await',label:'tests',cwd:'/synthetic/executing',cmd:'agetor-heavy -- pnpm test',startedAt:Date.now(),pid:process.pid,exitCode:null,finished:false,notified:false,resourceState:'running'}]};
+ for(const phase of ['running',undefined] as const) {
+  const ev={...base,awaits:base.awaits.map(a=>({...a,resourceState:phase}))};
+  expect(activeCardOwners(()=>false,ev).has(t.id)).toBe(true);expect(runnerUse(()=>false,ev)).toEqual({total:3,heavy:3});
+ }
+ const waiting={...base,awaits:base.awaits.map(a=>({...a,resourceState:'waiting' as const}))};
+ expect(activeCardOwners(()=>false,waiting).has(t.id)).toBe(false);expect(runnerUse(()=>false,waiting)).toEqual({total:2,heavy:2});
+});

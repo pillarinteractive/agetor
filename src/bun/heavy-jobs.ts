@@ -155,8 +155,14 @@ export function installHeavyHelper():void {
   if(!existsSync(route)||readFileSync(route,'utf8')!==HEAVY_ROUTE_SCRIPT)writeFileSync(route,HEAVY_ROUTE_SCRIPT,{mode:0o755});
   for(const tool of ['go','pnpm','npm','npx','bun','node','vitest','vite','tsc','jest','playwright'])if(!existsSync(path.join(HEAVY_TOOLS,tool)))symlinkSync('route',path.join(HEAVY_TOOLS,tool));
 }
+export function managedPillarRoot(cwd:string):string|null {
+  const git=Bun.spawnSync(['git','-C',cwd,'rev-parse','--show-toplevel'],{stdout:'pipe',stderr:'pipe'});
+  if(git.exitCode!==0)return null;
+  const root=git.stdout.toString().trim();
+  return root&&existsSync(path.join(root,'.github/scripts/verify_changed.py'))?root:null;
+}
 export function managedHeavyEnv(cwd:string,env:Record<string,string>={}):Record<string,string> {
-  if(!existsSync(path.join(cwd,'.github/scripts/verify_changed.py')))return env;
+  if(!managedPillarRoot(cwd))return env;
   installHeavyHelper();
   return {...env,PATH:[HEAVY_TOOLS,env.PATH??process.env.PATH??''].join(path.delimiter)};
 }

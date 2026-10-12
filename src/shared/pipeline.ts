@@ -20,6 +20,7 @@ import type {
 } from "./types.ts";
 import { PIPELINE_LIMITS } from "./types.ts";
 import { asksTheOwner, parseWaitingOn } from "./block-wait.ts";
+import {canonicalIssue} from './canonical-roadmap.ts';
 
 /** The XML-ish tag a step's agent is asked to wrap its final handoff JSON
  *  in — `<handoff>{...}</handoff>`. Single source of truth for both the
@@ -728,6 +729,17 @@ export function normalizeHandoff(input: unknown): Handoff {
       ? [capField(parsed.openQuestions)] : toStringArray(parsed.openQuestions)),
   };
   if (parsed.status === "done" || parsed.status === "blocked") handoff.status = parsed.status;
+  const approval=parsed.reviewApproval;
+  // Do not truncate/drop findings into an approval. Malformed, oversized
+  // and legacy records remain ineligible for automatic sign-off.
+  if(isPlainObject(approval)&&(approval.verdict==='approved'||approval.verdict==='changes-requested')
+    &&typeof approval.headSha==='string'&&/^[a-f0-9]{40}$/i.test(approval.headSha)
+    &&typeof approval.issueUrl==='string'&&canonicalIssue(approval.issueUrl)
+    &&typeof approval.acceptanceComplete==='boolean'&&Array.isArray(approval.findings)
+    &&approval.findings.every(f=>typeof f==='string')&&utf8Bytes(JSON.stringify(approval))<=4096) {
+    handoff.reviewApproval={verdict:approval.verdict,headSha:approval.headSha.toLowerCase(),issueUrl:approval.issueUrl,
+      acceptanceComplete:approval.acceptanceComplete,findings:approval.findings as string[]};
+  }
   // Preserve authorization/dependency holds even when an agent misspells
   // status or contradicts them with "done". Never discard a question to
   // repair an invalid success-shaped response.
@@ -752,6 +764,20 @@ export function normalizeHandoff(input: unknown): Handoff {
     fitHandoffToBudget(handoff);
   }
   return handoff;
+}
+
+/** Correctness repair signals outrank a contradictory Finish/approval. */
+export function reviewRequiresRepair(handoff:Handoff):boolean {
+  const r=normalizeHandoff(handoff).reviewApproval;
+  const prose=[handoff.summary,handoff.reason].join('\n').replace(/\b(?:no|zero|without)\s+unresolved\s+(?:(?:correctness|blocking|remaining)\s+)*(?:blocker|finding|defect)s?\b(?![^.\n]{0,40}\b(?:except|but)\b)/gi,'');
+  return r?.verdict==='changes-requested'||r?.acceptanceComplete===false||!!r?.findings.length
+    ||/\bchanges\s+requested\b|\bunresolved\s+(?:(?:correctness|blocking|remaining)\s+)*(?:blocker|finding|defect)s?\b|\bacceptance\s+(?:is\s+)?incomplete\b|\breturn\b[^.\n]*\bfindings\b[^.\n]*\bBuild\b/i.test(prose);
+}
+export function reviewApprovalMatches(handoff:Handoff,issueUrl:string,headSha:string):boolean {
+  const r=normalizeHandoff(handoff).reviewApproval;
+  return !!r&&r.verdict==='approved'&&r.acceptanceComplete&&r.findings.length===0
+    &&r.headSha===headSha.toLowerCase()&&canonicalIssue(r.issueUrl)===canonicalIssue(issueUrl)
+    &&handoff.status==='done'&&!handoff.waitingOn&&!handoff.openQuestions.length&&!reviewRequiresRepair(handoff);
 }
 
 /**

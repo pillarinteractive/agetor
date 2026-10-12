@@ -2280,6 +2280,27 @@ test("Major 2: a step that finished with a bad handoff while the whole run is be
   }
 }, 15000);
 
+test('Pillar Review requesting changes routes preserved findings to Build even if it contradictorily selects Finish',async()=>{
+ const {createTask,startTask}=await import('./orchestrator.ts');const {tasks,pipelines,runs}=await import('./db.ts');const {newStep}=await import('../shared/pipeline.ts');const {FAKE_CLAUDE_HANDOFF_PROMPT_MARKER:marker}=await import('./agents.ts');const {__forTest}=await import('./pipeline-runner.ts');
+ const repo=await makeRepo();mkdirSync(path.join(repo,'.github/scripts'),{recursive:true});writeFileSync(path.join(repo,'.github/scripts/verify_changed.py'),'# managed fixture');
+ const profile=await makeProfile('contradictory-review');const review=newStep({name:'Review',transition:'choose',agentProfileId:profile.id,instructions:marker+':missing'}),build=newStep({name:'Build',agentProfileId:profile.id,instructions:marker+':done'}),finish=newStep({name:'Finish',agentProfileId:profile.id,instructions:marker+':done'});
+ const pipeline=pipelines.insert({name:uniqueName('contradictory-review'),graph:{steps:[review,build,finish],edges:[{id:'repair',from:review.id,to:build.id,label:'changes requested'},{id:'approve',from:review.id,to:finish.id,label:'approved'}],startStepId:review.id},maxSteps:25});
+ const created=await createTask({title:'contradictory review',prompt:'goal',workdir:repo,isolation:'none',pipelineId:pipeline.id});if('error'in created)throw new Error(created.error);const parentId=created.task.id;liveParentIds.push(parentId);
+ __forTest.setListenerEnabled(false);
+ try{
+  const started=await startTask(parentId);if('error'in started)throw new Error(started.error);
+  const child=await waitFor(()=>tasks.stepsForParent(parentId)[0]);expect(child.prompt).toContain('reviewApproval');
+  const old=await waitFor(()=>{const r=runs.listForTask(child.id)[0];return r?.status==='succeeded'?r:null;});
+  const verdict={schemaVersion:1,status:'done',summary:'Changes requested: unresolved correctness blocker R1. Acceptance is incomplete.',reason:'Return all findings to Build',next:'Finish',openQuestions:[],artifacts:[]};
+  runs.appendEvent(old.id,'assistant','<handoff>'+JSON.stringify(verdict)+'</handoff>');
+  await __forTest.handleRunStatus(child.id,old.id,'succeeded');
+ }finally{__forTest.setListenerEnabled(true);}
+ const done=await waitFor(()=>tasks.get(parentId)?.pipelineRun?.status==='done'?tasks.get(parentId):null);
+ expect(done.pipelineRun!.history.map(h=>h.stepId)).toEqual([review.id,build.id]);
+ expect(done.pipelineRun!.history[0]!.handoff!.next).toBe('Finish');expect(done.pipelineRun!.history[0]!.handoff!.summary).toContain('Changes requested');expect(done.pipelineRun!.history[0]!.nextStepIds).toEqual([build.id]);
+ expect(tasks.stepsForParent(parentId).some(t=>t.pipelineStepId===finish.id)).toBe(false);
+});
+
 test('stale handoff reminder leaves a newer exact continuation running and never duplicates its run',async()=>{
  const {createTask,startTask}=await import('./orchestrator.ts');const {tasks,pipelines,runs}=await import('./db.ts');const {newStep}=await import('../shared/pipeline.ts');const {FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}=await import('./agents.ts');const {__forTest}=await import('./pipeline-runner.ts');
  const profile=await makeProfile('newer-continuation');const step=newStep({name:'Build',agentProfileId:profile.id,instructions:FAKE_CLAUDE_HANDOFF_PROMPT_MARKER+':missing'});

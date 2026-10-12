@@ -39,7 +39,7 @@ function waitingDetached(id:string,isLive:(id:string)=>boolean,ev:OwnerEvidence)
   const owner=t.pipelineParentId??t.id;
   if(ev.jobs.some(j=>jobOwner(j,ev.cards)===owner))return false;
   const outstanding=ev.awaits.filter(a=>!a.finished&&!a.notified&&ownerForCwd(a.cwd,ev.cards)===owner);
-  return outstanding.length>0&&outstanding.every(a=>a.resourceState==='waiting'||/verify_changed\.py|agetor-heavy/.test(a.cmd)&&ev.jobs.length===2);
+  return outstanding.length>0&&outstanding.every(a=>a.resourceState==='waiting');
 }
 /** Every progressing owner, including legacy detached work with no claim.
  * Card identity is independent of roadmap membership, issue state or queue. */
@@ -60,8 +60,7 @@ function owners(isLive:(id:string)=>boolean,claims:Record<string,RunnerClaim>,ev
   for(const a of ev.awaits) {
     if(a.finished||a.notified)continue;
     const owner=ownerForCwd(a.cwd,ev.cards);if(!owner)continue;
-    const guarded=/verify_changed\.py|agetor-heavy/.test(a.cmd);
-    if(a.resourceState==='waiting'&&!activeHeavy.has(owner)||guarded&&ev.jobs.length===2&&!activeHeavy.has(owner))continue;
+    if(a.resourceState==='waiting'&&!activeHeavy.has(owner))continue;
     result.add(owner);
   }
   for(const owner of activeHeavy)result.add(owner);
@@ -143,14 +142,14 @@ function measured(isLive:(id:string)=>boolean, claims:Record<string,RunnerClaim>
   const heavyOwners=new Set([...heavyRepresented].map(id=>ownerOf(id,claims,ev.cards)));
   for(const [id,c]of Object.entries(claims))if(id!==exclude&&!waitingDetached(id,isLive,ev)&&isHeavyStep(c.name,slots))heavyOwners.add(ownerOf(id,claims,ev.cards));
   const detachedOwners=new Set(ev.jobs.map(j=>jobOwner(j,ev.cards)));
-  for(const a of ev.awaits)if(!a.finished&&!a.notified&&a.resourceState!=='waiting'&&!/verify_changed\.py|agetor-heavy/.test(a.cmd)) {
+  for(const a of ev.awaits)if(!a.finished&&!a.notified&&a.resourceState!=='waiting') {
     const owner=ownerForCwd(a.cwd,ev.cards);if(owner)detachedOwners.add(owner);
   }
   for(const owner of detachedOwners)if(!representedOwners.has(owner))use.total++;
   for(const a of ev.awaits)if(!a.finished&&!a.notified&&a.resourceState!=='waiting') {
     const owner=ownerForCwd(a.cwd,ev.cards);if(!owner||heavyOwners.has(owner))continue;
     const parent=ev.cards.find(t=>t.id===owner),run=parent?.pipelineRun;
-    const heavy=run?.active.some(active=>isHeavyStep(run.snapshot?.graph.steps.find(s=>s.id===active.stepId)?.name??'',slots));
+    const heavy=/verify_changed\.py|agetor-heavy/.test(a.cmd)||run?.active.some(active=>isHeavyStep(run.snapshot?.graph.steps.find(s=>s.id===active.stepId)?.name??'',slots));
     if(heavy){use.heavy++;heavyOwners.add(owner);}
   }
   const jobsByOwner=new Map<string,number>();

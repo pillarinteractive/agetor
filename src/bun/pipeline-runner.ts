@@ -28,7 +28,6 @@
  * `headless.ts` call it explicitly, once, right before `reconcileOrphans()`.
  */
 import { randomUUID } from "node:crypto";
-import path from 'node:path';
 import { recordActivity } from "./activity.ts";
 import { syncBaseNote } from "./sync-base.ts";
 import { logBlocks, newBlocks } from "./block-log.ts";
@@ -38,7 +37,7 @@ import { reserveRunner, releaseUnspawnedRunner } from './dispatch-claims.ts';
 import { reconcileCardInputs } from './queue-validation.ts';
 import { isPriority, priorityFirst } from "./priority.ts";
 import { awaitsFor } from "./awaits.ts";
-import {HEAVY_INSTRUCTIONS} from './heavy-jobs.ts';
+import {HEAVY_INSTRUCTIONS,managedPillarRoot} from './heavy-jobs.ts';
 import { classifyFailure, formatRetryTime, harnessQuotaNotice, isQuotaPaused, nextRetryAt, TRANSIENT_RETRY_MAX, type FailureClass } from "./usage-limit.ts";
 import { listLeases } from "./lease-watch.ts";
 import { ownFailures, prStatusForTask } from "./pr-watch.ts";
@@ -95,6 +94,7 @@ import {
   incomingSteps,
   isFollowUpStepId,
   normalizeHandoff,
+  reviewRequiresRepair,
   outgoingSteps,
   renderHandoffFile,
   renderReportFile,
@@ -1850,8 +1850,12 @@ async function launchStep(
     : prompt;
   const withDecisions = (prompt: string) => snapshot.decisionPolicy === "planner-recommendation"
     ? `${prompt}\n\n${plannerDecisionInstructions(parent.id, snapshot.capturedAt)}` : prompt;
-  const withMachineCapacity=(prompt:string)=>existsSync(path.join(parent.workdir,'.github/scripts/verify_changed.py'))
-    ? `${prompt}\n\n## Machine test capacity\n${HEAVY_INSTRUCTIONS}`:prompt;
+  const managedRoot=managedPillarRoot(parent.worktreePath??parent.workdir);
+  const approvalNote=step.name==='Review'
+    ? `\n\nAutomatic sign-off requires explicit independent approval of this exact head and all issue acceptance. Map every acceptance criterion to checked evidence in your summary. In the handoff add "reviewApproval":{"verdict":"approved"|"changes-requested","headSha":"<full 40-character git rev-parse HEAD>","issueUrl":${JSON.stringify(parent.issueUrl??'')},"acceptanceComplete":true|false,"findings":[]}. Only use approved/true/empty findings when all required criteria are met and no finding remains. Otherwise record all findings, set changes-requested/false and choose Build. A succeeded/done review turn or Finish choice is not approval.`
+    :step.name==='Finish'?`\n\nPublish only the exact independently approved head. A change to reviewed code or a different head requires Build/Review again; passing verification alone is not independent approval.`:'';
+  const withMachineCapacity=(prompt:string)=>managedRoot
+    ? `${prompt}\n\n## Machine test capacity\n${HEAVY_INSTRUCTIONS}${approvalNote}`:prompt;
   let composed = withMachineCapacity(withSync(withRouting(withDecisions(composeStepPrompt({ ...composeArgs, inlineHandoff: true })))));
   if(inputReconciliation.note)composed+=`\n\n${inputReconciliation.note}`;
   // m12/D10: measure the SAME wrapping `startTaskInner` will actually launch
@@ -3406,7 +3410,19 @@ async function settleStepRun(
       }
 
       const parsedHandoff = classified.handoff!;
-      const resolved = resolveNextSteps(graph, activeEntry.stepId, parsedHandoff);
+      let resolved = resolveNextSteps(graph, activeEntry.stepId, parsedHandoff);
+      if(stepName==='Review'&&managedPillarRoot(parent.worktreePath??parent.workdir)&&reviewRequiresRepair(parsedHandoff)) {
+        const repair=outgoingSteps(graph,activeEntry.stepId).find(o=>o.step.name==='Build'&&/^(?:changes requested|needs work|fix|repair|rework)$/i.test(o.edge.label.trim()));
+        const corrective=repair?{...parsedHandoff,status:'blocked' as const,next:repair.step.id}:null;
+        if(corrective&&blockedHandoffChoosesNext(graph,activeEntry.stepId,corrective)) {
+          resolved=resolveNextSteps(graph,activeEntry.stepId,corrective);
+          recordActivity(parentId,{kind:'step',text:'Review has unresolved findings or incomplete acceptance — routing the preserved findings to Build',tone:'warning'});
+        }else {
+          if(historyEntry)historyEntry.handoff=parsedHandoff;
+          upsertBlocked(run,{taskId,stepId:activeEntry.stepId,kind:'step-blocked',message:'Review requires repair; no permitted corrective route can be followed'});
+          checkJoinIncomplete(run);persist(parentId,run);return null;
+        }
+      }
       if (resolved.kind === "ambiguous" || resolved.kind === "unknown") {
         // Low: a parsed handoff whose `next` didn't resolve to a real
         // outgoing step is a malformed handoff, not a valid one — override

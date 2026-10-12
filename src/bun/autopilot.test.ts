@@ -1011,10 +1011,11 @@ test('explicit Pillar lifecycle sign-off includes fresh manually created reviewe
  const {newStep}=await import('../shared/pipeline.ts');
  const review=newStep({name:'Review',agentProfileId:'reviewer'}),finish=newStep({name:'Finish',agentProfileId:'finisher'});
  const url='https://github.com/pillar-interactive/pillar/pull/1342';
- const handoff={schemaVersion:1,purpose:'test',summary:'approved',reason:'all required criteria met',next:'Finish',artifacts:[],openQuestions:[],status:'done'};
+ const head='a'.repeat(40),issue='https://github.com/pillar-interactive/pillar/issues/1314';
+ const handoff={schemaVersion:1,purpose:'test',summary:'approved',reason:'all required criteria met',next:'Finish',artifacts:[],openQuestions:[],status:'done',reviewApproval:{verdict:'approved',headSha:head,issueUrl:issue,acceptanceComplete:true,findings:[]}};
  const pipeline={status:'done',endedAt:200,active:[],blocked:[],joins:{},snapshot:{graph:{steps:[review,finish],edges:[],startStepId:review.id},profiles:{reviewer:{model:'gpt-6.1-sol'}},capturedAt:100},history:[{seq:1,stepId:review.id,taskId:'review-child',outcome:'succeeded',handoff,nextStepIds:[finish.id]},{seq:2,stepId:finish.id,taskId:'finish-child',outcome:'succeeded',handoff:{...handoff,next:null,artifacts:[url]},nextStepIds:[]}]};
  const t=reviewCard('manual-pillar',1314,{workdir:'/pillar',pipelineId:'p',issueUrl:'https://github.com/pillar-interactive/pillar/issues/1314',prUrl:url,pipelineRun:pipeline});
- const pr={...prOf(1342,'fresh-head'),url};
+ const pr={...prOf(1342,head),url};
  const policy={...cfg,enabled:false,project:'/pillar',roadmap:{issue:639},autoMergePipelines:true,autoMergeSince:150};
  expect(reviewedPillarPipeline(t,policy,pr)).toBe(true);
  const state=await roadmapState();const pass=signOffDeps({[t.id]:['apps/web/src/db/schema.ts']},{[t.id]:pr});
@@ -1030,6 +1031,21 @@ test('explicit Pillar lifecycle sign-off includes fresh manually created reviewe
  // Lifecycle sign-off queues the native merger; it never makes a failed CI
  // or unresolved thread green. Native merge-queue regressions cover repair.
  const failing={...pr,checks:'failure' as const,unresolvedThreads:1};expect(reviewedPillarPipeline(t,policy,failing)).toBe(true);expect(failing.checks).toBe('failure');
+ for(const changed of [
+  {...handoff,summary:'Changes requested: unresolved correctness blocker R1. Acceptance is incomplete.',reason:'Return all findings to Build'},
+  {...handoff,reviewApproval:undefined},
+  {...handoff,reviewApproval:{...handoff.reviewApproval,verdict:'changes-requested'}},
+  {...handoff,reviewApproval:{...handoff.reviewApproval,acceptanceComplete:false}},
+  {...handoff,reviewApproval:{...handoff.reviewApproval,findings:['R1 remains unresolved']}},
+  {...handoff,reviewApproval:{...handoff.reviewApproval,headSha:'b'.repeat(40)}},
+  {...handoff,reviewApproval:{...handoff.reviewApproval,issueUrl:issue.replace('1314','1315')}},
+ ]) {
+  const bad=reviewCard(t.id,1314,{...t,pipelineRun:{...pipeline,history:[{...pipeline.history[0],handoff:changed},pipeline.history[1]]}});
+  expect(reviewedPillarPipeline(bad,policy,pr)).toBe(false);
+  const s=await roadmapState();s.held=[t.id];s.holds[t.id]={pr:1342,headSha:head,rules:'segments-1',count:1,url,files:['apps/web/src/db/schema.ts']};
+  const no=signOffDeps({[t.id]:['apps/web/src/db/schema.ts']},{[t.id]:pr});await signOffPass(s,[bad],no.deps,policy);
+  expect(no.log.signedOff).toEqual([]);expect(s.held).toEqual([t.id]);
+ }
 });
 
 test('merge policy opt-in is independent from new admissions and fixes its activation boundary once',async()=>{
