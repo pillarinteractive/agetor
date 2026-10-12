@@ -820,6 +820,10 @@ export interface PipelineRunState {
    *  `attempt` counts this step's retries of this kind. See
    *  `scheduleAutoRetry` in src/bun/pipeline-runner.ts. */
   autoRetry?: PipelineAutoRetry;
+  /** Bounded technical launch recovery, keyed by the exact existing child.
+   * Parallel branches retain independent schedules and exhausted/stopped
+   * budgets; a successful sibling cannot consume another child's retry. */
+  launchRetries?: Record<string, PipelineAutoRetry>;
   /** A step that handed off `blocked` for a reason that clears by itself,
    *  parked in the wait queue. At most one per run. */
   wait?: PipelineBlockWait;

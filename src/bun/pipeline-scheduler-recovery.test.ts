@@ -15,7 +15,7 @@ process.env.AGETOR_CLAUDE_ARGS = '';
 process.env.AGETOR_TMUX_BIN = '/bin/echo';
 const { tasks, runs, pipelines, agentProfiles, preferences, db } = await import('./db.ts');
 const { createTask, startTask, isTaskRunLive, deleteTask } = await import('./orchestrator.ts');
-const { initPipelineRunner, reconcilePipelineRuns, fireAutoRetry, releaseSlotWaits,
+const { initPipelineRunner, reconcilePipelineRuns, fireLaunchRetry, releaseSlotWaits,
   cancelPipelineRun, retryPipelineStep, stopPipelineAutoRetryTimers, __forTest } = await import('./pipeline-runner.ts');
 const { newStep } = await import('../shared/pipeline.ts');
 const { PIPELINE_DECISIONS_PREF } = await import('../shared/pipeline-decisions.ts');
@@ -62,6 +62,7 @@ async function fixture(suffix = 'done', optedIn = true, name = 'Build') {
   return { id: made.task.id, step, profile, wd };
 }
 const run = (id: string) => tasks.get(id)!.pipelineRun!;
+const launchRetry = (id: string, child = run(id).active[0]!.taskId) => run(id).launchRetries![child]!;
 async function done(id: string) {
   return waitFor(() => run(id).status === 'done' ? run(id) : null);
 }
@@ -71,20 +72,20 @@ test('scheduler recovery: database-lock launch retries the same child and preser
   fault('database is locked');
   await startTask(f.id);
   const child = run(f.id).active[0]!.taskId;
-  const retry = run(f.id).autoRetry!;
+  const retry = launchRetry(f.id, child);
   expect(run(f.id).blocked[0]!.message).toContain('database is locked');
   expect(retry).toMatchObject({ stepId: f.step.id, kind: 'transient', attempt: 1 });
   expect(retry.at! - Date.now()).toBeGreaterThan(50_000);
   expect(runs.listForTask(child)).toHaveLength(0);
   expect(isTaskRunLive(child)).toBe(false);
   db.exec('DROP TRIGGER scheduler_launch_fault');
-  expect(await fireAutoRetry(f.id, retry.at!)).toBe(true);
+  expect(await fireLaunchRetry(f.id, child, retry.at!)).toBe(true);
   const finished = await done(f.id);
   expect(finished.stepCount).toBe(1);
   expect(finished.history).toHaveLength(1);
   expect(tasks.stepsForParent(f.id).map(t => t.id)).toEqual([child]);
   expect(runs.listForTask(child)).toHaveLength(1);
-  expect(await fireAutoRetry(f.id, retry.at!)).toBe(false);
+  expect(await fireLaunchRetry(f.id, child, retry.at!)).toBe(false);
 });
 
 test('scheduler recovery: persistent database contention stops after the bounded retry allowance', async () => {
@@ -93,14 +94,14 @@ test('scheduler recovery: persistent database contention stops after the bounded
   await startTask(f.id);
   const child = run(f.id).active[0]!.taskId;
   for (let attempt = 1; attempt <= 4; attempt++) {
-    const retry = run(f.id).autoRetry!;
+    const retry = launchRetry(f.id, child);
     expect(retry.attempt).toBe(attempt);
     expect(retry.at).not.toBeNull();
-    expect(await fireAutoRetry(f.id, retry.at!)).toBe(false);
+    expect(await fireLaunchRetry(f.id, child, retry.at!)).toBe(false);
   }
-  expect(run(f.id).autoRetry).toMatchObject({ kind: 'transient', attempt: 5, at: null });
+  expect(launchRetry(f.id, child)).toMatchObject({ kind: 'transient', attempt: 5, at: null });
   await reconcilePipelineRuns();
-  expect(run(f.id).autoRetry!.at).toBeNull();
+  expect(launchRetry(f.id, child).at).toBeNull();
   expect(tasks.stepsForParent(f.id).map(t => t.id)).toEqual([child]);
   expect(run(f.id).stepCount).toBe(1);
 });
@@ -125,8 +126,8 @@ test('scheduler recovery: targeted retry leaves a sibling evidence hold and pend
   const cap = { taskId: null, stepId: f.step.id, kind: 'step-cap' as const, message: 'step cap exhausted', pending: { stepId: f.step.id, arrivals: [] } };
   heldRun.blocked.push(ownerBlock, cap);
   tasks.setPipelineRun(f.id, heldRun);
-  const at = heldRun.autoRetry!.at!;
-  expect(await Promise.all([fireAutoRetry(f.id, at), fireAutoRetry(f.id, at)])).toEqual([true, false]);
+  const at = heldRun.launchRetries![target]!.at!;
+  expect(await Promise.all([fireLaunchRetry(f.id, target, at), fireLaunchRetry(f.id, target, at)])).toEqual([true, false]);
   await retryPipelineStep(f.id, { taskId: target });
   await waitFor(() => run(f.id).history[0]!.outcome === 'succeeded');
   expect(run(f.id).history[1]).toEqual(hold);
@@ -149,12 +150,12 @@ test('scheduler recovery: a never-started opted-in child recovers after boot, an
   interrupted.status = 'running';
   tasks.setPipelineRun(f.id, interrupted);
   await reconcilePipelineRuns();
-  const first = run(f.id).autoRetry!;
+  const first = launchRetry(f.id, child);
   await reconcilePipelineRuns();
-  expect(run(f.id).autoRetry).toEqual(first);
+  expect(launchRetry(f.id, child)).toEqual(first);
   expect(first.attempt).toBe(1);
   expect(run(f.id).blocked[0]!.message).toContain('never started');
-  expect(await fireAutoRetry(f.id, first.at!)).toBe(true);
+  expect(await fireLaunchRetry(f.id, child, first.at!)).toBe(true);
   await done(f.id);
   expect(tasks.stepsForParent(f.id).map(t => t.id)).toEqual([child]);
   expect(run(f.id).history).toHaveLength(1);
@@ -174,6 +175,7 @@ test('scheduler recovery: boot preserves non-opted-in, owner, configuration, sto
     tasks.setPipelineRun(f.id, held);
     await reconcilePipelineRuns();
     expect(run(f.id).autoRetry?.at ?? null).toBeNull();
+    expect(run(f.id).launchRetries?.[child]?.at ?? null).toBeNull();
     expect(runs.listForTask(child)).toHaveLength(0);
     if (kind === 'owner' || kind === 'configuration') expect(run(f.id).blocked).toEqual(held.blocked);
   }
@@ -270,6 +272,119 @@ test('scheduler recovery: completed Review routes downstream owner-only context 
       expect(run(f.id).history[0]!.handoff!.summary).toBe(verdict.summary);
       expect(run(f.id).history[0]!.nextStepIds).toEqual([build.id]);
       expect(tasks.stepsForParent(f.id).some(t => t.pipelineStepId === finish.id)).toBe(false);
+    }
+  }
+});
+
+test('SR1: parallel database launch failures retain independent child retries and stopped/exhausted budgets', async () => {
+  for (const disposition of ['recover both', 'recover concurrently', 'first stopped', 'first exhausted']) {
+    const f = await fixture();
+    const understand = newStep({ name: 'Understand', transition: 'all', agentProfileId: f.profile.id, instructions: `${marker}:done` });
+    const one = newStep({ name: 'Build one', agentProfileId: f.profile.id, instructions: `${marker}:done` });
+    const two = newStep({ name: 'Build two', agentProfileId: f.profile.id, instructions: `${marker}:done` });
+    pipelines.update(tasks.get(f.id)!.pipelineId!, { graph: { steps: [understand, one, two], startStepId: understand.id,
+      edges: [{ id: randomUUID(), from: understand.id, to: one.id, label: '' }, { id: randomUUID(), from: understand.id, to: two.id, label: '' }] } });
+    process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS = '120';
+    await startTask(f.id);
+    fault('database is locked');
+    await waitFor(() => run(f.id).blocked.length === 2 ? run(f.id) : null);
+    const before = run(f.id), children = before.active.map(a => a.taskId);
+    expect(before.stepCount).toBe(3);
+    expect(Object.keys(before.launchRetries!)).toEqual(children);
+    db.exec('DROP TRIGGER scheduler_launch_fault');
+    stopPipelineAutoRetryTimers();
+    expect((await import('./pipeline-runner.ts')).rearmPipelineAutoRetries()).toBe(2);
+    stopPipelineAutoRetryTimers();
+    if (disposition.startsWith('recover')) {
+      if (disposition === 'recover both') {
+        const first = children[0]!, second = children[1]!;
+        expect(await fireLaunchRetry(f.id, first, before.launchRetries![first]!.at!)).toBe(true);
+        await waitFor(() => run(f.id).history.find(h => h.taskId === first)?.outcome === 'succeeded');
+        expect(launchRetry(f.id, second)).toEqual(before.launchRetries![second]!);
+        expect(await fireLaunchRetry(f.id, second, before.launchRetries![second]!.at!)).toBe(true);
+      } else {
+        const results = await Promise.all(children.map(id => fireLaunchRetry(f.id, id, before.launchRetries![id]!.at!)));
+        expect(results).toEqual([true, true]);
+      }
+      await done(f.id);
+      expect(Object.keys(run(f.id).launchRetries ?? {})).toHaveLength(0);
+      expect(run(f.id).history.map(h => h.outcome)).toEqual(['succeeded', 'succeeded', 'succeeded']);
+    } else {
+      const first = children[0]!, second = children[1]!;
+      const stopped = { ...before.launchRetries![first]!, at: null, attempt: disposition === 'first exhausted' ? 5 : 1 };
+      before.launchRetries![first] = stopped;
+      tasks.setPipelineRun(f.id, before);
+      expect(await fireLaunchRetry(f.id, second, before.launchRetries![second]!.at!)).toBe(true);
+      await waitFor(() => run(f.id).history.find(h => h.taskId === second)?.outcome === 'succeeded');
+      await reconcilePipelineRuns();
+      expect(launchRetry(f.id, first)).toEqual(stopped);
+      expect(runs.listForTask(first)).toHaveLength(0);
+      expect(run(f.id).active.map(a => a.taskId)).toEqual([first]);
+    }
+    expect(tasks.stepsForParent(f.id)).toHaveLength(3);
+    expect(run(f.id).stepCount).toBe(3);
+    for (const id of children) expect(runs.listForTask(id).length).toBeLessThanOrEqual(1);
+  }
+});
+
+test('SR1: whole-card Stop cancels every pending launch retry without reviving another branch at boot', async () => {
+  const f = await fixture();
+  const understand = newStep({ name: 'Understand', transition: 'all', agentProfileId: f.profile.id, instructions: `${marker}:done` });
+  const one = newStep({ name: 'Build one', agentProfileId: f.profile.id, instructions: `${marker}:done` });
+  const two = newStep({ name: 'Build two', agentProfileId: f.profile.id, instructions: `${marker}:done` });
+  pipelines.update(tasks.get(f.id)!.pipelineId!, { graph: { steps: [understand, one, two], startStepId: understand.id,
+    edges: [{ id: randomUUID(), from: understand.id, to: one.id, label: '' }, { id: randomUUID(), from: understand.id, to: two.id, label: '' }] } });
+  process.env.AGETOR_FAKE_CLAUDE_RESOLVE_DELAY_MS = '120';
+  await startTask(f.id);
+  fault('database is locked');
+  await waitFor(() => run(f.id).blocked.length === 2);
+  db.exec('DROP TRIGGER scheduler_launch_fault');
+  const children = run(f.id).active.map(a => ({ id: a.taskId, at: launchRetry(f.id, a.taskId).at! }));
+  expect(await cancelPipelineRun(f.id)).toHaveProperty('task');
+  await reconcilePipelineRuns();
+  for (const child of children) {
+    expect(launchRetry(f.id, child.id).at).toBeNull();
+    expect(await fireLaunchRetry(f.id, child.id, child.at)).toBe(false);
+    expect(runs.listForTask(child.id)).toHaveLength(0);
+  }
+});
+
+test('SR2: stale queued formatting note yields to the exact newer completed, held or live turn', async () => {
+  for (const recovery of ['boot', 'slot-loop']) for (const result of ['done', 'owner hold', 'live']) {
+    const f = await fixture('missing-then-done', true, 'Finish');
+    __forTest.setListenerEnabled(false);
+    await startTask(f.id);
+    const child = run(f.id).active[0]!.taskId;
+    const original = await waitFor(() => { const r = runs.listForTask(child)[0]; return r?.status === 'succeeded' ? r : null; });
+    await waitFor(() => !isTaskRunLive(child));
+    fault('waiting for a verification slot — 2 of 2 in use');
+    await __forTest.handleRunStatus(child, original.id, 'succeeded');
+    expect(run(f.id).history[0]!.reminder).toMatchObject({ runId: original.id, delivered: false });
+    db.exec('DROP TRIGGER scheduler_launch_fault');
+    const newer = randomUUID();
+    runs.insert({ ...original, id: newer, status: result === 'live' ? 'running' : 'succeeded', startedAt: Date.now(), endedAt: result === 'live' ? null : Date.now(), exitCode: result === 'live' ? null : 0 });
+    tasks.update(child, { runId: newer, column: result === 'live' ? 'running' : 'review' });
+    const handoff = { schemaVersion: 1, purpose: 'Complete the issue', status: result === 'owner hold' ? 'blocked' : 'done',
+      summary: 'Completed after manual follow-up', reason: result === 'owner hold' ? 'Owner must supply authorized evidence' : 'Ordinary completed fixture',
+      next: null, openQuestions: result === 'owner hold' ? ['Can the owner supply the authorized reference run?'] : [], artifacts: [] };
+    if (result !== 'live') runs.appendEvent(newer, 'assistant', '<handoff>' + JSON.stringify(handoff) + '</handoff>');
+    __forTest.setListenerEnabled(true);
+    if (recovery === 'boot') await reconcilePipelineRuns();
+    await releaseSlotWaits();
+    expect(tasks.get(child)!.runId).toBe(newer);
+    expect(runs.listForTask(child)).toHaveLength(2);
+    expect(run(f.id).history[0]!.reminder ?? null).toBeNull();
+    expect(run(f.id).blocked.some(b => b.kind === 'slot-wait')).toBe(false);
+    if (result === 'done') {
+      expect(run(f.id).status).toBe('done');
+      expect(run(f.id).history[0]!.handoff!.summary).toBe(handoff.summary);
+    } else if (result === 'owner hold') {
+      expect(run(f.id).status).toBe('blocked');
+      expect(run(f.id).history[0]!.handoff!.openQuestions).toEqual(handoff.openQuestions);
+    } else {
+      expect(run(f.id).status).toBe('running');
+      expect(runs.get(newer)!.status).toBe('running');
+      runs.update(newer, { status: 'cancelled', endedAt: Date.now() });
     }
   }
 });

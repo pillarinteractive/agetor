@@ -761,6 +761,12 @@ export const parsePipelineRunState = (raw: string | null): PipelineRunState | nu
       ? Math.min(rec.capExtensions as number, PIPELINE_LIMITS.capExtensionsMax)
       : undefined,
     autoRetry: sanitizeAutoRetry(rec.autoRetry),
+    launchRetries: isPlainObject(rec.launchRetries)
+      ? Object.fromEntries(Object.entries(rec.launchRetries).flatMap(([taskId, value]) => {
+        const retry = sanitizeAutoRetry(value);
+        return retry?.kind === 'transient' && active.some(a => a.taskId === taskId && a.stepId === retry.stepId)
+          ? [[taskId, retry]] : [];
+      })) : undefined,
     wait: sanitizeBlockWait(rec.wait),
   };
 };

@@ -283,6 +283,59 @@ export function supersedeBlocksBefore(run: PipelineRunState, seq: number): strin
  */
 export { TRANSIENT_RETRY_MAX };
 const autoRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const launchRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const launchRecoveriesInFlight = new Set<string>();
+
+function armLaunchRetryTimer(parentId: string, taskId: string, at: number, fireAt = at): void {
+  const key = `${parentId}:${taskId}`;
+  const existing = launchRetryTimers.get(key);
+  if (existing) clearTimeout(existing);
+  const handle = setTimeout(() => {
+    if (launchRetryTimers.get(key) !== handle) return;
+    launchRetryTimers.delete(key);
+    void fireLaunchRetry(parentId, taskId, at);
+  }, Math.max(0, fireAt - Date.now()));
+  handle.unref?.();
+  launchRetryTimers.set(key, handle);
+}
+
+function scheduleLaunchRetry(parentId: string, run: PipelineRunState, taskId: string, stepId: string, reason: string): void {
+  const previous = run.launchRetries?.[taskId];
+  if (previous?.at != null) return;
+  const attempt = (previous?.attempt ?? 0) + 1;
+  const at = nextRetryAt('transient', attempt, null, Date.now());
+  (run.launchRetries ??= {})[taskId] = { stepId, kind: 'transient', attempt, at, reason: reason.slice(0, 300) };
+  const name = run.snapshot ? stepNameById(run.snapshot.graph, stepId) : stepId;
+  recordActivity(parentId, { kind: 'step', tone: at == null ? 'danger' : 'warning', text: at == null
+    ? `${name} could not launch again — left for you after ${TRANSIENT_RETRY_MAX} automatic retries`
+    : `${name} ${reason} — retrying its existing child automatically at ${formatRetryTime(at)} (${attempt} of ${TRANSIENT_RETRY_MAX})` });
+  if (at != null) armLaunchRetryTimer(parentId, taskId, at);
+}
+
+/** A launch retry belongs to one child, not to the most recently failed
+ * step name on its parent. The ordinary start path retains exact run and
+ * owner guards, and every sibling keeps its own schedule or hold. */
+export async function fireLaunchRetry(parentId: string, taskId: string, at: number): Promise<boolean> {
+  const key = `${parentId}:${taskId}`;
+  const go = await runExclusive(parentId, async () => {
+    const parent = tasks.get(parentId), run = parent?.pipelineRun, retry = run?.launchRetries?.[taskId];
+    if (!parent || !run || !retry || retry.at !== at || launchRecoveriesInFlight.has(key)) return false;
+    run.launchRetries![taskId] = { ...retry, at: null };
+    persist(parentId, run, { preserveStatus: true });
+    const child = tasks.get(taskId), block = run.blocked.find(b => b.taskId === taskId);
+    if (parent.archivedAt != null || run.status !== 'blocked' || !child || child.archivedAt != null
+      || isTaskRunLive(taskId) || listPendingForTask(taskId).length > 0
+      || !run.active.some(a => a.taskId === taskId && a.stepId === retry.stepId)
+      || block?.kind !== 'step-failed' || !isDatabaseBusy(block.message) && !/ never started$/.test(block.message)) return false;
+    launchRecoveriesInFlight.add(key);
+    return true;
+  }).catch(() => false);
+  if (!go) return false;
+  try {
+    const result = await retryPipelineStep(parentId, { taskId }).catch((error: unknown) => ({ error: String(error) }));
+    return !('error' in result);
+  } finally { launchRecoveriesInFlight.delete(key); }
+}
 
 /** The last few status/stderr/assistant rows of a turn — what a usage-limit
  *  or API error left — for `classifyFailure`. */
@@ -474,9 +527,17 @@ export function rearmPipelineAutoRetries(now = Date.now()): number {
   let n = 0;
   for (const t of tasks.listLive()) {
     const r = t.pipelineRun?.autoRetry;
-    if (t.archivedAt != null || t.pipelineParentId || !r || r.at == null) continue;
-    armAutoRetryTimer(t.id, r.at, Math.max(r.at, now + 30_000));
-    n++;
+    if (t.archivedAt != null || t.pipelineParentId) continue;
+    if (r?.at != null) {
+      armAutoRetryTimer(t.id, r.at, Math.max(r.at, now + 30_000));
+      n++;
+    }
+    if (t.pipelineRun?.status === 'cancelled') continue;
+    for (const [taskId, retry] of Object.entries(t.pipelineRun?.launchRetries ?? {})) {
+      if (retry.at == null) continue;
+      armLaunchRetryTimer(t.id, taskId, retry.at, Math.max(retry.at, now + 30_000));
+      n++;
+    }
   }
   return n;
 }
@@ -486,6 +547,8 @@ export function rearmPipelineAutoRetries(now = Date.now()): number {
 export function stopPipelineAutoRetryTimers(): void {
   for (const h of autoRetryTimers.values()) clearTimeout(h);
   autoRetryTimers.clear();
+  for (const h of launchRetryTimers.values()) clearTimeout(h);
+  launchRetryTimers.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -909,6 +972,25 @@ export function resetBlockWaitsForTests(): void {
  *  rebuilt from the first pass. */
 const slotWaitSince = new Map<string, number>();
 
+/** Retire only an undelivered formatting note superseded by the child's
+ * exact newer run. That turn owns settlement, including any real hold. */
+function retireStaleQueuedReminder(parentId: string, run: PipelineRunState, taskId: string): ReturnType<typeof runs.get> {
+  const active = run.active.find(a => a.taskId === taskId);
+  const history = active && run.history.find(h => h.taskId === taskId && h.seq === active.seq);
+  const reminder = history?.reminder;
+  const block = run.blocked.find(b => b.taskId === taskId && b.kind === 'slot-wait');
+  const child = tasks.get(taskId);
+  if (!block || !history || !reminder || reminder.delivered || !reminder.runId || !child?.runId
+    || child.runId === reminder.runId || child.archivedAt != null) return null;
+  const newer = runs.get(child.runId), original = runs.get(reminder.runId);
+  if (!newer || !original || newer.taskId !== taskId || newer.startedAt < original.startedAt) return null;
+  run.blocked = run.blocked.filter(b => b !== block);
+  delete history.reminder;
+  history.turnStartedAt = newer.startedAt;
+  persist(parentId, run);
+  return newer;
+}
+
 /** Launch queued steps while slots are free, longest-waiting first. Each
  *  launch re-checks the slots itself (a heavy step may still have to wait
  *  while a light one behind it goes). Exported for tests. */
@@ -930,7 +1012,6 @@ export async function releaseSlotWaits(now = Date.now()): Promise<number> {
   for (const w of priorityFirst(waiting, (x) => x.parentId)) {
     const slots = currentSlots();
     const urgent = isPriority(w.parentId);
-    if (!urgent && slotUse(isTaskRunLive, slots).total >= slots.max) break;
     const ok = await runExclusive(w.parentId, async () => {
       const parent = tasks.get(w.parentId);
       const run = parent?.pipelineRun;
@@ -939,6 +1020,13 @@ export async function releaseSlotWaits(now = Date.now()): Promise<number> {
         || b.kind === 'step-blocked' && b.taskId === null && b.inputRetry && b.inputRetry.at <= now));
       const step = run.snapshot?.graph.steps.find((s) => s.id === w.stepId);
       if (!block || !step) return false;
+      if (block.taskId) {
+        const newer = retireStaleQueuedReminder(parent.id, run, block.taskId);
+        if (newer) {
+          const status = newer.status;
+          return status === 'running' ? false : { taskId: newer.taskId, runId: newer.id, status };
+        }
+      }
       // Still over a limit for this step (e.g. the verification slot)? Leave it queued.
       if (!urgent && !slotDecision(step.name, slotUse(isTaskRunLive, slots), slots).ok) return false;
       if (block.taskId) {
@@ -969,6 +1057,10 @@ export async function releaseSlotWaits(now = Date.now()): Promise<number> {
       return r.ok;
     }).catch(() => false);
     if (typeof ok === 'object') {
+      if ('status' in ok) {
+        await handleRunStatus(ok.taskId, ok.runId, ok.status);
+        continue;
+      }
       // sendInput must stay outside the parent lock.
       await deliverHandoffReminder(ok);
       const history = tasks.get(ok.parentId)?.pipelineRun?.history.find(h => h.taskId === ok.taskId && h.seq === ok.seq);
@@ -2038,7 +2130,7 @@ function isDatabaseBusy(error: string): boolean {
 function recordLaunchRefusal(parentId: string, run: PipelineRunState, taskId: string, stepId: string, message: string): void {
   upsertBlocked(run, { taskId, stepId, kind: isCapacityRefusal(message) ? 'slot-wait' : 'step-failed', message });
   if (isDatabaseBusy(message) && run.snapshot?.decisionPolicy === 'planner-recommendation' && !isTaskRunLive(taskId)) {
-    scheduleAutoRetry(parentId, run, stepId, { kind: 'transient', resetAt: null, detail: message }, 'could not acquire the database writer');
+    scheduleLaunchRetry(parentId, run, taskId, stepId, 'could not acquire the database writer');
   }
 }
 
@@ -2083,8 +2175,9 @@ async function retryActiveExecutions(
       // block against a turn that's actually in flight.
       if (isStartTaskLiveRefusal(started.error)) continue;
       recordLaunchRefusal(parent.id,run,t.taskId,t.stepId,started.error);
-    } else if (!first) {
-      first = { runId: started.runId, ...(started.pending ? { pending: true as const } : {}) };
+    } else {
+      if (run.launchRetries) delete run.launchRetries[t.taskId];
+      if (!first) first = { runId: started.runId, ...(started.pending ? { pending: true as const } : {}) };
     }
   }
   checkJoinIncomplete(run);
@@ -2811,6 +2904,8 @@ export async function cancelPipelineRun(parentId: string): Promise<{ task: Task 
     const run = parent.pipelineRun;
 
     const runningTargets = run.active.filter((a) => isTaskRunLive(a.taskId));
+    const hadLaunchRetry = Object.values(run.launchRetries ?? {}).some(r => r.at != null);
+    for (const retry of Object.values(run.launchRetries ?? {})) retry.at = null;
     if (runningTargets.length === 0 && run.blocked.some(b => b.kind === 'slot-wait')) {
       if (run.autoRetry?.at != null) run.autoRetry = { ...run.autoRetry, at: null };
       run.status = 'cancelled';
@@ -2820,7 +2915,7 @@ export async function cancelPipelineRun(parentId: string): Promise<{ task: Task 
     }
     // Stop on a card that's only waiting for an automatic retry cancels the
     // retry; the step stays blocked for the user.
-    if (runningTargets.length === 0 && (run.autoRetry?.at != null || run.wait?.state === "waiting")) {
+    if (runningTargets.length === 0 && (hadLaunchRetry || run.autoRetry?.at != null || run.wait?.state === "waiting")) {
       if (run.autoRetry?.at != null) run.autoRetry = { ...run.autoRetry, at: null };
       // Out of the wait queue too: the block stays, for the user.
       if (run.wait?.state === "waiting") delete run.wait;
@@ -3288,6 +3383,9 @@ async function settleStepRun(
       const assistantText = executionAssistantText(taskId, runId, historyEntry?.startedAt ?? null, historyEntry?.turnStartedAt ?? null);
       const pendingInteractions = pendingInteractionsForRun(taskId, runId);
       const classified = classifyStepResponse({ runStatus: status, assistantText, pendingInteractions });
+      // A completed turn proves this exact child's launch succeeded.
+      // Its sibling's technical retry budget/schedule remains untouched.
+      if (run.launchRetries) delete run.launchRetries[taskId];
       if (historyEntry) historyEntry.responseKind = classified.kind;
       // The step got through: its automatic-retry count starts over.
       if (classified.kind === "handoff" && run.autoRetry?.stepId === activeEntry.stepId) delete run.autoRetry;
@@ -3938,8 +4036,8 @@ function markStepNeverStarted(parentId: string, taskId: string): void {
   }
   // This is an interrupted child launch, not a planner question. Preserve
   // a pending/exhausted/cancelled retry record across repeated boot sweeps.
-  if (run.snapshot?.decisionPolicy === 'planner-recommendation' && !run.autoRetry) {
-    scheduleAutoRetry(parentId, run, entry.stepId, null, 'was interrupted before its worker started');
+  if (run.snapshot?.decisionPolicy === 'planner-recommendation' && !run.autoRetry && !run.launchRetries?.[taskId]) {
+    scheduleLaunchRetry(parentId, run, taskId, entry.stepId, 'was interrupted before its worker started');
   }
   checkJoinIncomplete(run);
   persist(parentId, run);
@@ -3982,8 +4080,9 @@ export async function reconcilePipelineRuns(): Promise<number> {
     await runExclusive(parent.id, async () => {
       const fresh = tasks.get(parent.id);
       const run = fresh?.pipelineRun;
-      if (!fresh || !run || fresh.archivedAt != null || run.snapshot?.decisionPolicy !== 'planner-recommendation'
-        || run.autoRetry?.at === null || !['running', 'blocked'].includes(run.status)) return;
+      if (!fresh || !run || fresh.archivedAt != null || !['running', 'blocked'].includes(run.status)) return;
+      for (const active of run.active) retireStaleQueuedReminder(parent.id, run, active.taskId);
+      if (run.snapshot?.decisionPolicy !== 'planner-recommendation' || run.autoRetry?.at === null) return;
       let changed = false;
       for (const block of run.blocked) {
         if (block.kind !== 'step-failed' || !block.taskId || !block.stepId) continue;
@@ -3993,8 +4092,8 @@ export async function reconcilePipelineRuns(): Promise<number> {
         if (isCapacityRefusal(block.message)) {
           block.kind = 'slot-wait';
           changed = true;
-        } else if (isDatabaseBusy(block.message) && !run.autoRetry) {
-          scheduleAutoRetry(parent.id, run, block.stepId, { kind: 'transient', resetAt: null, detail: block.message }, 'could not acquire the database writer');
+        } else if (isDatabaseBusy(block.message) && !run.autoRetry && !run.launchRetries?.[child.id]) {
+          scheduleLaunchRetry(parent.id, run, child.id, block.stepId, 'could not acquire the database writer');
           changed = true;
         }
       }
