@@ -1,4 +1,6 @@
-import { existsSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import nodePath from "node:path";
 import type {
   GitHubAssigneesResult,
   GitHubCheckRun,
@@ -1030,12 +1032,52 @@ function fetchErrorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+/** Calls to GitHub since this core started, by endpoint shape
+ *  (`GET /repos/:o/:r/pulls/:n`). The hourly API allowance is shared with
+ *  every agent's own `gh`; this says how much of it Agetor itself spends.
+ *  Written to `<data dir>/github-calls.json` at most once a minute. */
+const githubCalls = new Map<string, number>();
+const githubCallsSince = Date.now();
+let githubCallsWrittenAt = 0;
+
+/** `https://api.github.com/repos/o/r/pulls/12/reviews?x=1` → `/repos/:o/:r/pulls/:n/reviews`. Exported for tests. */
+export function githubCallShape(url: string): string {
+  let pathname = url;
+  try {
+    pathname = new URL(url).pathname;
+  } catch {
+    // not a URL: count it as given
+  }
+  return pathname
+    .replace(/^\/repos\/[^/]+\/[^/]+/, "/repos/:o/:r")
+    .replace(/\/[0-9a-f]{40}(?=\/|$)/g, "/:sha")
+    .replace(/\/\d+(?=\/|$)/g, "/:n")
+    .replace(/(\/(?:commits|compare|branches|ref|refs|heads|contents)\/).+$/, "$1…");
+}
+
+function countGitHubCall(method: string, url: string): void {
+  const key = `${method} ${githubCallShape(url)}`;
+  githubCalls.set(key, (githubCalls.get(key) ?? 0) + 1);
+  const now = Date.now();
+  if (process.env.NODE_ENV === "test" || now - githubCallsWrittenAt < 60_000) return;
+  githubCallsWrittenAt = now;
+  try {
+    const dir = process.env.AGETOR_DATA_DIR || nodePath.join(homedir(), ".agetor");
+    const calls = Object.fromEntries([...githubCalls.entries()].sort((a, b) => b[1] - a[1]));
+    const total = [...githubCalls.values()].reduce((a, b) => a + b, 0);
+    writeFileSync(nodePath.join(dir, "github-calls.json"), JSON.stringify({ since: githubCallsSince, at: now, total, calls }, null, 1));
+  } catch {
+    // a counter must never break a request
+  }
+}
+
 async function fetchGitHub(
   url: string,
   token: string | null,
   accept: string,
   init?: { method?: string; body?: string },
 ): Promise<Response | GitHubListError> {
+  countGitHubCall(init?.method ?? "GET", url);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), GITHUB_FETCH_TIMEOUT_MS);
   try {
