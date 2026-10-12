@@ -22,6 +22,14 @@ function read<T>(key: string): Record<string,T> {
 }
 function alive(pid: number): boolean { try { process.kill(pid,0);return true; } catch(e) { return (e as NodeJS.ErrnoException).code!=='ESRCH'; } }
 const atomic=reservationTransaction;
+/** A reservation bound to a run that a core marked orphaned (no recoverable
+ * session at its boot), made by a core process that no longer exists, for a
+ * task this core is not running. Nothing can finish that run or report on
+ * it, so holding its place only blocks the card: release it and let a retry
+ * start the step again. A live creator, or a live task, keeps the hold. */
+function abandoned(c:RunnerClaim,isLive:(id:string)=>boolean):boolean {
+  return !!c.runId&&runs.get(c.runId)?.status==='orphaned'&&!alive(c.pid)&&!isLive(c.taskId);
+}
 export interface OwnerEvidence { cards:Task[]; awaits:AwaitRecord[]; jobs:HeavyJob[]; }
 const evidence=():OwnerEvidence=>({cards:tasks.listLive(),awaits:listAwaits(),jobs:heavyJobs()});
 /** An await that only watches remote work (`ci-wait` polls GitHub CI). It runs
@@ -140,6 +148,7 @@ function measured(isLive:(id:string)=>boolean, claims:Record<string,RunnerClaim>
     if(id===exclude) continue;
     const t=tasks.get(id), current=t?.runId?runs.get(t.runId):null, r=c.runId ? runs.get(c.runId) : current;
     if(c.runId&&!r) {if(!represented.has(id))use.total++;if(!heavyRepresented.has(id)&&isHeavyStep(c.name,slots))use.heavy++;continue;}
+    if(abandoned(c,isLive)) {delete claims[id];continue;}
     const detached=!!t?.worktreePath && awaitsFor(t.worktreePath,c.at,ev.awaits).some(a=>!a.finished);
     // An accepted retry may still point at the task's previous terminal run.
     // A live creator's unbound reservation has no completion receipt yet;
@@ -184,10 +193,11 @@ export function reserveRunner(taskId:string,name:string,isLive:(id:string)=>bool
       const t=tasks.get(taskId),r=existing.runId?runs.get(existing.runId):null;
       if(existing.runId&&!r)return {error:'runner spawn receipt is uncertain; no dispatch replay'};
       const current=t?.runId?runs.get(t.runId):null;
+      const lost=abandoned(existing,isLive)&&!['running','orphaned'].includes(current?.status??'');
       if(existing.pid===process.pid&&!existing.runId&&!isLive(taskId)&&!['running','orphaned'].includes(current?.status??'')) {
         return existing.name===name&&ownerOf(taskId,claims,ev.cards)===owner?{ok:true}:{error:'runner reservation resource identity changed; no dispatch replay'};
       }
-      if(!existing.runId&&alive(existing.pid)||t?.runId&&!current||isLive(taskId)||r?.status==='running'||r?.status==='orphaned'||current?.status==='running'||current?.status==='orphaned') return {error:'runner reservation is active or uncertain; reconcile its exact run first'};
+      if(!lost&&(!existing.runId&&alive(existing.pid)||t?.runId&&!current||isLive(taskId)||r?.status==='running'||r?.status==='orphaned'||current?.status==='running'||current?.status==='orphaned')) return {error:'runner reservation is active or uncertain; reconcile its exact run first'};
       if(t?.worktreePath&&awaitsFor(t.worktreePath,existing.at,ev.awaits).some(a=>!a.finished)) return {error:'runner reservation retains a detached command'};
       delete claims[taskId];
     }

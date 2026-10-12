@@ -11,7 +11,7 @@ import { rmTestDataDir } from './test-data-dir.ts';
 const dir = mkdtempSync(join(tmpdir(), 'agetor-remote-wait-'));
 process.env.AGETOR_DATA_DIR = dir;
 const { tasks, runs, preferences } = await import('./db.ts');
-const { activeCardOwners, runnerUse, isRemoteWait } = await import('./dispatch-claims.ts');
+const { activeCardOwners, runnerUse, isRemoteWait, reserveRunner } = await import('./dispatch-claims.ts');
 const created: string[] = [];
 beforeEach(() => {
   preferences.set('step_slots', JSON.stringify({ max: 8, heavy: { max: 2, steps: ['Finish'] } }));
@@ -80,4 +80,35 @@ test('a finished CI wait changes nothing until the step is woken', () => {
   const done = { ...record, finished: true, exitCode: 0 };
   expect(activeCardOwners(() => false, evidence([done])).size).toBe(0);
   expect(runnerUse(() => false, evidence([done]))).toEqual({ total: 0, heavy: 0 });
+});
+
+/** A step whose launch was orphaned: the task is back in `ready` with no
+ *  current run, and the reservation still names the orphaned run. */
+function orphanedLaunch(creatorPid: number) {
+  const parent = card({ column: 'blocked' });
+  const child = card({ column: 'ready', pipelineParentId: parent.id, pipelineStepId: 's' });
+  const runId = randomUUID();
+  runs.insert({ id: runId, taskId: child.id, agent: 'claude-code', status: 'orphaned', startedAt: Date.now(), endedAt: null,
+    exitCode: null, tmuxSession: 'gone', claudeSessionId: null, codexSessionId: null,
+    cursorSessionId: null, geminiSessionId: null, fxSessionId: null });
+  preferences.set('dispatch_runner_reservations_v1', JSON.stringify({
+    [child.id]: { taskId: child.id, ownerId: parent.id, runId, pid: creatorPid, at: Date.now(), name: 'Build' } }));
+  return { parent, child };
+}
+const DEAD_PID = 2 ** 22 + 4321;
+
+test('a reservation orphaned by a core that no longer exists is released on retry', () => {
+  const { parent, child } = orphanedLaunch(DEAD_PID);
+  expect(runnerUse(() => false, evidence([]))).toEqual({ total: 0, heavy: 0 });
+  orphanedLaunch(DEAD_PID); // runnerUse dropped the first claim; make a fresh one for the reserve path
+  const again = orphanedLaunch(DEAD_PID);
+  expect(reserveRunner(again.child.id, 'Build', () => false, again.parent.id)).toEqual({ ok: true });
+  expect(parent.id).not.toBe(child.id);
+});
+
+test('an orphaned reservation is kept while its creator or its task is alive', () => {
+  const mine = orphanedLaunch(process.pid);
+  expect(reserveRunner(mine.child.id, 'Build', () => false, mine.parent.id)).toEqual({ error: 'runner reservation is active or uncertain; reconcile its exact run first' });
+  const live = orphanedLaunch(DEAD_PID);
+  expect(reserveRunner(live.child.id, 'Build', (id) => id === live.child.id, live.parent.id)).toEqual({ error: 'runner reservation is active or uncertain; reconcile its exact run first' });
 });
