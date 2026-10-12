@@ -5,7 +5,7 @@ import path from "node:path";
 import type { WebSocketHandler } from "bun";
 import pkg from "../../package.json" with { type: "json" };
 import { API_TOKEN, getApiPort } from "./api-config.ts";
-import { removeCoreCreds } from "./core-creds.ts";
+import { removeOwnCoreCreds } from "./core-creds.ts";
 import {
   tasks,
   backlog,
@@ -7123,7 +7123,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       "/daemon/shutdown": {
         POST: authed((req) => {
           setTimeout(() => {
-            removeCoreCreds(dataDir);
+            removeOwnCoreCreds(dataDir);
             if (native) void Promise.resolve(native.quit()).catch(() => undefined);
             else process.exit(0);
           }, 0);

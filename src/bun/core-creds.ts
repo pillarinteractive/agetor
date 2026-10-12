@@ -1,3 +1,4 @@
+import { connect } from "node:net";
 import { homedir } from "node:os";
 import path from "node:path";
 import {
@@ -103,6 +104,36 @@ export function removeCoreCreds(dataDir?: string): void {
   } catch {
     /* best-effort — may already be gone */
   }
+}
+
+/**
+ * Remove the creds file only when it names this process. A core that lost a
+ * startup race (or a cli-daemon exiting beside the app's core) must not delete
+ * the winner's file: the CLI would then find no core and start another.
+ */
+export function removeOwnCoreCreds(dataDir?: string, pid: number = process.pid): void {
+  const creds = readCoreCreds(dataDir);
+  if (creds && creds.pid !== pid) return;
+  removeCoreCreds(dataDir);
+}
+
+/**
+ * Whether anything is bound to `port` on loopback, answering or not. A TCP
+ * connect is accepted by the kernel even while the owner's event loop is
+ * blocked, so this tells "a core is there but slow" apart from "nothing is
+ * running" — which an HTTP probe with a short timeout cannot.
+ */
+export function isPortBound(port: number, timeoutMs = 1500): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = connect({ host: "127.0.0.1", port });
+    const done = (bound: boolean) => {
+      socket.destroy();
+      resolve(bound);
+    };
+    socket.setTimeout(timeoutMs, () => done(true));
+    socket.once("connect", () => done(true));
+    socket.once("error", (e) => done((e as NodeJS.ErrnoException).code !== "ECONNREFUSED"));
+  });
 }
 
 /**

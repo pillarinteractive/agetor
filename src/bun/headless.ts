@@ -1,5 +1,7 @@
 import pkg from "../../package.json" with { type: "json" };
-import { db, subagents } from "./db.ts";
+import { dataDir, db, subagents } from "./db.ts";
+import { isPidAlive, isPortBound, readCoreCreds } from "./core-creds.ts";
+import { getApiPort } from "./api-config.ts";
 import { attachedClientCount } from "./server.ts";
 import { startCore, shutdownCore } from "./core-main.ts";
 import { daemonLog } from "./daemon-log.ts";
@@ -91,6 +93,14 @@ export async function runDaemon(): Promise<void> {
   // every background loop. A busy port held by a live core exits quietly.
   // Every loop timer is unref'd, so the idle-shutdown path below stays
   // reachable.
+  // Before touching any state: startCore reconciles orphaned runs ahead of
+  // binding the port, so a daemon started beside a live (even unresponsive)
+  // core would rewrite that core's runs before finding the port taken.
+  const other = readCoreCreds(dataDir);
+  if ((other && other.pid !== process.pid && isPidAlive(other.pid)) || (await isPortBound(getApiPort()))) {
+    daemonLog("another core already owns this data dir or API port — exiting without touching state");
+    process.exit(0);
+  }
   await startCore({ kind: "cli-daemon", log: daemonLog }); // no native → native routes 501
 
   process.on("SIGINT", () => shutdown("SIGINT"));

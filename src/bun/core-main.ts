@@ -29,7 +29,7 @@ import { startStallMonitor } from "./stall-monitor.ts";
 import { backfillIssues } from "./auto-issue.ts";
 import {
   writeCoreCreds,
-  removeCoreCreds,
+  removeOwnCoreCreds,
   readCoreCreds,
   probeLiveCore,
   waitForPortFree,
@@ -168,19 +168,31 @@ async function boot(opts: StartCoreOptions, deps: CoreDeps): Promise<ApiServer> 
 
   // Publish the per-launch port + token so the CLI (and the app, for its
   // core child) can discover and authenticate to this core.
-  deps.writeCoreCreds(
-    {
-      // `server.port` is typed `number | undefined`, but a bound server
-      // always has a numeric port.
-      port: server.port!,
-      token: API_TOKEN,
-      pid: process.pid,
-      kind: opts.kind,
-      version: pkg.version,
-      startedAt: Date.now(),
-    },
-    dataDir,
-  );
+  const ownCreds: CoreCreds = {
+    // `server.port` is typed `number | undefined`, but a bound server
+    // always has a numeric port.
+    port: server.port!,
+    token: API_TOKEN,
+    pid: process.pid,
+    kind: opts.kind,
+    version: pkg.version,
+    startedAt: Date.now(),
+  };
+  deps.writeCoreCreds(ownCreds, dataDir);
+  // This process owns the API port, so it is the core. If the creds file is
+  // lost or names someone else (a second core that started and exited beside
+  // this one), publish ours again: without it the CLI finds no core.
+  const credsGuard = setInterval(() => {
+    try {
+      if (!shuttingDown && deps.readCoreCreds(dataDir)?.pid !== process.pid) {
+        deps.writeCoreCreds(ownCreds, dataDir);
+        log("core creds file was missing or foreign — republished");
+      }
+    } catch {
+      /* best-effort */
+    }
+  }, CREDS_GUARD_MS);
+  credsGuard.unref?.();
   log(`core (${opts.kind}) listening on http://127.0.0.1:${server.port}`);
 
   // Stop the fx auto-resume engine's in-memory timers on the way out so a
@@ -248,6 +260,9 @@ async function boot(opts: StartCoreOptions, deps: CoreDeps): Promise<ApiServer> 
 
   return server;
 }
+
+/** How often a running core checks that the creds file still names it. */
+const CREDS_GUARD_MS = 10_000;
 
 /**
  * Bind the API. When the port is busy:
@@ -317,7 +332,7 @@ export function shutdownCore(reason: string, log: (m: string) => void, code = 0)
   stopFxAutoResumeTimers();
   stopPipelineAutoRetryTimers();
   try {
-    removeCoreCreds(dataDir);
+    removeOwnCoreCreds(dataDir);
   } catch {
     /* best-effort */
   }

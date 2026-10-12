@@ -2,7 +2,7 @@ import { openSync, closeSync, existsSync, mkdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { discoverCore, type CoreInfo } from "../api-client.ts";
-import { resolveDataDir } from "../../bun/core-creds.ts";
+import { isPidAlive, isPortBound, probeLiveCore, readCoreCreds, resolveDataDir } from "../../bun/core-creds.ts";
 
 /**
  * Owns the lifecycle of the shared Agetor "core" from the CLI's side. The core
@@ -16,12 +16,56 @@ export interface EnsureOptions {
   port?: number;
   /** Fail instead of auto-spawning a daemon when nothing is running. */
   noDaemon?: boolean;
+  /** How long to wait for a core that is running but slow to answer. */
+  busyWaitMs?: number;
 }
 
-/** Return a live core, spawning a headless daemon if none is running. */
+const BUSY_WAIT_MS = 60_000;
+const BUSY_PROBE_MS = 5_000;
+
+function apiPort(opts: EnsureOptions): number {
+  const fromEnv = Number(process.env.AGETOR_API_PORT);
+  return opts.port ?? (Number.isInteger(fromEnv) && fromEnv > 0 ? fromEnv : 4317);
+}
+
+/** A core that exists on this data dir but did not pass the quick probe: its
+ *  creds name a live process, or something holds the API port. */
+export async function coreOccupied(opts: EnsureOptions = {}): Promise<{ pid: number | null; port: number } | null> {
+  const creds = readCoreCreds(opts.dataDir);
+  if (creds && isPidAlive(creds.pid)) return { pid: creds.pid, port: creds.port };
+  const port = creds?.port ?? apiPort(opts);
+  return (await isPortBound(port)) ? { pid: null, port } : null;
+}
+
+/** Wait for a busy core to answer. Null when nothing is running any more. */
+async function waitForBusyCore(opts: EnsureOptions): Promise<CoreInfo | null> {
+  const deadline = Date.now() + (opts.busyWaitMs ?? BUSY_WAIT_MS);
+  let occupied = await coreOccupied(opts);
+  while (occupied) {
+    const creds = readCoreCreds(opts.dataDir);
+    const left = Math.max(250, deadline - Date.now());
+    if (creds && (await probeLiveCore(creds, Math.min(BUSY_PROBE_MS, left)))) return creds;
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `An Agetor core is running (${occupied.pid ? `pid ${occupied.pid}, ` : ""}port ${occupied.port}) but did not answer ` +
+          `within ${Math.round((opts.busyWaitMs ?? BUSY_WAIT_MS) / 1000)}s. Not starting a second core on the same data: ` +
+          "try again, or restart the Agetor app.",
+      );
+    }
+    await Bun.sleep(500);
+    occupied = await coreOccupied(opts);
+  }
+  return null;
+}
+
+/** Return a live core, spawning a headless daemon only when none is running.
+ *  A core that is merely slow (its event loop is busy) is waited for, never
+ *  replaced: two cores on one data dir orphan each other's runs. */
 export async function ensureCore(opts: EnsureOptions = {}): Promise<CoreInfo> {
   const existing = await discoverCore(opts.dataDir);
   if (existing) return existing;
+  const busy = await waitForBusyCore(opts);
+  if (busy) return busy;
   if (opts.noDaemon) {
     throw new Error(
       "No Agetor core is running. Open the app, run `agetor daemon start`, or drop --no-daemon.",
