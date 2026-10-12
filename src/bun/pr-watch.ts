@@ -7,8 +7,10 @@
  * (`prFollowUpActions`); and a merged PR moves its card to Done.
  *
  * GitHub only (the git-host facade's other providers don't expose the same
- * calls yet). Polls every `PR_WATCH_INTERVAL_MS`; a task stops being watched
- * once it's archived or its PR is closed.
+ * calls yet). Wakes every `PR_WATCH_INTERVAL_MS` but asks GitHub only about
+ * the cards that are due (`probeEvery`): each lookup spends the account's
+ * hourly API allowance, which the agents' own `gh` calls share. A task stops
+ * being watched once it's archived or its PR is closed.
  */
 import type { FollowUpAction, Task, TaskPrStatus } from "../shared/types.ts";
 import { agentProfiles, preferences, tasks } from "./db.ts";
@@ -38,6 +40,42 @@ export function autoFixEnabled(task: Task, pref: string | null | undefined): boo
 /** JSON map "<taskId>#<pr>" → { count, lastSha }: auto Fix CI bookkeeping. */
 const PR_AUTOFIX_ATTEMPTS_PREF = "pr_autofix_attempts";
 export const PR_AUTOFIX_MAX_ATTEMPTS = 2;
+
+/** How often a card is worth a GitHub lookup, by what its answer changes. */
+export const PROBE_EVERY_MS = { now: 60_000, soon: 3 * 60_000, idle: 10 * 60_000 } as const;
+/** A PR whose head and settled checks are unchanged keeps its last answer
+ *  this long before checks, base distance and review threads are re-read. */
+export const FULL_PROBE_EVERY_MS = 10 * 60_000;
+
+/**
+ * - now: the merge column (the merge queue acts on the checks) and a card in
+ *   Review whose checks are still running (the owner is waiting on them).
+ * - soon: any other open PR with checks running, and Review cards.
+ * - idle: everything else. An agent that is working reads GitHub itself, a
+ *   settled PR changes only on a push, and a card with no PR yet may get one.
+ * Pure; exported for tests.
+ */
+export function probeEvery(task: Pick<Task, "column">, prev: TaskPrStatus | undefined): number {
+  const unsettled = prev?.state === "open" && (prev.checks === "pending" || prev.checks === "none");
+  if (task.column === "merge") return PROBE_EVERY_MS.now;
+  if (task.column === "review") return unsettled ? PROBE_EVERY_MS.now : PROBE_EVERY_MS.soon;
+  return unsettled ? PROBE_EVERY_MS.soon : PROBE_EVERY_MS.idle;
+}
+
+/** When each card was last asked about, and where it was then: a card that
+ *  changed column is due at once (a step ended, a push is likely). */
+const probed = new Map<string, { at: number; fullAt: number; column: Task["column"] }>();
+
+/** Is this card due for a lookup? Pure; exported for tests. */
+export function probeDue(
+  task: Pick<Task, "column">,
+  prev: TaskPrStatus | undefined,
+  last: { at: number; column: Task["column"] } | undefined,
+  now: number,
+): boolean {
+  if (!last || last.column !== task.column) return true;
+  return now - last.at >= probeEvery(task, prev);
+}
 
 const statuses = new Map<string, TaskPrStatus>();
 let loop: ReturnType<typeof setInterval> | null = null;
@@ -232,7 +270,7 @@ export function hasConfirmedNoPr(taskId: string): boolean {
   return confirmedNoPr.has(taskId) && !statuses.has(taskId);
 }
 
-async function probe(task: Task): Promise<TaskPrStatus | null> {
+async function probe(task: Task, reuse: TaskPrStatus | null = null): Promise<TaskPrStatus | null> {
   const dir = task.workdir;
   const found = await findGitHubPullForBranch({ dir, branch: task.branch! });
   if (!found.ok) {
@@ -246,6 +284,11 @@ async function probe(task: Task): Promise<TaskPrStatus | null> {
   confirmedNoPr.delete(task.id);
   const pull = found.pull;
   const state: TaskPrStatus["state"] = pull.mergedAt ? "merged" : pull.state;
+  // Same PR, same head, checks already settled: one call was enough.
+  if (reuse && state === "open" && reuse.state === "open" && reuse.number === pull.number && reuse.headSha === pull.headSha && reuse.draft === pull.draft) {
+    reuse.checkedAt = Date.now();
+    return reuse; // the same object: the caller tells a reused answer by identity
+  }
   let checks: TaskPrStatus["checks"] = "none";
   let failingChecks: TaskPrStatus["failingChecks"] = [];
   let unresolvedThreads = 0;
@@ -297,13 +340,22 @@ export async function prWatchTick(opts: { column?: Task["column"] } = {}): Promi
         changed = true;
       }
     }
+    for (const id of [...probed.keys()]) if (!live.has(id)) probed.delete(id);
     for (const task of tasksToWatch(all, statuses).filter((t) => !opts.column || t.column === opts.column)) {
+      const known = statuses.get(task.id);
+      const last = probed.get(task.id);
+      const now = Date.now();
+      // The board's refresh button (opts.column) always asks, and in full.
+      if (!opts.column && !probeDue(task, known, last, now)) continue;
+      const settled = known?.state === "open" && (known.checks === "success" || known.checks === "failure");
+      const light = !opts.column && settled && !!last && last.column === task.column && now - last.fullAt < FULL_PROBE_EVERY_MS;
       let next: TaskPrStatus | null;
       try {
-        next = await probe(task);
+        next = await probe(task, light ? known! : null);
       } catch {
         continue; // network hiccup: keep the last status, try next tick
       }
+      probed.set(task.id, { at: now, fullAt: light && next === known ? last!.fullAt : now, column: task.column });
       if (task.column === "done") checkedDone.add(task.id);
       if (!next) {
         await maybeOpenMissingPr(task);
@@ -384,6 +436,7 @@ export function resetPrWatchForTests(): void {
   loop = null;
   statuses.clear();
   checkedDone.clear();
+  probed.clear();
   confirmedNoPr.clear();
   openPrStarted.clear();
   inFlight = false;

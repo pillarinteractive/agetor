@@ -7,7 +7,7 @@ import type { Task, TaskPrStatus } from "../shared/types.ts";
 process.env.AGETOR_DATA_DIR ??= mkdtempSync(path.join(tmpdir(), "agetor-pr-watch-"));
 const {
   PR_FIX_CI_ACTION, PR_REVIEW_ACTION, followUpReady, markInherited, prFollowUpActions, prFollowUpInstructions, rollUpChecks,
-  shouldAutoFix, staleAgainstBase, tasksToWatch,
+  shouldAutoFix, staleAgainstBase, tasksToWatch, probeDue, probeEvery, PROBE_EVERY_MS,
 } = await import("./pr-watch.ts");
 
 const run = (name: string, status: string, conclusion: string | null) => ({ name, status, conclusion, htmlUrl: `https://ci/${name}` });
@@ -200,4 +200,37 @@ test("an issue is closed only when the PR says it fixes it", async () => {
   expect(prClosesIssue("Refs #289 — deployed run still pending", 289)).toBe(false);
   expect(prClosesIssue("Fixes #2890", 289)).toBe(false);
   expect(prClosesIssue("Part of #289", 289)).toBe(false);
+});
+
+describe("probeEvery / probeDue: only cards that need GitHub are asked", () => {
+  const { now, soon, idle } = PROBE_EVERY_MS;
+
+  test("the merge column and a Review card with checks running are asked every pass", () => {
+    expect(probeEvery(task({ column: "merge" }), pr())).toBe(now);
+    expect(probeEvery(task({ column: "review" }), pr({ checks: "pending" }))).toBe(now);
+    expect(probeEvery(task({ column: "review" }), pr({ checks: "none" }))).toBe(now);
+  });
+
+  test("checks running elsewhere, and settled Review cards, are asked every few minutes", () => {
+    expect(probeEvery(task({ column: "blocked" }), pr({ checks: "pending" }))).toBe(soon);
+    expect(probeEvery(task({ column: "running" }), pr({ checks: "pending" }))).toBe(soon);
+    expect(probeEvery(task({ column: "review" }), pr({ checks: "success" }))).toBe(soon);
+  });
+
+  test("a working agent, a settled PR and a card with no PR yet are asked rarely", () => {
+    expect(probeEvery(task({ column: "running" }), undefined)).toBe(idle);
+    expect(probeEvery(task({ column: "running" }), pr({ checks: "failure" }))).toBe(idle);
+    expect(probeEvery(task({ column: "blocked" }), pr({ checks: "success" }))).toBe(idle);
+    expect(probeEvery(task({ column: "done" }), pr({ checks: "pending", state: "closed" }))).toBe(idle);
+  });
+
+  test("due on first sight, when the card changed column, and once its interval has passed", () => {
+    const running = task({ column: "running" });
+    expect(probeDue(running, undefined, undefined, 1000)).toBe(true);
+    expect(probeDue(running, undefined, { at: 1000, column: "running" }, 1000 + idle - 1)).toBe(false);
+    expect(probeDue(running, undefined, { at: 1000, column: "running" }, 1000 + idle)).toBe(true);
+    // The step ended and the card moved: a push is likely, so ask now.
+    expect(probeDue(task({ column: "review" }), pr(), { at: 1000, column: "running" }, 1001)).toBe(true);
+    expect(probeDue(task({ column: "merge" }), pr(), { at: 1000, column: "merge" }, 1000 + now - 1)).toBe(false);
+  });
 });
