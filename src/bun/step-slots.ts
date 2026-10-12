@@ -19,6 +19,20 @@ export const STEP_SLOTS_PREF = "step_slots";
 export interface StepSlots {
   max: number;
   heavy: { max: number; steps: string[] };
+  /** Cards allowed to wait on GitHub CI at once (`ci-wait`). At the cap no
+   *  further step starts, except the `exempt` ones (they push nothing), so
+   *  the runners are not handed more pushes than they can work through. */
+  ci?: { max: number; exempt: string[] };
+}
+
+export const DEFAULT_CI_SLOTS = { max: 6, exempt: ["Understand"] };
+export function ciSlots(slots: StepSlots): { max: number; exempt: string[] } {
+  return slots.ci ?? DEFAULT_CI_SLOTS;
+}
+/** Whether the CI cap applies to a step called `name`. */
+export function ciGated(name: string, slots: StepSlots): boolean {
+  const n = name.trim().toLowerCase();
+  return !ciSlots(slots).exempt.some((s) => n.startsWith(s.trim().toLowerCase()));
 }
 
 export const DEFAULT_STEP_SLOTS: StepSlots = {
@@ -37,7 +51,14 @@ export function parseStepSlots(raw: string | null | undefined): StepSlots {
   const n = (x: unknown, d: number) => (typeof x === "number" && Number.isFinite(x) && x >= 1 ? Math.floor(x) : d);
   const h = o.heavy && typeof o.heavy === "object" ? (o.heavy as Record<string, unknown>) : {};
   const steps = Array.isArray(h.steps) ? h.steps.filter((s): s is string => typeof s === "string" && !!s.trim()) : DEFAULT_STEP_SLOTS.heavy.steps;
-  return { max: n(o.max, DEFAULT_STEP_SLOTS.max), heavy: { max: n(h.max, DEFAULT_STEP_SLOTS.heavy.max), steps } };
+  const parsed: StepSlots = { max: n(o.max, DEFAULT_STEP_SLOTS.max), heavy: { max: n(h.max, DEFAULT_STEP_SLOTS.heavy.max), steps } };
+  // Only when configured: an absent `ci` means the defaults (`ciSlots`).
+  if (o.ci && typeof o.ci === "object" && !Array.isArray(o.ci)) {
+    const c = o.ci as Record<string, unknown>;
+    const exempt = Array.isArray(c.exempt) ? c.exempt.filter((s): s is string => typeof s === "string" && !!s.trim()) : DEFAULT_CI_SLOTS.exempt;
+    parsed.ci = { max: n(c.max, DEFAULT_CI_SLOTS.max), exempt };
+  }
+  return parsed;
 }
 
 /** A heavy step: its name starts with one of the configured names

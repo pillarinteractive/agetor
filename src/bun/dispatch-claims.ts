@@ -2,7 +2,7 @@
 import { randomUUID } from 'node:crypto';
 import { preferences, runs, tasks, reservationTransaction } from './db.ts';
 import path from 'node:path';
-import { currentSlots, isHeavyStep, slotDecision, slotUse, type SlotUse } from './step-slots.ts';
+import { ciGated, ciSlots, currentSlots, isHeavyStep, slotDecision, slotUse, type SlotUse } from './step-slots.ts';
 import { canonicalIssue } from '../shared/canonical-roadmap.ts';
 import { awaitsFor, listAwaits, type AwaitRecord } from './awaits.ts';
 import {heavyJobs, type HeavyJob} from './heavy-jobs.ts';
@@ -185,9 +185,9 @@ function measured(isLive:(id:string)=>boolean, claims:Record<string,RunnerClaim>
 export function runnerUse(isLive:(id:string)=>boolean,ev:OwnerEvidence=evidence()):SlotUse {
   return atomic(()=>{const claims=read<RunnerClaim>(RUNNER_PREF);const use=measured(isLive,claims,undefined,ev);preferences.set(RUNNER_PREF,JSON.stringify(claims));return use;});
 }
-export function reserveRunner(taskId:string,name:string,isLive:(id:string)=>boolean,ownerId?:string):{ok:true}|{error:string} {
+export function reserveRunner(taskId:string,name:string,isLive:(id:string)=>boolean,ownerId?:string,given?:OwnerEvidence):{ok:true}|{error:string} {
   return atomic(()=>{
-    const claims=read<RunnerClaim>(RUNNER_PREF), existing=claims[taskId],ev=evidence();
+    const claims=read<RunnerClaim>(RUNNER_PREF), existing=claims[taskId],ev=given??evidence();
     const owner=ownerId??tasks.get(taskId)?.pipelineParentId??taskId;
     if(existing) {
       const t=tasks.get(taskId),r=existing.runId?runs.get(existing.runId):null;
@@ -206,6 +206,10 @@ export function reserveRunner(taskId:string,name:string,isLive:(id:string)=>bool
     if(booking&&booking.pid===process.pid&&!booking.runId)delete claims[owner];
     const use=measured(isLive,claims,taskId,ev),cardOwners=owners(isLive,claims,ev),slots=currentSlots();
     if(!cardOwners.has(owner)&&cardOwners.size>=slots.max){preferences.set(RUNNER_PREF,JSON.stringify(claims));return {error:`waiting for a slot — ${cardOwners.size} of ${slots.max} card owners busy`};}
+    // Cards already parked on GitHub CI. At the cap, a card not yet among
+    // them starts no further step: each new step ends in another push.
+    const onCi=new Set(ev.awaits.filter(a=>!a.finished&&!a.notified&&isRemoteWait(a)).map(a=>ownerForCwd(a.cwd,ev.cards)).filter((o):o is string=>!!o));
+    if(ciGated(name,slots)&&!onCi.has(owner)&&onCi.size>=ciSlots(slots).max){preferences.set(RUNNER_PREF,JSON.stringify(claims));return {error:`waiting for a slot — ${onCi.size} of ${ciSlots(slots).max} cards are waiting on CI`};}
     const decision=slotDecision(name,use,slots);
     if(!decision.ok){preferences.set(RUNNER_PREF,JSON.stringify(claims));return {error:decision.why};}
     claims[taskId]={taskId,ownerId:owner,runId:null,pid:process.pid,at:Date.now(),name};preferences.set(RUNNER_PREF,JSON.stringify(claims));return {ok:true};

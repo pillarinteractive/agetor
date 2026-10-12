@@ -112,3 +112,28 @@ test('an orphaned reservation is kept while its creator or its task is alive', (
   const live = orphanedLaunch(DEAD_PID);
   expect(reserveRunner(live.child.id, 'Build', (id) => id === live.child.id, live.parent.id)).toEqual({ error: 'runner reservation is active or uncertain; reconcile its exact run first' });
 });
+
+test('at the CI cap a new card starts no further step, except the exempt ones', () => {
+  preferences.set('step_slots', JSON.stringify({ max: 24, heavy: { max: 6, steps: ['Finish'] }, ci: { max: 6, exempt: ['Understand'] } }));
+  const waiting = Array.from({ length: 6 }, () => parked('/Users/x/.agetor/bin/ci-wait '));
+  const ev = evidence(waiting.map((w) => w.record));
+  const fresh = () => {
+    const parent = card({ column: 'running' });
+    return { parent, child: card({ column: 'ready', pipelineParentId: parent.id, pipelineStepId: 's' }) };
+  };
+  const build = fresh();
+  expect(reserveRunner(build.child.id, 'Build', () => false, build.parent.id, ev)).toEqual({ error: 'waiting for a slot — 6 of 6 cards are waiting on CI' });
+  const plan = fresh();
+  expect(reserveRunner(plan.child.id, 'Understand', () => false, plan.parent.id, ev)).toEqual({ ok: true });
+  // A card already waiting on CI may start its next step (its wake-up, a retry).
+  const again = card({ column: 'ready', pipelineParentId: waiting[0]!.parent.id, pipelineStepId: 't' });
+  expect(reserveRunner(again.id, 'Review', () => false, waiting[0]!.parent.id, ev)).toEqual({ ok: true });
+});
+
+test('below the CI cap steps start as usual', () => {
+  preferences.set('step_slots', JSON.stringify({ max: 24, heavy: { max: 6, steps: ['Finish'] }, ci: { max: 6, exempt: [] } }));
+  const ev = evidence(Array.from({ length: 5 }, () => parked('ci-wait ').record));
+  const parent = card({ column: 'running' });
+  const child = card({ column: 'ready', pipelineParentId: parent.id, pipelineStepId: 's' });
+  expect(reserveRunner(child.id, 'Build', () => false, parent.id, ev)).toEqual({ ok: true });
+});
