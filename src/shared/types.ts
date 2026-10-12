@@ -739,12 +739,9 @@ export interface PipelineStepReminder {
   runId: string | null;
   /** The parser error / short reason the reminder was sent for. */
   detail: string;
-  /** Whether the reminder message was actually delivered to the agent (a
-   *  `sendInput` call that succeeds). `false` is never persisted today — the
-   *  runner only records a reminder once it has been sent — but the field is
-   *  required rather than defaulted so a future delivery-failure path can
-   *  record an honest `false` without a schema change, and so any UI reading
-   *  this record doesn't have to assume delivery. */
+  /** Whether the reminder message was actually delivered to the agent.
+   *  `false` records a formatting note queued by a capacity refusal; it
+   *  does not consume the execution's one delivered reminder. */
   delivered: boolean;
 }
 

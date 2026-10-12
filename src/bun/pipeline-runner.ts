@@ -938,16 +938,42 @@ export async function releaseSlotWaits(now = Date.now()): Promise<number> {
       const block = run.blocked.find((b) => b.stepId === w.stepId && (b.kind === "slot-wait"
         || b.kind === 'step-blocked' && b.taskId === null && b.inputRetry && b.inputRetry.at <= now));
       const step = run.snapshot?.graph.steps.find((s) => s.id === w.stepId);
-      if (!block?.pending || !step) return false;
+      if (!block || !step) return false;
       // Still over a limit for this step (e.g. the verification slot)? Leave it queued.
       if (!urgent && !slotDecision(step.name, slotUse(isTaskRunLive, slots), slots).ok) return false;
+      if (block.taskId) {
+        const active = run.active.find(a => a.taskId === block.taskId && a.stepId === w.stepId);
+        const child = tasks.get(block.taskId);
+        if (!active || !child || child.archivedAt != null || isTaskRunLive(child.id)
+          || listPendingForTask(child.id).length > 0) return false;
+        const historyEntry = run.history.find(h => h.taskId === child.id && h.seq === active.seq);
+        const reminder = historyEntry?.reminder;
+        // Retry only the undelivered formatting note, not the work that
+        // already completed. A newer turn owns its own settle/continuation.
+        if (reminder && !reminder.delivered) {
+          if (!reminder.runId || child.runId !== reminder.runId) return false;
+          run.blocked = run.blocked.filter(b => b !== block);
+          return attemptHandoffReminderOrBlock({ parentId: parent.id, run, taskId: child.id,
+            runId: reminder.runId, activeEntry: active, historyEntry, graph: run.snapshot!.graph,
+            stepName: step.name, reason: reminder.reason, detail: reminder.detail,
+            baseMessage: block.message.replace(/ \(automatic reminder could not be sent:.*\)$/s, '') }) ?? false;
+        }
+        const result = await performPipelineRetry(parent, run, child.id);
+        return !('error' in result);
+      }
+      if (!block.pending) return false;
       run.blocked = run.blocked.filter((b) => b !== block);
       const previous = block.pending.arrivals.map((a) => ({ stepId: a.fromStepId, seq: a.seq, handoff: a.handoff }));
       const r = await launchTarget(parent, run, step, previous, { inputRetryAttempt: block.inputRetry?.attempt });
       persist(w.parentId, run);
       return r.ok;
     }).catch(() => false);
-    if (ok) launched++;
+    if (typeof ok === 'object') {
+      // sendInput must stay outside the parent lock.
+      await deliverHandoffReminder(ok);
+      const history = tasks.get(ok.parentId)?.pipelineRun?.history.find(h => h.taskId === ok.taskId && h.seq === ok.seq);
+      if (history?.reminder?.delivered) launched++;
+    } else if (ok) launched++;
   }
   return launched;
 }
@@ -1926,7 +1952,7 @@ async function launchStep(
   }
 
   if ("error" in started) {
-    upsertBlocked(run, { taskId: childId, stepId: step.id, kind: "step-failed", message: started.error });
+    recordLaunchRefusal(parent.id, run, childId, step.id, started.error);
     persist(parent.id, run);
     return { ok: false };
   }
@@ -1971,12 +1997,7 @@ async function launchTarget(
     const message = err instanceof Error ? err.message : String(err);
     const inserted = run.active.find((a) => a.stepId === step.id && !activeIdsBefore.has(a.taskId));
     if (inserted) {
-      upsertBlocked(run, {
-        taskId: inserted.taskId,
-        stepId: step.id,
-        kind: "step-failed",
-        message: `step "${step.name}" failed to launch: ${message}`,
-      });
+      recordLaunchRefusal(parent.id, run, inserted.taskId, step.id, `step "${step.name}" failed to launch: ${message}`);
     } else {
       if (run.stepCount > stepCountBefore) run.stepCount = stepCountBefore;
       upsertBlocked(run, {
@@ -2005,6 +2026,20 @@ async function launchTarget(
  *  strings `startTask` returns. */
 function isStartTaskLiveRefusal(error: string): boolean {
   return error === "task is already starting" || error === "task already running";
+}
+
+/** Admission is a queue wait, not a failed execution or an owner question. */
+function isCapacityRefusal(error: string): boolean {
+  return /^(?:step "[^"]+" failed to launch: )?waiting for (?:a |a verification )slot\b|^runner reservation retains a detached command$/i.test(error);
+}
+function isDatabaseBusy(error: string): boolean {
+  return /database (?:is )?locked|SQLITE_BUSY|SQLITE_LOCKED/i.test(error);
+}
+function recordLaunchRefusal(parentId: string, run: PipelineRunState, taskId: string, stepId: string, message: string): void {
+  upsertBlocked(run, { taskId, stepId, kind: isCapacityRefusal(message) ? 'slot-wait' : 'step-failed', message });
+  if (isDatabaseBusy(message) && run.snapshot?.decisionPolicy === 'planner-recommendation' && !isTaskRunLive(taskId)) {
+    scheduleAutoRetry(parentId, run, stepId, { kind: 'transient', resetAt: null, detail: message }, 'could not acquire the database writer');
+  }
 }
 
 async function retryActiveExecutions(
@@ -2037,7 +2072,7 @@ async function retryActiveExecutions(
   let first: { runId: string; pending?: true } | null = null;
   for (const t of targets) {
     run.blocked = run.blocked.filter((b) => b.taskId !== t.taskId);
-    const started = await startTask(t.taskId);
+    const started = await startTask(t.taskId).catch((error:unknown)=>({error:error instanceof Error?error.message:String(error)}));
     if ("error" in started) {
       // L-R2: `startTask`'s own double-start guards ("task is already
       // starting" — a spawn claim still held, e.g. the bounded-pending
@@ -2047,7 +2082,7 @@ async function retryActiveExecutions(
       // above (no block, left alone) rather than recording a step-failed
       // block against a turn that's actually in flight.
       if (isStartTaskLiveRefusal(started.error)) continue;
-      upsertBlocked(run, { taskId: t.taskId, stepId: t.stepId, kind: "step-failed", message: started.error });
+      recordLaunchRefusal(parent.id,run,t.taskId,t.stepId,started.error);
     } else if (!first) {
       first = { runId: started.runId, ...(started.pending ? { pending: true as const } : {}) };
     }
@@ -2776,6 +2811,13 @@ export async function cancelPipelineRun(parentId: string): Promise<{ task: Task 
     const run = parent.pipelineRun;
 
     const runningTargets = run.active.filter((a) => isTaskRunLive(a.taskId));
+    if (runningTargets.length === 0 && run.blocked.some(b => b.kind === 'slot-wait')) {
+      if (run.autoRetry?.at != null) run.autoRetry = { ...run.autoRetry, at: null };
+      run.status = 'cancelled';
+      persist(parentId, run, { preserveStatus: true });
+      recordActivity(parentId, { kind: 'step', text: 'Queued execution cancelled — left for you', tone: 'muted' });
+      return { task: tasks.get(parentId)! };
+    }
     // Stop on a card that's only waiting for an automatic retry cancels the
     // retry; the step stays blocked for the user.
     if (runningTargets.length === 0 && (run.autoRetry?.at != null || run.wait?.state === "waiting")) {
@@ -2905,9 +2947,9 @@ function reminderBlockKind(reason: HandoffReminderReason): "handoff-missing" | "
  * the intent in-memory (`remindersInFlight`), persists the run with the
  * execution still active and unblocked, and hands this back;
  * {@link deliverHandoffReminder} then sends OUTSIDE the lock and re-acquires
- * it to stamp the outcome — `reminder` on the history entry only when
- * `sendInput` reports `delivered: true` (the "record only delivered"
- * contract is unchanged), an ordinary block otherwise.
+ * it to stamp the outcome: a delivered reminder consumes the one allowed
+ * reminder; a capacity refusal records an undelivered note for the slot
+ * loop; other refusals keep their ordinary blocked disposition.
  */
 interface PendingReminder {
   parentId: string;
@@ -2944,8 +2986,8 @@ const deferredSettles = new Map<string, { runId: string; status: "succeeded" | "
  * `persist` on every path.
  *
  * Order of checks (round 4 review fixes):
- *  - Already reminded once for this execution (`historyEntry.reminder` set,
- *    for ANY reason — one reminder max per execution) blocks immediately,
+ *  - Already reminded once for this execution (`reminder.delivered` true,
+ *    for ANY reason — one delivered reminder max per execution) blocks immediately,
  *    ahead of every other check below: there's nothing left to attempt.
  *  - Major 1: re-reads the parent AND the step task fresh — the copies
  *    `settleStepRun` captured at the top of its turn can be stale, since
@@ -2958,11 +3000,10 @@ const deferredSettles = new Map<string, { runId: string; status: "succeeded" | "
  *    handoff while the whole run is being torn down (`cancelPipelineRun`,
  *    or every other live sibling already mid-cancellation) must not have
  *    the reminder revive the run back into `running`.
- *  - Otherwise: hand the send back to the caller. Medium 3 — the reminder
- *    is recorded onto `historyEntry.reminder` ONLY when `sendInput` reports
- *    `delivered: true` (see `deliverHandoffReminder`); a failed/withheld
- *    send records NOTHING there, so the NEXT settle may still try once, and
- *    folds the failure reason into the ordinary block's message instead.
+ *  - Otherwise: hand the send back to the caller. A reminder recorded with
+ *    `delivered: true` consumes that allowance. A capacity refusal records
+ *    `false` for later delivery; other failed/withheld sends record nothing
+ *    there and retain their ordinary block and failure message.
  */
 function attemptHandoffReminderOrBlock(input: {
   parentId: string;
@@ -2980,7 +3021,7 @@ function attemptHandoffReminderOrBlock(input: {
   const { parentId, run, taskId, runId, activeEntry, historyEntry, graph, stepName, reason, detail, baseMessage } = input;
   const blockKind = reminderBlockKind(reason);
 
-  if (historyEntry?.reminder) {
+  if (historyEntry?.reminder?.delivered) {
     // Already reminded once for this execution (retries don't reset it —
     // see `PipelineStepReminder`'s doc) — a second bad response blocks
     // instead of reminding again.
@@ -3143,19 +3184,23 @@ async function deliverHandoffReminderInner(p: PendingReminder): Promise<void> {
         }
       }
 
-      // Could not deliver the reminder — fall straight through to the
-      // ordinary blocked path, folding the send failure into the message so
-      // a human can see why no reminder went out. Medium 3: nothing is
-      // recorded onto `historyEntry.reminder` here, so the NEXT settle may
-      // still try once. Only if this execution is still the active one —
+      // Capacity refusals queue the undelivered note. Other refusals keep
+      // their ordinary block and do not consume the reminder allowance.
+      // Only if this execution is still the active one —
       // a Retry/Advance that landed while the send was in flight already
       // decided its fate.
       const stillActive = run.active.some((a) => a.taskId === p.taskId && a.seq === p.seq);
       if (!stillActive||newerActive()) return;
+      const queued = !sent.withheld && isCapacityRefusal(sent.reason);
+      if (queued && historyEntry) {
+        historyEntry.reminder = { at: Date.now(), reason: p.reason, runId: p.runId, detail: p.detail, delivered: false };
+      } else if (historyEntry?.reminder && !historyEntry.reminder.delivered) {
+        delete historyEntry.reminder;
+      }
       upsertBlocked(run, {
         taskId: p.taskId,
         stepId: p.stepId,
-        kind: reminderBlockKind(p.reason),
+        kind: queued ? 'slot-wait' : reminderBlockKind(p.reason),
         message: `${p.baseMessage} (automatic reminder could not be sent: ${sent.reason})`,
       });
       checkJoinIncomplete(run);
@@ -3413,8 +3458,15 @@ async function settleStepRun(
       let resolved = resolveNextSteps(graph, activeEntry.stepId, parsedHandoff);
       if(stepName==='Review'&&managedPillarRoot(parent.worktreePath??parent.workdir)&&reviewRequiresRepair(parsedHandoff)) {
         const repair=outgoingSteps(graph,activeEntry.stepId).find(o=>o.step.name==='Build'&&/^(?:changes requested|needs work|fix|repair|rework)$/i.test(o.edge.label.trim()));
-        const corrective=repair?{...parsedHandoff,status:'blocked' as const,next:repair.step.id}:null;
-        if(corrective&&blockedHandoffChoosesNext(graph,activeEntry.stepId,corrective)) {
+        // A completed review can describe downstream owner-only evidence.
+        // Do not turn that completed verdict into an execution hold. The
+        // original verdict/findings stay in history; only the corrective
+        // graph edge changes. Explicit questions/waits and blocked verdicts
+        // still require their normal disposition.
+        const corrective=repair?{...parsedHandoff,next:repair.step.id}:null;
+        const completedRepair=parsedHandoff.status==='done'&&graph.steps.find(s=>s.id===activeEntry.stepId)?.transition==='choose'
+          &&!parsedHandoff.waitingOn&&!parsedHandoff.openQuestions.some(q=>q.trim());
+        if(corrective&&(completedRepair||blockedHandoffChoosesNext(graph,activeEntry.stepId,corrective))) {
           resolved=resolveNextSteps(graph,activeEntry.stepId,corrective);
           recordActivity(parentId,{kind:'step',text:'Review has unresolved findings or incomplete acceptance — routing the preserved findings to Build',tone:'warning'});
         }else {
@@ -3868,6 +3920,14 @@ function markStepNeverStarted(parentId: string, taskId: string): void {
   const idx = run.active.findIndex((a) => a.taskId === taskId);
   if (idx === -1) return;
   const entry = run.active[idx]!;
+  const child = tasks.get(taskId);
+  if (!child || child.archivedAt != null || isTaskRunLive(taskId) || listPendingForTask(taskId).length > 0
+    || isDeliberateWholeRunStop(run, taskId)) return;
+  const existing = run.blocked.find(b => b.taskId === taskId);
+  // A missing run row does not invalidate another recorded reason for a
+  // hold (configuration errors, owner questions, or queued admission).
+  if (existing && (existing.kind !== 'step-failed'
+    || !/ never started$/.test(existing.message) && !isDatabaseBusy(existing.message))) return;
   const stepName = run.snapshot ? stepNameById(run.snapshot.graph, entry.stepId) : entry.stepId;
   upsertBlocked(run, { taskId, stepId: entry.stepId, kind: "step-failed", message: `step "${stepName}" never started` });
   const h = run.history.find((x) => x.taskId === taskId && x.seq === entry.seq);
@@ -3875,6 +3935,11 @@ function markStepNeverStarted(parentId: string, taskId: string): void {
     h.endedAt = Date.now();
     freezeStepReport(h);
     h.outcome = "failed";
+  }
+  // This is an interrupted child launch, not a planner question. Preserve
+  // a pending/exhausted/cancelled retry record across repeated boot sweeps.
+  if (run.snapshot?.decisionPolicy === 'planner-recommendation' && !run.autoRetry) {
+    scheduleAutoRetry(parentId, run, entry.stepId, null, 'was interrupted before its worker started');
   }
   checkJoinIncomplete(run);
   persist(parentId, run);
@@ -3911,9 +3976,36 @@ export async function reconcilePipelineRuns(): Promise<number> {
   });
 
   for (const parent of parents) {
+    // Earlier builds stored admission refusals as permanent failures.
+    // Reclassify only those exact technical reasons on opted-in runs;
+    // never revive a cancelled retry, owner hold, or live execution.
+    await runExclusive(parent.id, async () => {
+      const fresh = tasks.get(parent.id);
+      const run = fresh?.pipelineRun;
+      if (!fresh || !run || fresh.archivedAt != null || run.snapshot?.decisionPolicy !== 'planner-recommendation'
+        || run.autoRetry?.at === null || !['running', 'blocked'].includes(run.status)) return;
+      let changed = false;
+      for (const block of run.blocked) {
+        if (block.kind !== 'step-failed' || !block.taskId || !block.stepId) continue;
+        const child = tasks.get(block.taskId);
+        if (!child || child.archivedAt != null || isTaskRunLive(child.id) || listPendingForTask(child.id).length > 0
+          || !run.active.some(a => a.taskId === child.id && a.stepId === block.stepId)) continue;
+        if (isCapacityRefusal(block.message)) {
+          block.kind = 'slot-wait';
+          changed = true;
+        } else if (isDatabaseBusy(block.message) && !run.autoRetry) {
+          scheduleAutoRetry(parent.id, run, block.stepId, { kind: 'transient', resetAt: null, detail: block.message }, 'could not acquire the database writer');
+          changed = true;
+        }
+      }
+      if (changed) persist(parent.id, run);
+    });
     const activeSnapshot = parent.pipelineRun!.active.slice();
     for (const a of activeSnapshot) {
       if (isTaskRunLive(a.taskId)) continue;
+      // A queued child (including an undelivered formatting reminder) is
+      // owned by the slot loop, not by another boot-time settle.
+      if (tasks.get(parent.id)?.pipelineRun?.blocked.some(b => b.taskId === a.taskId && b.kind === 'slot-wait')) continue;
       try {
         const stepRuns = runs.listForTask(a.taskId);
         const latest = stepRuns[0] ?? null;
