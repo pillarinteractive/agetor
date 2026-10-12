@@ -1,3 +1,5 @@
+import { levelOf, whyStopped } from "@/lib/board-health";
+import { cn } from "@/lib/utils";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ReactFlow, ReactFlowProvider, Background, BackgroundVariant, Controls, useNodesState, useEdgesState } from "@xyflow/react";
 import { AnimatePresence, motion } from "motion/react";
@@ -862,6 +864,7 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
           )}
         </div>
       </div>
+      <WhyStopped task={task} busy={actionBusy} onRetry={() => void handleRetry()} />
 
       <div className="relative flex min-h-0 flex-1">
         <div ref={canvasRef} className="relative min-w-0 flex-1">
@@ -1231,5 +1234,51 @@ function HistoryRow({ record, graph }: { record: PipelineStepRecord; graph: Pipe
         </div>
       )}
     </li>
+  );
+}
+
+/** The first thing a stopped card says: a light (red stays until someone acts,
+ *  yellow clears by itself), the cause in a few words, what clears it, and the
+ *  step's own explanation. Nothing when the card is moving. */
+function WhyStopped({ task, busy, onRetry }: { task: Task; busy: boolean; onRetry: () => void }) {
+  const [all, setAll] = useState(false);
+  const why = whyStopped(task);
+  if (!why) return null;
+  const red = levelOf(why.cause) === "blocked";
+  const shown = all ? why.lines : why.lines.slice(0, 2);
+  return (
+    <div data-testid="pipeline-run-why" data-cause={why.cause} className="flex items-start gap-3 border-b border-border bg-muted/30 px-4 py-2.5 text-sm">
+      <span aria-hidden className={cn("mt-1.5 inline-block size-2.5 shrink-0 rounded-full", red ? "bg-red-500" : "bg-amber-400")} />
+      <div className="min-w-0 flex-1">
+        <p>
+          <span className="font-medium">{why.title}</span>
+          {why.step && <span className="text-muted-foreground"> · {why.step}</span>}
+          <span className="text-muted-foreground"> — {why.clears}</span>
+        </p>
+        {shown.length > 0 && (
+          <ul className="mt-1 flex max-w-[90ch] flex-col gap-0.5 text-xs text-muted-foreground">
+            {shown.map((line, i) => (
+              <li key={i} className="break-words">
+                {line}
+              </li>
+            ))}
+          </ul>
+        )}
+        {why.lines.length > 2 && (
+          <button
+            type="button"
+            onClick={() => setAll((v) => !v)}
+            className="mt-1 rounded text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            {all ? "Show less" : `Show all ${why.lines.length} lines`}
+          </button>
+        )}
+      </div>
+      {why.action === "retry" && (
+        <Button type="button" size="sm" data-testid="pipeline-run-why-retry" disabled={busy} onClick={onRetry} className="shrink-0">
+          Retry
+        </Button>
+      )}
+    </div>
   );
 }

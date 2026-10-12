@@ -112,6 +112,25 @@ export function waitGroups(tasks: Task[], prs: ReadonlyMap<string, TaskPrStatus>
   return ORDER.filter((cause) => byCause.has(cause)).map((cause) => ({ cause, ...GROUPS[cause], cards: byCause.get(cause)! }));
 }
 
+/** Why one card is not moving, in the card's own view: the cause, what clears
+ *  it, and the step's own words in full. Null when the card is moving. */
+export function whyStopped(
+  task: Task,
+  pr: TaskPrStatus | null = null,
+): (Pick<WaitGroup, "cause" | "title" | "clears" | "action"> & { step: string | null; lines: string[] }) | null {
+  const group = waitGroups([task], pr ? new Map([[task.id, pr]]) : new Map())[0];
+  if (!group) return null;
+  const card = group.cards[0]!;
+  const names = new Map((task.pipelineRun?.snapshot?.graph.steps ?? []).map((st) => [st.id, st.name]));
+  const block = (task.pipelineRun?.blocked ?? []).find((b) => (b.stepId ? (names.get(b.stepId) ?? null) : null) === card.step && firstLine(b.message).length > 0);
+  const text = block ? block.message.replace(/^step "[^"]*" reported it is blocked:\s*/i, "") : card.detail;
+  const lines = text
+    .split(/\n|(?<=\.)\s+(?=- )/)
+    .map((l) => l.replace(/^[-–]\s*/, "").trim())
+    .filter(Boolean);
+  return { cause: group.cause, title: group.title, clears: group.clears, action: group.action, step: card.step, lines };
+}
+
 /** Red or yellow: a cause that stays until someone acts, or one that clears by itself. */
 export type WaitLevel = "blocked" | "waiting";
 const SELF_CLEARING: ReadonlySet<WaitCause> = new Set(["limit", "slot", "ci", "command"]);

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { boardHealth, boardSignal, levelOf, waitGroups } from "./board-health.ts";
+import { boardHealth, boardSignal, levelOf, waitGroups, whyStopped } from "./board-health.ts";
 import type { PipelineBlock, Task, TaskPrStatus } from "../../shared/types.ts";
 
 const STEPS = [{ id: "build", name: "Build" }, { id: "review", name: "Review" }, { id: "finish", name: "Finish" }];
@@ -159,5 +159,24 @@ describe("boardSignal", () => {
     const red = (["you", "failed", "no-handoff", "step-cap", "base", "blocked"] as const).map(levelOf);
     expect(new Set(yellow)).toEqual(new Set(["waiting"]));
     expect(new Set(red)).toEqual(new Set(["blocked"]));
+  });
+});
+
+describe("whyStopped", () => {
+  test("a moving card has no reason", () => {
+    expect(whyStopped(card("running", [], {}, ["running"])[0]!)).toBeNull();
+  });
+
+  test("gives the cause, the step and the step's own words line by line", () => {
+    const message = 'step "Review" reported it is blocked: - Exact-head CI remains unavailable.\n- The no-push instruction remains effective.\n- Resume Review after publication.';
+    const [task] = card("blocked", [{ stepId: "review", message }]);
+    const why = whyStopped(task!)!;
+    expect([why.cause, why.title, why.step, why.action]).toEqual(["blocked", "Step reports it is blocked", "Review", "open"]);
+    expect(why.lines).toEqual(["Exact-head CI remains unavailable.", "The no-push instruction remains effective.", "Resume Review after publication."]);
+  });
+
+  test("a retryable stop offers retry", () => {
+    const [task] = card("blocked", [{ kind: "handoff-missing", message: "still no valid handoff after one reminder" }]);
+    expect(whyStopped(task!)).toMatchObject({ cause: "no-handoff", action: "retry", lines: ["still no valid handoff after one reminder"] });
   });
 });
