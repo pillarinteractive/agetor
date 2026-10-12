@@ -29,7 +29,7 @@ afterAll(()=>{rmSync(fixture,{recursive:true,force:true});});
 
 test('managed pnpm and node Vitest routes wait behind two authoritative leases, preserve argv/exit and ignore capacity overrides',async()=>{
  const held=await blockers();const before=entries().length;
- const pnpm=start(['env','CI=1','PILLAR_VERIFY_SLOTS=999','PILLAR_VERIFY_SLOT_DIR=/tmp/forged-policy','pnpm','test','space arg'],{TEST_EXIT:'7'});
+ const pnpm=start(['env','CI=1','PILLAR_VERIFY_SLOTS=999','PILLAR_VERIFY_SLOT_DIR=/tmp/forged-policy','PILLAR_VERIFY_SLOT_HELD=1','PILLAR_TEST_SLOT=off','pnpm','test','space arg'],{TEST_EXIT:'7',PILLAR_VERIFY_SLOT_HELD:'1',PILLAR_TEST_SLOT:'off'});
  const node=start(['node','/synthetic/node_modules/vitest/vitest.mjs','run','a.ts']);
  try{
   await Bun.sleep(250);expect(entries()).toHaveLength(before);expect(heavyJobs()).toHaveLength(2);
@@ -52,6 +52,29 @@ test('nested supported tools and a verifier share their exact ancestor job, with
   expect(entries().some(e=>e.args.includes('nested-verifier'))).toBe(true);
   expect(heavyJobs()).toHaveLength(1);
  }finally{stop(other);await other.exited;}
+},10000);
+
+test('native Vitest admission inherits only an authenticated held lease, so two outer jobs cannot deadlock on their own pool',async()=>{
+ const other=blocker();await until(()=>heavyJobs().length===1);
+ const nativeNode=Bun.which('node')!;
+ const code=`const {spawn}=require('node:child_process');
+ const fs=require('node:fs');
+ if(process.env.PILLAR_TEST_SLOT==='off')throw new Error('skip override leaked');
+ if(process.env.PILLAR_VERIFY_SLOT_HELD==='1'){
+   console.log(JSON.stringify({held:process.env.PILLAR_VERIFY_SLOT_HELD,slots:process.env.PILLAR_VERIFY_SLOTS,directory:process.env.PILLAR_VERIFY_SLOT_DIR,pid:process.env.AGETOR_HEAVY_PID,slot:process.env.AGETOR_HEAVY_SLOT}));
+ }else{
+   // Faithful native admission: without the held marker it tries to flock
+   // the same two occupied files. Bound this regression probe to one second.
+   const child=spawn('python3',['-c',"import fcntl,os,pathlib,time,sys\\nd=pathlib.Path(os.environ['PILLAR_VERIFY_SLOT_DIR'])\\nend=time.time()+1\\nwhile time.time()<end:\\n for i in range(2):\\n  f=open(d/f'slot{i}.lock','a+')\\n  try: fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB);print('held',flush=True);sys.exit(0)\\n  except BlockingIOError:f.close()\\n time.sleep(0.02)\\nsys.exit(23)"],{stdio:['pipe','pipe','inherit']});
+   child.on('exit',code=>process.exit(code??24));
+ }`;
+ const nested=start([HEAVY_BIN,'--',nativeNode,'-e',code]);
+ try{
+  const [out,err]=await Promise.all([new Response(nested.stdout).text(),new Response(nested.stderr).text()]);
+  expect(await nested.exited).toBe(0);expect(err).toBe('');
+  const observed=JSON.parse(out.trim());expect(observed.held).toBe('1');expect(observed.slots).toBe('2');expect(observed.directory).toBe(HEAVY_SLOTS);expect(Number(observed.pid)).toBeGreaterThan(0);expect([0,1]).toContain(Number(observed.slot));
+  expect(heavyJobs()).toHaveLength(1);
+ }finally{stop(other);await other.exited;nested.kill();}
 },10000);
 
 test('forged unrelated parent identity fails closed; unlocked stale PID markers are not executing',async()=>{

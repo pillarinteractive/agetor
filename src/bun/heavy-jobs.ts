@@ -37,9 +37,10 @@ if pathlib.Path(args[0]).name=='env':
  args=args[1:]
  while args and '=' in args[0] and not args[0].startswith('-'):
   key,value=args.pop(0).split('=',1)
-  if key not in ('CI','GITHUB_ACTIONS','PILLAR_VERIFY_SLOTS','PILLAR_VERIFY_SLOT_DIR') and not key.startswith('AGETOR_HEAVY_'): env[key]=value
+  if key not in ('CI','GITHUB_ACTIONS','PILLAR_VERIFY_SLOTS','PILLAR_VERIFY_SLOT_DIR','PILLAR_VERIFY_SLOT_HELD','PILLAR_TEST_SLOT') and not key.startswith('AGETOR_HEAVY_'): env[key]=value
  if not args or args[0].startswith('-'): raise SystemExit('unsupported env option; pass direct command argv')
 env.pop('CI',None); env.pop('GITHUB_ACTIONS',None)
+env.pop('PILLAR_VERIFY_SLOT_HELD',None); env.pop('PILLAR_TEST_SLOT',None)
 env['PILLAR_VERIFY_SLOTS']='2'; env['PILLAR_VERIFY_SLOT_DIR']=str(directory)
 record=env.get('AGETOR_AWAIT_RECORD')
 def state(value):
@@ -93,7 +94,7 @@ def lease(*_args,**_kwargs):
  inherited=parent_lease()
  if inherited:
   pid,slot,fd=inherited
-  env.update(AGETOR_HEAVY_PID=str(pid),AGETOR_HEAVY_SLOT=str(slot),AGETOR_HEAVY_DIR=str(directory),AGETOR_HEAVY_FD=str(fd))
+  env.update(AGETOR_HEAVY_PID=str(pid),AGETOR_HEAVY_SLOT=str(slot),AGETOR_HEAVY_DIR=str(directory),AGETOR_HEAVY_FD=str(fd),PILLAR_VERIFY_SLOT_HELD='1')
   os.environ.update(env)
   yield fd
   return
@@ -107,7 +108,10 @@ def lease(*_args,**_kwargs):
    handle=candidate; break
   if handle is None: time.sleep(0.2)
  fd=handle.fileno()
- env.update(AGETOR_HEAVY_PID=str(os.getpid()),AGETOR_HEAVY_SLOT=str(slot),AGETOR_HEAVY_DIR=str(directory),AGETOR_HEAVY_FD=str(fd))
+ # Native Vitest admission understands this marker. Set it ONLY after taking
+ # the actual kernel lease (or proving the exact ancestor lease above), never
+ # from caller input. The wrapper keeps that lease until the child exits.
+ env.update(AGETOR_HEAVY_PID=str(os.getpid()),AGETOR_HEAVY_SLOT=str(slot),AGETOR_HEAVY_DIR=str(directory),AGETOR_HEAVY_FD=str(fd),PILLAR_VERIFY_SLOT_HELD='1')
  os.environ.update(env)
  try:
   state('running'); yield fd
