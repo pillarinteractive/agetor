@@ -137,7 +137,11 @@ function measured(isLive:(id:string)=>boolean, claims:Record<string,RunnerClaim>
     const t=tasks.get(id), current=t?.runId?runs.get(t.runId):null, r=c.runId ? runs.get(c.runId) : current;
     if(c.runId&&!r) {if(!represented.has(id))use.total++;if(!heavyRepresented.has(id)&&isHeavyStep(c.name,slots))use.heavy++;continue;}
     const detached=!!t?.worktreePath && awaitsFor(t.worktreePath,c.at,ev.awaits).some(a=>!a.finished);
-    if(!isLive(id)&&!detached&&r&&['succeeded','failed','cancelled'].includes(r.status)&&(!t?.runId||current&&['succeeded','failed','cancelled'].includes(current.status))) {delete claims[id];continue;}
+    // An accepted retry may still point at the task's previous terminal run.
+    // A live creator's unbound reservation has no completion receipt yet;
+    // another core cannot use that older run (or its local liveness) to free it.
+    const acceptedUnbound=!c.runId&&alive(c.pid);
+    if(!acceptedUnbound&&!isLive(id)&&!detached&&r&&['succeeded','failed','cancelled'].includes(r.status)&&(!t?.runId||current&&['succeeded','failed','cancelled'].includes(current.status))) {delete claims[id];continue;}
     if(!r&&!t&&!alive(c.pid)) {delete claims[id];continue;}
     // No spawn receipt plus a dead owner is safely absent, even when a
     // pre-inserted ready row survives. Running/orphaned rows remain held.

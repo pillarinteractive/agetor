@@ -93,6 +93,39 @@ test('a live accepted-but-unspawned reservation behind an idle queue is retained
   expect(JSON.parse(preferences.get('dispatch_runner_reservations_v1')!)[q.child.id]).toBeDefined();
 });
 
+test('another live creator retains an accepted retry despite an older terminal receipt', () => {
+  const foreign = Bun.spawn(['/bin/cat'], { stdin: 'pipe', stdout: 'ignore', stderr: 'ignore' });
+  try {
+    for (const status of ['succeeded', 'failed', 'cancelled'] as const) {
+      const q = queued(status);
+      const accepted = { taskId: q.child.id, ownerId: q.parent.id, runId: null,
+        pid: foreign.pid, at: Date.now(), name: 'Build' };
+      preferences.set('dispatch_runner_reservations_v1', JSON.stringify({ [q.child.id]: accepted }));
+      const otherOwners: string[] = [];
+      for (let i = 0; i < 7; i++) {
+        const other = card({ column: 'running' });
+        receipt(other.id, 'running');
+        otherOwners.push(other.id);
+      }
+      const owners = activeCardOwners(() => false, evidence());
+      expect(owners.has(q.parent.id)).toBe(true);
+      expect(owners.size).toBe(8);
+      expect(runnerUse(() => false, evidence())).toEqual({ total: 8, heavy: 0 });
+      expect('error' in reserveRunner('ninth-' + status, 'Build', () => false)).toBe(true);
+      expect(JSON.parse(preferences.get('dispatch_runner_reservations_v1')!)[q.child.id]).toEqual(accepted);
+
+      // Only the new retry's bound receipt can establish its completion.
+      const ownRun = receipt(q.child.id, 'succeeded');
+      preferences.set('dispatch_runner_reservations_v1', JSON.stringify({ [q.child.id]: { ...accepted, runId: ownRun } }));
+      expect(activeCardOwners(() => false, evidence()).has(q.parent.id)).toBe(false);
+      expect(JSON.parse(preferences.get('dispatch_runner_reservations_v1')!)[q.child.id]).toBeUndefined();
+      for (const id of otherOwners) tasks.delete(id);
+    }
+  } finally {
+    foreign.kill();
+  }
+});
+
 test('detached running or unknown-phase work remains an owner even when its model turn is queued', () => {
   const q = queued();
   for (const resourceState of ['running', undefined] as const) {
