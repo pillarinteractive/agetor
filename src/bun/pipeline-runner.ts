@@ -39,6 +39,7 @@ import { isPriority, priorityFirst } from "./priority.ts";
 import { awaitsFor, listAwaits, resourceBlockedAwaits } from "./awaits.ts";
 import {HEAVY_INSTRUCTIONS,managedPillarRoot} from './heavy-jobs.ts';
 import { classifyFailure, formatRetryTime, harnessQuotaNotice, isQuotaPaused, nextRetryAt, TRANSIENT_RETRY_MAX, type FailureClass } from "./usage-limit.ts";
+import { fallbackHarnessFor, harnessDuringLimit, noteQuotaLimit } from "./quota-fallback.ts";
 import { listLeases } from "./lease-watch.ts";
 import { ownFailures, prStatusForTask } from "./pr-watch.ts";
 import { run as runCommand } from "./github.ts";
@@ -366,6 +367,9 @@ function quotaNoticeFrom(events: MainStreamEvent[]): FailureClass | null {
   return classifyFailure(status.slice(Math.max(0, lastQuota - 5), lastQuota + 1).join("\n"));
 }
 
+/** Pause before a step restarts on its backup harness after a usage limit. */
+const QUOTA_FALLBACK_DELAY_MS = 3_000;
+
 function scheduleAutoRetry(
   parentId: string,
   run: PipelineRunState,
@@ -388,6 +392,29 @@ function scheduleAutoRetry(
   const attempt = prev && prev.stepId === stepId && prev.kind === kind ? prev.attempt + 1 : 1;
   const stepName = run.snapshot ? stepNameById(run.snapshot.graph, stepId) : stepId;
   const reason = (failure?.detail ?? why).slice(0, 300);
+  if (kind === "quota") {
+    // Quota fallback (quota-fallback.ts): remember the limit, and when a
+    // backup harness is configured start the step again on it now instead of
+    // waiting for the reset. A fresh launch, not a resume: the cut-off
+    // session belongs to the limited provider.
+    const limited = tasks.get(run.active.find((a) => a.stepId === stepId)?.taskId ?? "");
+    if (limited) {
+      noteQuotaLimit(limited.agent, failure?.resetAt ?? null, now);
+      const backup = fallbackHarnessFor(limited.agent);
+      if (backup) {
+        tasks.update(limited.id, { agent: backup });
+        const at = now + QUOTA_FALLBACK_DELAY_MS;
+        run.autoRetry = { stepId, kind, attempt: 1, at, reason };
+        recordActivity(parentId, {
+          kind: "step",
+          text: `${stepName} hit a usage limit (${reason}) — starting it again on ${harnesses.get(backup)?.label ?? backup}`,
+          tone: "info",
+        });
+        armAutoRetryTimer(parentId, at);
+        return;
+      }
+    }
+  }
   const at = nextRetryAt(kind, attempt, failure?.resetAt ?? null, now);
   const resume = kind === "quota" ? opts?.resume : undefined;
   run.autoRetry = { stepId, kind, attempt, at, reason, ...(resume ? { resume } : {}) };
@@ -2002,7 +2029,9 @@ async function launchStep(
     title: `${run.pipelineName} · ${step.name}`,
     prompt: composed,
     column: "ready",
-    agent: profile.harness,
+    // While the profile's harness is at a known usage limit, start on its
+    // configured backup (quota-fallback.ts); otherwise this is the profile's.
+    agent: harnessDuringLimit(profile.harness),
     workdir: parent.workdir,
     isolation: parent.isolation,
     taskType: parent.taskType,
