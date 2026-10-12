@@ -48,6 +48,7 @@ import { IssuesPage } from "@/components/issues/IssuesPage";
 import { AutopilotDialog } from "@/components/kanban/AutopilotDialog";
 import { VelocityDialog } from "@/components/kanban/VelocityDialog";
 import { NeedsYouBar } from "@/components/kanban/NeedsYouBar";
+import { SystemStrip } from "@/components/kanban/SystemStrip";
 import { BlockedByDialog } from "@/components/kanban/BlockedByDialog";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
@@ -2344,6 +2345,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                     void api.openExternal(url).catch(surfaceError);
                   }}
                 />
+                <SystemStrip tasks={tasks} prs={prs} harnesses={harnesses} onOpen={openTask} onChanged={() => void refresh()} />
                 {onboardingVisibility.showChecklist && tasks.length > 0 && (
                   <div className="px-4 pt-3">
                     <OnboardingChecklist
