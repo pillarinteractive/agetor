@@ -24,6 +24,10 @@ function alive(pid: number): boolean { try { process.kill(pid,0);return true; } 
 const atomic=reservationTransaction;
 export interface OwnerEvidence { cards:Task[]; awaits:AwaitRecord[]; jobs:HeavyJob[]; }
 const evidence=():OwnerEvidence=>({cards:tasks.listLive(),awaits:listAwaits(),jobs:heavyJobs()});
+/** An await that only watches remote work (`ci-wait` polls GitHub CI). It runs
+ * nothing on this machine, so a step parked on it holds no agent slot, no
+ * verification slot and no card-owner place: the wake-up takes those again. */
+export const isRemoteWait=(a:Pick<AwaitRecord,'cmd'>)=>/(^|[\s/])ci-wait(\s|$)/.test(a.cmd);
 const inside=(root:string,value:string)=>value===root||value.startsWith(root+path.sep);
 function ownerForCwd(cwd:string,list:Task[]):string|null {
   if(!cwd)return null;
@@ -39,7 +43,7 @@ function waitingDetached(id:string,isLive:(id:string)=>boolean,ev:OwnerEvidence)
   const owner=t.pipelineParentId??t.id;
   if(ev.jobs.some(j=>jobOwner(j,ev.cards)===owner))return false;
   const outstanding=ev.awaits.filter(a=>!a.finished&&!a.notified&&ownerForCwd(a.cwd,ev.cards)===owner);
-  return outstanding.length>0&&outstanding.every(a=>a.resourceState==='waiting');
+  return outstanding.length>0&&outstanding.every(a=>a.resourceState==='waiting'||isRemoteWait(a));
 }
 /** Every progressing owner, including legacy detached work with no claim.
  * Card identity is independent of roadmap membership, issue state or queue. */
@@ -66,7 +70,7 @@ function owners(isLive:(id:string)=>boolean,claims:Record<string,RunnerClaim>,ev
   }
   for(const id of Object.keys(claims))if(!waitingDetached(id,isLive,ev))result.add(ownerOf(id,claims,ev.cards));
   for(const a of ev.awaits) {
-    if(a.finished||a.notified)continue;
+    if(a.finished||a.notified||isRemoteWait(a))continue;
     const owner=ownerForCwd(a.cwd,ev.cards);if(!owner)continue;
     if(a.resourceState==='waiting'&&!activeHeavy.has(owner))continue;
     result.add(owner);
@@ -154,11 +158,11 @@ function measured(isLive:(id:string)=>boolean, claims:Record<string,RunnerClaim>
   const heavyOwners=new Set([...heavyRepresented].map(id=>ownerOf(id,claims,ev.cards)));
   for(const [id,c]of Object.entries(claims))if(id!==exclude&&!waitingDetached(id,isLive,ev)&&isHeavyStep(c.name,slots))heavyOwners.add(ownerOf(id,claims,ev.cards));
   const detachedOwners=new Set(ev.jobs.map(j=>jobOwner(j,ev.cards)));
-  for(const a of ev.awaits)if(!a.finished&&!a.notified&&a.resourceState!=='waiting') {
+  for(const a of ev.awaits)if(!a.finished&&!a.notified&&a.resourceState!=='waiting'&&!isRemoteWait(a)) {
     const owner=ownerForCwd(a.cwd,ev.cards);if(owner)detachedOwners.add(owner);
   }
   for(const owner of detachedOwners)if(!representedOwners.has(owner))use.total++;
-  for(const a of ev.awaits)if(!a.finished&&!a.notified&&a.resourceState!=='waiting') {
+  for(const a of ev.awaits)if(!a.finished&&!a.notified&&a.resourceState!=='waiting'&&!isRemoteWait(a)) {
     const owner=ownerForCwd(a.cwd,ev.cards);if(!owner||heavyOwners.has(owner))continue;
     const parent=ev.cards.find(t=>t.id===owner),run=parent?.pipelineRun;
     const heavy=/verify_changed\.py|agetor-heavy/.test(a.cmd)||run?.active.some(active=>isHeavyStep(run.snapshot?.graph.steps.find(s=>s.id===active.stepId)?.name??'',slots));
