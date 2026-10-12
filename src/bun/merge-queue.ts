@@ -325,6 +325,7 @@ async function tick(now: number): Promise<void> {
     (e) => !riding.has(e.t.id) && e.t.column === "merge" && !!e.t.branch && trainEligible(e.pr, e.mergeability) && !skipsTrain(e.pr!),
   );
   const eligibleIds = new Set(eligible.map((e) => e.t.id));
+  const leftOut = new Set<string>();
   for (const id of [...readySince.keys()]) if (!eligibleIds.has(id)) readySince.delete(id);
   for (const e of eligible) if (!readySince.has(e.t.id)) readySince.set(e.t.id, now);
   saveReadySince();
@@ -336,8 +337,12 @@ async function tick(now: number): Promise<void> {
     }
     const group = [...groups.values()].sort((x, y) => y.length - x.length)[0] ?? [];
     if (shouldDepart(group.map((e) => readySince.get(e.t.id)!), cfg, now)) {
-      const train = await buildTrain(group.slice(0, cfg.max).map((e) => ({ task: e.t, pr: e.pr! }))).catch(() => null);
+      const candidates = group.slice(0, cfg.max);
+      const train = await buildTrain(candidates.map((e) => ({ task: e.t, pr: e.pr! }))).catch(() => null);
       for (const m of train?.members ?? []) riding.add(m.taskId);
+      // Offered a train and left out of it (it conflicts with the others, or
+      // no train could be built): it has had its wait for company.
+      for (const e of candidates) if (!riding.has(e.t.id)) leftOut.add(e.t.id);
     }
   }
 
@@ -353,7 +358,9 @@ async function tick(now: number): Promise<void> {
         (x) => x.t.id !== e.t.id && !riding.has(x.t.id) && x.t.workdir === e.t.workdir && x.pr!.baseRef === e.pr!.baseRef,
       ).length;
       const waited = now - (readySince.get(e.t.id) ?? now);
-      if (others > 0 || waited < cfg.windowMin * 60_000) {
+      // Two green PRs that conflict with each other can never share a train;
+      // if each kept waiting for the other, neither would ever merge.
+      if (!leftOut.has(e.t.id) && (others > 0 || waited < cfg.windowMin * 60_000)) {
         note(e.t, `Green — waiting up to ${cfg.windowMin} min to merge together with other PRs`, "muted");
         continue;
       }
