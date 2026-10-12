@@ -1,5 +1,5 @@
 import { test, expect, beforeAll, afterEach, afterAll } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -484,6 +484,39 @@ test("the lease watcher's own retry leaves queued cards to the queue, and never 
     preferences.set(LEASE_WATCHERS_PREF, before ?? "[]");
     resetLeaseWatchForTests();
   }
+});
+
+test('an exact registered resource await owns completion, without timed retries or duplicate resumes', async()=>{
+  const {tasks}=await import('./db.ts');
+  const {releaseBlockWaits}=await import('./pipeline-runner.ts');
+  const {AWAITS_DIR,awaitTick}=await import('./awaits.ts');
+  await noJitter();
+  process.env.AGETOR_FAKE_CLAUDE_BLOCKED_REASON='the registered check has not finished';
+  process.env.AGETOR_FAKE_CLAUDE_BLOCKED_WAITING=JSON.stringify({waitingOn:'resource',waitingRef:'registered-check'});
+  const f=await startBuildReview('blocked-then-Review');
+  const run=await blockedRun(f.parentId,parked(0));
+  const childId=run.active[0]!.taskId,turn=run.history[0]!.turnStartedAt??run.history[0]!.startedAt;
+  tasks.update(f.parentId,{worktreePath:f.workdir});
+  tasks.update(childId,{worktreePath:f.workdir});
+  const record=path.join(AWAITS_DIR,'registered-'+randomUUID());
+  mkdirSync(record,{recursive:true});
+  for(const [name,value]of Object.entries({label:'registered-check',cwd:f.workdir,cmd:'synthetic check',
+    started:String(Math.ceil(turn/1000)),pid:String(process.pid),'resource-state':'waiting',log:'synthetic result\n'}))writeFileSync(path.join(record,name),value);
+  const due=run.wait!.at!;
+  expect(await releaseBlockWaits(due)).toBe(0);
+  expect(tasks.get(f.parentId)!.pipelineRun!.wait).toMatchObject({state:'waiting',attempt:0});
+  expect(await awaitTick()).toBe(0);
+  writeFileSync(path.join(record,'exit'),'0');
+  writeFileSync(path.join(record,'resource-state'),'finished');
+  // A completed result also belongs to the notification watcher, not the timer.
+  expect(await releaseBlockWaits(due+30*MIN)).toBe(0);
+  expect(tasks.get(f.parentId)!.pipelineRun!.wait!.attempt).toBe(0);
+  expect(await awaitTick()).toBe(1);
+  expect(existsSync(path.join(record,'notified'))).toBe(true);
+  expect(await awaitTick()).toBe(0);
+  await waitFor(()=>tasks.get(f.parentId)?.pipelineRun?.status==='done');
+  expect(tasks.get(f.parentId)!.pipelineRun!.stepCount).toBe(3);
+  expect(tasks.get(f.parentId)!.pipelineRun!.history[0]!.taskId).toBe(childId);
 });
 
 test("a resume waits for a free step slot like any other step", async () => {

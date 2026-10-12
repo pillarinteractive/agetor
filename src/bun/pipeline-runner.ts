@@ -36,7 +36,7 @@ import { currentSlots, slotDecision, slotUse } from "./step-slots.ts";
 import { reserveRunner, releaseUnspawnedRunner } from './dispatch-claims.ts';
 import { reconcileCardInputs } from './queue-validation.ts';
 import { isPriority, priorityFirst } from "./priority.ts";
-import { awaitsFor } from "./awaits.ts";
+import { awaitsFor, listAwaits, resourceBlockedAwaits } from "./awaits.ts";
 import {HEAVY_INSTRUCTIONS,managedPillarRoot} from './heavy-jobs.ts';
 import { classifyFailure, formatRetryTime, harnessQuotaNotice, isQuotaPaused, nextRetryAt, TRANSIENT_RETRY_MAX, type FailureClass } from "./usage-limit.ts";
 import { listLeases } from "./lease-watch.ts";
@@ -731,6 +731,14 @@ async function refStateCached(project: string, n: number, now: number): Promise<
  *   unknown — nothing watches it (or the watcher failed): the timer decides.
  */
 async function waitTriggerState(parent: Task, w: PipelineBlockWait, now: number): Promise<{ state: "cleared" | "holding" | "unknown"; text: string }> {
+  if(w.category==='resource') {
+    const commands=resourceBlockedAwaits(parent,w.taskId,listAwaits());
+    if(commands.length) {
+      // Await notifications own this transition. A timed retry would spend an
+      // attempt while the same command waits, or race its completion message.
+      return {state:'holding',text:commands.some(a=>!a.finished)?'the registered background commands have not finished':'the registered background results await their completion notification'};
+    }
+  }
   if (w.category === "resource" && w.ref) {
     const lease = leasesOf(parent).find((l) => l.label.toLowerCase() === w.ref!.toLowerCase());
     if (!lease || lease.error) return { state: "unknown", text: "" };

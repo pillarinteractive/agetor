@@ -27,6 +27,8 @@ import { isTaskRunLive, sendInput } from "./orchestrator.ts";
 import { currentSlots, slotDecision, slotUse } from "./step-slots.ts";
 import { isPriority } from "./priority.ts";
 import {installHeavyHelper} from './heavy-jobs.ts';
+import {asksTheOwner} from '../shared/block-wait.ts';
+import {isQuotaPaused} from './usage-limit.ts';
 
 export const AWAITS_DIR = path.join(dataDir, "awaits");
 export const AWAIT_BIN = path.join(dataDir, "bin", "agetor-await");
@@ -250,10 +252,31 @@ export function awaitResultMessage(done: AwaitRecord[], now = Date.now()): strin
  *  started has results it was never told — left alone it would sit until a
  *  person looked. (Each record wakes a step once: `notified`.)
  *
- *  Not `step-blocked`: that is the step saying it is blocked or asking the
+ *  Most `step-blocked`: that is the step saying it is blocked or asking the
  *  owner something, or a usage-limit stop — which the limit's own resume
- *  continues, after which the turn parks on its awaits like any other. */
+ *  continues, after which the turn parks on its awaits like any other.
+ *  A declared queued resource wait bound below to its current await can wake. */
 const WAKEABLE = new Set<string>(["await", "handoff-missing", "handoff-invalid"]);
+
+/** A declared resource wait bound to an actual await from this execution's
+ * current turn. Only the existing automatic wait queue can grant this
+ * notification path; owner/permission holds and older/foreign jobs stay held.
+ * Completion wakes this same step to inspect the result, never approves it. */
+export function resourceBlockedAwaits(parent:Task, taskId:string, all:AwaitRecord[]):AwaitRecord[] {
+  const run=parent.pipelineRun, wait=run?.wait;
+  if(!parent.worktreePath||parent.archivedAt!=null||parent.pendingInteractionCount||run?.status!=='blocked'
+    ||wait?.taskId!==taskId||wait.state!=='waiting'||wait.category!=='resource'||wait.source!=='declared')return [];
+  const active=run.active.find(a=>a.taskId===taskId);
+  const history=active&&run.history.find(h=>h.taskId===taskId&&h.seq===active.seq);
+  const handoff=history?.handoff;
+  if(!history||!handoff||handoff.status!=='blocked'||handoff.waitingOn?.on!=='resource'
+    ||handoff.openQuestions.some(q=>q.trim())||asksTheOwner([handoff.reason,handoff.summary].join('\n')))return [];
+  const mine=awaitsFor(parent.worktreePath,history.turnStartedAt??history.startedAt,all);
+  const ref=handoff.waitingOn.ref;
+  const bound=mine.some(a=>ref===a.id||ref===a.label||handoff.artifacts.some(f=>
+    path.isAbsolute(f)&&path.resolve(f)===path.resolve(a.dir,'log')));
+  return bound?mine:[];
+}
 
 /** Step + await pairs ready to be woken: an active, idle step under a
  *  {@link WAKEABLE} block whose awaits have all finished. Pure over its
@@ -268,14 +291,20 @@ export function readyToWake(
     if (!run || parent.archivedAt != null || !parent.worktreePath) continue;
     const seen = new Set<string>();
     for (const b of run.blocked) {
-      if (!WAKEABLE.has(b.kind) || !b.taskId || !b.stepId || seen.has(b.taskId)) continue;
+      if (!b.taskId || !b.stepId || seen.has(b.taskId)) continue;
+      const resource=b.kind==='step-blocked'?resourceBlockedAwaits(parent,b.taskId,all):[];
+      if (!WAKEABLE.has(b.kind) && resource.length===0) continue;
+      if(resource.length) {
+        const child=list.find(t=>t.id===b.taskId);
+        if(!child||child.archivedAt!=null||child.pendingInteractionCount||child.column==='running')continue;
+      }
       if (b.kind !== "await") {
         // Only the step the run is on, and only while it is idle.
         if (!run.active.some((a) => a.taskId === b.taskId)) continue;
         if (list.find((t) => t.id === b.taskId)?.column === "running") continue;
       }
       const since = run.history.filter((h) => h.taskId === b.taskId).reduce((m, h) => Math.min(m, h.startedAt), Infinity);
-      const mine = awaitsFor(parent.worktreePath, Number.isFinite(since) ? since : 0, all);
+      const mine = resource.length?resource:awaitsFor(parent.worktreePath, Number.isFinite(since) ? since : 0, all);
       if (mine.length && mine.every((a) => a.finished)) {
         seen.add(b.taskId);
         out.push({ parent, stepTaskId: b.taskId, stepId: b.stepId, done: mine });
@@ -291,6 +320,7 @@ export async function awaitTick(now = Date.now()): Promise<number> {
   const all = listAwaits();
   let woke = 0;
   for (const w of readyToWake(tasks.listLive(), all)) {
+    if(isTaskRunLive(w.stepTaskId)||isQuotaPaused(w.stepTaskId))continue;
     const step = w.parent.pipelineRun?.snapshot?.graph.steps.find((s) => s.id === w.stepId);
     if (!isPriority(w.parent.id)) {
       const slots = currentSlots();
