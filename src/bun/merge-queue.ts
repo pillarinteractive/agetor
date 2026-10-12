@@ -23,7 +23,7 @@ import { preferences, tasks } from "./db.ts";
 import { recordActivity } from "./activity.ts";
 import { mergeQueue, setMergeQueued } from "./merge-intent.ts";
 import { hasConfirmedNoPr, openPrDirectly, ownFailures, prAgent, prStatusForTask, PR_FIX_CI_ACTION, PR_REVIEW_ACTION, refreshPrsNow } from "./pr-watch.ts";
-import { getGitHubPullMergeability, mergeGitHubPull, updateGitHubPullBranch } from "./github.ts";
+import { getGitHubPullMergeability, mergeGitHubPull, updateGitHubPullBranch, setGitHubPullDraft } from "./github.ts";
 import { startFollowUp } from "./pipeline-followups.ts";
 
 export const MERGE_METHOD_PREF = "merge_method";
@@ -33,6 +33,7 @@ export const MAX_AUTO_STEPS = 4;
 export type MergeStep =
   | { kind: "wait"; why: string }
   | { kind: "open-pr" }
+  | { kind: "mark-ready" }
   | { kind: "resolve-conflicts" }
   | { kind: "update-branch" }
   | { kind: "fix-ci" }
@@ -56,7 +57,9 @@ export function nextMergeStep(
   }
   if (pr.state === "merged") return { kind: "wait", why: "merged" };
   if (pr.state === "closed") return { kind: "needs-you", why: `PR #${pr.number} was closed without merging` };
-  if (pr.draft) return { kind: "needs-you", why: `PR #${pr.number} is a draft` };
+  // A pipeline card reaches Ready to Merge only once its work is approved, so
+  // a PR its Build step opened as a draft is ready: say so, don't wait for someone.
+  if (pr.draft) return task.pipelineId ? { kind: "mark-ready" } : { kind: "needs-you", why: `PR #${pr.number} is a draft` };
   const followUps = !!task.pipelineId;
   if (mergeability?.mergeable === false || mergeability?.mergeableState === "dirty") {
     return followUps ? { kind: "resolve-conflicts" } : { kind: "needs-you", why: `PR #${pr.number} conflicts with ${pr.baseRef ?? "its base"}` };
@@ -110,7 +113,7 @@ async function take(task: Task, pr: TaskPrStatus | null, step: MergeStep): Promi
   const key = step.kind === "open-pr" ? `${task.id}:open-pr` : `${task.id}:${step.kind}:${pr?.headSha ?? ""}`;
   if (taken.has(key)) return;
   const count = stepCounts.get(task.id) ?? 0;
-  if (step.kind !== "merge" && step.kind !== "update-branch" && count >= MAX_AUTO_STEPS) {
+  if (step.kind !== "merge" && step.kind !== "update-branch" && step.kind !== "mark-ready" && count >= MAX_AUTO_STEPS) {
     note(task, `Left for you: ${MAX_AUTO_STEPS} automatic fix-ups didn't get PR #${pr?.number ?? "?"} green`, "danger");
     return;
   }
@@ -129,6 +132,13 @@ async function take(task: Task, pr: TaskPrStatus | null, step: MergeStep): Promi
       }
       const r = await startFollowUp(task.id, { presetId: "pr" });
       note(task, "error" in r ? `Couldn't open a PR: ${r.error}` : "Opening a PR so it can merge", "error" in r ? "warning" : "info");
+      return;
+    }
+    case "mark-ready": {
+      const r = await setGitHubPullDraft({ dir: task.workdir, number: pr!.number, draft: false });
+      note(task, r.ok ? `Marked PR #${pr!.number} ready for review so it can merge` : `Couldn't mark PR #${pr!.number} ready: ${r.error}`, r.ok ? "info" : "warning");
+      // A failed attempt is tried again on the next pass.
+      if (!r.ok) taken.delete(key);
       return;
     }
     case "resolve-conflicts": {

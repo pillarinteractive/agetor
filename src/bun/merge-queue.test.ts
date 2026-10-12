@@ -43,7 +43,10 @@ test("plain tasks can't run fix-up steps — those need the user", () => {
 
 test("closed or draft PRs need the user", () => {
   expect(nextMergeStep(card(), pr({ state: "closed" }), null).kind).toBe("needs-you");
-  expect(nextMergeStep(card(), pr({ draft: true }), null).kind).toBe("needs-you");
+  // A pipeline's approved card marks its own draft ready; a plain task's draft is the owner's call.
+  expect(nextMergeStep(card(), pr({ draft: true }), null).kind).toBe(card().pipelineId ? "mark-ready" : "needs-you");
+  expect(nextMergeStep(card({ pipelineId: "p1" }), pr({ draft: true }), null).kind).toBe("mark-ready");
+  expect(nextMergeStep(card({ pipelineId: null }), pr({ draft: true }), null).kind).toBe("needs-you");
 });
 
 test("no PR status because the lookup failed isn't 'no PR' — it waits instead of opening another", () => {
