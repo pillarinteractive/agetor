@@ -112,6 +112,23 @@ export function waitGroups(tasks: Task[], prs: ReadonlyMap<string, TaskPrStatus>
   return ORDER.filter((cause) => byCause.has(cause)).map((cause) => ({ cause, ...GROUPS[cause], cards: byCause.get(cause)! }));
 }
 
+/** Red or yellow: a cause that stays until someone acts, or one that clears by itself. */
+export type WaitLevel = "blocked" | "waiting";
+const SELF_CLEARING: ReadonlySet<WaitCause> = new Set(["limit", "slot", "ci", "command"]);
+export const levelOf = (cause: WaitCause): WaitLevel => (SELF_CLEARING.has(cause) ? "waiting" : "blocked");
+
+/** The board in one light: red when any card is blocked, yellow when cards are
+ *  only waiting on something that clears by itself, green otherwise. */
+export function boardSignal(groups: WaitGroup[]): { level: "good" | WaitLevel; blocked: number; waiting: number } {
+  let blocked = 0;
+  let waiting = 0;
+  for (const g of groups) {
+    if (levelOf(g.cause) === "blocked") blocked += g.cards.length;
+    else waiting += g.cards.length;
+  }
+  return { level: blocked > 0 ? "blocked" : waiting > 0 ? "waiting" : "good", blocked, waiting };
+}
+
 export interface BoardHealth {
   /** Steps with an agent working right now. */
   working: number;

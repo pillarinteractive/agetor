@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { boardHealth, waitGroups } from "./board-health.ts";
+import { boardHealth, boardSignal, levelOf, waitGroups } from "./board-health.ts";
 import type { PipelineBlock, Task, TaskPrStatus } from "../../shared/types.ts";
 
 const STEPS = [{ id: "build", name: "Build" }, { id: "review", name: "Review" }, { id: "finish", name: "Finish" }];
@@ -138,5 +138,26 @@ describe("boardHealth", () => {
     expect(boardHealth([], NONE, limited, at, label).fallback).toBeNull();
     const noBackup = { ...limited, quota_fallback: JSON.stringify({ enabled: false, harness: "claude-deepseek" }) };
     expect(boardHealth([], NONE, noBackup, at - 1, label).fallback!.startsWith("Claude Code at its limit until ")).toBe(true);
+  });
+});
+
+describe("boardSignal", () => {
+  test("green with nothing waiting, yellow when everything clears by itself, red once a card is blocked", () => {
+    expect(boardSignal([])).toEqual({ level: "good", blocked: 0, waiting: 0 });
+    const waiting = [
+      ...card("running", [{ kind: "await", message: 'Build is waiting on "ci" — wakes when it finishes' }]),
+      ...card("running", [{ kind: "slot-wait", message: "Finish is waiting for a slot — 6 of 6 in use" }]),
+      ...card("blocked", [{ kind: "step-failed", message: 'step "Understand" hit a usage limit — Usage limit reached' }]),
+    ];
+    expect(boardSignal(waitGroups(waiting, NONE))).toEqual({ level: "waiting", blocked: 0, waiting: 3 });
+    const blocked = [...waiting, ...card("blocked", [{ kind: "handoff-missing", message: "no handoff" }])];
+    expect(boardSignal(waitGroups(blocked, NONE))).toEqual({ level: "blocked", blocked: 1, waiting: 3 });
+  });
+
+  test("only causes that clear by themselves are yellow", () => {
+    const yellow = (["limit", "slot", "ci", "command"] as const).map(levelOf);
+    const red = (["you", "failed", "no-handoff", "step-cap", "base", "blocked"] as const).map(levelOf);
+    expect(new Set(yellow)).toEqual(new Set(["waiting"]));
+    expect(new Set(red)).toEqual(new Set(["blocked"]));
   });
 });

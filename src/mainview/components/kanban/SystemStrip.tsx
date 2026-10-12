@@ -2,12 +2,22 @@ import { useEffect, useMemo, useState } from "react";
 import { ChevronDown } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { Button } from "@/components/ui/button";
-import { boardHealth, waitGroups, type WaitGroup, type WaitingCard } from "@/lib/board-health";
+import { boardHealth, boardSignal, levelOf, waitGroups, type WaitGroup, type WaitingCard } from "@/lib/board-health";
 import { cn } from "@/lib/utils";
 import type { Harness, Task, TaskPrStatus } from "../../../shared/types.ts";
 
 /** Cards named inline per group before the rest fold into "+N". */
 const INLINE_CARDS = 8;
+
+const DOT = {
+  good: "bg-emerald-500",
+  waiting: "bg-amber-400",
+  blocked: "bg-red-500",
+} as const;
+
+function Dot({ level }: { level: keyof typeof DOT }) {
+  return <span aria-hidden className={cn("inline-block size-2 shrink-0 rounded-full", DOT[level])} />;
+}
 
 /** "Issue #1265: Maintain…" → "#1265"; anything else keeps the start of its title. */
 function shortName(task: Task): string {
@@ -17,25 +27,15 @@ function shortName(task: Task): string {
   return title.length > 24 ? `${title.slice(0, 23)}…` : title;
 }
 
-function Stat({ label, value, note, tone, title }: { label: string; value: string; note?: string | null; tone?: "warning"; title?: string }) {
-  return (
-    <span className="flex items-baseline gap-1.5 whitespace-nowrap" title={title}>
-      <span className="text-muted-foreground">{label}</span>
-      <span className={cn("font-medium tabular-nums", tone === "warning" && "text-warning")}>{value}</span>
-      {note && <span className="max-w-[28ch] truncate text-muted-foreground">{note}</span>}
-    </span>
-  );
-}
-
 /**
- * The board's own status in one row — agents working, cards on CI against the
- * cap, the queue and why it is not moving, a failing base branch, a usage
- * limit and its backup — and, on demand, every card that is not moving grouped
- * by what it waits on, with the one action that clears a group.
+ * The board in one light: green when nothing is held up, yellow when cards are
+ * only waiting on something that clears by itself (CI, a free place, a usage
+ * limit, a background command), red when a card stays put until someone acts.
+ * The counts open a list of the causes, each with its cards and, where there
+ * is one, the action that clears the whole group.
  *
- * A card says why it waits on its own status line; this says it once for all
- * of them. Built from the board's cards and PR statuses (`board-health.ts`),
- * plus the preferences that hold the caps.
+ * Built from the board's cards and PR statuses (`board-health.ts`), plus the
+ * preferences that hold the caps (shown in the tooltip).
  */
 export function SystemStrip({
   tasks,
@@ -69,13 +69,14 @@ export function SystemStrip({
   }, []);
 
   const groups = useMemo(() => waitGroups(tasks, prs), [tasks, prs]);
+  const signal = useMemo(() => boardSignal(groups), [groups]);
   const health = useMemo(() => {
     const label = (id: string) => harnesses.find((h) => h.id === id)?.label ?? id;
     return boardHealth(tasks, prs, preferences, Date.now(), label);
   }, [tasks, prs, preferences, harnesses]);
-  const waiting = groups.reduce((sum, g) => sum + g.cards.length, 0);
 
-  if (waiting === 0 && health.working === 0 && !health.fallback) return null;
+  // Nothing running and nothing held up: no light to show.
+  if (signal.level === "good" && health.working === 0) return null;
 
   const retryAll = async (group: WaitGroup) => {
     setBusy(group.cause);
@@ -94,58 +95,61 @@ export function SystemStrip({
     onChanged();
   };
 
-  const ciFull = health.onCi >= health.ciCap;
+  // The numbers behind the light, for anyone who hovers.
+  const numbers = [
+    `${health.working} of ${health.agentCap} agents working`,
+    `${health.onCi} of ${health.ciCap} cards on CI${health.onCi >= health.ciCap ? " (at the cap: no new step starts)" : ""}`,
+    health.queued > 0 ? `${health.queued} queued${health.queuedWhy ? `: ${health.queuedWhy}` : ""}` : null,
+    health.baseFailing,
+    health.fallback,
+  ]
+    .filter(Boolean)
+    .join("\n");
+  const held = signal.blocked + signal.waiting;
+
   return (
-    <section data-testid="system-strip" aria-label="Board status" className="mx-4 mt-3 rounded-md border border-border bg-muted/30 text-xs">
-      <div className="flex flex-wrap items-center gap-x-5 gap-y-1 px-3 py-1.5">
-        <Stat label="Agents" value={`${health.working}/${health.agentCap}`} note="working" title="Steps with an agent working now, of the most allowed at once" />
-        <Stat
-          label="On CI"
-          value={`${health.onCi}/${health.ciCap}`}
-          tone={ciFull ? "warning" : undefined}
-          note={ciFull ? "at the cap: no new step starts" : null}
-          title="Cards waiting for GitHub CI, against the cap. At the cap, cards not already on CI start no further step."
-        />
-        {health.queued > 0 && <Stat label="Queued" value={String(health.queued)} note={health.queuedWhy} title={health.queuedWhy ?? undefined} />}
-        {health.baseFailing && (
-          <span data-testid="system-strip-base" className="max-w-[44ch] truncate font-medium text-warning" title={health.baseFailing}>
-            {health.baseFailing}
+    <section data-testid="system-strip" data-level={signal.level} aria-label="Board status" className="mx-4 mt-3 rounded-md border border-border bg-muted/30 text-xs">
+      <button
+        type="button"
+        data-testid="system-strip-toggle"
+        aria-expanded={held > 0 ? open : undefined}
+        aria-controls={held > 0 ? "system-strip-waiting" : undefined}
+        disabled={held === 0}
+        onClick={() => setOpen((v) => !v)}
+        title={numbers}
+        className="flex w-full items-center gap-4 rounded-md px-3 py-1.5 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-default"
+      >
+        {signal.level === "good" && (
+          <span className="flex items-center gap-1.5">
+            <Dot level="good" />
+            All good
           </span>
         )}
-        {health.fallback && (
-          <span data-testid="system-strip-fallback" className="max-w-[52ch] truncate text-info" title={health.fallback}>
-            {health.fallback}
+        {signal.blocked > 0 && (
+          <span className="flex items-center gap-1.5">
+            <Dot level="blocked" />
+            <span className="font-medium tabular-nums">{signal.blocked}</span> blocked
           </span>
         )}
-        {waiting > 0 && (
-          <button
-            type="button"
-            data-testid="system-strip-toggle"
-            aria-expanded={open}
-            aria-controls="system-strip-waiting"
-            onClick={() => setOpen((v) => !v)}
-            className="ml-auto flex items-center gap-1 rounded px-1 py-0.5 text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            <span>
-              Waiting <span className="font-medium tabular-nums text-foreground">{waiting}</span>
-              {health.needsYou > 0 && <span className="text-warning"> · {health.needsYou} on you</span>}
-            </span>
-            <ChevronDown className={cn("size-3 transition-transform", open && "rotate-180")} aria-hidden />
-          </button>
+        {signal.waiting > 0 && (
+          <span className="flex items-center gap-1.5">
+            <Dot level="waiting" />
+            <span className="font-medium tabular-nums">{signal.waiting}</span> waiting
+          </span>
         )}
-      </div>
-      {open && waiting > 0 && (
+        {held > 0 && <ChevronDown className={cn("ml-auto size-3 text-muted-foreground transition-transform", open && "rotate-180")} aria-hidden />}
+      </button>
+      {open && held > 0 && (
         <div id="system-strip-waiting" data-testid="system-strip-waiting" className="border-t border-border px-3 py-2">
           <ul className="flex flex-col gap-1.5">
             {groups.map((group) => (
-              <li key={group.cause} data-testid="wait-group" data-cause={group.cause} className="flex items-start gap-3">
-                <div className="w-52 shrink-0">
-                  <div className={cn("font-medium", group.cause === "you" && "text-warning")}>
-                    {group.title} <span className="tabular-nums text-muted-foreground">· {group.cards.length}</span>
-                  </div>
-                  <div className="text-[11px] text-muted-foreground">{group.clears}</div>
-                </div>
-                <div className="flex min-w-0 flex-1 flex-wrap gap-x-2 gap-y-0.5 pt-px">
+              <li key={group.cause} data-testid="wait-group" data-cause={group.cause} className="flex items-center gap-3" title={group.clears}>
+                <span className="flex w-56 shrink-0 items-center gap-1.5">
+                  <Dot level={levelOf(group.cause)} />
+                  <span className="truncate">{group.title}</span>
+                  <span className="tabular-nums text-muted-foreground">{group.cards.length}</span>
+                </span>
+                <span className="flex min-w-0 flex-1 flex-wrap gap-x-2 gap-y-0.5">
                   {group.cards.slice(0, INLINE_CARDS).map((card: WaitingCard) => (
                     <button
                       key={card.task.id}
@@ -156,11 +160,10 @@ export function SystemStrip({
                       className="rounded px-0.5 tabular-nums hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
                     >
                       {shortName(card.task)}
-                      {card.step && <span className="text-muted-foreground"> {card.step}</span>}
                     </button>
                   ))}
                   {group.cards.length > INLINE_CARDS && <span className="text-muted-foreground">+{group.cards.length - INLINE_CARDS}</span>}
-                </div>
+                </span>
                 {group.action === "retry" && (
                   <Button
                     type="button"
@@ -183,7 +186,7 @@ export function SystemStrip({
                     onClick={() => onOpen(group.cards[0]!.task)}
                     className="h-6 shrink-0 px-2 text-[11px]"
                   >
-                    {group.cards.length === 1 ? "Open" : "Open first"}
+                    Open
                   </Button>
                 )}
               </li>
