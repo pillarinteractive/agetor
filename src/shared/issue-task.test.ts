@@ -547,7 +547,7 @@ describe("buildIssueTaskPrompt", () => {
     expect(prompt).toContain("reproduce it");
     expect(prompt).toContain("Implement the fix or change the issue asks for, add or adjust tests");
     expect(prompt).toContain("Fixes #7");
-    expect(prompt).toContain("Do not push");
+    expect(prompt).toContain("Never push to the base branch");
     expect(prompt).toContain("saved as `issue-7-thread.md`");
     expect(prompt).toContain(
       "To re-fetch the live thread later, run: `gh issue view 7 --repo acme/widgets --comments`",

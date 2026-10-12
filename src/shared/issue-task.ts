@@ -409,7 +409,8 @@ export function buildIssueTaskPrompt(
   );
   paragraphs.push(
     `Commit locally with a clear message that includes "${commitReferencePhrase(provider, number)}". `
-      + "Do not push. Leave the commit local — the user will review and push it themselves.",
+      + "Push only this task's own branch, and only when your step's instructions ask for it (for example to verify in CI). "
+      + "Never push to the base branch, and never merge.",
   );
   if (snapshotAttached) {
     paragraphs.push(snapshotParagraph(number, comments.length, truncated, commentsError));

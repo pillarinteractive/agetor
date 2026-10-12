@@ -2006,7 +2006,7 @@ async function launchStep(
   const managedRoot=managedPillarRoot(parent.worktreePath??parent.workdir);
   const approvalNote=step.name==='Review'
     ? `\n\nAutomatic sign-off requires explicit independent approval of this exact head and all issue acceptance. Map every acceptance criterion to checked evidence in your summary. In the handoff add "reviewApproval":{"verdict":"approved"|"changes-requested","headSha":"<full 40-character git rev-parse HEAD>","issueUrl":${JSON.stringify(parent.issueUrl??'')},"acceptanceComplete":true|false,"findings":[]}. Only use approved/true/empty findings when all required criteria are met and no finding remains. Otherwise record all findings, set changes-requested/false and choose Build. A succeeded/done review turn or Finish choice is not approval.`
-    :step.name==='Finish'?`\n\nPublish only the exact independently approved head. A change to reviewed code or a different head requires Build/Review again; passing verification alone is not independent approval.`:'';
+    :step.name==='Finish'?`\n\nPublish only the exact independently approved head: do not merge, rebase or amend the branch in this step (GitHub CI already tests the pull request merged with its base). A change to reviewed code or a different head requires Build/Review again; passing verification alone is not independent approval.`:'';
   const withMachineCapacity=(prompt:string)=>managedRoot
     ? `${prompt}\n\n## Machine test capacity\n${HEAVY_INSTRUCTIONS}${approvalNote}`:prompt;
   let composed = withMachineCapacity(withSync(withRouting(withDecisions(composeStepPrompt({ ...composeArgs, inlineHandoff: true })))));
