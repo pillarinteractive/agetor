@@ -52,6 +52,49 @@ test('resource notification requires current execution, exact binding, same work
   expect(readyToWake([f.parent,f.child],[f.job])).toEqual([]);
 });
 
+test('declared resource wakes exclude prior-turn receipts even inside the legacy five-second window',()=>{
+  const f=fixture();
+  const history=f.parent.pipelineRun!.history[1]!;
+  for(const offset of [-4000,-1000,-1]) {
+    expect(readyToWake([f.parent,f.child],[{...f.job,startedAt:history.turnStartedAt!+offset}])).toEqual([]);
+  }
+  // A seconds-only timestamp in the turn's first second cannot prove ownership.
+  history.turnStartedAt=2_000_492;
+  expect(readyToWake([f.parent,f.child],[{...f.job,startedAt:2_000_000}])).toEqual([]);
+  expect(readyToWake([f.parent,f.child],[{...f.job,startedAt:2_001_000}])).toHaveLength(1);
+});
+
+test('explicit foreign, stale or conflicting job references cannot be satisfied by an unrelated local log',()=>{
+  const f=fixture();
+  const foreign={...f.job,id:'foreign-job',label:'foreign check',dir:'/synthetic/awaits/foreign-job',cwd:'/synthetic/foreign',finished:false,exitCode:null};
+  f.handoff.waitingOn.ref=foreign.id;f.parent.pipelineRun!.wait!.ref=foreign.id;
+  expect(readyToWake([f.parent,f.child],[f.job,foreign])).toEqual([]);
+  f.handoff.waitingOn.ref=foreign.label;f.parent.pipelineRun!.wait!.ref=foreign.label;
+  expect(readyToWake([f.parent,f.child],[f.job,foreign])).toEqual([]);
+  // A local label that happens to equal the foreign ID cannot shadow it.
+  f.handoff.waitingOn.ref=foreign.id;f.parent.pipelineRun!.wait!.ref=foreign.id;
+  expect(readyToWake([f.parent,f.child],[{...f.job,label:foreign.id},foreign])).toEqual([]);
+  f.handoff.waitingOn.ref='missing-job';f.parent.pipelineRun!.wait!.ref='missing-job';
+  expect(readyToWake([f.parent,f.child],[f.job])).toEqual([]);
+  f.handoff.waitingOn.ref=f.job.id;f.parent.pipelineRun!.wait!.ref=foreign.id;
+  expect(readyToWake([f.parent,f.child],[f.job,foreign])).toEqual([]);
+  const stale={...foreign,cwd:f.job.cwd,startedAt:1_500_000,finished:true,exitCode:0};
+  f.handoff.waitingOn.ref=stale.id;f.parent.pipelineRun!.wait!.ref=stale.id;
+  expect(readyToWake([f.parent,f.child],[f.job,stale])).toEqual([]);
+});
+
+test('job id and scoped label can bind the same receipt; log fallback requires absent explicit references',()=>{
+  const f=fixture();
+  f.handoff.waitingOn.ref=f.job.id;f.parent.pipelineRun!.wait!.ref=f.job.label;
+  expect(readyToWake([f.parent,f.child],[f.job])).toHaveLength(1);
+  delete (f.handoff.waitingOn as {ref?:string}).ref;f.parent.pipelineRun!.wait!.ref=null;
+  expect(readyToWake([f.parent,f.child],[f.job])).toHaveLength(1);
+  // Labels are scoped to the current turn/worktree; another card can reuse one.
+  const elsewhere={...f.job,id:'elsewhere',cwd:'/synthetic/elsewhere'};
+  f.handoff.waitingOn.ref=f.job.label;f.parent.pipelineRun!.wait!.ref=f.job.label;
+  expect(readyToWake([f.parent,f.child],[f.job,elsewhere])).toHaveLength(1);
+});
+
 test('owner requests, permissions, cancelled runs, and live children remain held',()=>{
   for (const change of ['question','permission','owner','interaction','cancelled','running','escalated','unclassified'] as const) {
     const f=fixture();

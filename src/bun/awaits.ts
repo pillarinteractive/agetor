@@ -21,7 +21,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type { PipelineRunState, Task } from "../shared/types.ts";
-import { dataDir, tasks } from "./db.ts";
+import { dataDir, runs, tasks } from "./db.ts";
 import { recordActivity } from "./activity.ts";
 import { isTaskRunLive, sendInput } from "./orchestrator.ts";
 import { currentSlots, slotDecision, slotUse } from "./step-slots.ts";
@@ -271,10 +271,32 @@ export function resourceBlockedAwaits(parent:Task, taskId:string, all:AwaitRecor
   const handoff=history?.handoff;
   if(!history||!handoff||handoff.status!=='blocked'||handoff.waitingOn?.on!=='resource'
     ||handoff.openQuestions.some(q=>q.trim())||asksTheOwner([handoff.reason,handoff.summary].join('\n')))return [];
-  const mine=awaitsFor(parent.worktreePath,history.turnStartedAt??history.startedAt,all);
-  const ref=handoff.waitingOn.ref;
-  const bound=mine.some(a=>ref===a.id||ref===a.label||handoff.artifacts.some(f=>
-    path.isAbsolute(f)&&path.resolve(f)===path.resolve(a.dir,'log')));
+  // The general await lookup allows a five-second launch grace. A declared
+  // resource wake must instead prove this turn: second-resolution receipts
+  // earlier than its precise start (including the ambiguous first second)
+  // cannot establish ownership of the new turn.
+  const since=history.turnStartedAt??history.startedAt;
+  const mine=all.filter(a=>!a.notified&&a.startedAt>=since&&samePath(a.cwd,parent.worktreePath!));
+  const refs=[handoff.waitingOn.ref,wait.ref].filter((r):r is string=>!!r);
+  let bound=false;
+  if(refs.length) {
+    let identity:AwaitRecord|undefined;
+    for(const ref of refs) {
+      // IDs/log paths name global receipts; never let a local artifact or
+      // reused label override a known foreign/stale exact identity.
+      const exact=all.filter(a=>a.id===ref||path.isAbsolute(ref)&&
+        (path.resolve(ref)===path.resolve(a.dir)||path.resolve(ref)===path.resolve(a.dir,'log')));
+      const matches=exact.length?exact:mine.filter(a=>a.label===ref);
+      const receipt=matches.length===1?matches[0]:undefined;
+      if(!receipt||!mine.includes(receipt)||identity&&identity!==receipt)return [];
+      identity=receipt;
+    }
+    bound=identity!=null;
+  } else {
+    // With no explicit reference, an exact current-turn log can bind the
+    // await. Unresolved/conflicting explicit references never fall back.
+    bound=mine.some(a=>handoff.artifacts.some(f=>path.isAbsolute(f)&&path.resolve(f)===path.resolve(a.dir,'log')));
+  }
   return bound?mine:[];
 }
 
@@ -316,24 +338,50 @@ export function readyToWake(
 
 /** One pass: wake every step whose awaits all finished (when a slot allows),
  *  and sweep old records. Exported for tests. */
+const notificationClaims=new Set<string>();
+
 export async function awaitTick(now = Date.now()): Promise<number> {
   const all = listAwaits();
+  const initial=tasks.listLive();
   let woke = 0;
-  for (const w of readyToWake(tasks.listLive(), all)) {
-    if(isTaskRunLive(w.stepTaskId)||isQuotaPaused(w.stepTaskId))continue;
-    const step = w.parent.pipelineRun?.snapshot?.graph.steps.find((s) => s.id === w.stepId);
-    if (!isPriority(w.parent.id)) {
-      const slots = currentSlots();
-      if (!slotDecision(step?.name ?? "", slotUse(isTaskRunLive, slots), slots).ok) continue;
+  for (const candidate of readyToWake(initial, all)) {
+    const originalChild=initial.find(t=>t.id===candidate.stepTaskId);
+    const originalActive=candidate.parent.pipelineRun?.active.find(a=>a.taskId===candidate.stepTaskId);
+    const originalHistory=originalActive&&candidate.parent.pipelineRun?.history.find(h=>h.taskId===candidate.stepTaskId&&h.seq===originalActive.seq);
+    if(!originalChild?.runId||!originalActive||!originalHistory||notificationClaims.has(candidate.stepTaskId))continue;
+    // Per-child claims deduplicate overlapping ticks without holding the
+    // parent lock through a slow spawn; Stop and new owner holds stay free.
+    notificationClaims.add(candidate.stepTaskId);
+    try {
+      // Earlier sends yield. Re-read the wait, current execution, exact run
+      // and receipts immediately before this dispatch, never use its cached
+      // eligibility or write a notified marker for a replaced execution.
+      const parent=tasks.get(candidate.parent.id),child=tasks.get(candidate.stepTaskId);
+      if(!parent||!child||parent.pipelineRun?.status==='cancelled'||parent.archivedAt!=null
+        ||child.archivedAt!=null||parent.pendingInteractionCount||child.pendingInteractionCount
+        ||child.runId!==originalChild.runId||isTaskRunLive(child.id)||isQuotaPaused(child.id))continue;
+      const active=parent.pipelineRun?.active.find(a=>a.taskId===child.id);
+      const history=active&&parent.pipelineRun?.history.find(h=>h.taskId===child.id&&h.seq===active.seq);
+      const receipt=runs.get(originalChild.runId);
+      if(!active||!history||active.seq!==originalActive.seq||active.stepId!==candidate.stepId
+        ||(history.turnStartedAt??history.startedAt)!==(originalHistory.turnStartedAt??originalHistory.startedAt)
+        ||!receipt||receipt.taskId!==child.id||!['succeeded','failed'].includes(receipt.status))continue;
+      const w=readyToWake([parent,child],listAwaits()).find(w=>w.parent.id===parent.id&&w.stepTaskId===child.id&&w.stepId===candidate.stepId);
+      if(!w)continue;
+      const step = w.parent.pipelineRun?.snapshot?.graph.steps.find((s) => s.id === w.stepId);
+      if (!isPriority(w.parent.id)) {
+        const slots = currentSlots();
+        if (!slotDecision(step?.name ?? "", slotUse(isTaskRunLive, slots), slots).ok) continue;
+      }
+      const sent = await sendInput(originalChild.runId, awaitResultMessage(w.done, now)).catch((e: Error) => ({ delivered: false, reason: e.message }));
+      if (!sent.delivered) continue;
+      for (const a of w.done) writeFileSync(path.join(a.dir, "notified"), String(now));
+      const what = w.done.map((a) => `"${a.label}" ${a.exitCode === 0 ? "passed" : a.exitCode == null ? "stopped" : `failed (exit ${a.exitCode})`}`).join(", ");
+      recordActivity(w.parent.id, { kind: "auto", text: `${what} — woke ${step?.name ?? "the step"} to carry on`, tone: w.done.every((a) => a.exitCode === 0) ? "success" : "warning" });
+      woke++;
+    } finally {
+      notificationClaims.delete(candidate.stepTaskId);
     }
-    const runId = tasks.get(w.stepTaskId)?.runId;
-    if (!runId) continue;
-    const sent = await sendInput(runId, awaitResultMessage(w.done, now)).catch((e: Error) => ({ delivered: false, reason: e.message }));
-    if (!sent.delivered) continue;
-    for (const a of w.done) writeFileSync(path.join(a.dir, "notified"), String(now));
-    const what = w.done.map((a) => `"${a.label}" ${a.exitCode === 0 ? "passed" : a.exitCode == null ? "stopped" : `failed (exit ${a.exitCode})`}`).join(", ");
-    recordActivity(w.parent.id, { kind: "auto", text: `${what} — woke ${step?.name ?? "the step"} to carry on`, tone: w.done.every((a) => a.exitCode === 0) ? "success" : "warning" });
-    woke++;
   }
   for (const a of all) {
     if (a.finished && now - a.startedAt > KEEP_MS) rmSync(a.dir, { recursive: true, force: true });
