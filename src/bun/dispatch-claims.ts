@@ -50,7 +50,15 @@ function owners(isLive:(id:string)=>boolean,claims:Record<string,RunnerClaim>,ev
     const r=t.runId?runs.get(t.runId):null;
     if(isLive(t.id)||r?.status==='running'||r?.status==='orphaned')result.add(t.pipelineParentId??t.id);
     if(!t.pipelineParentId&&t.pipelineRun?.status==='running') {
-      const queuedOnly=t.pipelineRun.active.length===0&&t.pipelineRun.blocked.length>0&&t.pipelineRun.blocked.every(b=>b.kind==='slot-wait');
+      // Existing-child retries retain `active` while waiting for admission.
+      // A terminal idle child is not a busy owner. Live/uncertain runs,
+      // accepted reservations and detached jobs still count via their own
+      // evidence below; never infer absence from the queue label alone.
+      const queuedOnly=t.pipelineRun.blocked.length>0&&t.pipelineRun.blocked.every(b=>b.kind==='slot-wait')
+        &&t.pipelineRun.active.every(a=>{
+          const child=ev.cards.find(c=>c.id===a.taskId),receipt=child?.runId?runs.get(child.runId):null;
+          return !!child&&!isLive(a.taskId)&&(!child.runId||!!receipt&&['succeeded','failed','cancelled'].includes(receipt.status));
+        });
       const onlyAwait=t.pipelineRun.blocked.length>0&&t.pipelineRun.blocked.every(b=>b.kind==='await');
       const waitingOnly=onlyAwait&&!activeHeavy.has(t.id)&&t.pipelineRun.active.every(a=>!isLive(a.taskId)&&!['running','orphaned'].includes(runs.get(ev.cards.find(c=>c.id===a.taskId)?.runId??'')?.status??''));
       if(!waitingOnly&&!queuedOnly)result.add(t.id);
