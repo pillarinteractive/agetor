@@ -209,7 +209,11 @@ export function reserveRunner(taskId:string,name:string,isLive:(id:string)=>bool
     // Cards already parked on GitHub CI. At the cap, a card not yet among
     // them starts no further step: each new step ends in another push.
     const onCi=new Set(ev.awaits.filter(a=>!a.finished&&!a.notified&&isRemoteWait(a)).map(a=>ownerForCwd(a.cwd,ev.cards)).filter((o):o is string=>!!o));
-    if(ciGated(name,slots)&&!onCi.has(owner)&&onCi.size>=ciSlots(slots).max){preferences.set(RUNNER_PREF,JSON.stringify(claims));return {error:`waiting for a slot — ${onCi.size} of ${ciSlots(slots).max} cards are waiting on CI`};}
+    // A turn on a step that has already run (a wake-up, an owner's answer, a
+    // retry) is not a new start: holding it back would leave a blocked card
+    // unable to receive the reply that unblocks it.
+    const continuing=!!tasks.get(taskId)?.runId;
+    if(!continuing&&ciGated(name,slots)&&!onCi.has(owner)&&onCi.size>=ciSlots(slots).max){preferences.set(RUNNER_PREF,JSON.stringify(claims));return {error:`waiting for a slot — ${onCi.size} of ${ciSlots(slots).max} cards are waiting on CI`};}
     const decision=slotDecision(name,use,slots);
     if(!decision.ok){preferences.set(RUNNER_PREF,JSON.stringify(claims));return {error:decision.why};}
     claims[taskId]={taskId,ownerId:owner,runId:null,pid:process.pid,at:Date.now(),name};preferences.set(RUNNER_PREF,JSON.stringify(claims));return {ok:true};

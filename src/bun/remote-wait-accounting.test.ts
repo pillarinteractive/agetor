@@ -123,6 +123,9 @@ test('at the CI cap a new card starts no further step, except the exempt ones', 
   };
   const build = fresh();
   expect(reserveRunner(build.child.id, 'Build', () => false, build.parent.id, ev)).toEqual({ error: 'waiting for a slot — 6 of 6 cards are waiting on CI' });
+  // The same card's step, once it has run, may take a further turn (an owner's answer, a wake-up).
+  receipt(build.child.id, 'succeeded');
+  expect(reserveRunner(build.child.id, 'Build', () => false, build.parent.id, ev)).toEqual({ ok: true });
   const plan = fresh();
   expect(reserveRunner(plan.child.id, 'Understand', () => false, plan.parent.id, ev)).toEqual({ ok: true });
   // A card already waiting on CI may start its next step (its wake-up, a retry).
