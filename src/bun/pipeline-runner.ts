@@ -98,6 +98,8 @@ import {
   normalizeHandoff,
   reviewRequiresRepair,
   outgoingSteps,
+  capWrapUpStep,
+  capWrapUpSection,
   renderHandoffFile,
   renderReportFile,
   resolveNextSteps,
@@ -1844,7 +1846,33 @@ async function launchStep(
       tone: "warning",
     });
   }
-  if (run.stepCount >= effectiveStepCap(run)) {
+  // Out of extensions, an unattended run is finished once through its
+  // terminal step, which files issues for what is unresolved, instead of
+  // waiting for someone (`run.capWrapUp`). The mark has no `seq` until that
+  // step's task exists, so a wrap-up that queued for a slot or threw before
+  // the insert comes back through here and is let past the cap again.
+  let wrapUp = false;
+  if (
+    run.stepCount >= effectiveStepCap(run) &&
+    snapshot.decisionPolicy === "planner-recommendation" &&
+    run.capWrapUp?.seq === undefined
+  ) {
+    const terminal = capWrapUpStep(snapshot.graph);
+    const mine = !run.capWrapUp || step.id === terminal?.id || step.id === run.capWrapUp.fromStepId;
+    if (terminal && mine && !run.active.some((a) => a.stepId === terminal.id)) {
+      if (!run.capWrapUp) {
+        run.capWrapUp = { at: Date.now(), fromStepId: step.id };
+        recordActivity(parent.id, {
+          kind: "step",
+          text: `Reached the ${effectiveStepCap(run)}-step cap — finishing through ${terminal.name} and filing issues for what is unresolved`,
+          tone: "warning",
+        });
+      }
+      step = terminal;
+      wrapUp = true;
+    }
+  }
+  if (!wrapUp && run.stepCount >= effectiveStepCap(run)) {
     upsertBlocked(run, {
       taskId: null,
       stepId: step.id,
@@ -2002,7 +2030,8 @@ async function launchStep(
     pipelineName: run.pipelineName,
     step,
     stepIndex: seq,
-    stepCap: effectiveStepCap(run),
+    // The wrap-up execution is the one step past the cap.
+    stepCap: Math.max(effectiveStepCap(run), seq),
     goal: parent.prompt,
     previous: previousWithFiles,
     outgoing,
@@ -2032,7 +2061,11 @@ async function launchStep(
     :step.name==='Finish'?`\n\nPublish only the exact independently approved head: do not merge, rebase or amend the branch in this step (GitHub CI already tests the pull request merged with its base). A change to reviewed code or a different head requires Build/Review again; passing verification alone is not independent approval.`:'';
   const withMachineCapacity=(prompt:string)=>managedRoot
     ? `${prompt}\n\n## Machine test capacity\n${HEAVY_INSTRUCTIONS}${approvalNote}`:prompt;
-  let composed = withMachineCapacity(withSync(withRouting(withDecisions(composeStepPrompt({ ...composeArgs, inlineHandoff: true })))));
+  // Last, so nothing after it reads as taking the wrap-up back.
+  const withWrapUp = (prompt: string) => wrapUp
+    ? `${prompt}\n\n${capWrapUpSection({ stepCap: effectiveStepCap(run), issueUrl: parent.issueUrl, prUrl: parent.prUrl })}`
+    : prompt;
+  let composed = withWrapUp(withMachineCapacity(withSync(withRouting(withDecisions(composeStepPrompt({ ...composeArgs, inlineHandoff: true }))))));
   if(inputReconciliation.note)composed+=`\n\n${inputReconciliation.note}`;
   // m12/D10: measure the SAME wrapping `startTaskInner` will actually launch
   // with — `composeLaunchPrompt` (the profile's instructions/skills
@@ -2042,7 +2075,7 @@ async function launchStep(
   if (profile.harnessKind === "gemini") {
     const fullPrompt = appendReferences(composeLaunchPrompt(profile, composed), references);
     if (promptByteOverage("gemini", fullPrompt)) {
-      composed = withMachineCapacity(withSync(withRouting(withDecisions(composeStepPrompt({ ...composeArgs, inlineHandoff: false })))));
+      composed = withWrapUp(withMachineCapacity(withSync(withRouting(withDecisions(composeStepPrompt({ ...composeArgs, inlineHandoff: false }))))));
     }
   }
 
@@ -2091,6 +2124,7 @@ async function launchStep(
 
   run.active.push({ stepId: step.id, taskId: childId, seq });
   run.history.push({ seq, stepId: step.id, taskId: childId, startedAt: now, endedAt: null, outcome: null, handoff: null, nextStepIds: [] });
+  if (wrapUp && run.capWrapUp) run.capWrapUp.seq = seq;
   persist(parent.id, run);
 
   const started = await startTask(childId);

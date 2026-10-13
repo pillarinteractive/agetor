@@ -947,6 +947,20 @@ test("parsePipelineRunState: a snapshot.graph entry that fails the per-entry sha
   expect(parsePipelineRunState(JSON.stringify(snap(ok)))?.snapshot?.graph).toEqual(ok as unknown as PipelineGraph);
 });
 
+test("parsePipelineRunState: `capWrapUp` round-trips, with or without its `seq`; junk is dropped", () => {
+  const parse = (capWrapUp: unknown) => parsePipelineRunState(JSON.stringify({ pipelineId: "pipe-1", capWrapUp }));
+  expect(parse({ at: 1700, fromStepId: "build", seq: 35 })?.capWrapUp).toEqual({ at: 1700, fromStepId: "build", seq: 35 });
+  // Still queued: decided, its step task not inserted yet.
+  expect(parse({ at: 1700, fromStepId: "build" })?.capWrapUp).toEqual({ at: 1700, fromStepId: "build" });
+  expect(parse({ at: 1700, fromStepId: "build", seq: 0, extra: true })?.capWrapUp).toEqual({ at: 1700, fromStepId: "build" });
+  expect(parse({ at: 1700, fromStepId: "build", seq: 1.5 })?.capWrapUp).toEqual({ at: 1700, fromStepId: "build" });
+  expect(parse({ at: "soon", fromStepId: "build" })?.capWrapUp).toBeUndefined();
+  expect(parse({ at: 1700 })?.capWrapUp).toBeUndefined();
+  expect(parse({ at: 1700, fromStepId: "" })?.capWrapUp).toBeUndefined();
+  expect(parse("yes")?.capWrapUp).toBeUndefined();
+  expect(parsePipelineRunState(JSON.stringify({ pipelineId: "pipe-1" }))?.capWrapUp).toBeUndefined();
+});
+
 test("parsePipelineRunState: stepCount/capExtensions must be non-negative integers, and capExtensions is capped at PIPELINE_LIMITS.capExtensionsMax (L-S4)", () => {
   const parse = (extra: Record<string, unknown>) => parsePipelineRunState(JSON.stringify({ pipelineId: "pipe-1", ...extra }));
   expect(parse({ stepCount: 3, capExtensions: 2 })).toMatchObject({ stepCount: 3, capExtensions: 2 });

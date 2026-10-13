@@ -473,7 +473,7 @@ test("stored run state: a run from before this change still loads, and a reworke
   const done = await waitFor(() => (tasks.get(id)!.pipelineRun?.status === "done" ? tasks.get(id)! : null));
   // The frozen graph and prompts are untouched (a follow-up would have appended a step).
   expect(JSON.stringify(done.pipelineRun!.snapshot!.graph)).toBe(snapshotBefore);
-  const known = new Set(["pipelineId", "pipelineName", "snapshot", "status", "active", "joins", "blocked", "history", "stepCount", "startedAt", "endedAt", "capExtensions", "autoRetry", "launchRetries", "wait"]);
+  const known = new Set(["pipelineId", "pipelineName", "snapshot", "status", "active", "joins", "blocked", "history", "stepCount", "startedAt", "endedAt", "capExtensions", "capWrapUp", "autoRetry", "launchRetries", "wait"]);
   expect(Object.keys(done.pipelineRun!).filter((k) => !known.has(k))).toEqual([]);
   expect(parsePipelineRunState(JSON.stringify(done.pipelineRun))).toEqual(done.pipelineRun!);
   // A launch that had to queue keeps its arrival (seq 0 names no execution) through a restart.

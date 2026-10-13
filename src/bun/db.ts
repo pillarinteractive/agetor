@@ -760,6 +760,7 @@ export const parsePipelineRunState = (raw: string | null): PipelineRunState | nu
     capExtensions: Number.isSafeInteger(rec.capExtensions) && (rec.capExtensions as number) >= 0
       ? Math.min(rec.capExtensions as number, PIPELINE_LIMITS.capExtensionsMax)
       : undefined,
+    capWrapUp: sanitizeCapWrapUp(rec.capWrapUp),
     autoRetry: sanitizeAutoRetry(rec.autoRetry),
     launchRetries: isPlainObject(rec.launchRetries)
       ? Object.fromEntries(Object.entries(rec.launchRetries).flatMap(([taskId, value]) => {
@@ -803,6 +804,19 @@ const sanitizeBlockWait = (raw: unknown): PipelineRunState["wait"] => {
       : [],
     ...(isFiniteNumber(r.escalatedAt) ? { escalatedAt: r.escalatedAt } : {}),
     ...(typeof r.escalation === "string" ? { escalation: r.escalation.slice(0, 300) } : {}),
+  };
+};
+
+/** `run.capWrapUp`. An unreadable one is dropped — the run then reads as
+ *  never wrapped up, and a cap hit finishes it through the terminal step. */
+const sanitizeCapWrapUp = (raw: unknown): PipelineRunState["capWrapUp"] => {
+  if (!isPlainObject(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  if (!isFiniteNumber(r.at) || typeof r.fromStepId !== "string" || r.fromStepId.length === 0) return undefined;
+  return {
+    at: r.at,
+    fromStepId: r.fromStepId,
+    ...(Number.isSafeInteger(r.seq) && (r.seq as number) > 0 ? { seq: r.seq as number } : {}),
   };
 };
 

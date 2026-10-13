@@ -1203,6 +1203,40 @@ export function effectiveStepCap(run: PipelineRunState): number {
   return Math.min(EFFECTIVE_STEP_CAP_MAX, maxSteps * (1 + capExtensions));
 }
 
+/**
+ * The step an unattended run is finished through when it reaches its step
+ * cap (`run.capWrapUp`): the one step {@link resolveNextSteps} can end the
+ * run from — no outgoing edge, or a "choose" step with `canFinish`
+ * (follow-up steps, appended edgeless, are not counted). Null when the graph
+ * has none or more than one, which keeps the `step-cap` block.
+ */
+export function capWrapUpStep(g: PipelineGraph): PipelineStep | null {
+  const hasOutgoing = new Set(g.edges.map((e) => e.from));
+  const ends = g.steps.filter((s) =>
+    !isFollowUpStepId(s.id) && (!hasOutgoing.has(s.id) || (s.canFinish === true && s.transition !== "all")));
+  return ends.length === 1 ? (ends[0] ?? null) : null;
+}
+
+/** The section a cap wrap-up launch appends to the step's prompt, after
+ *  everything else, so it is the last thing the agent reads. */
+export function capWrapUpSection(input: { stepCap: number; issueUrl?: string | null; prUrl?: string | null }): string {
+  const issue = input.issueUrl ? `this card's issue (${input.issueUrl})` : "this card's issue";
+  const pr = input.prUrl ? `its pull request (${input.prUrl})` : "its pull request";
+  return [
+    "## Step cap reached — wrap up this run",
+    `This run reached its ${input.stepCap}-step cap, so this is its last step. No earlier step will run again; ` +
+      "what is still open is handed to people as GitHub issues instead.",
+    "- Publish the branch as this step normally does (push it, and open or update the pull request). Do not merge it.",
+    "- Do not hand back to an earlier step: finish the run from here, whatever the incoming reports ask for.",
+    "- For every unresolved finding, failed check or blocker in the incoming reports, file one GitHub issue " +
+      `(\`gh issue create\`) that states the problem and the evidence, and references ${issue} and ${pr}.`,
+    "- List those issue numbers in the pull request description and in your handoff summary.",
+    "- If nothing is unresolved, say so in the pull request description and in the handoff, and file no issue.",
+    "Publishing here is not approval: if the incoming reports do not approve this exact head, say in the pull " +
+      "request description that it is published unapproved at the step cap.",
+  ].join("\n");
+}
+
 
 /**
  * The handoff schema + `next`-field rule, rendered identically wherever a

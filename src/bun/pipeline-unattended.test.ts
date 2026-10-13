@@ -120,3 +120,111 @@ test("attended: a step that never hands off waits for a person", async () => {
   expect(run.blocked.some((b) => b.kind === "handoff-missing")).toBe(true);
   expect(run.autoRetry ?? null).toBeNull();
 });
+
+/** Build → Review → Finish (may end the run, or go back to Build); Review and Finish each choose `reviewNext`/`finishNext`. */
+async function startTemplate(reviewNext: string, finishNext: string, maxSteps: number, unattended: boolean) {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { agentProfiles, pipelines, preferences } = await import("./db.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+  const { PIPELINE_DECISIONS_PREF } = await import("../shared/pipeline-decisions.ts");
+  const workdir = mkdtempSync(path.join(tmpdir(), "agetor-unattended-wd-"));
+  preferences.set(PIPELINE_DECISIONS_PREF, JSON.stringify({ mode: "planner-recommendation", projects: unattended ? [workdir] : [] }));
+  const profile = agentProfiles.insert({
+    name: `unattended-${randomUUID()}`, harness: "claude-code", model: "fake-model", effort: null, mode: null, fast: false, maxMode: false, instructions: "", skills: [],
+  });
+  const step = (name: string, next: string) => newStep({ name, agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:${next}` });
+  const build = step("Build", "Review"), review = step("Review", reviewNext), finish = { ...step("Finish", finishNext), canFinish: true };
+  const graph = {
+    steps: [build, review, finish],
+    edges: [
+      { id: "build-review", from: build.id, to: review.id, label: "" },
+      { id: "review-build", from: review.id, to: build.id, label: "changes requested" },
+      { id: "review-finish", from: review.id, to: finish.id, label: "approved" },
+      { id: "finish-build", from: finish.id, to: build.id, label: "verification failed" },
+    ],
+    startStepId: build.id,
+  };
+  const pipeline = pipelines.insert({ name: `unattended-${randomUUID()}`, graph, maxSteps });
+  const created = await createTask({ title: "unattended", prompt: "goal", workdir, isolation: "none", pipelineId: pipeline.id });
+  if ("error" in created) throw new Error(created.error);
+  parents.push(created.task.id);
+  const started = await startTask(created.task.id);
+  if ("error" in started) throw new Error(started.error);
+  return { parentId: created.task.id, build, review, finish };
+}
+
+const WRAP_UP_HEADING = "## Step cap reached — wrap up this run";
+const wrapUpLines = (id: string) => activity(id).filter((l) => l.includes("finishing through Finish and filing issues for what is unresolved"));
+
+test("unattended: the cap reached on the launch of the terminal step launches it as the wrap-up", async () => {
+  const { tasks } = await import("./db.ts");
+  // Cap 1 → 2 (the automatic extension, on Review); Finish is the third launch.
+  const { parentId, review, finish } = await startTemplate("Finish", "done", 1, true);
+  const done = await waitFor(() => (tasks.get(parentId)?.pipelineRun?.status === "done" ? tasks.get(parentId)! : null));
+  const run = done.pipelineRun!;
+  expect(run.stepCount).toBe(3);
+  expect(run.capExtensions).toBe(1);
+  expect(run.blocked).toEqual([]);
+  expect(run.capWrapUp).toMatchObject({ fromStepId: finish.id, seq: 3 });
+  const last = run.history.at(-1)!;
+  expect(last).toMatchObject({ seq: 3, stepId: finish.id, outcome: "succeeded" });
+  const prompt = tasks.get(last.taskId)!.prompt;
+  expect(prompt).toContain(WRAP_UP_HEADING);
+  expect(prompt).toContain("This run reached its 2-step cap");
+  expect(prompt).toContain("step 3 of at most 3: Finish");
+  // Earlier steps were launched under the cap, with no wrap-up section.
+  expect(tasks.get(run.history.find((h) => h.stepId === review.id)!.taskId)!.prompt).not.toContain(WRAP_UP_HEADING);
+  expect(wrapUpLines(parentId)).toEqual(["Reached the 2-step cap — finishing through Finish and filing issues for what is unresolved"]);
+});
+
+test("unattended: the cap reached on the launch of another step launches the terminal step in its place, then blocks", async () => {
+  const { tasks } = await import("./db.ts");
+  const { retryPipelineStep } = await import("./pipeline-runner.ts");
+  // Review keeps asking for Build, and so does Finish: Build, Review, Build,
+  // Review (cap 2 → 4), Finish as the wrap-up in place of Build, then the
+  // Build that Finish asks for meets the cap with the wrap-up used.
+  const { parentId, build, review, finish } = await startTemplate("Build", "Build", 2, true);
+  const run = await blockedRun(parentId);
+  expect(run.stepCount).toBe(5);
+  expect(run.history.map((h) => h.stepId)).toEqual([build.id, review.id, build.id, review.id, finish.id]);
+  expect(run.capWrapUp).toMatchObject({ fromStepId: build.id, seq: 5 });
+  // The reviewer's own choice stays on record; Finish ran in Build's place.
+  expect(run.history[3]!.nextStepIds).toEqual([build.id]);
+  const wrapUp = tasks.get(run.history[4]!.taskId)!;
+  expect(wrapUp.prompt).toContain(WRAP_UP_HEADING);
+  // The same arrival Build would have had: Review's handoff, as a file reference and inline.
+  expect(wrapUp.prompt).toContain('### From "Review"');
+  expect(wrapUp.references.some((r) => /handoff-[0-9a-z]+-5-from-4\.json$/.test(r.path))).toBe(true);
+  expect(wrapUpLines(parentId).length).toBe(1);
+
+  const block = run.blocked.find((b) => b.kind === "step-cap")!;
+  expect(block.message).toBe("reached the 4-step cap for this run — retry to keep going, or stop here");
+  expect(block.pending).toMatchObject({ stepId: build.id, arrivals: [{ fromStepId: finish.id, seq: 5 }] });
+
+  // A person's Retry extends the cap and carries on as before; the next cap
+  // hit blocks again, with no second wrap-up.
+  const retried = await retryPipelineStep(parentId);
+  expect("error" in retried).toBe(false);
+  const again = (await waitFor(() => {
+    const t = tasks.get(parentId);
+    return t?.pipelineRun?.status === "blocked" && t.pipelineRun.capExtensions === 2 ? t : undefined;
+  })).pipelineRun!;
+  expect(again.stepCount).toBe(6);
+  expect(again.history.at(-1)!.stepId).toBe(build.id);
+  expect(tasks.get(again.history.at(-1)!.taskId)!.prompt).not.toContain(WRAP_UP_HEADING);
+  expect(again.capWrapUp).toMatchObject({ fromStepId: build.id, seq: 5 });
+  expect(again.blocked.some((b) => b.kind === "step-cap")).toBe(true);
+  expect(wrapUpLines(parentId).length).toBe(1);
+});
+
+test("attended: the cap blocks on the terminal step's launch too, with no wrap-up", async () => {
+  const { tasks } = await import("./db.ts");
+  const { parentId, finish } = await startTemplate("Finish", "done", 2, false);
+  const run = await blockedRun(parentId);
+  expect(run.stepCount).toBe(2);
+  expect(run.capWrapUp).toBeUndefined();
+  expect(run.blocked.find((b) => b.kind === "step-cap")!.pending).toMatchObject({ stepId: finish.id });
+  expect(run.history.every((h) => !tasks.get(h.taskId)!.prompt.includes(WRAP_UP_HEADING))).toBe(true);
+  expect(wrapUpLines(parentId)).toEqual([]);
+});

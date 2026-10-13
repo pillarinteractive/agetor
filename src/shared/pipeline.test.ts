@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
+  capWrapUpSection,
+  capWrapUpStep,
   EFFECTIVE_STEP_CAP_MAX,
   HANDOFF_FILE_UNTRUSTED_WARNING,
   PIPELINE_CONTROL_CHAR_RE,
@@ -1325,6 +1327,45 @@ describe("deriveRunStatus", () => {
 
 // ---------------------------------------------------------------------------
 // effectiveStepCap
+
+describe("capWrapUpStep / capWrapUpSection", () => {
+  const edge = (from: string, to: string) => ({ id: `${from}-${to}`, from, to, label: "" });
+  const build = makeStep({ id: "build", name: "Build" }), review = makeStep({ id: "review", name: "Review" });
+  const finish = makeStep({ id: "finish", name: "Finish" });
+  const loops = [edge("build", "review"), edge("review", "build"), edge("review", "finish")];
+
+  test("the one step with no outgoing edge", () => {
+    expect(capWrapUpStep(makeGraph({ steps: [build, review, finish], edges: loops }))?.id).toBe("finish");
+  });
+
+  test("a canFinish step with a loop edge back, as resolveNextSteps ends a run from it", () => {
+    const g = makeGraph({ steps: [build, review, { ...finish, canFinish: true }], edges: [...loops, edge("finish", "build")] });
+    expect(capWrapUpStep(g)?.id).toBe("finish");
+    expect(resolveNextSteps(g, "finish", null)).toEqual({ kind: "terminal" });
+  });
+
+  test("follow-up steps are not counted", () => {
+    const g = makeGraph({ steps: [build, review, finish, makeStep({ id: "followup-1", name: "Follow-up" })], edges: loops });
+    expect(capWrapUpStep(g)?.id).toBe("finish");
+  });
+
+  test("null with no end, or more than one", () => {
+    expect(capWrapUpStep(makeGraph({ steps: [build, review], edges: [edge("build", "review"), edge("review", "build")] }))).toBeNull();
+    expect(capWrapUpStep(makeGraph({ steps: [build, review, finish], edges: [edge("build", "review"), edge("build", "finish")] }))).toBeNull();
+    // A fan-out step never ends the run, whatever `canFinish` says.
+    const fanOut = { ...finish, canFinish: true, transition: "all" as const };
+    expect(capWrapUpStep(makeGraph({ steps: [build, review, fanOut], edges: [...loops, edge("finish", "build")] }))).toBeNull();
+  });
+
+  test("the section names the cap, the issue and the pull request", () => {
+    const text = capWrapUpSection({ stepCap: 34, issueUrl: "https://example.test/issues/7", prUrl: "https://example.test/pull/9" });
+    expect(text.startsWith("## Step cap reached — wrap up this run\n")).toBe(true);
+    expect(text).toContain("reached its 34-step cap");
+    expect(text).toContain("`gh issue create`");
+    expect(text).toContain("this card's issue (https://example.test/issues/7) and its pull request (https://example.test/pull/9)");
+    expect(capWrapUpSection({ stepCap: 34, issueUrl: null })).toContain("references this card's issue and its pull request.");
+  });
+});
 
 describe("effectiveStepCap", () => {
   test("falls back to PIPELINE_LIMITS.maxStepsDefault with no snapshot", () => {
