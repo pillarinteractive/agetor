@@ -233,6 +233,22 @@ Restart resolves the position and offers it ("Restart from Review"), with "from 
 
 ## 10. Risks and open questions
 
+### Decided by the owner, 2026-10-13
+
+These answers replace the "Recommend" lines below wherever the two differ.
+
+| # | Question | Decision |
+| --- | --- | --- |
+| 1 | The base moved or recovered after Review approved | **A.** Agetor merges the base into the branch when the merge is clean and the change's own diff is unchanged (`git patch-id` of `git diff base...HEAD`, before and after), pushes, and the Review approval carries over. No agent step. A conflict or a changed diff falls back to today's route: Build, with "merge origin/<base>". |
+| 2 | What must be true of a green PR before the merge queue merges it | **A.** Its checks are fresh against the current base, or it was tested in a train. A lone stale PR rides a train of one. |
+| 3 | Running cards | **A.** They adopt the new loop at their next step launch, on an explicit refresh. Never automatically. |
+| 4 | Build still fails its checks after `maxTurns` (Stage 2) | **B.** One fresh session, then the owner. Not built yet. |
+| 5 | A handoff is missing and the checks pass (Stage 2) | **A.** Advance. Not built yet; Stage 1 must not stand in its way. |
+| 6 | Checks on the Mac | **A.** Built-in checks only for now. |
+| — | Order | Stages 0 and 1 are built now. Stage 1 ships behind a per-pipeline switch that is off by default, with a trial list of card ids, so it can be turned on for a few cards first. |
+
+The questions as they were asked:
+
 **1. After the base recovers or moves, how does a card get CI against the new base?**
 A re-run of the old CI run tests the old merge commit, so it cannot answer this. The same fact makes `merge-rework.ts`'s "base recovered → re-run the failed jobs" ineffective when the base was fixed by a commit.
 - A. Agetor merges the base into the branch when the merge is clean and the change's own diff is unchanged (`git patch-id` of `git diff base...HEAD`), pushes, and the approval carries over. No agent step, one CI run.
