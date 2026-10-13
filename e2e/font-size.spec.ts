@@ -283,7 +283,7 @@ test.describe("font-size: persists across reload", () => {
     // channel — hence polling rather than asserting the instant the
     // "Settings" button appears.
     await page.reload();
-    await expect(page.getByRole("button", { name: "Settings" })).toBeVisible();
+    await expect(page.getByTestId("autopilot-button")).toBeVisible();
     await expect.poll(() => rootFontSizePx(page)).toBe("19.2px");
 
     await setFontSizePreference(request, backend, "100");

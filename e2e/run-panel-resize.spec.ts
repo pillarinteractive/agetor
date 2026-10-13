@@ -143,7 +143,7 @@ test.describe("run panel resize", () => {
     // Reload to prove the standard-list selection comes back from the
     // persisted preference, rather than only living in App state.
     await page.reload();
-    await expect(page.getByRole("button", { name: "Settings" })).toBeVisible();
+    await expect(page.getByTestId("autopilot-button")).toBeVisible();
     const standardPanel = await openTask(page, prompt);
     await expect(standardPanel.locator("[data-evid].sticky")).toHaveCount(0);
   });

@@ -106,7 +106,7 @@ async function openTask(page: Page, title: string): Promise<Locator> {
  *  load, so this is only needed for a second observation point mid-test). */
 async function reloadApp(page: Page): Promise<void> {
   await page.reload();
-  await expect(page.getByRole("button", { name: "Settings" })).toBeVisible();
+  await expect(page.getByTestId("autopilot-button")).toBeVisible();
 }
 
 /** Closes the run panel via its own "Close task details" button and waits
@@ -135,7 +135,7 @@ async function closeTaskPanel(page: Page, panel: Locator): Promise<void> {
 /** Opens Settings and switches to the Agents section (mirrors
  *  `e2e/agent-profiles.spec.ts`'s `openSettingsAgents`). */
 async function openSettingsAgents(page: Page): Promise<Locator> {
-  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.keyboard.press("ControlOrMeta+Comma");
   const dialog = page.getByRole("dialog");
   await expect(dialog.getByRole("heading", { name: "Settings" })).toBeVisible();
   await dialog.getByRole("button", { name: "Agents", exact: true }).click();
@@ -743,7 +743,7 @@ test.describe("agent profiles: launch surfaces", () => {
     // is what NewTaskForm's own "the selected profile vanished from the
     // refreshed list" effect (right after `selectedProfile` in
     // NewTaskForm.tsx) reacts to.
-    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await page.keyboard.press("ControlOrMeta+Comma");
     const dialog = page.getByRole("dialog");
     await expect(dialog.getByRole("heading", { name: "Settings" })).toBeVisible();
     await dialog.getByRole("button", { name: "Close", exact: true }).click();

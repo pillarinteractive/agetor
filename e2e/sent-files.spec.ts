@@ -197,7 +197,7 @@ test.describe("sent files to user", () => {
 
     // --- (7) historical render: reload and re-open from persisted events --
     await page.reload();
-    await expect(page.getByRole("button", { name: "Settings" })).toBeVisible();
+    await expect(page.getByTestId("autopilot-button")).toBeVisible();
     const reopenedPanel = await openTask(page, title);
     const reopenedCards = sentFilesCards(reopenedPanel);
     await expect(reopenedCards).toHaveCount(2);

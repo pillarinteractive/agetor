@@ -71,13 +71,13 @@ export async function gotoApp(page: Page, url: string, options: GotoAppOptions =
     }
   }
   await page.goto(url);
-  await expect(page.getByRole("button", { name: "Settings" })).toBeVisible();
+  await expect(page.getByTestId("autopilot-button")).toBeVisible();
 }
 
 /** Opens Settings → General (the default section on open — no tab click
  *  needed) and waits for the dialog to render. */
 export async function openSettingsGeneral(page: Page): Promise<Locator> {
-  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.keyboard.press("ControlOrMeta+Comma");
   const dialog = page.getByRole("dialog");
   await expect(dialog.getByRole("heading", { name: "Settings" })).toBeVisible();
   return dialog;

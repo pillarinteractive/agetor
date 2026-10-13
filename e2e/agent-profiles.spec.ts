@@ -135,7 +135,7 @@ async function openTask(page: Page, title: string): Promise<Locator> {
  *  `e2e/helpers.ts`'s `openSettingsGeneral`, plus the one extra sidebar
  *  click this section needs). */
 async function openSettingsAgents(page: Page): Promise<Locator> {
-  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.keyboard.press("ControlOrMeta+Comma");
   const dialog = page.getByRole("dialog");
   await expect(dialog.getByRole("heading", { name: "Settings" })).toBeVisible();
   await dialog.getByRole("button", { name: "Agents", exact: true }).click();

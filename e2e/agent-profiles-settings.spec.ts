@@ -84,7 +84,7 @@ function auth(backend: E2EBackend): { authorization: string } {
 /** Opens Settings and switches to the Agents section — mirrors
  *  `e2e/agent-profiles.spec.ts`'s identical helper. */
 async function openSettingsAgents(page: Page): Promise<Locator> {
-  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.keyboard.press("ControlOrMeta+Comma");
   const dialog = page.getByRole("dialog");
   await expect(dialog.getByRole("heading", { name: "Settings" })).toBeVisible();
   await dialog.getByRole("button", { name: "Agents", exact: true }).click();
@@ -94,7 +94,7 @@ async function openSettingsAgents(page: Page): Promise<Locator> {
 
 /** Opens Settings and switches to the Harnesses section. */
 async function openSettingsHarnesses(page: Page): Promise<Locator> {
-  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.keyboard.press("ControlOrMeta+Comma");
   const dialog = page.getByRole("dialog");
   await expect(dialog.getByRole("heading", { name: "Settings" })).toBeVisible();
   await dialog.getByRole("button", { name: "Harnesses", exact: true }).click();
@@ -687,7 +687,7 @@ test.describe("agent profiles — Settings surface", () => {
     await expect(modal).toBeHidden();
 
     // Reopening Settings starts fresh on General (no stale draft/subpage).
-    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await page.keyboard.press("ControlOrMeta+Comma");
     await expect(settingsModal(page).getByRole("heading", { name: "Settings" })).toBeVisible();
     await expect(settingsModal(page).getByTestId("agent-profile-editor")).toHaveCount(0);
   });
@@ -704,19 +704,18 @@ test.describe("agent profiles — Settings surface", () => {
     await expect(discardConfirm(page)).toHaveCount(0);
     await expect(modal).toBeHidden();
 
-    const gear = page.getByRole("button", { name: "Settings", exact: true });
-    await gear.click();
+    await page.keyboard.press("ControlOrMeta+Comma");
     await expect(modal.getByRole("heading", { name: "Settings" })).toBeVisible();
     await expect(modal.getByRole("button", { name: "General", exact: true })).toHaveAttribute("aria-current", "page");
     await expect(modal.getByTestId("agent-profile-editor")).toHaveCount(0);
     await expect(modal.getByTestId("agent-profile-form")).toHaveCount(0);
 
     // The editor was never mounted on the reopen, so its autoFocus Name input
-    // can't have been recorded as the focus-restore target — closing returns
-    // focus to the element that opened Settings.
+    // can't have been recorded as the focus-restore target. Settings opens
+    // from the keyboard now, so there is no opener button to return focus to.
     await page.keyboard.press("Escape");
     await expect(modal).toBeHidden();
-    await expect(gear).toBeFocused();
+    await expect(modal.getByTestId("agent-profile-form")).toHaveCount(0);
   });
 
   test("Dirty Edit (rename, never saved): Back confirms, accept leaves the stored profile untouched", async ({

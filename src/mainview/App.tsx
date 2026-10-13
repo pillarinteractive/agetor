@@ -30,6 +30,7 @@ import {
   Sun,
   SunDim,
   Zap,
+  Gauge,
   type LucideIcon,
 } from "lucide-react";
 import { api, type AgentModelMap, type HarnessModelMap } from "@/lib/api";
@@ -1603,6 +1604,23 @@ function AppInner() {
   const openPipelinesPage = useCallback(() => {
     navigate({ kind: "pipelines", pipelineId: null, editing: false });
   }, [navigate]);
+  // Settings and Pipelines have no button in the top bar (both are driven
+  // from code and the API); they still open from the keyboard: ⌘, / Ctrl+, and
+  // ⌘⇧P / Ctrl+Shift+P.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || e.altKey) return;
+      if (e.key === "," && !e.shiftKey) {
+        e.preventDefault();
+        setSettingsOpen(true);
+      } else if (e.shiftKey && e.key.toLowerCase() === "p") {
+        e.preventDefault();
+        openPipelinesPage();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [openPipelinesPage]);
   // "Merge together" on Ready to Merge: send a merge train now.
   const mergeTogether = useCallback(() => {
     api
@@ -2427,16 +2445,17 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
             <GitPullRequest className="size-4" />
           </Button>
           {velocity?.available && (
-            <button
-              type="button"
+            <Button
+              variant={velocityShown ? "secondary" : "ghost"}
+              size="icon"
               data-testid="velocity-summary"
               aria-pressed={velocityShown}
               onClick={() => navigate({ kind: "velocity" })}
-              title="Velocity of the roadmap run — throughput, where the time goes, forecast"
-              className="hidden max-w-[22rem] truncate rounded-md px-2 py-1 text-xs tabular-nums text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:block"
+              aria-label="Velocity"
+              title={`Velocity — ${velocitySummary(velocity)}`}
             >
-              {velocitySummary(velocity)}
-            </button>
+              <Gauge className="size-4" />
+            </Button>
           )}
           <Button
             variant={autopilotOpen ? "secondary" : "ghost"}
@@ -2468,25 +2487,6 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
             title="Issues"
           >
             <CircleDot className="size-4" />
-          </Button>
-          <Button
-            variant={view.kind === "pipelines" || view.kind === "pipeline-run" ? "secondary" : "ghost"}
-            size="icon"
-            data-testid="pipelines-button"
-            onClick={openPipelinesPage}
-            aria-label="Pipelines"
-            title="Pipelines"
-          >
-            <Workflow className="size-4" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={() => setSettingsOpen(true)}
-            aria-label="Settings"
-            title="Settings"
-          >
-            <Settings className="size-4" />
           </Button>
         </div>
       </header>

@@ -1,6 +1,6 @@
 import { memo, useState } from "react";
 import { useDroppable } from "@dnd-kit/core";
-import { RefreshCw } from "lucide-react";
+import { ChevronsLeft, ChevronsRight, RefreshCw } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { ColumnId, Task } from "../../../shared/types.ts";
 import type { CardAction } from "@/lib/card-state";
@@ -65,16 +65,82 @@ function sameTasks(a: Task[], b: Task[]): boolean {
 /** Done keeps piling up; show the newest few and fold the rest. */
 const COLLAPSE_AFTER: Partial<Record<ColumnId, number>> = { done: 5 };
 
+/** Columns that can be folded to a narrow strip: the long queue of cards that
+ *  have not started, and the two ends of the board. A folded column keeps its
+ *  name and count, still takes a dropped card, and opens on a click. */
+const FOLDABLE: ReadonlySet<ColumnId> = new Set<ColumnId>(["backlog", "merge", "done"]);
+
+/** Columns whose cards sit two abreast, filling each row before the next:
+ *  Running is the column watched most and its cards are the ones that change. */
+const TWO_ABREAST: ReadonlySet<ColumnId> = new Set<ColumnId>(["running"]);
+
+/** Which columns the viewer folded. A per-viewer convenience kept in the
+ *  browser: the board must render the same without it. */
+const FOLDED_KEY = "agetor.board.foldedColumns";
+function readFolded(id: ColumnId): boolean {
+  try {
+    const raw = JSON.parse(localStorage.getItem(FOLDED_KEY) ?? "[]");
+    return Array.isArray(raw) && raw.includes(id);
+  } catch {
+    return false;
+  }
+}
+function writeFolded(id: ColumnId, folded: boolean): void {
+  try {
+    const raw = JSON.parse(localStorage.getItem(FOLDED_KEY) ?? "[]");
+    const ids = new Set<string>(Array.isArray(raw) ? raw.filter((x): x is string => typeof x === "string") : []);
+    if (folded) ids.add(id); else ids.delete(id);
+    localStorage.setItem(FOLDED_KEY, JSON.stringify([...ids]));
+  } catch {
+    // storage blocked or full: the fold lasts until the board reloads
+  }
+}
+
 function ColumnImpl({ id, label, tasks, homeDir, onCancel, onDelete, onSelect, onOpen, onAction, onDiff, onMarkDone, onArchive, onUnarchive, emptyHint, selectedTaskId, inspectedTaskId, onContextMenu, onMergeTogether, onRefresh, initialExpanded, onExpandedChange }: Props) {
   const [refreshing, setRefreshing] = useState(false);
   const { setNodeRef, isOver } = useDroppable({ id });
   const [expanded, setExpanded] = useState(initialExpanded ?? false);
+  const foldable = FOLDABLE.has(id);
+  const [folded, setFolded] = useState(() => foldable && readFolded(id));
+  const fold = (next: boolean) => {
+    setFolded(next);
+    writeFolded(id, next);
+  };
+  const twoAbreast = TWO_ABREAST.has(id);
   const limit = COLLAPSE_AFTER[id];
   const sorted = limit ? [...tasks].sort((a, b) => b.updatedAt - a.updatedAt) : tasks;
   const shown = limit && !expanded ? sorted.slice(0, limit) : sorted;
   const hidden = sorted.length - shown.length;
   // What the column's cards are doing, counted by state ("2 working · 1 needs you").
   const summary = useColumnSummary(tasks);
+  if (folded) {
+    return (
+      <section
+        ref={setNodeRef}
+        aria-label={label}
+        data-column-id={id}
+        data-folded="true"
+        className={cn(
+          "flex w-9 shrink-0 flex-col items-center rounded-[9px] bg-lane pb-2.5 pt-2 outline-2 -outline-offset-2 outline-primary/60",
+          isOver && "[outline-style:solid]",
+        )}
+      >
+        <button
+          type="button"
+          data-testid="column-unfold"
+          aria-expanded={false}
+          aria-label={`Show ${label} (${tasks.length})`}
+          title={`Show ${label} — ${tasks.length} ${tasks.length === 1 ? "card" : "cards"}${summary ? ` · ${summary}` : ""}`}
+          onClick={() => fold(false)}
+          className="flex w-full flex-1 flex-col items-center gap-2 rounded-md py-1 text-muted-foreground hover:bg-board-card hover:text-foreground"
+        >
+          <ChevronsRight className="size-3.5 shrink-0" aria-hidden />
+          <span data-testid="column-count" className="text-[11px] tabular-nums">{tasks.length}</span>
+          <span className="text-xs font-[650] text-foreground [writing-mode:vertical-rl]">{label}</span>
+        </button>
+      </section>
+    );
+  }
   return (
     <section
       ref={setNodeRef}
@@ -83,14 +149,31 @@ function ColumnImpl({ id, label, tasks, homeDir, onCancel, onDelete, onSelect, o
       className={cn(
         // Columns share the board's width down to a narrow minimum; below
         // that the board scrolls sideways rather than wrapping.
-        "flex min-w-[11.5rem] max-w-[26rem] flex-1 flex-col rounded-[9px] bg-lane px-1.5 pb-2.5 pt-2 outline-2 -outline-offset-2 outline-primary/60",
+        "flex flex-col rounded-[9px] bg-lane px-1.5 pb-2.5 pt-2 outline-2 -outline-offset-2 outline-primary/60",
+        // A two-abreast column takes two columns' share of the width.
+        twoAbreast ? "min-w-[23.5rem] max-w-[52rem] flex-[2]" : "min-w-[11.5rem] max-w-[26rem] flex-1",
         isOver && "[outline-style:solid]",
       )}
     >
       <div className="flex items-center justify-between gap-1 px-[3px] pb-1 pt-[5px]">
         <h2 className="min-w-0 truncate text-xs font-[650] leading-[1.3] text-foreground">{label}</h2>
-        <span data-testid="column-count" className="shrink-0 text-[11px] tabular-nums text-muted-foreground">
-          {tasks.length}
+        <span className="flex shrink-0 items-center gap-1">
+          <span data-testid="column-count" className="text-[11px] tabular-nums text-muted-foreground">
+            {tasks.length}
+          </span>
+          {foldable && (
+            <button
+              type="button"
+              data-testid="column-fold-away"
+              aria-expanded
+              aria-label={`Fold ${label} away`}
+              title={`Fold ${label} to a strip`}
+              onClick={() => fold(true)}
+              className="rounded p-0.5 text-muted-foreground hover:bg-board-card hover:text-foreground"
+            >
+              <ChevronsLeft className="size-3" aria-hidden />
+            </button>
+          )}
         </span>
       </div>
       {/* The summary line; Ready to Merge's two buttons sit at its end, so
@@ -128,9 +211,9 @@ function ColumnImpl({ id, label, tasks, homeDir, onCancel, onDelete, onSelect, o
           </button>
         )}
       </div>
-      <div className="flex flex-col gap-2">
+      <div className={twoAbreast ? "grid grid-cols-2 items-start gap-2" : "flex flex-col gap-2"}>
         {tasks.length === 0 && emptyHint && (
-          <p className="pointer-events-none px-1 text-xs text-muted-foreground">{emptyHint}</p>
+          <p className={cn("pointer-events-none px-1 text-xs text-muted-foreground", twoAbreast && "col-span-2")}>{emptyHint}</p>
         )}
         {shown.map((t) => (
           <TaskCard

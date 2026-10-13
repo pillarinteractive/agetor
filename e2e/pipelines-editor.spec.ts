@@ -92,10 +92,6 @@ function boardReadyColumn(page: Page): Locator {
   return page.getByText("Ready", { exact: true });
 }
 
-function pipelinesButton(page: Page): Locator {
-  return page.getByTestId("pipelines-button");
-}
-
 function stepNode(page: Page, stepId: string): Locator {
   return page.locator(`[data-testid="pipeline-step-node"][data-step-id="${stepId}"]`);
 }
@@ -180,7 +176,7 @@ async function agentProfileExists(backend: E2EBackend, name: string): Promise<bo
 /** New pipeline → select the default step → open its "New agent…" dialog. */
 async function openNewAgentDialog(page: Page, backend: E2EBackend): Promise<{ editor: Locator; panel: Locator; dialog: Locator }> {
   await gotoApp(page, backend.bootBase);
-  await pipelinesButton(page).click();
+  await page.keyboard.press("ControlOrMeta+Shift+KeyP");
   await page.getByTestId("pipelines-new").click();
   const editor = page.getByTestId("pipeline-editor");
   await expect(editor).toBeVisible();
@@ -214,7 +210,7 @@ test.describe("pipelines editor", () => {
     await gotoApp(page, backend.bootBase);
     await expect(boardReadyColumn(page)).toBeVisible();
 
-    await pipelinesButton(page).click();
+    await page.keyboard.press("ControlOrMeta+Shift+KeyP");
     await expect(page.getByTestId("pipelines-back")).toBeVisible();
     await expect(boardReadyColumn(page)).toBeHidden();
 
@@ -235,7 +231,7 @@ test.describe("pipelines editor", () => {
     await page.setViewportSize({ width: 1600, height: 900 });
 
     await gotoApp(page, backend.bootBase);
-    await pipelinesButton(page).click();
+    await page.keyboard.press("ControlOrMeta+Shift+KeyP");
     await page.getByTestId("pipelines-new").click();
     const editor = page.getByTestId("pipeline-editor");
     await expect(editor).toBeVisible();
@@ -396,8 +392,8 @@ test.describe("pipelines editor", () => {
 
     // ---- Reload: still there ----
     await page.reload();
-    await expect(page.getByRole("button", { name: "Settings" })).toBeVisible();
-    await pipelinesButton(page).click();
+    await expect(page.getByTestId("autopilot-button")).toBeVisible();
+    await page.keyboard.press("ControlOrMeta+Shift+KeyP");
     const rowAfterReload = page
       .locator('[data-testid="pipelines-row"]')
       .filter({ hasText: pipelineName });
@@ -465,7 +461,7 @@ test.describe("pipelines editor", () => {
     createdProfileIds.push(helperOne.id, helperTwo.id);
 
     await gotoApp(page, backend.bootBase);
-    await pipelinesButton(page).click();
+    await page.keyboard.press("ControlOrMeta+Shift+KeyP");
     await page.getByTestId("pipelines-new").click();
     const editor = page.getByTestId("pipeline-editor");
     await expect(editor).toBeVisible();
@@ -527,8 +523,8 @@ test.describe("pipelines editor", () => {
 
     // ---- Reload + reopen: the panel round-trips the same settings ----
     await page.reload();
-    await expect(page.getByRole("button", { name: "Settings" })).toBeVisible();
-    await pipelinesButton(page).click();
+    await expect(page.getByTestId("autopilot-button")).toBeVisible();
+    await page.keyboard.press("ControlOrMeta+Shift+KeyP");
     const row = page.locator(`[data-testid="pipelines-row"][data-pipeline-id="${pipelineId}"]`);
     await expect(row).toBeVisible();
     await row.getByTestId("pipelines-edit").click();
@@ -606,7 +602,7 @@ test.describe("pipelines editor", () => {
     await page.setViewportSize({ width: 1600, height: 900 });
 
     await gotoApp(page, backend.bootBase);
-    await pipelinesButton(page).click();
+    await page.keyboard.press("ControlOrMeta+Shift+KeyP");
     await page.getByTestId("pipelines-new").click();
     const editor = page.getByTestId("pipeline-editor");
     await expect(editor).toBeVisible();
@@ -670,7 +666,7 @@ test.describe("pipelines editor", () => {
 
   test("Escape deselects the step (closes its panel); Enter on a focused node re-selects it", async ({ page, backend }) => {
     await gotoApp(page, backend.bootBase);
-    await pipelinesButton(page).click();
+    await page.keyboard.press("ControlOrMeta+Shift+KeyP");
     await page.getByTestId("pipelines-new").click();
     const editor = page.getByTestId("pipeline-editor");
     await expect(editor).toBeVisible();
@@ -694,14 +690,14 @@ test.describe("pipelines editor", () => {
     backend,
   }) => {
     await gotoApp(page, backend.bootBase);
-    await pipelinesButton(page).click();
+    await page.keyboard.press("ControlOrMeta+Shift+KeyP");
     await page.getByTestId("pipelines-new").click();
     const editor = page.getByTestId("pipeline-editor");
     await expect(editor).toBeVisible();
     await editor.getByTestId("pipeline-name").fill(`E2E Dirty Draft ${randomUUID()}`);
 
     // The header button routes through App's `navigate` guard.
-    await pipelinesButton(page).click();
+    await page.keyboard.press("ControlOrMeta+Shift+KeyP");
     const discardDialog = page.getByRole("dialog").filter({ hasText: "Discard unsaved pipeline changes?" });
     await expect(discardDialog).toBeVisible();
     await discardDialog.getByRole("button", { name: "Keep editing", exact: true }).click();
@@ -709,7 +705,7 @@ test.describe("pipelines editor", () => {
     await expect(editor).toBeVisible();
     await expect(page.getByTestId("pipelines-back")).toHaveCount(0);
 
-    await pipelinesButton(page).click();
+    await page.keyboard.press("ControlOrMeta+Shift+KeyP");
     await expect(discardDialog).toBeVisible();
     await discardDialog.getByRole("button", { name: "Discard", exact: true }).click();
     await expect(discardDialog).toBeHidden();
@@ -722,7 +718,7 @@ test.describe("pipelines editor", () => {
     const created = await createPipelineRest(backend, name);
 
     await gotoApp(page, backend.bootBase);
-    await pipelinesButton(page).click();
+    await page.keyboard.press("ControlOrMeta+Shift+KeyP");
     const row = page.locator(`[data-testid="pipelines-row"][data-pipeline-id="${created.id}"]`);
     await expect(row).toBeVisible();
 
@@ -745,7 +741,7 @@ test.describe("pipelines editor", () => {
     createdPipelineIds.push(created.id);
 
     await gotoApp(page, backend.bootBase);
-    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await page.keyboard.press("ControlOrMeta+Comma");
     const dialog = page.getByRole("dialog");
     await expect(dialog.getByRole("heading", { name: "Settings" })).toBeVisible();
     await dialog.getByRole("button", { name: "Pipelines", exact: true }).click();
@@ -798,7 +794,7 @@ test.describe("pipelines editor", () => {
     await page.setViewportSize({ width: 1600, height: 900 });
 
     await gotoApp(page, backend.bootBase);
-    await pipelinesButton(page).click();
+    await page.keyboard.press("ControlOrMeta+Shift+KeyP");
     await page.getByTestId("pipelines-new").click();
     const editor = page.getByTestId("pipeline-editor");
     await expect(editor).toBeVisible();

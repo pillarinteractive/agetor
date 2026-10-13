@@ -66,7 +66,7 @@ async function clickBackdrop(modal: Locator): Promise<void> {
 
 /** Opens Settings and switches to the Harnesses section. */
 async function openSettingsHarnesses(page: Page): Promise<Locator> {
-  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.keyboard.press("ControlOrMeta+Comma");
   const modal = settingsModal(page);
   await expect(modal.getByRole("heading", { name: "Settings" })).toBeVisible();
   await modal.getByRole("button", { name: "Harnesses", exact: true }).click();
@@ -124,7 +124,7 @@ test.describe("Settings → Harnesses editor — dirty-leave guard", () => {
     await expect(discardConfirm(page)).toHaveCount(0);
     await expect(modal).toBeHidden();
 
-    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    await page.keyboard.press("ControlOrMeta+Comma");
     await expect(modal.getByRole("heading", { name: "Settings" })).toBeVisible();
     await expect(modal.getByRole("button", { name: "General", exact: true })).toHaveAttribute("aria-current", "page");
     await expect(modal.getByRole("heading", { name: "Add harness" })).toHaveCount(0);

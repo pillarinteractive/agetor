@@ -144,7 +144,7 @@ test.describe("theme: Settings → General picker", () => {
     await expect.poll(() => isDark(page)).toBe(false);
 
     await page.reload();
-    await expect(page.getByRole("button", { name: "Settings" })).toBeVisible();
+    await expect(page.getByTestId("autopilot-button")).toBeVisible();
 
     // Persisted server-side (PUT /preferences/theme), not client localStorage
     // — so a fresh load must come back Light without re-touching the UI.
