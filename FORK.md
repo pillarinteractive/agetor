@@ -163,14 +163,31 @@ No caps, approvals, merge protections or commercial/planning source policy
 are changed. A real session teardown cancels its obsolete interaction cards,
 while a defensive reattach preserves the live session's interactions.
 
-An edited template does not silently change an existing run. Use
-`agetor pipeline refresh-instructions <parent-id>` to apply its instruction edits
-to a blocked or cancelled run before Retry or Advance. This never starts an agent
-or clears a verdict, permission/dependency hold or resource cap. Topology, agent
-assignments, delegation and frozen profiles must remain compatible. A live step,
-pending interaction or scheduled recovery refuses the update. The command checks
-the run/template revisions and saves the instruction diff under the run's data
-directory. The existing step's generated prompt is updated for Retry too.
+Edited step instructions always reach the runs already started from that
+template. Saving a pipeline whose step text changed (`PATCH /pipelines/:id`)
+makes every unarchived running, blocked or cancelled run of it adopt the new
+text in the background, each under its own run lock; the save does not wait for
+them. `POST /pipelines/:id/refresh-runs` does the same on demand and returns
+`{ results: [{ taskId, stepIds, unmatched, skippedPrompts, error? }] }`, and
+`agetor pipeline refresh-instructions <parent-id>` (`POST
+/tasks/:id/pipeline/refresh-instructions`) does it for one run. Never-started
+cards need nothing: they snapshot the template when they start.
+
+Only the text is copied, step by step, matched by step id. The run keeps its
+own topology, agent assignments, delegation, frozen profiles and caps, so a
+template whose agents or edges were changed since is no reason to refuse. A step
+the template no longer has keeps its text and is listed in `unmatched`;
+follow-up steps are never touched. No agent is started or interrupted and no
+verdict, hold, wait, scheduled retry or step count changes. A step that is
+executing keeps the prompt it was given and gets the new text at its next launch
+or Retry; a step that is stopped or waiting has the `## Your step` section of
+its prompt rewritten now. A step prompt someone edited by hand is left as it is
+and listed in `skippedPrompts` (the run's snapshot is still updated). Each
+update writes the instruction diff under the run's data directory and one
+activity line on the card. `expectedCapturedAt` / `expectedTemplateUpdatedAt`
+are optional on the per-run route: when sent they must still match. Otherwise
+a refresh is refused only when it cannot be done: not a pipeline task, archived,
+never started, or the template is deleted or invalid.
 
 Manual Advance now retains the sender's handoff and full report by default.
 Choosing Build does not make a blocked review an approval: Build receives the
