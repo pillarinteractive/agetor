@@ -221,7 +221,7 @@ Restart resolves the position and offers it ("Restart from Review"), with "from 
 
 ## 8. Compatibility and rollout
 
-**Switch.** A `pipeline_gates` preference: per project, per pipeline and, for the trial, per card (`{"publish": {"cards": ["…"]}}`). It is captured in the run's snapshot as `pipeline_decisions` is.
+**Switch.** A `pipeline_gates` preference: per project, per pipeline and, for the trial, per card (`{"publish": {"cards": ["…"]}}`). A pipeline is named by its id or its exact name (case-insensitive), a card by its full id; an entry that matches nothing is reported by the gates refresh and on the card's timeline (added after the trial, where `"Change"` silently matched nothing). It is captured in the run's snapshot as `pipeline_decisions` is.
 
 **Running cards.** They adopt gates at their next step launch, and only when the owner asks through the refresh-runs route with an explicit flag. They do not adopt on save, because gates change behaviour and `refreshPipelineInstructions` promises to change text only. They are not held back until a restart either, because that is incident 5. A step in mid-turn is never switched.
 

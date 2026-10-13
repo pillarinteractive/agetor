@@ -46,8 +46,8 @@ import { run as runCommand } from "./github.ts";
 import { waitingOnQuota } from "../shared/autopilot.ts";
 import { decisionPolicyForProject, PIPELINE_DECISIONS_PREF, plannerDecisionInstructions } from "../shared/pipeline-decisions.ts";
 import {
-  PIPELINE_GATES_PREF, initialPublishState, parsePipelineGate, publishBlockMessage, publishGateOn, publishStepOf, publishVisitOver,
-  type PipelineGateName,
+  PIPELINE_GATES_PREF, gateUnmatchedLine, initialPublishState, parsePipelineGate, publishBlockMessage, publishGateOn, publishStepOf, publishVisitOver,
+  unmatchedGateRefs, type GateUnmatched, type PipelineGateName,
 } from "../shared/publish.ts";
 import { composedHandoff, exhaustedHandoff, gateFailureLine, gateVerdict, type CheckResult } from "../shared/checks.ts";
 import { recordWaivedChecks, runStepChecks } from "./check-runner.ts";
@@ -1802,6 +1802,18 @@ function gatePref(gate: PipelineGateName, parent: Pick<Task, "id" | "pipelineId"
   return publishGateOn(parsePipelineGate(preferences.get(PIPELINE_GATES_PREF), gate), { id: parent.id, pipelineId: parent.pipelineId ?? null, pipelineName: name });
 }
 
+/** What `pipeline_gates` names that is not there — a pipeline that is no
+ *  pipeline's id or exact name, a card id no task has — or null when every
+ *  entry matches. Such an entry switches nothing on, and says so wherever
+ *  gates are adopted. */
+export function pipelineGatesUnmatched(): GateUnmatched | null {
+  const found = unmatchedGateRefs(preferences.get(PIPELINE_GATES_PREF), {
+    pipelines: pipelines.list().map((p) => ({ id: p.id, name: p.name })),
+    hasCard: (id) => !!tasks.get(id),
+  });
+  return found.pipelines.length > 0 || found.cards.length > 0 ? found : null;
+}
+
 export function publishGatePref(parent: Pick<Task, "id" | "pipelineId">, run: Pick<PipelineRunState, "pipelineName">): boolean {
   return gatePref("publish", parent, run);
 }
@@ -2009,8 +2021,42 @@ export function stopPublishForOwner(parentId: string, why: string): Promise<bool
  * that has started. Takes effect at the step's next launch; a step in
  * mid-turn is not switched.
  */
-export function adoptPipelineGates(parentId: string): Promise<{ publish: boolean; steps: boolean; changed: boolean } | { error: string; status: 404 | 409 }> {
+export function adoptPipelineGates(parentId: string): Promise<PipelineGateAdoption | { error: string; status: 404 | 409 }> {
   return runExclusive(parentId, async () => {
+    const adopted = await adoptPipelineGatesLocked(parentId);
+    if ("error" in adopted) return adopted;
+    // An entry of the preference that matches nothing gates nothing: say so
+    // on the card that was asked about, and in the answer.
+    const unmatched = pipelineGatesUnmatched();
+    if (!unmatched) return adopted;
+    const parent = tasks.get(parentId);
+    const mine = parent?.pipelineId ? pipelines.get(parent.pipelineId) : null;
+    const line = gateUnmatchedLine(unmatched)!;
+    const said = `${line}.${mine ? ` This card's pipeline is ${JSON.stringify(mine.name)} (id ${mine.id}).` : ""}`;
+    if (gateUnmatchedSaid.get(parentId) !== said) {
+      gateUnmatchedSaid.set(parentId, said);
+      recordActivity(parentId, { kind: "auto", tone: "warning", text: said });
+      console.warn(`[agetor] ${line}`);
+    }
+    return { ...adopted, unmatched };
+  });
+}
+
+/** What {@link adoptPipelineGates} answers. `unmatched` is only there when
+ *  `pipeline_gates` names a pipeline or a card that does not exist. */
+export interface PipelineGateAdoption {
+  publish: boolean;
+  steps: boolean;
+  changed: boolean;
+  unmatched?: GateUnmatched;
+}
+
+/** The last "names what is not there" line said on each card: once per
+ *  wording, not once per refresh. */
+const gateUnmatchedSaid = new Map<string, string>();
+
+async function adoptPipelineGatesLocked(parentId: string): Promise<{ publish: boolean; steps: boolean; changed: boolean } | { error: string; status: 404 | 409 }> {
+  {
     const parent = tasks.get(parentId);
     if (!parent?.pipelineId || tombstonedPipelineParents.has(parentId)) return { error: "not a pipeline task", status: 404 as const };
     if (parent.archivedAt != null) return { error: "pipeline task is archived — unarchive it first", status: 409 as const };
@@ -2046,7 +2092,7 @@ export function adoptPipelineGates(parentId: string): Promise<{ publish: boolean
     }
     persist(parentId, run, { preserveStatus: true });
     return { publish, steps, changed: true };
-  });
+  }
 }
 
 async function launchStep(
@@ -3256,7 +3302,7 @@ export interface PipelineRunRefreshResult extends PipelineInstructionRefresh {
   taskId: string;
   error?: string;
   /** Only when the refresh asked for gates (`adoptPipelineGates`). */
-  gates?: { publish: boolean; steps: boolean; changed: boolean } | { error: string };
+  gates?: PipelineGateAdoption | { error: string };
 }
 
 /** Push a template's current instructions into every unarchived, unfinished

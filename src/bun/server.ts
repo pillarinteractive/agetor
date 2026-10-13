@@ -31,7 +31,8 @@ import {
 import { refreshOne } from "./usage/poller.ts";
 import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, publishGlobalEvent, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import { readCheckLedger } from "./check-runner.ts";
-import { advancePipeline, cancelPipelineRun, isPipelineStepTask, listBlockWaits, adoptPipelineGates, adoptPipelineInstructions, pipelineStepReports, refreshPipelineInstructions, refreshPipelineRuns, releaseSlotWaits, retryPipelineStep, startPipelineRun } from "./pipeline-runner.ts";
+import { advancePipeline, cancelPipelineRun, isPipelineStepTask, listBlockWaits, adoptPipelineGates, adoptPipelineInstructions, pipelineGatesUnmatched, pipelineStepReports, refreshPipelineInstructions, refreshPipelineRuns, releaseSlotWaits, retryPipelineStep, startPipelineRun } from "./pipeline-runner.ts";
+import { PIPELINE_GATES_PREF, gateUnmatchedLine } from "../shared/publish.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
 import { accountUsageDays } from "./account-usage.ts";
@@ -3466,6 +3467,12 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: "value (string) required" }, { status: 400, headers: corsHeaders(req) });
           }
           preferences.set(req.params.key, body.value);
+          if (req.params.key === PIPELINE_GATES_PREF) {
+            // Saved as given; an entry that matches nothing is said in the
+            // log now and on each card when gates are next adopted.
+            const unmatched = pipelineGatesUnmatched();
+            if (unmatched) console.warn(`[agetor] ${gateUnmatchedLine(unmatched)}`);
+          }
           // Keep-awake toggles take effect now, not on the next tick.
           if (req.params.key === KEEP_SCREEN_ON_PREF_KEY || req.params.key === KEEP_AWAKE_PREF_KEY) recheckKeepAwake();
           return new Response(null, { status: 204, headers: corsHeaders(req) });
@@ -4250,7 +4257,12 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           // each run: a started run changes its loop only when asked to.
           const body = await req.json().catch(() => null);
           const gates = !!body && typeof body === "object" && (body as { gates?: unknown }).gates === true;
-          return json({ results: await refreshPipelineRuns(req.params.id, { gates }) }, { headers: corsHeaders(req) });
+          const results = await refreshPipelineRuns(req.params.id, { gates });
+          // What `pipeline_gates` names that is not there (a pipeline by a
+          // prefix of its name, a card id no task has): it gates nothing,
+          // and a refresh that adopts nothing must say why.
+          const unmatched = gates ? pipelineGatesUnmatched() : null;
+          return json(unmatched ? { results, gatesUnmatched: unmatched } : { results }, { headers: corsHeaders(req) });
         }),
       },
 

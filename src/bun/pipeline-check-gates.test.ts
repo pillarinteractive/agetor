@@ -396,7 +396,8 @@ test("a started run adopts the gate only on an explicit refresh, and drops it th
   // Taken out of the trial list: off at once, with no refresh.
   gateOn(card.pipeline.name, ["another-card"]);
   expect(runner.stepGateFor(tasks.get(card.id)!, runOf(card.id), adoptedBuild)).toBeNull();
-  expect(await runner.adoptPipelineGates(card.id)).toEqual({ publish: false, steps: false, changed: true });
+  // …and the trial list's other entry is no card: the answer says so.
+  expect(await runner.adoptPipelineGates(card.id)).toEqual({ publish: false, steps: false, changed: true, unmatched: { pipelines: [], cards: ["steps: another-card"] } });
   expect(runOf(card.id).snapshot!.gates).toBeUndefined();
 
   // Both gates at once: one preference, two entries, adopted together.
@@ -423,6 +424,39 @@ test("a started run adopts the gate only on an explicit refresh, and drops it th
   expect(launched).toMatchObject({ outcome: "succeeded", gate: { state: "passed", composed: true } });
   expect(tasks.get(launched.taskId)!.prompt).toContain("## Step goal\n\nWhat must be true when this step ends: Committed.");
   expect(timesRun(counter)).toBe(1);
+}, 90_000);
+
+// The trial's preference named the pipeline "Change"; it is called "Change:
+// Understand, Build, Review, Finish". Nothing was gated and nothing said so.
+test("a preference that names a pipeline by a prefix, or a card that is not there, gates nothing and says so", async () => {
+  const card = await makeCard({ script: { build: "missing" } });
+  await start(card.id);
+  await settled(card.id, "blocked");
+  const prefix = card.pipeline.name.slice(0, 11); // "check-gates"
+  preferences.set(PIPELINE_GATES_PREF, JSON.stringify({ publish: { pipelines: [prefix] }, steps: { pipelines: [prefix, card.pipeline.id], cards: [card.id, "no-such-card"] } }));
+  expect(runner.pipelineGatesUnmatched()).toEqual({ pipelines: [`publish: ${prefix}`, `steps: ${prefix}`], cards: ["steps: no-such-card"] });
+
+  // The id still matches for `steps`; `publish` named nothing real.
+  expect(await runner.adoptPipelineGates(card.id)).toEqual({
+    publish: false, steps: true, changed: true, unmatched: { pipelines: [`publish: ${prefix}`, `steps: ${prefix}`], cards: ["steps: no-such-card"] },
+  });
+  const said = () => activity(card.id).filter((l) => l.startsWith("pipeline_gates names what is not there"));
+  expect(said()).toHaveLength(1);
+  expect(said()[0]).toContain(`no pipeline has the id or the exact name "${prefix}"`);
+  expect(said()[0]).toContain('no card has the id "no-such-card"');
+  expect(said()[0]).toContain(`This card's pipeline is "${card.pipeline.name}" (id ${card.pipeline.id})`);
+  // Said once per wording, not once per refresh.
+  await runner.adoptPipelineGates(card.id);
+  expect(said()).toHaveLength(1);
+
+  // A refresh of the pipeline's runs carries it on each run's result.
+  const results = await runner.refreshPipelineRuns(card.pipeline.id, { gates: true });
+  expect(results.find((r) => r.taskId === card.id)!.gates).toMatchObject({ steps: true, unmatched: { cards: ["steps: no-such-card"] } });
+
+  // The exact name in another case, and real ids only: nothing to report.
+  preferences.set(PIPELINE_GATES_PREF, JSON.stringify({ steps: { pipelines: [card.pipeline.name.toUpperCase()], cards: [card.id] } }));
+  expect(runner.pipelineGatesUnmatched()).toBeNull();
+  expect(await runner.adoptPipelineGates(card.id)).toEqual({ publish: false, steps: true, changed: false });
 }, 90_000);
 
 test("the run state's gate fields survive the store's sanitizer, and junk does not", async () => {

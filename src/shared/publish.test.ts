@@ -5,6 +5,7 @@ import {
   PUBLISH_MAX_TRIES, PUBLISH_NO_CHECKS_MS, PUBLISH_PR_LAG_MS, PUBLISH_RERUN_SETTLE_MS,
   applyPublish, approvedHeadFor, baseHealth, baseVerdicts, decidePublish, failingCauses, initialPublishState, parsePublishGate,
   publishBuildHandoff, publishEvidenceComment, publishGateOn, publishStepOf, publishVisitOver, publishWriterBrief, verdictsSettled,
+  gateUnmatchedLine, unmatchedGateRefs,
   type PublishAction, type PublishObservation, type PullSeen,
 } from "./publish.ts";
 
@@ -313,5 +314,43 @@ describe("what Build, the writer and the pull request are told", () => {
     expect(brief).toContain('"next": null');
     expect(brief).toContain("https://github.com/o/r/pull/7");
     expect(brief).toContain("with origin/develop merged in by Agetor");
+  });
+});
+
+// The trial's preference named the pipeline "Change"; the pipeline is called
+// "Change: Understand, Build, Review, Finish". Nothing matched, and nothing said so.
+describe("pipeline_gates entries that match nothing", () => {
+  const known = {
+    pipelines: [{ id: "deec4252", name: "Change: Understand, Build, Review, Finish" }, { id: "5e82ae3d", name: "Branch Review" }],
+    hasCard: (id: string) => id === "card-1",
+  };
+  const pref = (v: unknown) => JSON.stringify(v);
+  const cases: [string, unknown, { pipelines: string[]; cards: string[] }][] = [
+    ["a prefix of a name is not the name", { publish: { pipelines: ["Change"] } }, { pipelines: ["publish: Change"], cards: [] }],
+    ["the whole name, in any case", { publish: { pipelines: ["change: understand, build, review, finish"] } }, { pipelines: [], cards: [] }],
+    ["the id", { steps: { pipelines: ["deec4252"] } }, { pipelines: [], cards: [] }],
+    ["a prefix of an id is not the id", { steps: { pipelines: ["deec"] } }, { pipelines: ["steps: deec"], cards: [] }],
+    ["each gate is reported by name", { publish: { pipelines: ["Change"] }, steps: { pipelines: ["Change", "Branch review"] } }, { pipelines: ["publish: Change", "steps: Change"], cards: [] }],
+    ["a card id no task has", { publish: { pipelines: ["deec4252"], cards: ["card-1", "card-9"] } }, { pipelines: [], cards: ["publish: card-9"] }],
+    ["nothing set", null, { pipelines: [], cards: [] }],
+  ];
+  for (const [name, value, want] of cases) {
+    test(name, () => expect(unmatchedGateRefs(value === null ? null : pref(value), known)).toEqual(want));
+  }
+
+  test("the switch itself takes an id or the exact name, never a prefix", () => {
+    const card = { id: "card-1", pipelineId: "deec4252", pipelineName: "Change: Understand, Build, Review, Finish" };
+    const on = (pipelines: string[]) => publishGateOn(parsePublishGate(pref({ publish: { pipelines } })), card);
+    expect(on(["Change"])).toBe(false);
+    expect(on(["deec"])).toBe(false);
+    expect(on(["CHANGE: understand, build, review, finish"])).toBe(true);
+    expect(on(["deec4252"])).toBe(true);
+  });
+
+  test("one line names what did not match, and nothing is said when all did", () => {
+    expect(gateUnmatchedLine({ pipelines: [], cards: [] })).toBeNull();
+    const line = gateUnmatchedLine({ pipelines: ["publish: Change"], cards: ["publish: card-9"] })!;
+    expect(line).toContain('no pipeline has the id or the exact name "Change"');
+    expect(line).toContain('no card has the id "card-9"');
   });
 });

@@ -658,11 +658,17 @@ put on hold. The visit's state is `run.publish`, so a core restart loses nothing
 **The switch** is the `pipeline_gates` preference:
 
 ```json
-{"publish": {"pipelines": ["Change"], "cards": ["<task id>", "<task id>"]}}
+{"publish": {"pipelines": ["<pipeline id>"], "cards": ["<task id>", "<task id>"]}}
 ```
 
-`pipelines` (names or ids) turns it on; `cards` is the trial list, and while it is present only those cards are
-covered. Remove `cards` to cover every card of those pipelines. A card is covered when its run *adopted* the gate
+`pipelines` turns it on: each entry is a pipeline's **id** (`agetor pipeline ls --json`) or its **exact name**,
+compared without regard to case — `"Change: Understand, Build, Review, Finish"`, never a prefix such as `"Change"`.
+`cards` is the trial list (full task ids), and while it is present only those cards are covered. Remove `cards` to
+cover every card of those pipelines. An entry that matches nothing gates nothing, and is no longer silent: the
+`{"gates": true}` refreshes below answer with what did not match (`gatesUnmatched` on `refresh-runs`, `unmatched` in
+each `gates` result: `{"pipelines": ["publish: Change"], "cards": ["steps: <id>"]}`), the card that was refreshed gets
+a timeline line "pipeline_gates names what is not there …" naming its own pipeline's name and id, and the core log
+has the same line when the preference is saved (`unmatchedGateRefs`, `src/shared/publish.ts`). A card is covered when its run *adopted* the gate
 (`run.snapshot.gates.publish`) **and** the preference still names it:
 - A run adopts when it starts. A run that has started adopts only on an explicit refresh:
   `POST /pipelines/:id/refresh-runs` with `{"gates": true}`, or `POST /tasks/:id/pipeline/refresh-instructions` with
@@ -768,11 +774,12 @@ selected step's rows under "Recorded while … was executing".
 **The switch** is the same `pipeline_gates` preference as Finish, under its own key:
 
 ```json
-{"steps": {"pipelines": ["Change"], "cards": ["<task id>", "<task id>"]}}
+{"steps": {"pipelines": ["<pipeline id>"], "cards": ["<task id>", "<task id>"]}}
 ```
 
-Both gates at once: `{"publish": {"pipelines": ["Change"], "cards": […]}, "steps": {"pipelines": ["Change"], "cards": […]}}`.
-The semantics are those of `publish`: `pipelines` (names or ids) turns it on, `cards` is the trial list (remove it
+Both gates at once: `{"publish": {"pipelines": ["<pipeline id>"], "cards": […]}, "steps": {"pipelines": ["<pipeline id>"], "cards": […]}}`.
+The semantics are those of `publish`: `pipelines` (ids, or exact names — not `"Change"` for a pipeline called
+`"Change: Understand, Build, Review, Finish"`) turns it on, `cards` is the trial list (remove it
 to cover every card of those pipelines), and a card is covered when its run *adopted* the gate
 (`run.snapshot.gates.steps`) **and** the preference still names it.
 - A run adopts when it starts. A started run adopts only on an explicit refresh — `POST /pipelines/:id/refresh-runs`
