@@ -26,7 +26,8 @@ import { shortCardName } from "./card-names.ts";
  *  parked on a dependency included); amber is the owner's move. */
 export type CardStateTone = "working" | "waiting" | "needs" | "failed" | "merged" | "queued";
 
-export type CardStateIcon = "activity" | "clock" | "alert" | "x" | "merge" | "dashed";
+/** `check` is not a card state's icon: the run view uses it for a step that handed off. */
+export type CardStateIcon = "activity" | "clock" | "alert" | "x" | "merge" | "dashed" | "check";
 
 export const CARD_STATE_ICON: Record<CardStateTone, CardStateIcon> = {
   working: "activity",
@@ -120,25 +121,45 @@ function sansPr(line: string): string {
 
 export const clockTime = (ts: number) => new Date(ts).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
 
-/** A graph's steps from the start step along the edges; steps the walk
- *  doesn't reach keep their array order, at the end. Follow-up steps are not
- *  part of the pipeline and are left out. */
+/**
+ * A graph's steps in reading order: by how far each is from the start step
+ * along the edges, taking the longest way there and leaving out the edges
+ * that lead back (a loop to an earlier step). So a step reached both
+ * directly and through others (Understand → Finish for a trivial change,
+ * beside Understand → Build → Review → Finish) comes after the others, not
+ * before them. Steps the walk doesn't reach keep their array order, at the
+ * end. Follow-up steps are not part of the pipeline and are left out.
+ */
 export function stepOrder(graph: PipelineGraph): string[] {
   const steps = graph.steps.filter((s) => !isFollowUpStepId(s.id));
   const ids = new Set(steps.map((s) => s.id));
-  const order: string[] = [];
-  const seen = new Set<string>();
   const start = resolveStartStep(graph);
-  const queue = start && ids.has(start.id) ? [start.id] : [];
-  while (queue.length > 0) {
-    const id = queue.shift()!;
-    if (seen.has(id)) continue;
-    seen.add(id);
-    order.push(id);
-    for (const e of graph.edges) if (e.from === id && ids.has(e.to) && !seen.has(e.to)) queue.push(e.to);
-  }
-  for (const s of steps) if (!seen.has(s.id)) order.push(s.id);
-  return order;
+  if (!start || !ids.has(start.id)) return steps.map((s) => s.id);
+  const out = (id: string) => graph.edges.filter((e) => e.from === id && ids.has(e.to));
+  // Depth-first from the start: an edge to a step still being walked leads back.
+  const back = new Set<string>();
+  const found: string[] = [];
+  const walking = new Set<string>();
+  const walk = (id: string) => {
+    found.push(id);
+    walking.add(id);
+    for (const e of out(id)) {
+      if (walking.has(e.to)) back.add(e.id);
+      else if (!found.includes(e.to)) walk(e.to);
+    }
+    walking.delete(id);
+  };
+  walk(start.id);
+  const rank = new Map<string, number>();
+  const rankOf = (id: string): number => {
+    if (rank.has(id)) return rank.get(id)!;
+    const into = graph.edges.filter((e) => e.to === id && !back.has(e.id) && found.includes(e.from));
+    const r = id === start.id || into.length === 0 ? 0 : 1 + Math.max(...into.map((e) => rankOf(e.from)));
+    rank.set(id, r);
+    return r;
+  };
+  const reached = [...found].sort((x, y) => rankOf(x) - rankOf(y) || found.indexOf(x) - found.indexOf(y));
+  return [...reached, ...steps.filter((s) => !found.includes(s.id)).map((s) => s.id)];
 }
 
 /**

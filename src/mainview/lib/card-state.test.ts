@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { cardState, columnSummary, formatElapsed, stepStrip, type CardState, type CardStateContext } from "./card-state.ts";
+import { cardState, columnSummary, formatElapsed, stepOrder, stepStrip, type CardState, type CardStateContext } from "./card-state.ts";
 import { cardStatus } from "./card-status.ts";
 import type { PipelineBlockWait, PipelineRunState, PipelineStepRecord, Task, TaskPrStatus } from "../../shared/types.ts";
 import type { TaskLeaseInfo } from "./leases.ts";
@@ -262,6 +262,29 @@ describe("stepStrip", () => {
     const s = state(task({ pipelineRun: followUp }));
     expect(s.strip!.map((x) => x.status)).toEqual(["done", "done", "done", "done"]);
     expect(s).toMatchObject({ label: "Working", step: { name: "Fix CI" }, elapsedMs: 3 * MIN });
+  });
+
+  test("a step reached both directly and through others comes after the others; a loop back does not reorder", () => {
+    // Understand → Finish for a trivial change, beside Understand → Build → Review → Finish.
+    const edges = [
+      { id: "a", from: "understand", to: "build", label: "" },
+      { id: "b", from: "understand", to: "finish", label: "trivial" },
+      { id: "c", from: "build", to: "review", label: "" },
+      { id: "d", from: "review", to: "build", label: "changes" },
+      { id: "e", from: "review", to: "finish", label: "approved" },
+      { id: "f", from: "finish", to: "build", label: "verification failed" },
+    ];
+    expect(stepOrder(snapshot(STEPS, edges)!.graph)).toEqual(["understand", "build", "review", "finish"]);
+    // The steps as listed, when nothing says where the start is reached from.
+    expect(stepOrder(snapshot(STEPS, [])!.graph)).toEqual(["understand", "build", "review", "finish"]);
+    // A fan-out and its join: both branches before the step that joins them.
+    const fan = [
+      { id: "a", from: "understand", to: "build", label: "" },
+      { id: "b", from: "understand", to: "review", label: "" },
+      { id: "c", from: "build", to: "finish", label: "" },
+      { id: "d", from: "review", to: "finish", label: "" },
+    ];
+    expect(stepOrder(snapshot(STEPS, fan)!.graph)).toEqual(["understand", "build", "review", "finish"]);
   });
 
   test("no snapshot, no strip — and the step falls back to its id", () => {
