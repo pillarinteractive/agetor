@@ -91,6 +91,7 @@ import {
   composeStepPrompt,
   deriveRunStatus,
   effectiveStepCap,
+  exhaustedEdge,
   FOLLOW_UP_STEP_PREFIX,
   incomingSteps,
   isFollowUpStepId,
@@ -3665,6 +3666,29 @@ async function settleStepRun(
           detail: `choose exactly one of: ${candidates}`,
           baseMessage,
         });
+      }
+
+      // An edge with `maxTraversals` is a bounded corrective loop (Finish →
+      // Build after a CI failure). Once the run has taken it that often, the
+      // step's choice is kept in history and the run waits for a person, who
+      // can Advance it by hand; it is never routed onward or retried here.
+      if (resolved.kind === "steps") {
+        const spent = exhaustedEdge(graph, run.history, activeEntry.stepId, resolved.stepIds);
+        if (spent) {
+          if (historyEntry) historyEntry.handoff = parsedHandoff;
+          const label = spent.edge.label.trim() || stepNameById(graph, spent.edge.to);
+          upsertBlocked(run, {
+            taskId,
+            stepId: activeEntry.stepId,
+            kind: "step-blocked",
+            message: `step "${stepName}" chose "${label}" again, but this run has already taken that route ${spent.taken} of ${spent.edge.maxTraversals} times — decide whether to continue (Advance to ${stepNameById(graph, spent.edge.to)}) or take the card over`,
+          });
+          recordActivity(parentId, { kind: "step", tone: "warning",
+            text: `${stepName} → ${stepNameById(graph, spent.edge.to)} ("${label}") reached its limit of ${spent.edge.maxTraversals} — waiting for you` });
+          checkJoinIncomplete(run);
+          persist(parentId, run);
+          return null;
+        }
       }
 
       // M-R2: decided BEFORE this execution is removed from `active` —

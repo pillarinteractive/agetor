@@ -337,6 +337,19 @@ describe("toFlowNodes / toFlowEdges", () => {
     expect(rebuilt.edges).toEqual([{ id: "e1", from: "s1", to: "s2", label: "next" }]);
   });
 
+  test("an edge's maxTraversals survives the editor: load, relabel, save", () => {
+    const capped = { ...makeEdge({ id: "e1", from: "s2", to: "s1", label: "verification failed" }), maxTraversals: 2 };
+    const plain = makeEdge({ id: "e2", from: "s1", to: "s2", label: "" });
+    const graph = makeGraph([makeStep({ id: "s1" }), makeStep({ id: "s2" })], [capped, plain], "s1");
+    // What PipelineEditor does on load and on a label edit: spread `data`.
+    const edges = toFlowEdges(graph).map((e) => ({ ...e, data: { ...e.data, onDelete: () => {}, label: e.id === "e1" ? "ci failed" : e.data?.label } }));
+    const rebuilt = graphFromFlow(toFlowNodes(graph), edges, "s1");
+    expect(rebuilt.edges).toEqual([
+      { id: "e1", from: "s2", to: "s1", label: "ci failed", maxTraversals: 2 },
+      { id: "e2", from: "s1", to: "s2", label: "" },
+    ]);
+  });
+
   test("graphFromFlow defaults a missing/non-string data.label to empty string", () => {
     const nodes = toFlowNodes(makeGraph([makeStep({ id: "s1" })]));
     const edges = [

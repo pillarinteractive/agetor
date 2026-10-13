@@ -15,6 +15,7 @@ import {
   STEP_ECONOMY_GUIDANCE,
   deriveRunStatus,
   effectiveStepCap,
+  exhaustedEdge,
   incomingSteps,
   isPipelineColumnRunnerOwned,
   matchPipelineRef,
@@ -2957,4 +2958,59 @@ test("every step's prompt carries the usage guidance, between its instructions a
   // Short enough to cost nothing next to what it saves, and project-agnostic.
   expect(STEP_ECONOMY_GUIDANCE.length).toBeLessThan(1200);
   expect(STEP_ECONOMY_GUIDANCE).not.toMatch(/pnpm|bun |npm|\.github/);
+});
+
+// ---------------------------------------------------------------------------
+// A bounded corrective edge, and the reviewed shape
+// ---------------------------------------------------------------------------
+
+/** The live "Change" pipeline's shape: Understand, Build, Review, Finish. */
+function changeGraph(): PipelineGraph {
+  const step = (id: string, name: string, canFinish = false) => ({ ...newStep({ id, name, agentProfileId: "p" }), ...(canFinish ? { canFinish: true } : {}) });
+  return {
+    steps: [step("understand", "Understand", true), step("build", "Build"), step("review", "Review"), step("finish", "Finish", true)],
+    edges: [
+      { id: "understand-build", from: "understand", to: "build", label: "build" },
+      { id: "understand-finish", from: "understand", to: "finish", label: "trivial change made" },
+      { id: "build-review", from: "build", to: "review", label: "" },
+      { id: "review-build", from: "review", to: "build", label: "changes requested" },
+      { id: "review-finish", from: "review", to: "finish", label: "approved" },
+      { id: "finish-build", from: "finish", to: "build", label: "verification failed" },
+    ],
+    startStepId: "understand",
+  };
+}
+
+describe("an edge's maxTraversals", () => {
+  test("is validated, kept and optional", () => {
+    const g = changeGraph();
+    expect(validatePipelineGraph(g).ok).toBe(true);
+    g.edges.find((e) => e.id === "finish-build")!.maxTraversals = 2;
+    const v = validatePipelineGraph(g);
+    expect(v.ok).toBe(true);
+    if (v.ok) {
+      expect(v.graph.edges.find((e) => e.id === "finish-build")!.maxTraversals).toBe(2);
+      expect("maxTraversals" in v.graph.edges.find((e) => e.id === "review-build")!).toBe(false);
+    }
+    for (const bad of [0, 1.5, -1, PIPELINE_LIMITS.maxStepsMax + 1, "2"]) {
+      const b = changeGraph();
+      (b.edges[0] as { maxTraversals?: unknown }).maxTraversals = bad;
+      expect(validatePipelineGraph(b).ok).toBe(false);
+    }
+  });
+
+  test("the third Finish → Build is held; Review → Build has no limit of its own", () => {
+    const g = changeGraph();
+    g.edges.find((e) => e.id === "finish-build")!.maxTraversals = 2;
+    const h = (stepId: string, next: string[], outcome: "succeeded" | "advanced-manually" | "failed" | null = "succeeded") => ({ stepId, outcome, nextStepIds: next });
+    const once = [h("finish", ["build"]), h("build", ["review"]), h("review", ["finish"]), h("finish", [], null)];
+    expect(exhaustedEdge(g, once, "finish", ["build"])).toBeNull();
+    const twice = [h("finish", ["build"]), h("review", ["build"]), h("finish", ["build"], "advanced-manually"), h("finish", [], null)];
+    expect(exhaustedEdge(g, twice, "finish", ["build"])?.taken).toBe(2);
+    // Finishing instead of going round again is never held.
+    expect(exhaustedEdge(g, twice, "finish", [])).toBeNull();
+    // A failed execution took no edge.
+    expect(exhaustedEdge(g, [h("finish", ["build"]), h("finish", ["build"], "failed")], "finish", ["build"])).toBeNull();
+    expect(exhaustedEdge(g, Array.from({ length: 9 }, () => h("review", ["build"])), "review", ["build"])).toBeNull();
+  });
 });

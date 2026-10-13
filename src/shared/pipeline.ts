@@ -16,6 +16,7 @@ import type {
   PipelineRunState,
   PipelineRunStatus,
   PipelineStep,
+  PipelineStepRecord,
   StepResponseKind,
 } from "./types.ts";
 import { PIPELINE_LIMITS } from "./types.ts";
@@ -468,7 +469,15 @@ export function validatePipelineGraph(
     if (PIPELINE_CONTROL_CHAR_RE.test(label)) {
       return { ok: false, error: `edge "${id}" label must not contain control characters` };
     }
-    edges.push({ id, from, to, label });
+    const rawMax = rawEdge.maxTraversals;
+    if (rawMax !== undefined && rawMax !== null) {
+      if (typeof rawMax !== "number" || !Number.isInteger(rawMax) || rawMax < 1 || rawMax > PIPELINE_LIMITS.maxStepsMax) {
+        return { ok: false, error: `edge "${id}" maxTraversals must be an integer between 1 and ${PIPELINE_LIMITS.maxStepsMax}` };
+      }
+      edges.push({ id, from, to, label, maxTraversals: rawMax });
+    } else {
+      edges.push({ id, from, to, label });
+    }
   }
 
   // Outgoing-edge labels are a `next` matching tier (`resolveNextSteps`):
@@ -980,6 +989,28 @@ export function resolveNextSteps(
   }
 
   return { kind: "unknown", next, candidates };
+}
+
+/**
+ * The first edge from `fromStepId` to one of `nextStepIds` that this run has
+ * already taken as often as its `maxTraversals` allows, or null. A traversal
+ * is a finished execution of `fromStepId` (succeeded, or advanced by hand)
+ * whose recorded next steps include the edge's target; executions with no
+ * outcome yet (the one being settled) do not count. Pure.
+ */
+export function exhaustedEdge(
+  g: PipelineGraph,
+  history: readonly Pick<PipelineStepRecord, "stepId" | "outcome" | "nextStepIds">[],
+  fromStepId: string,
+  nextStepIds: readonly string[],
+): { edge: PipelineEdge; taken: number } | null {
+  for (const edge of g.edges) {
+    if (edge.from !== fromStepId || edge.maxTraversals === undefined || !nextStepIds.includes(edge.to)) continue;
+    const taken = history.filter((h) =>
+      h.stepId === fromStepId && (h.outcome === "succeeded" || h.outcome === "advanced-manually") && h.nextStepIds.includes(edge.to)).length;
+    if (taken >= edge.maxTraversals) return { edge, taken };
+  }
+  return null;
 }
 
 /**

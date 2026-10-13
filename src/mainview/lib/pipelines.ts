@@ -228,7 +228,7 @@ export type StepFlowNodeData = Record<string, unknown> & { step: PipelineStep };
 export type StepFlowNode = Node<StepFlowNodeData, "step">;
 
 /** Edge data shape shared by every {@link toFlowEdges} caller. */
-export type StepFlowEdgeData = Record<string, unknown> & { label?: string };
+export type StepFlowEdgeData = Record<string, unknown> & { label?: string; maxTraversals?: number };
 export type StepFlowEdge = Edge<StepFlowEdgeData, "step">;
 
 /**
@@ -254,7 +254,10 @@ export function toFlowNodes(
  * Convert a {@link PipelineGraph}'s edges into React Flow edges: `id` = edge
  * id, `type: "step"`, `source`/`target` = `from`/`to`, fixed
  * `sourceHandle: "out"` / `targetHandle: "in"` (matching {@link StepNode}'s
- * two handles), `data: { label }`.
+ * two handles), `data: { label }` — plus `maxTraversals` when the edge has
+ * one. The editor has no control for it (it is set through the API), so it
+ * rides along in `data` and {@link graphFromFlow} writes it back: saving a
+ * pipeline from the editor must not drop the cap.
  */
 export function toFlowEdges(graph: PipelineGraph): StepFlowEdge[] {
   return graph.edges.map((edge) => ({
@@ -264,7 +267,7 @@ export function toFlowEdges(graph: PipelineGraph): StepFlowEdge[] {
     target: edge.to,
     sourceHandle: "out",
     targetHandle: "in",
-    data: { label: edge.label },
+    data: { label: edge.label, ...(edge.maxTraversals !== undefined ? { maxTraversals: edge.maxTraversals } : {}) },
   }));
 }
 
@@ -285,6 +288,7 @@ export function graphFromFlow(nodes: StepFlowNode[], edges: StepFlowEdge[], star
     from: e.source,
     to: e.target,
     label: typeof e.data?.label === "string" ? e.data.label : "",
+    ...(typeof e.data?.maxTraversals === "number" ? { maxTraversals: e.data.maxTraversals } : {}),
   }));
   return { steps, edges: graphEdges, startStepId };
 }

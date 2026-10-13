@@ -471,6 +471,11 @@ export interface PipelineEdge {
   from: string;
   to: string;
   label: string;
+  /** How many times one run may take this edge (1..PIPELINE_LIMITS.maxStepsMax).
+   *  Absent: no limit of its own, only the run's step cap. A step that chooses
+   *  the edge once more is held for a person instead (`exhaustedEdge`): the
+   *  cap on a corrective loop such as Finish → Build after a CI failure. */
+  maxTraversals?: number;
 }
 
 /** The full graph a {@link Pipeline} is built from. `startStepId` is the
