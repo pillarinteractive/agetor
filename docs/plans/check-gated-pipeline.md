@@ -3,7 +3,7 @@
 | Field | Value |
 | --- | --- |
 | Date | 2026-10-13 |
-| Status | Proposal for the owner. No production code changes with this document. |
+| Status | Stages 0, 1 and 2 are built (Stage 2 on `feat/check-gates-stage-2`, 2026-10-13; see "Stage 2 as built" in section 5 and FORK.md "Checks on working steps"). Stage 3 is not. |
 | Base | `release` at `56e9adb` |
 | Location | `docs/plans/`, where this repository already keeps designs (`pipelines.md`, `global-owner-and-test-caps.md`); no `docs/design/` was created. |
 | Evidence | Source on `release`; the live board's database, block log and await records, read-only, on 2026-10-13. |
@@ -165,6 +165,29 @@ I could not confirm that Pillar's `verify_changed.py` has a static-only mode; it
 
 **What still routes back.** Review findings go to Build with the full report as today. A CI failure of the change's own and a real conflict go from Finish to Build. Review → Build gets `maxTraversals` (suggested 4), so the bound counts review rounds and not launches. A commit after an approval invalidates it by construction: `head-approved` is keyed on HEAD.
 
+### Stage 2 as built (2026-10-13)
+
+Built as described above, behind `pipeline_gates` → `"steps"` (default off). Where the code differs from this
+document, and why:
+
+| This document says | Built as | Why |
+| --- | --- | --- |
+| After `maxTurns` the run blocks with `check-failed` (section 3). | One fresh session of the same step first, then `check-failed`. | The owner's decision 4. Applied to every gated step, not only Build: the rule is the step's, and a Review whose verdict names the wrong head is the same kind of mechanical failure. |
+| The run gains one small field, `publish`; results live only in the ledger (section 3). | Each step record also carries `gate` (`state`, `turns`, `max`, `failed`, `at`, `composed`). | The runner must count feedback turns between turns and the board must say "fixing checks" without reading a file. An older build drops the field: the count restarts, no check is skipped. |
+| The ledger line holds the turn. | `turn` is the evaluation's number within the visit, counted from the ledger itself. | A Retry after the owner's stop evaluates again without a new feedback turn; numbering evaluations keeps every line addressable. |
+| Review's edge follows its verdict (section 3, handoff table). | Unchanged from before: the Pillar-only reroute (`reviewRequiresRepair`) still decides it. | Section 9 leaves removing the Pillar-specific code out. `review-verdict` only binds the verdict to HEAD. |
+| `status: "blocked"` is not authoritative for what Agetor can observe. | A `blocked` handoff is honoured as before and its checks are not run. | Stage 2's built-in checks observe the tree, not CI or the base; nothing they compute contradicts a block. |
+| Refresh instructions copies text and `goal` (section 7). | `goal`, `checks` and `maxTurns` are copied only by the explicit gates refresh. | The goal is only rendered for a run that adopted the gate, and a refresh that promises text only should not change what a step is judged by. |
+| Retry re-runs the checks, then gives a turn only if one fails (section 7). | Retry gives a turn; the checks run when it ends. | Operator operations are Stage 3. |
+| `StepPanel.tsx` gets a goal field and a checks list (section 8). | A read-only display; edited through `PATCH /pipelines/:id`. | Agreed scope for Stage 2. |
+| "running checks 2 of 4" on the card (section 8). | "Agetor is running this step's checks", no count. | The built-ins take milliseconds; a count would never be seen. |
+| Review → Build gets `maxTraversals` 4 (section 5). | Not set by code. | It is pipeline data (`maxTraversals` on the edge), set with the same `PATCH`. |
+| `static` on Build, optional (section 5 table). | Not shipped. | Decision 6: built-ins only. The command-check runner exists and is tested with trivial commands. |
+
+Also built: `halt` for a check that cannot be evaluated (no turn spent, the owner at once); `waived` lines when the
+owner advances past a `check-failed` stop; `pr-required-check`, `head-approved`, `merges-with-base` and
+`head-published` as built-ins that no default uses.
+
 ## 6. Stage 3 — Finding the position
 
 `resolvePosition` walks the steps from the start along forward edges and stops at the first step whose gate is not satisfied.
@@ -242,8 +265,8 @@ These answers replace the "Recommend" lines below wherever the two differ.
 | 1 | The base moved or recovered after Review approved | **A.** Agetor merges the base into the branch when the merge is clean and the change's own diff is unchanged (`git patch-id` of `git diff base...HEAD`, before and after), pushes, and the Review approval carries over. No agent step. A conflict or a changed diff falls back to today's route: Build, with "merge origin/<base>". |
 | 2 | What must be true of a green PR before the merge queue merges it | **A.** Its checks are fresh against the current base, or it was tested in a train. A lone stale PR rides a train of one. |
 | 3 | Running cards | **A.** They adopt the new loop at their next step launch, on an explicit refresh. Never automatically. |
-| 4 | Build still fails its checks after `maxTurns` (Stage 2) | **B.** One fresh session, then the owner. Not built yet. |
-| 5 | A handoff is missing and the checks pass (Stage 2) | **A.** Advance. Not built yet; Stage 1 must not stand in its way. |
+| 4 | Build still fails its checks after `maxTurns` (Stage 2) | **B.** One fresh session, then the owner. Built in Stage 2. |
+| 5 | A handoff is missing and the checks pass (Stage 2) | **A.** Advance. Built in Stage 2. |
 | 6 | Checks on the Mac | **A.** Built-in checks only for now. |
 | — | Order | Stages 0 and 1 are built now. Stage 1 ships behind a per-pipeline switch that is off by default, with a trial list of card ids, so it can be turned on for a few cards first. |
 

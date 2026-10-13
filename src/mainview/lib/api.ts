@@ -84,6 +84,7 @@ import type {
   Task,
   TaskDiff,
   PipelineStepReport,
+  CheckLedgerEntry,
   TaskEventsReplayMeta,
   TaskGitStatus,
   TaskReference,
@@ -651,6 +652,10 @@ export const api = {
    *  run state itself only keeps the handoff block. */
   getPipelineReport: (taskId: string, seq: number) =>
     j<{ reports: PipelineStepReport[] }>(`/tasks/${encodeURIComponent(taskId)}/pipeline/reports?seq=${seq}`),
+  /** The run's check ledger, oldest first (src/bun/check-runner.ts): every
+   *  evaluation of every gated step. Empty for a run without gates. */
+  getPipelineChecks: (taskId: string) =>
+    j<{ checks: CheckLedgerEntry[] }>(`/tasks/${encodeURIComponent(taskId)}/pipeline/checks`),
   /** Manually advance a blocked (or just-settled) pipeline execution: start
    *  `nextStepIds`, or `null` to finish the run here. `handoff` seeds the
    *  synthetic handoff recorded for this manual transition (e.g. a

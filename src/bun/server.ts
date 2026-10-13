@@ -30,6 +30,7 @@ import {
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
 import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, publishGlobalEvent, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
+import { readCheckLedger } from "./check-runner.ts";
 import { advancePipeline, cancelPipelineRun, isPipelineStepTask, listBlockWaits, adoptPipelineGates, adoptPipelineInstructions, pipelineStepReports, refreshPipelineInstructions, refreshPipelineRuns, releaseSlotWaits, retryPipelineStep, startPipelineRun } from "./pipeline-runner.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
@@ -4996,6 +4997,18 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             { task: withRunningSubagents(task), steps: steps.map(withRunningSubagents) },
             { headers: corsHeaders(req) },
           );
+        }),
+      },
+
+      // The run's check ledger (src/bun/check-runner.ts): every evaluation of
+      // every gated step, oldest first — what the run view's Checks tab lists.
+      // `[]` for a run without gates. Read-only: only the core writes it.
+      "/tasks/:id/pipeline/checks": {
+        GET: authed((req) => {
+          const task = tasks.get(req.params.id);
+          if (!task) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          if (!task.pipelineId) return json({ error: "task is not a pipeline task" }, { status: 400, headers: corsHeaders(req) });
+          return json({ checks: task.pipelineRun ? readCheckLedger(task.id, task.pipelineRun) : [] }, { headers: corsHeaders(req) });
         }),
       },
 

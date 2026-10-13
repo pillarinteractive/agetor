@@ -13,6 +13,7 @@ import {
   satellitesSignature,
   stepLayoutFootprint,
   stepReminded,
+  stepGateDisplay,
   stepTaskFor,
   stepVisualState,
   subagentEdgeKey,
@@ -890,5 +891,35 @@ describe("runResultRecords", () => {
     const run = makeRun({ history: [rec(1, "build", []), rec(3, "build", []), rec(2, "review", [])] });
     expect(latestRecordForTask(run, "task-build")?.seq).toBe(3);
     expect(latestRecordForTask(run, null)).toBeNull();
+  });
+});
+
+describe("stepGateDisplay", () => {
+  const step = (id: string, name: string, o: Partial<PipelineStep> = {}): PipelineStep =>
+    ({ id, name, instructions: "", agentProfileId: null, position: { x: 0, y: 0 }, subagents: { profileIds: [], cap: null }, transition: "choose", join: "any", ...o });
+  const reviewed = (build: PipelineStep): PipelineGraph => ({
+    steps: [build, step("r", "Review"), step("f", "Finish")], startStepId: build.id,
+    edges: [{ id: "e1", from: build.id, to: "r", label: "" }, { id: "e2", from: "r", to: "f", label: "approved" }],
+  });
+
+  test("a reviewed pipeline's Build and Review show the built-in defaults; Finish shows none", () => {
+    const build = step("b", "Build");
+    const g = reviewed(build);
+    expect(stepGateDisplay(g, build)).toMatchObject({ source: "defaults", goal: null, maxTurns: 2, maxTurnsDeclared: false, checks: [{ id: "tree-clean", how: "built-in", required: true }, { id: "diff-nonempty", how: "built-in" }] });
+    expect(stepGateDisplay(g, g.steps[1]!).checks.map((c) => c.id)).toEqual(["tree-clean", "review-verdict"]);
+    expect(stepGateDisplay(g, g.steps[2]!)).toMatchObject({ source: "none", checks: [], maxTurns: 2 });
+  });
+
+  test("a step's own goal, checks and turns are shown as declared; an empty list is no gate", () => {
+    const build = step("b", "Build", {
+      goal: " The change is committed. ", maxTurns: 3,
+      checks: [{ id: "unit", description: "unit tests pass", run: { kind: "command", command: "make unit" }, required: false, timeoutSec: 90 }],
+    });
+    expect(stepGateDisplay(reviewed(build), build)).toEqual({
+      source: "declared", goal: "The change is committed.", maxTurns: 3, maxTurnsDeclared: true,
+      checks: [{ id: "unit", description: "unit tests pass", how: "command, 90 s: make unit", required: false }],
+    });
+    const none = step("b", "Build", { checks: [], goal: "Still shown." });
+    expect(stepGateDisplay(reviewed(none), none)).toMatchObject({ source: "none", goal: "Still shown.", checks: [] });
   });
 });

@@ -461,6 +461,111 @@ export interface PipelineStep {
    *  finishes the pipeline, naming a step goes there (e.g. Finish → "verification
    *  failed" → Fix). Without it, a step with outgoing edges always continues. */
   canFinish?: boolean;
+  /** The outcome this step must reach, one or two sentences: what must be
+   *  true when it ends (`instructions` stay the how). Rendered as its own
+   *  prompt section and repeated in every check-feedback turn, for a run that
+   *  adopted the `steps` gate (src/shared/checks.ts). */
+  goal?: string;
+  /** The step's gate: checks Agetor runs itself when the step's turn ends.
+   *  All required ones pass → the run advances by the graph; one fails → the
+   *  same step gets another turn with the failure. Absent: the defaults for
+   *  the step's place in a reviewed pipeline (`defaultStepChecks`); `[]`: no
+   *  gate. Only read by a run that adopted the `steps` gate. */
+  checks?: StepCheck[];
+  /** Check-feedback turns one visit of this step may take (0..5, default 2)
+   *  before the run gives it one fresh session and then the owner. */
+  maxTurns?: number;
+}
+
+/** The checks Agetor can compute itself (src/bun/check-runner.ts). */
+export type BuiltinCheck =
+  | "tree-clean" | "diff-nonempty" | "review-verdict" | "head-approved"
+  | "merges-with-base" | "head-published" | "pr-required-check";
+
+/**
+ * A test of a step's work that Agetor runs and whose result Agetor records
+ * (docs/plans/check-gated-pipeline.md §3). A step's required checks are its
+ * gate.
+ */
+export interface StepCheck {
+  /** Unique within the step: "tree-clean". */
+  id: string;
+  /** One line: shown in the step's prompt, on the card and in the feedback. */
+  description: string;
+  run:
+    | { kind: "builtin"; name: BuiltinCheck }
+    /** Run with `sh -c` in the card's worktree; exit 0 passes. */
+    | { kind: "command"; command: string };
+  /** Runs only after these passed. */
+  dependsOn?: string[];
+  /** Reuse a recorded pass of this check for the same head, tree, base tip
+   *  and definition instead of running it again. */
+  skipWhen?: "unchanged-since-pass";
+  /** false: reported, never gates. */
+  required: boolean;
+  /** Commands: default 120, at most 600. */
+  timeoutSec: number;
+}
+
+/** What a check came to. `skip`: not run — a recorded pass was reused, a
+ *  dependency did not pass, or it does not apply (`satisfied` says which way
+ *  it counts). `halt`: it could not be evaluated, through no fault of the
+ *  work. `waived`: the owner advanced past it. `void`: a recorded result
+ *  that no longer stands. */
+export type CheckOutcome = "pass" | "fail" | "skip" | "waived" | "halt" | "void";
+
+/**
+ * One line of a run's check ledger: `<data dir>/pipeline-runs/<card>/
+ * checks-<generation>.jsonl`, append-only, written only by the core
+ * (src/bun/check-runner.ts). A file and not a field of the run so a build
+ * that does not know it cannot erase it.
+ */
+export interface CheckLedgerEntry {
+  at: number;
+  stepId: string;
+  stepName: string;
+  /** The visit (`PipelineStepRecord.seq`) and its turn, from 1. */
+  seq: number;
+  turn: number;
+  checkId: string;
+  description: string;
+  required: boolean;
+  outcome: CheckOutcome;
+  /** Whether it counts as met for the gate: a pass, or a skip that stands
+   *  for one. */
+  satisfied: boolean;
+  /** What it was computed for. `def` is a hash of the check's definition. */
+  key: { head: string | null; tree: string | null; baseTip: string | null; def: string };
+  /** A command's exit code; null for a built-in or a check that did not run. */
+  exitCode: number | null;
+  /** One line: what was found. */
+  detail: string;
+  /** The end of the output (a command's, or a built-in's findings). */
+  outputTail: string;
+  /** Where a command's whole output is. */
+  outputPath: string | null;
+}
+
+/** Where one visit of a gated step stands (`PipelineStepRecord.gate`). Set
+ *  when the visit is launched under the gate: a visit launched without it is
+ *  never judged by checks, whatever the run adopts afterwards. */
+export interface PipelineStepGateState {
+  /** working — launched under the gate, its first turn is running; checking
+   *  — Agetor is running the checks; feedback — a failed check went back to
+   *  the step and its turn is running; passed; exhausted — still failing
+   *  after its turns, ended for one fresh session; owner — waiting for the
+   *  owner. */
+  state: "working" | "checking" | "feedback" | "passed" | "exhausted" | "owner";
+  /** Check-feedback turns delivered in this visit. */
+  turns: number;
+  /** Turns the visit may take (`PipelineStep.maxTurns` when it was judged). */
+  max: number;
+  /** The required checks that did not pass at the last look. */
+  failed: string[];
+  at: number;
+  /** The handoff on record was composed by Agetor: the step wrote none and
+   *  its required checks passed. */
+  composed?: true;
 }
 
 /** A directed connection between two {@link PipelineStep}s by id.
@@ -644,6 +749,9 @@ export type PipelineBlockKind =
   | "step-cap"
   | "profile-missing"
   | "join-incomplete"
+  /** A gated step's required checks still fail after its feedback turns and
+   *  its one fresh session, or could not be evaluated (src/shared/checks.ts). */
+  | "check-failed"
   /** Not a problem: the step is queued for a free slot (src/bun/step-slots.ts)
    *  and starts by itself. A run whose only blocks are these reads as running. */
   | "slot-wait"
@@ -715,8 +823,9 @@ export interface PipelineRunSnapshot {
   decisionPolicy?: "planner-recommendation";
   /** Check gates this run adopted (`pipeline_gates`, src/shared/publish.ts):
    *  captured when the run starts, or on an explicit refresh — never by
-   *  itself. `publish`: the pipeline's Finish step is run by Agetor. */
-  gates?: { publish?: true };
+   *  itself. `publish`: the pipeline's Finish step is run by Agetor. `steps`:
+   *  working steps are judged by their checks (src/shared/checks.ts). */
+  gates?: { publish?: true; steps?: true };
 }
 
 /** Where an Agetor-run Finish is (src/shared/publish.ts has the machine):
@@ -847,6 +956,10 @@ export interface PipelineStepRecord {
   /** Last persisted main-stream event belonging to this completed execution.
    * Later explanation turns cannot rewrite its report. Optional on old runs. */
   reportThroughEventId?: number;
+  /** This visit's gate, for a step judged by checks. The results themselves
+   *  are in the check ledger; this is the little the runner and the board
+   *  need between turns. Optional/additive. */
+  gate?: PipelineStepGateState;
 }
 
 /**

@@ -6,7 +6,7 @@
  * state (card-state.ts) and `now`, so the view and the board card can't
  * disagree about the same task.
  */
-import type { PipelineBlock, PipelineBlockKind, PipelineGraph, PipelineRunState, PipelineRunStatus, PipelineStepRecord, Task, TaskPrStatus } from "../../shared/types.ts";
+import type { CheckLedgerEntry, PipelineBlock, PipelineBlockKind, PipelineGraph, PipelineRunState, PipelineRunStatus, PipelineStepRecord, Task, TaskPrStatus } from "../../shared/types.ts";
 import { effectiveStepCap, isFollowUpStepId } from "../../shared/pipeline.ts";
 import { waitingInQueue } from "../../shared/block-wait.ts";
 import { causeOf } from "./board-health.ts";
@@ -189,13 +189,13 @@ export const RESTARTABLE_STATUSES: PipelineRunStatus[] = ["done", "cancelled", "
 /** Block kinds Retry can re-attempt — everything except a missing/invalid
  *  handoff, which Retry can't fix (re-running the same step reproduces the
  *  same non-handoff, or the same malformed one) — those need Advance. */
-export const RETRY_BLOCK_KINDS: PipelineBlockKind[] = ["step-failed", "step-blocked", "step-cap", "profile-missing", "join-incomplete"];
+export const RETRY_BLOCK_KINDS: PipelineBlockKind[] = ["step-failed", "step-blocked", "step-cap", "profile-missing", "join-incomplete", "check-failed"];
 
 /** Block kinds Advance can resolve by manually picking (or skipping) the
  *  next step(s) — a missing/invalid handoff, an incomplete join the user
  *  wants to force past, a step reported as blocked, or (for a task-level
  *  block, `taskId != null`) a step that was stopped. */
-export const ADVANCE_BLOCK_KINDS: PipelineBlockKind[] = ["handoff-missing", "handoff-invalid", "join-incomplete", "step-blocked", "step-failed"];
+export const ADVANCE_BLOCK_KINDS: PipelineBlockKind[] = ["handoff-missing", "handoff-invalid", "join-incomplete", "step-blocked", "step-failed", "check-failed"];
 
 /** One button of the state band. All of a run's recovery lives there; Retry
  *  appears once however many places could have offered it. */
@@ -355,7 +355,7 @@ export function recoveryControls(task: Task, steps: Task[], state: CardState): R
       key: `block:${i}:${b.taskId ?? b.stepId ?? "run"}`,
       fromTaskId: b.taskId,
       stepName: nameIn(graph, b.stepId),
-      why: b.kind === "handoff-missing" || b.kind === "handoff-invalid" ? "finished without a usable handoff" : b.kind === "join-incomplete" ? "its join is incomplete" : b.kind === "step-failed" ? "failed" : "reported it is blocked",
+      why: b.kind === "handoff-missing" || b.kind === "handoff-invalid" ? "finished without a usable handoff" : b.kind === "join-incomplete" ? "its join is incomplete" : b.kind === "step-failed" ? "failed" : b.kind === "check-failed" ? "did not pass its checks (advancing records them as waived)" : "reported it is blocked",
     })),
     ...awaitingAdvance(run, steps).map((x) => ({ key: `review:${x.taskId}`, fromTaskId: x.taskId, stepName: nameIn(graph, x.stepId), why: "finished and waits for the next step to be chosen" })),
   ];
@@ -372,7 +372,9 @@ export type CheckStatus = "passing" | "failing" | "running" | "none" | "unavaila
 /** One observation of checks. Every source fills the same row, so a later
  *  per-step check record can be listed beside these. */
 export interface CheckRow {
-  source: "current-head" | "step-wait" | "activity";
+  /** `step-check`: one check of one evaluation of a step's gate, from the
+   *  run's check ledger (src/bun/check-runner.ts). */
+  source: "current-head" | "step-wait" | "activity" | "step-check";
   status: CheckStatus;
   /** "CI passed", "Checks failing: unit, e2e-web". */
   text: string;
@@ -415,7 +417,11 @@ const shortSha = (sha: string) => sha.slice(0, 7);
  * timeline. Those carry no head commit, so none of them is ever presented
  * as the current head's result.
  */
-export function checksEvidence(input: { pr: TaskPrStatus | null; run: PipelineRunState | null; activity: CheckActivityEntry[] | null; task: Task; now: number }): ChecksEvidence {
+export function checksEvidence(input: {
+  pr: TaskPrStatus | null; run: PipelineRunState | null; activity: CheckActivityEntry[] | null; task: Task; now: number;
+  /** The run's check ledger, oldest first; null or absent when there is none. */
+  ledger?: CheckLedgerEntry[] | null;
+}): ChecksEvidence {
   const { pr, run, activity, task, now } = input;
   const during = (ts: number): string | null => run?.history.find((r) => r.startedAt <= ts && ts <= (r.endedAt ?? now))?.stepId ?? null;
 
@@ -474,14 +480,51 @@ export function checksEvidence(input: { pr: TaskPrStatus | null; run: PipelineRu
       url: e.url ?? null,
     });
   }
+  // A gated step's own checks, as Agetor ran them: each row names the head
+  // it was computed for, so it is never read as another head's result.
+  const ledger = input.ledger ?? [];
+  for (const e of ledger) recorded.push(stepCheckRow(e, pr));
   recorded.sort((x, y) => (y.observedAt ?? now) - (x.observedAt ?? now));
 
+  const stepChecks = ledger.length > 0 ? " Step checks are the ones Agetor ran when a step's turn ended, each for the head it names; they are not CI." : "";
+  if (stepChecks) {
+    const base = !pr
+      ? "No pull request is known for this task, so the current head's CI checks are unavailable."
+      : "Only the first row speaks for the pull request's current head.";
+    return { current, recorded, note: `${base}${stepChecks}` };
+  }
   const note = !pr
     ? "No pull request is known for this task, so the current head's checks are unavailable. Recorded events below are history, not a current result."
     : recorded.some((r) => r.status === "passing" && r.source === "activity")
       ? "A recorded pass is history: it does not show that the current head passes. Only the first row speaks for the current head."
       : "Only the first row speaks for the current head. No check record is kept per step.";
   return { current, recorded, note };
+}
+
+const STEP_CHECK_WORD: Record<CheckLedgerEntry["outcome"], string> = {
+  pass: "passed", fail: "failed", skip: "not run", waived: "waived by the owner", halt: "could not be evaluated", void: "no longer stands",
+};
+
+/** One ledger line as a row of the Checks tab. */
+export function stepCheckRow(e: CheckLedgerEntry, pr: Pick<TaskPrStatus, "headSha"> | null): CheckRow {
+  const status: CheckStatus = e.outcome === "pass" || (e.outcome === "skip" && e.satisfied) ? "passing" : e.outcome === "fail" ? "failing" : e.outcome === "halt" ? "unavailable" : "none";
+  const head = e.key.head;
+  return {
+    source: "step-check",
+    status,
+    text: `${e.checkId}: ${e.outcome === "skip" && e.satisfied ? "passed earlier, unchanged" : STEP_CHECK_WORD[e.outcome]}${e.detail ? ` — ${e.detail}` : ""}`,
+    observedAt: e.at,
+    head,
+    // Agetor's own check of that commit; whether it is the PR's head is said, never assumed.
+    currentHead: false,
+    qualifier: [
+      `${e.stepName} #${e.seq}, evaluation ${e.turn}`,
+      head ? `on ${shortSha(head)}${pr?.headSha ? (pr.headSha === head ? " (the pull request's head)" : " (not the pull request's head)") : ""}` : "head not read",
+      e.required ? null : "optional",
+    ].filter(Boolean).join(" · "),
+    duringStepId: e.stepId,
+    url: null,
+  };
 }
 
 // ── Words ─────────────────────────────────────────────────────────────────

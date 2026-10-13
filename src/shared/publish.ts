@@ -42,8 +42,13 @@ import { ROLLUP_CHECKS, checksState, failedConclusion, newestPerName, type Check
 /** `{"publish": {"pipelines": ["Change"], "cards": ["<task id>", …]}}`.
  *  `pipelines` (names or ids) is the switch, off when absent or empty.
  *  `cards` is the trial list: when present, only those cards of those
- *  pipelines; leave it out to cover every card of them. */
+ *  pipelines; leave it out to cover every card of them. Each gate has its own
+ *  entry of the same shape: `publish` (Finish run by Agetor) and `steps`
+ *  (checks on working steps, src/shared/checks.ts). */
 export const PIPELINE_GATES_PREF = "pipeline_gates";
+
+/** The gates the preference can switch on. */
+export type PipelineGateName = "publish" | "steps";
 
 export interface PublishGate {
   pipelines: string[];
@@ -51,7 +56,8 @@ export interface PublishGate {
   cards: string[] | null;
 }
 
-export function parsePublishGate(raw: string | null | undefined): PublishGate {
+/** One gate's entry of the preference. Anything unreadable is off. */
+export function parsePipelineGate(raw: string | null | undefined, name: PipelineGateName): PublishGate {
   const off: PublishGate = { pipelines: [], cards: null };
   let v: unknown;
   try {
@@ -59,13 +65,17 @@ export function parsePublishGate(raw: string | null | undefined): PublishGate {
   } catch {
     return off;
   }
-  const publish = v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>).publish : null;
-  if (!publish || typeof publish !== "object" || Array.isArray(publish)) return off;
-  const o = publish as Record<string, unknown>;
+  const entry = v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>)[name] : null;
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return off;
+  const o = entry as Record<string, unknown>;
   const strings = (x: unknown) => (Array.isArray(x) ? x.filter((s): s is string => typeof s === "string" && !!s.trim()).map((s) => s.trim()) : null);
   // A `cards` that is present but unreadable allows no card: a typo in the
   // trial list must never widen the trial to the whole pipeline.
   return { pipelines: strings(o.pipelines) ?? [], cards: o.cards === undefined ? null : (strings(o.cards) ?? []) };
+}
+
+export function parsePublishGate(raw: string | null | undefined): PublishGate {
+  return parsePipelineGate(raw, "publish");
 }
 
 /** Whether the switch covers this card now. Pure. */

@@ -8,6 +8,7 @@ import { SearchSelect } from "@/components/ui/search-select";
 import { MultiSearchSelect, type MultiSearchSelectItem } from "@/components/ui/multi-search-select";
 import { useConfirm } from "@/components/ui/confirm";
 import { cn } from "@/lib/utils";
+import { stepGateDisplay } from "@/lib/pipelines";
 import { outgoingSteps } from "../../../shared/pipeline.ts";
 import { PIPELINE_LIMITS } from "../../../shared/types.ts";
 import type { AgentProfile, Harness, PipelineGraph, PipelineStep } from "../../../shared/types.ts";
@@ -64,6 +65,7 @@ export function StepPanel({
   const isStart = graph.startStepId === step.id;
 
   const capUnlimited = step.subagents.cap == null;
+  const gate = stepGateDisplay(graph, step);
 
   const handleDelete = async () => {
     const ok = await confirm({
@@ -268,6 +270,33 @@ export function StepPanel({
                 >
                   <Trash2 className="size-3.5" aria-hidden />
                 </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      {/* Read-only: a step's goal, checks and turns are edited through the
+          pipeline's JSON (PATCH /pipelines/:id) for now. */}
+      <div data-testid="pipeline-step-gate" data-source={gate.source}>
+        <span className="text-xs font-medium text-muted-foreground">Checks</span>
+        <p className="mt-1 text-xs text-muted-foreground">
+          {gate.source === "none"
+            ? "None. This step advances on its agent's handoff."
+            : `For cards with check gates on, this step advances when Agetor's own checks pass${gate.source === "defaults" ? " (the built-in defaults for this step)" : ""}. A failed check goes back to this step, up to ${gate.maxTurns} time${gate.maxTurns === 1 ? "" : "s"} per visit${gate.maxTurnsDeclared ? "" : " (the default)"}.`}
+        </p>
+        {gate.goal && (
+          <p data-testid="pipeline-step-goal" className="mt-1.5 text-xs text-foreground">
+            <span className="font-medium">Goal:</span> {gate.goal}
+          </p>
+        )}
+        {gate.checks.length > 0 && (
+          <ul className="mt-1.5 flex flex-col gap-1.5">
+            {gate.checks.map((c) => (
+              <li key={c.id} data-testid="pipeline-step-check" className="text-xs">
+                <span className="font-mono text-foreground">{c.id}</span>
+                <span className="text-muted-foreground">{c.required ? "" : " · optional"} · {c.how}</span>
+                <span className="block text-muted-foreground">{c.description}</span>
               </li>
             ))}
           </ul>
