@@ -91,6 +91,7 @@ import { parsePullNumber } from "@/lib/pr-url";
 import { hasTextSelection, keepsNativeContextMenu } from "@/lib/context-menu";
 import { buildTaskContextMenu, type TaskMenuAction, type TaskMenuGroup } from "@/lib/task-context-menu";
 import { cn } from "@/lib/utils";
+import { snapshotVerdict, STALE_REFRESH_RETRIES } from "@/lib/snapshot-order";
 import { ONBOARDING_DISMISSED_PREF, deriveOnboardingSteps, resolveOnboardingVisibility } from "@/lib/onboarding";
 import type { SettingsSectionId } from "@/lib/settings-dialog-view";
 import { reconcileById } from "@/lib/reconcile";
@@ -546,6 +547,18 @@ function AppInner() {
   // parse or reconcile — and when the last full (200) response landed.
   const tasksEtagRef = useRef<string | null>(null);
   const tasksFullFetchAtRef = useRef(0);
+  // Bumped when a change the board shows at once starts and when the server
+  // has answered it; a list answer that spans a bump is stale. With the order
+  // refreshes were sent in and the newest one applied.
+  const localChangeEpochRef = useRef(0);
+  const localChangesInFlightRef = useRef(0);
+  const refreshSeqRef = useRef(0);
+  const refreshAppliedSeqRef = useRef(0);
+  const localChange = useCallback(async <T,>(send: () => Promise<T>): Promise<T> => {
+    localChangeEpochRef.current++;
+    localChangesInFlightRef.current++;
+    try { return await send(); } finally { localChangesInFlightRef.current--; localChangeEpochRef.current++; }
+  }, []);
   /** Archived board cards the lean list left out (archived filter off) — so
    *  the header's "N of M tasks" total still counts them. */
   const [omittedArchivedCount, setOmittedArchivedCount] = useState(0);
@@ -567,10 +580,12 @@ function AppInner() {
    *  server rejected can't outlive a 304. A conditional poll still goes
    *  unconditional once 30 s pass without a full response, as a backstop
    *  against any other local-only drift. */
-  const refresh = useCallback(async (opts?: { conditional?: boolean }): Promise<Task[] | null> => {
+  const refresh = useCallback(async (opts?: { conditional?: boolean; again?: number }): Promise<Task[] | null> => {
     try {
       const now = Date.now();
       const conditional = opts?.conditional === true && now - tasksFullFetchAtRef.current < 30_000;
+      const epochAtStart = localChangeEpochRef.current;
+      const seq = ++refreshSeqRef.current;
       const include: string[] = [];
       if (selectedIdRef.current) include.push(selectedIdRef.current);
       const v = viewRef.current;
@@ -580,6 +595,17 @@ function AppInner() {
         include,
         etag: conditional ? tasksEtagRef.current : null,
       });
+      // An answer from before a local change, or older than one already
+      // applied, would put cards back (src/mainview/lib/snapshot-order.ts).
+      const verdict = snapshotVerdict({ epochAtStart, epochNow: localChangeEpochRef.current, changesInFlight: localChangesInFlightRef.current, seq, appliedSeq: refreshAppliedSeqRef.current });
+      if (verdict === "late") return tasksRef.current;
+      if (verdict === "stale") {
+        // A change still with the server refreshes by itself when it is answered.
+        if (localChangesInFlightRef.current > 0) return tasksRef.current;
+        const again = (opts?.again ?? 0) + 1;
+        return again <= STALE_REFRESH_RETRIES ? refresh({ again }) : tasksRef.current;
+      }
+      refreshAppliedSeqRef.current = seq;
       if (res.unchanged) {
         setTasksLoaded(true);
         return tasksRef.current;
@@ -1730,7 +1756,7 @@ function AppInner() {
     setTasks((cur) => cur.map((x) => (x.id === id ? { ...x, column: col } : x)));
     try {
       setError(null);
-      await api.moveTask(id, col);
+      await localChange(() => api.moveTask(id, col));
     } catch (e) {
       surfaceError(e);
       // Server didn't accept the move — re-sync the optimistic UI.
@@ -1798,7 +1824,7 @@ function AppInner() {
     setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, column: "done" } : x)));
     try {
       setError(null);
-      await api.moveTask(t.id, "done");
+      await localChange(() => api.moveTask(t.id, "done"));
       await refresh();
     } catch (e) {
       surfaceError(e);
@@ -1835,19 +1861,19 @@ function AppInner() {
     setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, archivedAt: now } : x)));
     try {
       setError(null);
-      await api.archiveTask(t.id, active ? { force: true, stopRun: true } : undefined);
+      await localChange(() => api.archiveTask(t.id, active ? { force: true, stopRun: true } : undefined));
       clearSelectedStepOf(t.id);
       await refresh();
     } catch (e) {
       surfaceError(e);
       await refresh();
     }
-  }, [confirm, refresh, surfaceError, clearSelectedStepOf]);
+  }, [confirm, refresh, surfaceError, clearSelectedStepOf, localChange]);
   const unarchive = useCallback(async (t: Task) => {
     setTasks((cur) => cur.map((x) => (x.id === t.id ? { ...x, archivedAt: null } : x)));
     try {
       setError(null);
-      await api.unarchiveTask(t.id);
+      await localChange(() => api.unarchiveTask(t.id));
       await refresh();
     } catch (e) {
       surfaceError(e);
