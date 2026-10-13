@@ -47,7 +47,6 @@ import { velocitySummary, type VelocityAnswer } from "../shared/velocity.ts";
 import { IssuesPage } from "@/components/issues/IssuesPage";
 import { AutopilotDialog } from "@/components/kanban/AutopilotDialog";
 import { VelocityDialog } from "@/components/kanban/VelocityDialog";
-import { SystemStrip } from "@/components/kanban/SystemStrip";
 import { BlockedByDialog } from "@/components/kanban/BlockedByDialog";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
@@ -57,7 +56,6 @@ import { GitHubDialog, type GitHubItemDetailPrefill, type GitHubPullPrefill } fr
 import { UsageMeter } from "@/components/usage/UsageMeter";
 import { UsagePopover } from "@/components/usage/UsagePopover";
 import { visibleTopbarAgents } from "@/lib/usage";
-import { KanbanFilters } from "@/components/kanban/KanbanFilters";
 import { isMacPlatform } from "@/lib/platform";
 import { FIND_SHORTCUT_BLOCKING_LAYERS, isFindShortcut } from "@/lib/find-shortcut";
 import { EXIT_DURATION_MS as RUN_PANEL_EXIT_MS, RunPanel } from "@/components/kanban/RunPanel";
@@ -2331,7 +2329,6 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                 transition={{ duration: 0.18 }}
                 className="flex min-h-0 flex-1 flex-col"
               >
-                <SystemStrip tasks={tasks} prs={prs} harnesses={harnesses} onOpen={openTask} onChanged={() => void refresh()} />
                 {onboardingVisibility.showChecklist && tasks.length > 0 && (
                   <div className="px-4 pt-3">
                     <OnboardingChecklist
@@ -2346,24 +2343,6 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                     />
                   </div>
                 )}
-                <KanbanFilters
-                  searchInputRef={boardSearchRef}
-                  textQuery={textQuery}
-                  onTextQueryChange={setTextQuery}
-                  repoFilter={repoFilter}
-                  onRepoFilterChange={setRepoFilter}
-                  statusFilter={statusFilter}
-                  onStatusFilterChange={setStatusFilter}
-                  archivedView={archivedView}
-                  onArchivedViewChange={setArchivedView}
-                  harnessFilter={harnessFilter}
-                  onHarnessFilterChange={setHarnessFilter}
-                  typeFilter={typeFilter}
-                  onTypeFilterChange={setTypeFilter}
-                  projects={projects}
-                  harnesses={harnesses}
-                  taskAgentIds={taskAgentIds}
-                />
                 {/* Kanban gets all remaining vertical space and scrolls horizontally
                     on its own — the bottom bar stays anchored regardless of column
                     count. */}
