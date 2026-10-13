@@ -255,7 +255,8 @@ export function awaitResultMessage(done: AwaitRecord[], now = Date.now()): strin
  *  Most `step-blocked`: that is the step saying it is blocked or asking the
  *  owner something, or a usage-limit stop — which the limit's own resume
  *  continues, after which the turn parks on its awaits like any other.
- *  A declared queued resource wait bound below to its current await can wake. */
+ *  A declared queued resource wait bound below to its current await can wake,
+ *  and so can a queued step whose own CI wait finished (`ciBlockedAwaits`). */
 const WAKEABLE = new Set<string>(["await", "handoff-missing", "handoff-invalid"]);
 
 /** A declared resource wait bound to an actual await from this execution's
@@ -300,6 +301,41 @@ export function resourceBlockedAwaits(parent:Task, taskId:string, all:AwaitRecor
   return bound?mine:[];
 }
 
+/** An await that only watches remote work (`ci-wait` polls GitHub CI). It runs
+ * nothing on this machine, so a step parked on it holds no agent slot, no
+ * verification slot and no card-owner place: the wake-up takes those again. */
+export const isRemoteWait=(a:Pick<AwaitRecord,'cmd'>)=>/(^|[\s/])ci-wait(\s|$)/.test(a.cmd)
+  // The built-in Fix CI step waits with `gh pr checks N --watch`; `gh run watch` is the same thing for one run.
+  ||/(^|[\s/])gh\s+pr\s+checks\b.*\s--watch\b/.test(a.cmd)||/(^|[\s/])gh\s+run\s+watch\b/.test(a.cmd);
+
+/**
+ * A step that started a CI wait and then ended the same turn with a `blocked`
+ * handoff ("waiting for CI on develop") instead of ending it bare. The run
+ * records `step-blocked`, not `await`, so the finished wait woke nobody: the
+ * wait queue retried it on a timer that knows nothing of the CI run, and after
+ * its attempts the card went to the owner with its CI long finished
+ * (2026-10-12/13: five finished `ci` awaits never marked `notified`).
+ *
+ * Those awaits wake the step like any other, under the same guards as a
+ * declared resource wait: the wait queue holds the step (not the owner, not a
+ * usage limit), the handoff asks nobody anything, and the awaits are this
+ * turn's own, in this worktree, and all remote CI waits. The step is told the
+ * result and decides; nothing is approved by the wake.
+ */
+export function ciBlockedAwaits(parent:Task, taskId:string, all:AwaitRecord[]):AwaitRecord[] {
+  const run=parent.pipelineRun, wait=run?.wait;
+  if(!parent.worktreePath||parent.archivedAt!=null||parent.pendingInteractionCount||run?.status!=='blocked'
+    ||wait?.taskId!==taskId||wait.state!=='waiting'||wait.category==='limit')return [];
+  const active=run.active.find(a=>a.taskId===taskId);
+  const history=active&&run.history.find(h=>h.taskId===taskId&&h.seq===active.seq);
+  const handoff=history?.handoff;
+  if(!history||!handoff||handoff.status!=='blocked'||handoff.waitingOn?.on==='owner'||handoff.waitingOn?.on==='usage_limit'
+    ||handoff.openQuestions.some(q=>q.trim())||asksTheOwner([handoff.reason,handoff.summary].join('\n')))return [];
+  const since=history.turnStartedAt??history.startedAt;
+  const mine=all.filter(a=>!a.notified&&a.startedAt>=since&&samePath(a.cwd,parent.worktreePath!));
+  return mine.length>0&&mine.every(isRemoteWait)?mine:[];
+}
+
 /** Step + await pairs ready to be woken: an active, idle step under a
  *  {@link WAKEABLE} block whose awaits have all finished. Pure over its
  *  inputs. Exported for tests. */
@@ -314,7 +350,8 @@ export function readyToWake(
     const seen = new Set<string>();
     for (const b of run.blocked) {
       if (!b.taskId || !b.stepId || seen.has(b.taskId)) continue;
-      const resource=b.kind==='step-blocked'?resourceBlockedAwaits(parent,b.taskId,all):[];
+      const declared=b.kind==='step-blocked'?resourceBlockedAwaits(parent,b.taskId,all):[];
+      const resource=declared.length||b.kind!=='step-blocked'?declared:ciBlockedAwaits(parent,b.taskId,all);
       if (!WAKEABLE.has(b.kind) && resource.length===0) continue;
       if(resource.length) {
         const child=list.find(t=>t.id===b.taskId);

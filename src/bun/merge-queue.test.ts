@@ -61,3 +61,37 @@ test("behind the base: merge a green PR as it is; update only when GitHub requir
   expect(nextMergeStep(card(), pr({ behindBy: 3 }), behind).kind).toBe("update-branch");
   expect(nextMergeStep(card(), pr({ behindBy: 3, checks: "failure", failingChecks: [{ name: "x", url: null }] as never }), clean).kind).toBe("update-branch");
 });
+
+// The fresh rule (`merge_queue_fresh`): a green PR merges by itself only when
+// its head contains the base's tip — otherwise CI never tested what lands.
+const fresh = (p: TaskPrStatus, m: { mergeable: boolean | null; mergeableState: string } = clean, c = card()) => nextMergeStep(c, p, m, true, false, true);
+const freshCases: { name: string; pr: TaskPrStatus; mergeability?: { mergeable: boolean | null; mergeableState: string }; card?: Task; kind: string }[] = [
+  { name: "green and current merges", pr: pr({ behindBy: 0 }), kind: "merge" },
+  { name: "green but behind rides a train", pr: pr({ behindBy: 3 }), kind: "train" },
+  { name: "green, distance unknown, is treated as stale", pr: pr({ behindBy: null }), kind: "train" },
+  { name: "a plain task's stale PR rides a train too", pr: pr({ behindBy: 1 }), card: card({ pipelineId: null }), kind: "train" },
+  { name: "checks still running: wait, whatever the distance", pr: pr({ behindBy: 3, checks: "pending" }), kind: "wait" },
+  { name: "GitHub requires an up-to-date branch: update it", pr: pr({ behindBy: 3 }), mergeability: { mergeable: true, mergeableState: "behind" }, kind: "update-branch" },
+  { name: "conflicts come first", pr: pr({ behindBy: 3 }), mergeability: { mergeable: false, mergeableState: "dirty" }, kind: "resolve-conflicts" },
+  { name: "review comments come first", pr: pr({ behindBy: 3, unresolvedThreads: 1 }), kind: "address-review" },
+  { name: "not mergeable yet: wait", pr: pr({ behindBy: 3 }), mergeability: { mergeable: null, mergeableState: "unknown" }, kind: "wait" },
+];
+for (const c of freshCases) {
+  test(`fresh rule: ${c.name}`, () => {
+    expect(fresh(c.pr, c.mergeability, c.card).kind).toBe(c.kind as never);
+  });
+}
+
+test("fresh rule: the train step says how far behind; with the rule off a stale green PR merges as before", () => {
+  expect(fresh(pr({ behindBy: 1 }))).toEqual({ kind: "train", why: "its checks ran 1 commit behind develop" });
+  expect(fresh(pr({ behindBy: 4 }))).toEqual({ kind: "train", why: "its checks ran 4 commits behind develop" });
+  expect(nextMergeStep(card(), pr({ behindBy: 4 }), clean, true, false, false)).toEqual({ kind: "merge" });
+  expect(nextMergeStep(card(), pr({ behindBy: 4 }), clean)).toEqual({ kind: "merge" });
+});
+
+test("fresh rule: the last look before a merge — behind now, or unknown, does not merge", async () => {
+  const { mergeNow } = await import("./merge-queue.ts");
+  expect(mergeNow(0)).toBe("merge");
+  expect(mergeNow(2)).toBe("stale");
+  expect(mergeNow(null)).toBe("unknown");
+});

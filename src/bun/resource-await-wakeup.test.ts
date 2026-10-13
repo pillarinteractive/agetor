@@ -109,3 +109,49 @@ test('owner requests, permissions, cancelled runs, and live children remain held
     expect(readyToWake([f.parent,f.child],[f.job])).toEqual([]);
   }
 });
+
+// 2026-10-12/13: Finish started `ci-wait`, then ended the same turn with a
+// blocked handoff "waiting for CI on develop" (a declared dependency, not a
+// resource). The run recorded `step-blocked`, the finished wait woke nobody,
+// and the card went to the owner with its CI long done.
+function ciFixture() {
+  const f=fixture();
+  const job:AwaitRecord={...f.job,id:'ci-job',dir:'/synthetic/awaits/ci-job',label:'CI for PR #12',cmd:'/Users/x/.agetor/bin/ci-wait 12 ',resourceState:undefined};
+  const handoff={...f.handoff,reason:'CI on develop is red; waiting for it',artifacts:[] as string[],waitingOn:{on:'dependency',ref:'CI on develop'}};
+  f.parent.pipelineRun!.history[1]!.handoff=handoff as never;
+  f.parent.pipelineRun!.wait={...f.parent.pipelineRun!.wait!,category:'dependency',ref:'CI on develop'} as never;
+  return {...f,job,handoff};
+}
+
+test('a queued blocked step whose own CI wait finished is woken, whatever it wrote as waitingRef',()=>{
+  const f=ciFixture();
+  expect(readyToWake([f.parent,f.child],[f.job]).map(w=>[w.stepTaskId,w.done[0]?.id])).toEqual([['child','ci-job']]);
+  // A failed or killed wait wakes it too: the step is told the result and decides.
+  for (const exitCode of [1,null]) expect(readyToWake([f.parent,f.child],[{...f.job,exitCode}])).toHaveLength(1);
+  // No declared wait at all, or `gh pr checks --watch` as the command: the same.
+  delete (f.handoff as {waitingOn?:unknown}).waitingOn;
+  expect(readyToWake([f.parent,f.child],[{...f.job,cmd:'gh pr checks 12 --watch --interval 60 '}])).toHaveLength(1);
+});
+
+test('the CI wake waits for the run to finish and leaves the owner, a usage limit and other work alone',()=>{
+  const f=ciFixture();
+  const cases:[string,()=>void|AwaitRecord[]][]=[
+    ['the wait is still running',()=>[{...f.job,finished:false,exitCode:null}]],
+    ['already told',()=>[{...f.job,notified:true}]],
+    ['a local command, not a CI wait',()=>[{...f.job,cmd:'make test '}]],
+    ['a CI wait beside an unfinished local command of this turn',()=>[f.job,{...f.job,id:'local',dir:'/synthetic/awaits/local',cmd:'make test ',finished:false,exitCode:null}]],
+    ['started before this turn',()=>[{...f.job,startedAt:1_500_000}]],
+    ['another worktree',()=>[{...f.job,cwd:'/synthetic/other'}]],
+    ['the step asked the owner a question',()=>{f.handoff.openQuestions=['May I push?'];}],
+    ['the step declared it waits on the owner',()=>{f.handoff.waitingOn={on:'owner',ref:''};}],
+    ['the wait queue gave it to the owner',()=>{(f.parent.pipelineRun!.wait as {state:string}).state='escalated';}],
+    ['a usage-limit wait',()=>{(f.parent.pipelineRun!.wait as {category:string}).category='limit';}],
+    ['the card has a pending question',()=>{f.parent.pendingInteractionCount=1;}],
+    ['the step is running again',()=>{f.child.column='running';}],
+  ];
+  for(const [name,arrange] of cases) {
+    const fresh=ciFixture();Object.assign(f,fresh);
+    const awaits=arrange()??[f.job];
+    expect([name,readyToWake([f.parent,f.child],awaits)]).toEqual([name,[]]);
+  }
+});

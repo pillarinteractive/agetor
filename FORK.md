@@ -447,7 +447,8 @@ stopped pipeline) but shows in Backlog (`boardColumnOf`).
 - **Ready to Merge** (column id `merge`) = sign-off (`src/bun/merge-queue.ts`, intent in `merge_queue` pref via
   `merge-intent.ts`). The user drags a card there, or Autopilot signs it off. Every minute, one next step per card:
   open PR → resolve conflicts → update from base → Fix CI → address review → wait for checks → squash-merge
-  (`merge_method` pref). Agetor opens the PR itself (`openPrDirectly`: push, then the API) and starts the Open PR
+  (`merge_method` pref) when its checks are fresh against the base, else a merge train first (the fresh rule, under
+  Merge trains). Agetor opens the PR itself (`openPrDirectly`: push, then the API) and starts the Open PR
   follow-up only when that fails; the branch is updated from its base only when GitHub requires it or CI is failing.
   Each automatic step once per PR head, ≤4 fix-ups per card.
   A card whose pipeline has steps named Build, Review and Finish (Build → Review → Finish) gets no Fix CI or Resolve
@@ -529,11 +530,34 @@ mergeable and thread-free (behind is fine) and the oldest has waited `windowMin`
 PRs drop out and merge alone), pushes it, opens "Merge train: #a, #b" — CI runs once — and when green merges it with
 **rebase** (develop keeps one commit per PR, one push → one develop CI run). Originals are closed "Merged in merge train
 #T", cards → Done, issues closed (`closeIssueForTask`). CI failure / conflict / a member changed or withdrawn →
-disband, members merge individually. A lone ready PR waits the window for company, then merges alone. One train at a
-time. Config `merge_train` = {"enabled":true,"windowMin":10,"max":6}. Cards show "In merge train #T" / "Merged in
+disband, members are handled individually. A lone ready PR waits the window for company, then merges alone if its
+checks are fresh (below). One train at a time. Config `merge_train` = {"enabled":true,"windowMin":10,"max":6}. Cards show "In merge train #T" / "Merged in
 merge train #T" (`Task.mergeTrain`). Ready to Merge's **Merge together** button (`POST /merge-train/depart`) sends a
 train now with every PR that can go, without waiting for the window or for each PR's own checks; it replaces a train
 whose CI hasn't started and is refused once one is running CI.
+
+**The fresh rule** (`merge_queue_fresh` preference; on unless it is `false`). Before it, a green PR that was behind
+its base merged on its old result, and a failed train's members merged one at a time on theirs, so a PR could land on
+checks older than a rule added to `develop`. Now a green PR merges by itself only when its checks are *fresh*: its
+head contains the base's tip (`freshAgainstBase`: `behindBy === 0`; unknown counts as stale), so the commit CI tested
+is what lands. Run times are not used: a re-run tests the old merge commit. Otherwise:
+- `nextMergeStep` returns `train` for a green PR that is behind. With company it joins the usual train; alone, it
+  waits the window, then leaves as a **train of one** (`shouldDepart`/`buildTrain`/`assembleTrain` take a minimum).
+- Members of a train that disbanded (and PRs left out of one) are re-tested as trains of one, one at a time, instead
+  of merging directly. A train of one whose CI fails means "green alone, red on the latest base": the PR's branch is
+  updated from the base so the failure shows on the PR, where Fix CI or a fix round can reach it.
+- With trains off, or when a train of one cannot be built, the branch is updated from the base instead.
+- Just before any direct merge the queue asks GitHub how far behind the head is (`mergeQueueDeps.behindBy`): the
+  watcher's cached answer can be ten minutes old, and another PR merging in between is the case the rule is for.
+  Behind → no merge, the PR is re-read and sent by train; unknown → no merge this pass.
+
+What it costs in CI runs, also written on the card's timeline each time: nothing for a PR whose head contains the
+base tip; one run per train as before when two or more are ready; **one extra run for a lone PR that is behind**;
+and after a failed train of N, up to N more (one train of one each). `merge_queue_fresh` = `false` restores the old
+behaviour without a rebuild: stale green PRs merge as they are and disbanded members merge one at a time.
+`rollUpChecks` (`src/bun/pr-watch.ts`) judges each check name by its **newest** run (`newestPerName`: start time,
+then id), so a duplicate run cancelled by `cancel-in-progress` beside one that passed no longer reads as pending; a
+name whose newest run is cancelled is still not a pass.
 
 ## Priority cards (`feat/priority-cards`)
 

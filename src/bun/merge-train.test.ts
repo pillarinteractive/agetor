@@ -33,6 +33,51 @@ describe("when a train leaves", () => {
   });
 });
 
+describe("the fresh rule", () => {
+  const cfg = parseTrainConfig(null);
+  test("fresh means the head contains the base's tip; unknown is stale", async () => {
+    const { freshAgainstBase } = await import("./merge-train.ts");
+    expect(freshAgainstBase({ behindBy: 0 })).toBe(true);
+    expect(freshAgainstBase({ behindBy: 2 })).toBe(false);
+    expect(freshAgainstBase({ behindBy: null })).toBe(false);
+    expect(freshAgainstBase({})).toBe(false);
+  });
+  test("on unless the preference says false", async () => {
+    const { freshRuleOn } = await import("./merge-train.ts");
+    expect(freshRuleOn(null)).toBe(true);
+    expect(freshRuleOn("true")).toBe(true);
+    expect(freshRuleOn("false")).toBe(false);
+    expect(freshRuleOn(" FALSE ")).toBe(false);
+  });
+  test("a lone stale PR leaves as a train of one once it has waited the window", () => {
+    const now = 100 * 60_000;
+    expect(shouldDepart([now - 11 * 60_000], cfg, now, 1)).toBe(true);
+    expect(shouldDepart([now - 5 * 60_000], cfg, now, 1)).toBe(false);
+    expect(shouldDepart([now - 11 * 60_000], cfg, now)).toBe(false); // without the rule: never alone
+    expect(shouldDepart([], cfg, now, 1)).toBe(false);
+    expect(shouldDepart([0], { ...cfg, enabled: false }, now, 1)).toBe(false);
+  });
+  test("a train of one says what it is for, and what a failure leads to", () => {
+    const body = trainBody([{ pr: 7, title: "fix: a" }], "develop");
+    expect(body).toContain("Re-tests one signed-off pull request on the latest `develop`");
+    expect(body).toContain("updated from the base");
+    expect(trainTitle([{ pr: 7 }])).toBe("Merge train: #7");
+  });
+  test("what members are told when a train disbands, with the CI cost", async () => {
+    const { disbandNote } = await import("./merge-train.ts");
+    const m = (n: number) => ({ taskId: `t${n}`, pr: n, branch: `b${n}`, title: "t", headSha: null });
+    const three = { pr: 50, base: "develop", members: [m(1), m(2), m(3)] };
+    const one = { pr: 51, base: "develop", members: [m(1)] };
+    expect(disbandNote(three, "its CI failed", { fresh: true, ciFailed: true }))
+      .toBe("Merge train #50 disbanded (its CI failed) — each of its 3 PRs is re-tested alone on the latest develop before it merges (up to 3 more CI runs, one at a time)");
+    expect(disbandNote(one, "its CI failed", { fresh: true, ciFailed: true }))
+      .toBe("Merge train #51 disbanded (its CI failed): this PR passes alone but fails on the latest develop — updating its branch so the failure shows on the PR");
+    expect(disbandNote(three, "#2 got new commits", { fresh: true, ciFailed: false })).toContain("handled on its own");
+    // Rule off: the wording, and the behaviour, of before.
+    expect(disbandNote(three, "its CI failed", { fresh: false, ciFailed: true })).toBe("Merge train #50 disbanded (its CI failed) — merging on its own");
+  });
+});
+
 test("train PR title and body name every PR", () => {
   const m = [{ pr: 164, title: "fix: a" }, { pr: 165, title: "fix: b" }];
   expect(trainTitle(m)).toBe("Merge train: #164, #165");
@@ -84,6 +129,15 @@ test("assembling: one squashed commit per PR on the latest base; a PR that confl
   expect(log.split("\n")).toEqual(["fix: feat-b (#2)", "fix: feat-a (#1)"]); // three wip commits squashed into one
   // Each member records the head it was squashed from (not a cached, possibly stale one).
   expect(members[0]!.headSha).toBe(await sh(repo, "git", "rev-parse", "origin/feat-a"));
+
+  // A train of one: pushed only when asked for (the fresh rule), built on the latest base.
+  const none = await assembleTrain(repo, "develop", "agetor/merge-train-y", path.join(root, "wt-y"), [m("b", 2, "feat-b")]);
+  expect(none.members.map((x) => x.pr)).toEqual([2]);
+  expect(await sh(repo, "git", "ls-remote", "origin", "refs/heads/agetor/merge-train-y")).toBe("");
+  const alone = await assembleTrain(repo, "develop", "agetor/merge-train-z", path.join(root, "wt-z"), [m("b", 2, "feat-b")], 1);
+  expect(alone.members.map((x) => x.pr)).toEqual([2]);
+  expect((await sh(repo, "git", "log", "--format=%s", "origin/develop..origin/agetor/merge-train-z")).split("\n")).toEqual(["fix: feat-b (#2)"]);
+  expect(await sh(repo, "git", "rev-parse", "origin/agetor/merge-train-z~1")).toBe(await sh(repo, "git", "rev-parse", "origin/develop"));
 }, 30_000);
 
 test("sent by hand: a PR whose own checks are still running can ride; failing, conflicting, draft or commented ones can't", async () => {

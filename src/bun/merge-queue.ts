@@ -9,6 +9,8 @@
  *   its own CI failing      → run Fix CI (*)
  *   unresolved review       → run Address review
  *   checks pending          → wait
+ *   green, behind the base  → ride a merge train, alone if need be (the
+ *                             fresh rule; src/bun/merge-train.ts)
  *   green and mergeable     → squash-merge (the repo's convention; pref
  *                             `merge_method` overrides)
  *
@@ -19,11 +21,14 @@
  * which also re-runs a job a runner broke instead of "fixing" it, and holds
  * the card for the owner after `merge_queue_rework.maxRounds` rounds).
  *
- * Being behind the base never starts a fix: a green PR merges as it is or
- * rides a train built on the latest base (whose CI tests the combination),
- * and the branch is updated — a merge of the base made by GitHub, no agent
- * and no edit — only when GitHub requires it or CI is failing on a base that
- * has since fixed it.
+ * Being behind the base never starts a fix. A green PR merges by itself only
+ * when its checks are fresh (its head contains the base's tip); one that is
+ * behind rides a train built on the latest base, whose CI tests what will
+ * land — with other ready PRs, or alone as a train of one (the fresh rule,
+ * `merge_queue_fresh`; "false" restores merging a green PR as it is). The
+ * branch itself is updated — a merge of the base made by GitHub, no agent
+ * and no edit — only when GitHub requires it, CI is failing on a base that
+ * has since fixed it, or no train can test the PR.
  *
  * Each automatic step is taken at most once per PR head, and at most
  * {@link MAX_AUTO_STEPS} times per card before it's left for the user. A
@@ -31,12 +36,12 @@
  * Dragging the card back to In Review (or Backlog) withdraws the sign-off.
  */
 import type { Task, TaskPrStatus } from "../shared/types.ts";
-import { MERGE_TRAIN_PREF, activeTrain, advanceTrain, buildTrain, manualTrainEligible, parseTrainConfig, replaceTrain, shouldDepart, skipsTrain, trainCiStarted, trainEligible } from "./merge-train.ts";
+import { MERGE_TRAIN_PREF, activeTrain, advanceTrain, buildTrain, freshAgainstBase, freshRuleOn, manualTrainEligible, markRidesAlone, parseTrainConfig, replaceTrain, shouldDepart, skipsTrain, trainCiStarted, trainEligible, trainFailedAlone } from "./merge-train.ts";
 import { preferences, tasks } from "./db.ts";
 import { recordActivity } from "./activity.ts";
 import { mergeQueue, setMergeQueued } from "./merge-intent.ts";
-import { hasConfirmedNoPr, openPrDirectly, ownFailures, prAgent, prStatusForTask, PR_FIX_CI_ACTION, PR_REVIEW_ACTION, refreshPrsNow } from "./pr-watch.ts";
-import { getGitHubPullMergeability, mergeGitHubPull, updateGitHubPullBranch, setGitHubPullDraft } from "./github.ts";
+import { hasConfirmedNoPr, invalidatePrStatus, openPrDirectly, ownFailures, prAgent, prStatusForTask, PR_FIX_CI_ACTION, PR_REVIEW_ACTION, refreshPrsNow } from "./pr-watch.ts";
+import { getGitHubCompare, getGitHubPullMergeability, mergeGitHubPull, updateGitHubPullBranch, setGitHubPullDraft } from "./github.ts";
 import { startFollowUp } from "./pipeline-followups.ts";
 import { noteBaseRed, pruneReworkState, reviewedReworkFor, reworkCiFailure, reworkConflict } from "./merge-rework.ts";
 
@@ -53,6 +58,9 @@ export type MergeStep =
   | { kind: "fix-ci" }
   | { kind: "address-review" }
   | { kind: "merge" }
+  /** Green but behind its base: CI must test what will land first — a merge
+   *  train (of one, when nothing else is ready). The fresh rule only. */
+  | { kind: "train"; why: string }
   | { kind: "needs-you"; why: string };
 
 /** The one next step for a signed-off card. Pure; exported for tests. */
@@ -65,6 +73,9 @@ export function nextMergeStep(
    *  (`reviewedReworkFor`): a failure of its own is not worth a CI run on an
    *  updated branch first — Build merges the base as part of the round. */
   reviewed = false,
+  /** The fresh rule: a green PR that is behind its base does not merge on
+   *  its old result (`freshAgainstBase`). */
+  requireFresh = false,
 ): MergeStep {
   if (task.column === "running") return { kind: "wait", why: "a fix-up step is running" };
   if (task.column === "blocked") return { kind: "wait", why: "blocked — see the card" };
@@ -84,9 +95,10 @@ export function nextMergeStep(
   }
   // Bring the base in only when it helps: GitHub requires an up-to-date
   // branch to merge ("behind"), or CI is failing and the base may already
-  // carry the fix. A green PR that's merely behind merges as it is (a merge
-  // train rebuilds on the latest base anyway) — updating restarts its CI, and
-  // with several PRs queued every merge would restart all the others.
+  // carry the fix. A green PR that's merely behind is not updated — that
+  // restarts its CI, and with several PRs queued every merge would restart
+  // all the others. It rides a train built on the latest base instead (or,
+  // with the fresh rule off, merges as it is).
   if (mergeability?.mergeableState === "behind") return { kind: "update-branch" };
   if ((pr.behindBy ?? 0) > 0 && pr.checks === "failure" && !(reviewed && ownFailures(pr).length > 0)) return { kind: "update-branch" };
   if (pr.checks === "failure") {
@@ -99,6 +111,10 @@ export function nextMergeStep(
   if (pr.checks === "pending" || pr.checks === "none") return { kind: "wait", why: "checks running" };
   if (mergeability && mergeability.mergeableState !== "clean" && mergeability.mergeableState !== "has_hooks") {
     return { kind: "wait", why: `GitHub says ${mergeability.mergeableState}` };
+  }
+  if (requireFresh && !freshAgainstBase(pr)) {
+    const behind = pr.behindBy == null ? "an unknown number of commits" : `${pr.behindBy} commit${pr.behindBy === 1 ? "" : "s"}`;
+    return { kind: "train", why: `its checks ran ${behind} behind ${pr.baseRef ?? "the base"}` };
   }
   return { kind: "merge" };
 }
@@ -123,7 +139,28 @@ function note(task: Task, text: string, tone: "info" | "success" | "warning" | "
   recordActivity(task.id, { kind: "auto", text, tone });
 }
 
+/** GitHub — replaceable in tests. */
+export const mergeQueueDeps = {
+  /** How far the PR's head is behind its base right now; null when GitHub
+   *  could not say. */
+  async behindBy(task: Pick<Task, "workdir">, pr: Pick<TaskPrStatus, "baseRef" | "headSha">): Promise<number | null> {
+    if (!pr.baseRef || !pr.headSha) return null;
+    const cmp = await getGitHubCompare({ dir: task.workdir, base: pr.baseRef, head: pr.headSha }).catch(() => null);
+    return cmp && cmp.ok ? cmp.behindBy : null;
+  },
+};
+
+/** The last look before a merge under the fresh rule. The watcher's answer
+ *  can be ten minutes old (`FULL_PROBE_EVERY_MS`), and another PR may have
+ *  merged since — the very case the rule is for. Pure. */
+export function mergeNow(behindBy: number | null): "merge" | "stale" | "unknown" {
+  if (behindBy == null) return "unknown";
+  return behindBy === 0 ? "merge" : "stale";
+}
+
 async function take(task: Task, pr: TaskPrStatus | null, step: MergeStep): Promise<void> {
+  // A train step is the tick's to carry out (it needs the other cards).
+  if (step.kind === "train") return;
   if (step.kind === "wait") {
     // The base is failing this head's checks: not this card's failure. If the
     // base recovers without a new commit, the jobs are re-run, not "fixed".
@@ -140,6 +177,19 @@ async function take(task: Task, pr: TaskPrStatus | null, step: MergeStep): Promi
   if (step.kind === "needs-you") {
     note(task, `Can't merge yet: ${step.why}`, "warning");
     return;
+  }
+  if (step.kind === "merge" && pr && freshRuleOn()) {
+    const now = mergeNow(await mergeQueueDeps.behindBy(task, pr));
+    if (now === "unknown") {
+      note(task, `Couldn't check PR #${pr.number} against the latest ${pr.baseRef ?? "base"} — not merging until that is known`, "muted");
+      return;
+    }
+    if (now === "stale") {
+      // The next pass reads the PR in full and sends it by train.
+      invalidatePrStatus(task.id);
+      note(task, `${pr.baseRef ?? "The base"} moved since PR #${pr.number} was checked — re-testing before it merges`, "muted");
+      return;
+    }
   }
   // Opening a PR is a once-per-card step; the rest once per PR head.
   const key = step.kind === "open-pr" ? `${task.id}:open-pr` : `${task.id}:${step.kind}:${pr?.headSha ?? ""}`;
@@ -290,6 +340,7 @@ export function departTrainNow(): Promise<{ train: { pr: number; url: string; me
 
 async function tick(now: number): Promise<void> {
   const list = tasks.listLive();
+  const freshOn = freshRuleOn();
   pruneReworkState(new Set(list.filter((t) => t.archivedAt == null && t.column !== "done").map((t) => t.id)));
   // In Ready to Merge → signed off. Withdrawing is the user's own move out
   // of the column (server.ts PATCH); a card the pipeline runner parked in In
@@ -322,7 +373,7 @@ async function tick(now: number): Promise<void> {
       const m = await getGitHubPullMergeability({ dir: t.workdir, number: pr.number }).catch(() => null);
       if (m && m.ok) mergeability = { mergeable: m.mergeable, mergeableState: m.mergeableState };
     }
-    evals.push({ t, pr, mergeability, step: nextMergeStep(t, pr, mergeability, hasConfirmedNoPr(id), !!reviewedReworkFor(t)) });
+    evals.push({ t, pr, mergeability, step: nextMergeStep(t, pr, mergeability, hasConfirmedNoPr(id), !!reviewedReworkFor(t), freshOn) });
   }
 
   // A Fix CI step that blocked only because CI hadn't run yet (runners busy)
@@ -369,6 +420,8 @@ async function tick(now: number): Promise<void> {
   );
   const eligibleIds = new Set(eligible.map((e) => e.t.id));
   const leftOut = new Set<string>();
+  /** Stale PRs no train of one could be built for. */
+  const untestable = new Set<string>();
   for (const id of [...readySince.keys()]) if (!eligibleIds.has(id)) readySince.delete(id);
   for (const e of eligible) if (!readySince.has(e.t.id)) readySince.set(e.t.id, now);
   saveReadySince();
@@ -378,14 +431,38 @@ async function tick(now: number): Promise<void> {
       const key = `${e.t.workdir}\0${e.pr!.baseRef ?? ""}`;
       groups.set(key, [...(groups.get(key) ?? []), e]);
     }
-    const group = [...groups.values()].sort((x, y) => y.length - x.length)[0] ?? [];
-    if (shouldDepart(group.map((e) => readySince.get(e.t.id)!), cfg, now)) {
+    const bySize = [...groups.values()].sort((x, y) => y.length - x.length);
+    // A lone stale PR has nobody to share a run with: once it has waited the
+    // window for company it leaves as a train of one.
+    const minFor = (g: Eval[]) => (freshOn && g.length === 1 && g[0]!.step.kind === "train" ? 1 : 2);
+    const departs = (g: Eval[]) => shouldDepart(g.map((e) => readySince.get(e.t.id)!), cfg, now, minFor(g));
+    const group = (freshOn ? bySize.find(departs) : bySize[0]) ?? [];
+    if (departs(group)) {
       const candidates = group.slice(0, cfg.max);
-      const train = await buildTrain(candidates.map((e) => ({ task: e.t, pr: e.pr! }))).catch(() => null);
+      const train = await buildTrain(candidates.map((e) => ({ task: e.t, pr: e.pr! })), minFor(group)).catch(() => null);
       for (const m of train?.members ?? []) riding.add(m.taskId);
       // Offered a train and left out of it (it conflicts with the others, or
       // no train could be built): it has had its wait for company.
-      for (const e of candidates) if (!riding.has(e.t.id)) leftOut.add(e.t.id);
+      for (const e of candidates) {
+        if (riding.has(e.t.id)) continue;
+        leftOut.add(e.t.id);
+        if (candidates.length === 1) untestable.add(e.t.id);
+        else if (freshOn) markRidesAlone(e.pr!);
+      }
+    }
+  }
+  // 2b. The fresh rule: a stale PR kept out of shared trains (its train
+  //     disbanded, or it conflicts with the others) is re-tested as a train
+  //     of one, one such train at a time.
+  if (freshOn && cfg.enabled && !activeTrain()) {
+    const alone = evals.find(
+      (e) => !riding.has(e.t.id) && e.t.column === "merge" && !!e.t.branch && e.step.kind === "train" &&
+        trainEligible(e.pr, e.mergeability) && skipsTrain(e.pr!) && !trainFailedAlone(e.pr!) && !leftOut.has(e.t.id),
+    );
+    if (alone) {
+      const train = await buildTrain([{ task: alone.t, pr: alone.pr! }], 1).catch(() => null);
+      if (train) riding.add(alone.t.id);
+      else untestable.add(alone.t.id);
     }
   }
 
@@ -395,6 +472,20 @@ async function tick(now: number): Promise<void> {
     if (riding.has(e.t.id)) continue;
     // A train that landed above moved its members to Done: don't step them.
     if (tasks.get(e.t.id)?.column !== "merge") continue;
+    if (e.step.kind === "train") {
+      const base = e.pr!.baseRef ?? "the base";
+      // No train can test it (trains are off, one could not be built, or its
+      // train of one failed): bring the base into the branch, so the PR's own
+      // CI tests the combination and a failure shows where it can be fixed.
+      const why = !cfg.enabled ? "merge trains are off" : trainFailedAlone(e.pr!) ? `it fails on the latest ${base}` : untestable.has(e.t.id) ? "a merge train could not be built for it" : null;
+      if (why) {
+        note(e.t, `Green, but ${e.step.why} and ${why} — updating its branch so CI tests what will land (one extra CI run)`, "info");
+        await take(e.t, e.pr, { kind: "update-branch" }).catch((err: Error) => note(e.t, `Merge queue error: ${err.message}`, "warning"));
+        continue;
+      }
+      note(e.t, `Green, but ${e.step.why} — it rides a merge train${skipsTrain(e.pr!) ? " of one" : ""} so CI tests what will land before it merges (one extra CI run when it rides alone)`, "muted");
+      continue;
+    }
     if (cfg.enabled && eligibleIds.has(e.t.id) && (e.step.kind === "merge" || e.step.kind === "update-branch")) {
       // Company = other ready PRs that could share its train (same project and base).
       const others = eligible.filter(
