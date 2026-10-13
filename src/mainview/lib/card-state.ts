@@ -11,7 +11,7 @@
  * (src/shared/block-wait.ts) and on `causeOf` (board-health.ts). Pure: the
  * caller passes `now`.
  */
-import type { PipelineBlock, PipelineRunState, Task, TaskPrStatus } from "../../shared/types.ts";
+import type { PipelineBlock, PipelineGraph, PipelineRunState, Task, TaskPrStatus } from "../../shared/types.ts";
 import type { RoadmapCardInfo } from "../../shared/roadmap.ts";
 import { neverStarted } from "../../shared/autopilot.ts";
 import { blockReasonLine, effectiveStepCap, handoffHeadline, isFollowUpStepId, resolveStartStep } from "../../shared/pipeline.ts";
@@ -22,7 +22,8 @@ import { causeOf, WAIT_CAUSE_ORDER, type WaitCause } from "./board-health.ts";
 import { latestRecord, mergePhrase, prPhrase, quietFor, stepName, type MergePhraseKind } from "./card-status.ts";
 import { shortCardName } from "./card-names.ts";
 
-/** The colour family. Blue is a wait that ends by itself; amber is the owner's move. */
+/** The colour family. Blue is a wait that ends by itself (a started run
+ *  parked on a dependency included); amber is the owner's move. */
 export type CardStateTone = "working" | "waiting" | "needs" | "failed" | "merged" | "queued";
 
 export type CardStateIcon = "activity" | "clock" | "alert" | "x" | "merge" | "dashed";
@@ -119,36 +120,43 @@ function sansPr(line: string): string {
 
 export const clockTime = (ts: number) => new Date(ts).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
 
-/**
- * The pipeline's steps as equal segments, ordered from the start step along
- * the edges (steps the walk doesn't reach keep their array order, at the
- * end). Follow-up steps are not part of the pipeline and get no segment. A
- * segment is done only when it comes before the current step and has a
- * succeeded execution: after a loop back, the steps ahead are to do again.
- */
-export function stepStrip(run: PipelineRunState, currentStepId: string | null): CardStripSegment[] | null {
-  const graph = run.snapshot?.graph;
-  if (!graph) return null;
+/** A graph's steps from the start step along the edges; steps the walk
+ *  doesn't reach keep their array order, at the end. Follow-up steps are not
+ *  part of the pipeline and are left out. */
+export function stepOrder(graph: PipelineGraph): string[] {
   const steps = graph.steps.filter((s) => !isFollowUpStepId(s.id));
-  if (steps.length === 0) return null;
-  const byId = new Map(steps.map((s) => [s.id, s]));
+  const ids = new Set(steps.map((s) => s.id));
   const order: string[] = [];
   const seen = new Set<string>();
   const start = resolveStartStep(graph);
-  const queue = start && byId.has(start.id) ? [start.id] : [];
+  const queue = start && ids.has(start.id) ? [start.id] : [];
   while (queue.length > 0) {
     const id = queue.shift()!;
     if (seen.has(id)) continue;
     seen.add(id);
     order.push(id);
-    for (const e of graph.edges) if (e.from === id && byId.has(e.to) && !seen.has(e.to)) queue.push(e.to);
+    for (const e of graph.edges) if (e.from === id && ids.has(e.to) && !seen.has(e.to)) queue.push(e.to);
   }
   for (const s of steps) if (!seen.has(s.id)) order.push(s.id);
+  return order;
+}
+
+/**
+ * The pipeline's steps as equal segments, in `stepOrder`. A segment is done
+ * only when it comes before the current step and has a succeeded execution:
+ * after a loop back, the steps ahead are to do again.
+ */
+export function stepStrip(run: PipelineRunState, currentStepId: string | null): CardStripSegment[] | null {
+  const graph = run.snapshot?.graph;
+  if (!graph) return null;
+  const order = stepOrder(graph);
+  if (order.length === 0) return null;
+  const names = new Map(graph.steps.map((s) => [s.id, s.name]));
   const succeeded = new Set(run.history.filter((r) => r.outcome === "succeeded").map((r) => r.stepId));
   const at = currentStepId == null ? -1 : order.indexOf(currentStepId);
   return order.map((id, i) => ({
     id,
-    name: byId.get(id)!.name,
+    name: names.get(id)!,
     status: i === at ? "current" : succeeded.has(id) && (at < 0 || i < at) ? "done" : "todo",
   }));
 }
@@ -246,7 +254,9 @@ export function cardState(task: Task, ctx: CardStateContext): CardState {
   if (waitingOn.length > 0 && task.column !== "running" && task.column !== "done") {
     const names = waitingOn.map((d) => d.ref ?? shortCardName(d.title)).join(", ");
     const detail = waitingOn.length === 1 ? ` · ${waitingOn[0]!.detail}` : "";
-    return make("queued", "dependency", "Dependency", `Waiting on ${names}${detail}`, { kind: "open-dependency", label: "Open dependency", taskId: waitingOn[0]!.taskId });
+    // A card nothing has run yet is queued behind its predecessor (grey). One
+    // that has run is parked on it and moves on by itself when it lands (blue).
+    return make(neverStarted(task) ? "queued" : "waiting", "dependency", "Dependency", `Waiting on ${names}${detail}`, { kind: "open-dependency", label: "Open dependency", taskId: waitingOn[0]!.taskId });
   }
 
   // Ready to Merge: Agetor works the PR to green and merges it
@@ -312,7 +322,7 @@ export function cardState(task: Task, ctx: CardStateContext): CardState {
           // The card it waits on, when the board knows it as one of this card's dependencies.
           const dep = (task.blockedBy ?? []).find((d) => d.ref != null && d.ref === parked.ref);
           return make(
-            "queued",
+            "waiting",
             "dependency",
             "Dependency",
             reason.charAt(0).toUpperCase() + reason.slice(1),
