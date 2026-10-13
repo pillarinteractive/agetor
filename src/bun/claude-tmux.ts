@@ -31,7 +31,7 @@ import {
 } from "./interactions.ts";
 import { resolveTmuxBin, tmuxSocketArgs, tmuxSpawnOptions, ensureDisclaimedServer } from "./tmux-resolution.ts";
 import { createDeathProbe } from "./session-liveness.ts";
-import { environmentReminderKey } from "./optional-claude-prompt.ts";
+import { environmentReminderKey, gatewayBillingNoticeKey } from "./optional-claude-prompt.ts";
 import { detectAskModal, isLossyAskPane, parseModalPane, type AskModalKind, type DriveStep, type NavKey, type ParsedQuestionPane } from "./claude-questions.ts";
 
 /**
@@ -6792,6 +6792,15 @@ async function scrapeOnce(state: SessionState): Promise<void> {
   })) {
     markTmuxPromptAnswered(state.taskId, match.fingerprint);
     recordActivity(parent!.id, { kind: "auto", text: "Dismissed the optional Claude environment-teaching reminder with Don't show again; no permissions granted", tone: "info" });
+    return;
+  }
+  // A gateway session (e.g. Claude Code pointed at another provider) stops on
+  // an informational billing notice that only waits for Enter. Left alone it
+  // parks the step and shows the card as having asked a question.
+  const noticeKey = gatewayBillingNoticeKey(match.paneText, match.choices);
+  if (noticeKey && await sendModalKeys(state.taskId, [noticeKey])) {
+    markTmuxPromptAnswered(state.taskId, match.fingerprint);
+    recordActivity(parent?.id ?? state.taskId, { kind: "auto", text: "Continued past Claude Code's gateway billing notice with Enter; it asked nothing and granted nothing", tone: "info" });
     return;
   }
 

@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { decisionPolicyForProject, PIPELINE_DECISIONS_PREF, plannerDecisionInstructions } from "../shared/pipeline-decisions.ts";
 import { rmTestDataDir } from "./test-data-dir.ts";
-import { environmentReminderKey } from "./optional-claude-prompt.ts";
+import { environmentReminderKey, gatewayBillingNoticeKey } from "./optional-claude-prompt.ts";
 const dir = mkdtempSync(join(tmpdir(), "agetor-decisions-"));
 process.env.AGETOR_DATA_DIR = dir;
 process.env.AGETOR_CLAUDE_DRIVER = "fake";
@@ -71,6 +71,23 @@ test("only the exact harmless environment reminder is dismissible; permission pr
   expect(environmentReminderKey("Allow deleting credentials?", choices)).toBeNull();
   expect(environmentReminderKey(text, [{ key: "1", label: "Allow (Recommended)" }])).toBeNull();
   expect(environmentReminderKey("Teach auto mode about your environment?", choices)).toBeNull();
+});
+test("only the exact gateway billing notice is continued, at any wrap width, and never when choices are offered", () => {
+  const notice = [
+    "  ⎿  Waiting…", "────────────",
+    "  We're changing auto mode to no longer charge for classifier requests in", "  Claude Code.",
+    "  However, this session isn't eligible because your requests go through", "  api.deepseek.com, which isn't compatible with this update.",
+    "  Nothing breaks: auto mode keeps working, and its classifier requests are", "  billed as before.",
+    "  To fix it and access the new version of auto mode, ask your gateway to", "  implement: https://code.claude.com/docs/en/auto-mode-classifier-billing",
+    "  Enter to continue · Esc to cancel",
+  ].join("\n");
+  expect(gatewayBillingNoticeKey(notice, [])).toBe("Enter");
+  expect(gatewayBillingNoticeKey(notice.replace(/\n\s*/g, " "), [])).toBe("Enter"); // one long line
+  expect(gatewayBillingNoticeKey(notice.replace("classifier requests in\n  Claude Code.", "classifier\n  requests in Claude Code."), [])).toBe("Enter"); // wrapped elsewhere
+  expect(gatewayBillingNoticeKey(notice, [{ key: "1", label: "Yes" }])).toBeNull();
+  expect(gatewayBillingNoticeKey(notice.replace("Nothing breaks: auto mode keeps working", "Auto mode will be turned off"), [])).toBeNull();
+  expect(gatewayBillingNoticeKey(notice.replace("Enter to continue · Esc to cancel", "Enter to allow · Esc to cancel"), [])).toBeNull();
+  expect(gatewayBillingNoticeKey("Allow deleting credentials?\n  Enter to continue · Esc to cancel", [])).toBeNull();
 });
 test("planner instructions choose on the same card, derive missing recommendations, and preserve authority and quality boundaries", () => {
   const p = plannerDecisionInstructions("parent", 123);
