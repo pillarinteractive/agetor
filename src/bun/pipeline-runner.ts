@@ -111,8 +111,6 @@ import {
   reviewedPipelineShape,
   reviewRequiresRepair,
   outgoingSteps,
-  capWrapUpStep,
-  capWrapUpSection,
   renderHandoffFile,
   renderReportFile,
   resolveNextSteps,
@@ -304,11 +302,6 @@ export function supersedeBlocksBefore(run: PipelineRunState, seq: number): strin
  * Stop the user pressed never comes through here. Callers persist `run`.
  */
 export { TRANSIENT_RETRY_MAX };
-/** Step-cap extensions an unattended run grants itself before it waits for a
- *  person: a 14-step run goes to 28, then stops. Of 285 runs to date, 18
- *  reached 14 steps and 2 went past 28; every extended run that ended, ended
- *  done. One extension covers the long review cycles without funding a loop. */
-export const AUTO_CAP_EXTENSIONS = 1;
 const autoRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const launchRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const launchRecoveriesInFlight = new Set<string>();
@@ -2157,6 +2150,18 @@ async function launchStep(
     parent = prepared.parent;
   }
 
+  // Budget exhaustion parks before even a code-run Finish is dispatched.
+  // Retry is an explicit allowance; no wrap-up publishes an unapproved head.
+  if (run.stepCount >= effectiveStepCap(run)) {
+    upsertBlocked(run, {
+      taskId: null, stepId: step.id, kind: "step-cap",
+      message: `reached the ${effectiveStepCap(run)}-step cap — parked with findings preserved; retry explicitly to continue`,
+      pending: { stepId: step.id, arrivals: pendingArrivals },
+    });
+    persist(parent.id, run);
+    return { ok: false };
+  }
+
   // Finish run by Agetor (`pipeline_gates`): no step task while it verifies,
   // pushes and waits — the launch is parked and src/bun/publish-step.ts
   // carries the visit. Its one agent turn (`write`) comes back through here.
@@ -2167,60 +2172,6 @@ async function launchStep(
   }
   const publishBrief = publishing === "write" ? run.publish?.brief : undefined;
 
-  // The step cap stops a run that goes round in circles. On an unattended
-  // board the first hit extends the allowance by itself (the same
-  // extension a person's Retry grants); a run that uses those up as well is
-  // the loop the cap exists for, and waits for someone.
-  if (
-    run.stepCount >= effectiveStepCap(run) &&
-    snapshot.decisionPolicy === "planner-recommendation" &&
-    (run.capExtensions ?? 0) < AUTO_CAP_EXTENSIONS
-  ) {
-    const before = effectiveStepCap(run);
-    run.capExtensions = (run.capExtensions ?? 0) + 1;
-    recordActivity(parent.id, {
-      kind: "step",
-      text: `Reached the ${before}-step cap — continuing automatically up to ${effectiveStepCap(run)} (${run.capExtensions} of ${AUTO_CAP_EXTENSIONS} automatic extensions)`,
-      tone: "warning",
-    });
-  }
-  // Out of extensions, an unattended run is finished once through its
-  // terminal step, which files issues for what is unresolved, instead of
-  // waiting for someone (`run.capWrapUp`). The mark has no `seq` until that
-  // step's task exists, so a wrap-up that queued for a slot or threw before
-  // the insert comes back through here and is let past the cap again.
-  let wrapUp = false;
-  if (
-    run.stepCount >= effectiveStepCap(run) &&
-    snapshot.decisionPolicy === "planner-recommendation" &&
-    run.capWrapUp?.seq === undefined
-  ) {
-    const terminal = capWrapUpStep(snapshot.graph);
-    const mine = !run.capWrapUp || step.id === terminal?.id || step.id === run.capWrapUp.fromStepId;
-    if (terminal && mine && !run.active.some((a) => a.stepId === terminal.id)) {
-      if (!run.capWrapUp) {
-        run.capWrapUp = { at: Date.now(), fromStepId: step.id };
-        recordActivity(parent.id, {
-          kind: "step",
-          text: `Reached the ${effectiveStepCap(run)}-step cap — finishing through ${terminal.name} and filing issues for what is unresolved`,
-          tone: "warning",
-        });
-      }
-      step = terminal;
-      wrapUp = true;
-    }
-  }
-  if (!wrapUp && run.stepCount >= effectiveStepCap(run)) {
-    upsertBlocked(run, {
-      taskId: null,
-      stepId: step.id,
-      kind: "step-cap",
-      message: `reached the ${effectiveStepCap(run)}-step cap for this run — retry to keep going, or stop here`,
-      pending: { stepId: step.id, arrivals: pendingArrivals },
-    });
-    persist(parent.id, run);
-    return { ok: false };
-  }
   const profile = step.agentProfileId ? snapshot.profiles[step.agentProfileId] : undefined;
   if (!profile) {
     upsertBlocked(run, {
@@ -2364,13 +2315,13 @@ async function launchStep(
     .map((id) => snapshot.profiles[id])
     .filter((p): p is AgentProfileSnapshot => p !== undefined);
 
-  const stepChecks = publishBrief || wrapUp ? null : stepGateFor(parent, run, step);
+  const stepChecks = publishBrief ? null : stepGateFor(parent, run, step);
   const composeArgs = {
     pipelineName: run.pipelineName,
     // The writer's turn of an Agetor-run Finish: the brief is its whole job.
     step: publishBrief ? { ...step, instructions: publishBrief } : step,
     stepIndex: seq,
-    // The wrap-up execution is the one step past the cap.
+    // The finite allowance was checked before dispatch.
     stepCap: Math.max(effectiveStepCap(run), seq),
     goal: parent.prompt,
     previous: previousWithFiles,
@@ -2381,8 +2332,7 @@ async function launchStep(
     parentHarnessKind: profile.harnessKind,
     parallelSiblings,
     // What the step will be judged by (`pipeline_gates`), so its agent knows.
-    // Not the writer of an Agetor-run Finish or a wrap-up at the cap: neither
-    // is gated when its turn ends.
+    // The writer of an Agetor-run Finish does not repeat its mechanical gates.
     gate: stepChecks ? { goal: stepChecks.goal, checks: stepChecks.checks, issueUrl: parent.issueUrl } : null,
   };
   // M10: step tasks carry the parent's own references plus every handoff
@@ -2399,8 +2349,8 @@ async function launchStep(
   const withRouting = (prompt: string) => manuallyRouted
     ? `${prompt}\n\nThis step was explicitly selected by manual Advance. The preceding verdict and findings are preserved for you to address. This routing decision is not approval of the change and grants no additional permissions.`
     : prompt;
-  const withDecisions = (prompt: string) => snapshot.decisionPolicy === "planner-recommendation"
-    ? `${prompt}\n\n${plannerDecisionInstructions(parent.id, snapshot.capturedAt)}` : prompt;
+  const withDecisions = (prompt: string) => snapshot.decisionPolicy
+    ? `${prompt}\n\n${plannerDecisionInstructions(parent.id, snapshot.capturedAt, snapshot.decisionPolicy)}` : prompt;
   const managedRoot=managedPillarRoot(parent.worktreePath??parent.workdir);
   const approvalNote=step.name==='Review'
     ? `\n\nAutomatic sign-off requires explicit independent approval of this exact head and all issue acceptance. Map every acceptance criterion to checked evidence in your summary. In the handoff add "reviewApproval":{"verdict":"approved"|"changes-requested","headSha":"<full 40-character git rev-parse HEAD>","issueUrl":${JSON.stringify(parent.issueUrl??'')},"acceptanceComplete":true|false,"findings":[]}. Only use approved/true/empty findings when all required criteria are met and no finding remains. Otherwise record all findings, set changes-requested/false and choose Build. A succeeded/done review turn or Finish choice is not approval.`
@@ -2409,17 +2359,13 @@ async function launchStep(
     ? `${prompt}\n\n## Machine test capacity\n${HEAVY_INSTRUCTIONS}${approvalNote}`:prompt;
   // The owner's notes for a run they reopened (`steerPipelineRun`): carried
   // by this step and the steps after it until each has finished once since.
-  // Never by the writer of an Agetor-run Finish or the wrap-up, whose turn
+  // Never by the writer of an Agetor-run Finish, whose turn
   // must not change the head. A run with no note has no such section.
-  const ownerNotes = publishBrief || wrapUp ? [] : applicableFeedback(
+  const ownerNotes = publishBrief ? [] : applicableFeedback(
     readFeedback(parent.id, run), forwardPath(snapshot.graph, run.history) ?? [], run.history, step.id);
   const feedbackSection = renderOwnerFeedback(ownerNotes, { stepId: step.id, nameOf: (id) => stepNameById(snapshot.graph, id) });
   const withFeedback = (prompt: string) => (feedbackSection ? `${prompt}\n\n${feedbackSection}` : prompt);
-  // Last, so nothing after it reads as taking the wrap-up back.
-  const withWrapUp = (prompt: string) => wrapUp
-    ? `${prompt}\n\n${capWrapUpSection({ stepCap: effectiveStepCap(run), issueUrl: parent.issueUrl, prUrl: parent.prUrl })}`
-    : prompt;
-  let composed = withWrapUp(withMachineCapacity(withSync(withRouting(withDecisions(withFeedback(composeStepPrompt({ ...composeArgs, inlineHandoff: true })))))));
+  let composed = withMachineCapacity(withSync(withRouting(withDecisions(withFeedback(composeStepPrompt({ ...composeArgs, inlineHandoff: true }))))));
   if(inputReconciliation.note)composed+=`\n\n${inputReconciliation.note}`;
   // m12/D10: measure the SAME wrapping `startTaskInner` will actually launch
   // with — `composeLaunchPrompt` (the profile's instructions/skills
@@ -2429,7 +2375,7 @@ async function launchStep(
   if (profile.harnessKind === "gemini") {
     const fullPrompt = appendReferences(composeLaunchPrompt(profile, composed), references);
     if (promptByteOverage("gemini", fullPrompt)) {
-      composed = withWrapUp(withMachineCapacity(withSync(withRouting(withDecisions(withFeedback(composeStepPrompt({ ...composeArgs, inlineHandoff: false })))))));
+      composed = withMachineCapacity(withSync(withRouting(withDecisions(withFeedback(composeStepPrompt({ ...composeArgs, inlineHandoff: false }))))));
     }
   }
 
@@ -2487,7 +2433,6 @@ async function launchStep(
   if (run.publish && run.publish.stepId === step.id && (run.publish.state === "write" || run.publish.state === "agent") && run.publish.seq === undefined) {
     run.publish.seq = seq;
   }
-  if (wrapUp && run.capWrapUp) run.capWrapUp.seq = seq;
   persist(parent.id, run);
 
   const started = await startTask(childId);
@@ -2586,7 +2531,7 @@ function isDatabaseBusy(error: string): boolean {
 }
 function recordLaunchRefusal(parentId: string, run: PipelineRunState, taskId: string, stepId: string, message: string): void {
   upsertBlocked(run, { taskId, stepId, kind: isCapacityRefusal(message) ? 'slot-wait' : 'step-failed', message });
-  if (isDatabaseBusy(message) && run.snapshot?.decisionPolicy === 'planner-recommendation' && !isTaskRunLive(taskId)) {
+  if (isDatabaseBusy(message) && !!run.snapshot?.decisionPolicy && !isTaskRunLive(taskId)) {
     scheduleLaunchRetry(parentId, run, taskId, stepId, 'could not acquire the database writer');
   }
 }
@@ -4173,7 +4118,7 @@ function attemptHandoffReminderOrBlock(input: {
     // Nothing here needs a person: the step simply ended without saying
     // what happens next. On an unattended board, start it again (bounded,
     // with backoff) before leaving the block for someone.
-    if (run.snapshot?.decisionPolicy === "planner-recommendation") {
+    if (!!run.snapshot?.decisionPolicy) {
       scheduleAutoRetry(parentId, run, activeEntry.stepId, null, "ended without a handoff");
     }
     checkJoinIncomplete(run);
@@ -4479,12 +4424,12 @@ async function settleStepRun(
       // The step's gate (`pipeline_gates`, src/shared/checks.ts): with one,
       // the step is finished when its required checks pass, not when its
       // handoff says so. Never for the writer of an Agetor-run Finish (CI
-      // already decided that visit) or the wrap-up at the step cap (it
+      // already decided that visit); legacy wrap-up metadata cannot skip gates (it
       // publishes what there is).
       // Only a visit that was launched under the gate (`gate` on its record):
       // adopting gates never switches a step that is already under way.
       const stepObj = graph.steps.find((s) => s.id === activeEntry.stepId);
-      const gate = stepObj && historyEntry?.gate && run.publish?.seq !== activeEntry.seq && run.capWrapUp?.seq !== activeEntry.seq
+      const gate = stepObj && historyEntry?.gate && run.publish?.seq !== activeEntry.seq
         ? stepGateFor(parent, run, stepObj) : null;
       /**
        * Judge the turn by the gate. `return`: the settle ends here — with the
@@ -5440,7 +5385,7 @@ function markStepNeverStarted(parentId: string, taskId: string): void {
   }
   // This is an interrupted child launch, not a planner question. Preserve
   // a pending/exhausted/cancelled retry record across repeated boot sweeps.
-  if (run.snapshot?.decisionPolicy === 'planner-recommendation' && !run.autoRetry && !run.launchRetries?.[taskId]) {
+  if (!!run.snapshot?.decisionPolicy && !run.autoRetry && !run.launchRetries?.[taskId]) {
     scheduleLaunchRetry(parentId, run, taskId, entry.stepId, 'was interrupted before its worker started');
   }
   checkJoinIncomplete(run);
@@ -5486,7 +5431,7 @@ export async function reconcilePipelineRuns(): Promise<number> {
       const run = fresh?.pipelineRun;
       if (!fresh || !run || fresh.archivedAt != null || !['running', 'blocked'].includes(run.status)) return;
       for (const active of run.active) retireStaleQueuedReminder(parent.id, run, active.taskId);
-      if (run.snapshot?.decisionPolicy !== 'planner-recommendation' || run.autoRetry?.at === null) return;
+      if (!run.snapshot?.decisionPolicy || run.autoRetry?.at === null) return;
       let changed = false;
       for (const block of run.blocked) {
         if (block.kind !== 'step-failed' || !block.taskId || !block.stepId) continue;

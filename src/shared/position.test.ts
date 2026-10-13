@@ -155,11 +155,11 @@ describe("resolvePosition", () => {
     ["Agetor's Finish published HEAD and the required check passed", input({ publish: { stepId: "finish", head: HEAD, approvedHead: HEAD, carried: 0, requiredPassed: true } }), ["complete"]],
     ["…published another head: Finish again", input({ publish: { stepId: "finish", head: OLD, approvedHead: OLD, carried: 0, requiredPassed: true } }), ["finish", ["understand", "build", "review"], [["review", 3]]]],
     ["…the required check has not passed for it: Finish again", input({ publish: { stepId: "finish", head: HEAD, approvedHead: HEAD, carried: 0, requiredPassed: false } }), ["finish", ["understand", "build", "review"], [["review", 3]]]],
-    ["Agetor merged the base in (the diff unchanged): the approval of the head it carried over still stands",
+    ["A legacy carried approval cannot complete a different HEAD",
       input({
         history: [...FINISHED.slice(0, 2), rec(3, "review", ["finish"], { handoff: verdict(OLD) }), rec(4, "finish", [])],
         publish: { stepId: "finish", head: HEAD, approvedHead: OLD, carried: 1, requiredPassed: true },
-      }), ["complete"]],
+      }), ["review", ["understand", "build"], [["build", 2]]]],
     // The trivial path.
     ["Understand made the trivial change and Finish published it", input({ history: [rec(1, "understand", ["finish"]), rec(2, "finish", [])] }), ["complete"]],
     ["a graph that fans out", input({ graph: { ...CHANGE, steps: CHANGE.steps.map((s) => (s.id === "understand" ? { ...s, transition: "all" as const } : s)) } }), ["unsupported"]],

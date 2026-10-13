@@ -268,7 +268,7 @@ export function resolvePosition(input: PositionInput): Position {
     // The head a verdict has to name: HEAD, or — when Agetor merged the base
     // into the approved head with the change's own diff unchanged — that head.
     const p = input.publish;
-    const verdictHead = p && p.carried > 0 && p.approvedHead && p.head === input.key.head ? p.approvedHead : input.key.head;
+    const verdictHead = input.key.head;
     for (const check of ev?.checks ?? []) {
       if (!check.required) continue;
       let found: { satisfied: boolean; detail: string };

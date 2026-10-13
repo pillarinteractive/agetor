@@ -201,7 +201,7 @@ export const USAGE: Record<string, string> = {
   Update a profile. --skill appends to the existing skill list unless
   --clear-skills is also given (then the list is replaced).`,
 
-  pipeline: `usage: agetor pipeline <ls | show <ref> | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> [--name <n>] | retry <task> [--from <task>] | advance <task> [--next <step>… | --finish] [--from <task>] | refresh-instructions <task> | restart <task> [--from-scratch] | position <task> | rewind <task> --to <step> | feedback <task> --from <step> (--note <text> | --note-file <file|->) [--invalidate] | status <task> [--handoffs] | handoff <task> [<step>|--all]>
+  pipeline: `usage: agetor pipeline <ls | show <ref> | edit <ref> --file <pipeline.json|-> | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> [--name <n>] | retry <task> [--from <task>] | advance <task> [--next <step>… | --finish] [--from <task>] | refresh-instructions <task> | restart <task> [--from-scratch] | position <task> | rewind <task> --to <step> | feedback <task> --from <step> (--note <text> | --note-file <file|->) [--invalidate] | status <task> [--handoffs] | handoff <task> [<step>|--all]>
 
   Manage pipelines — named graphs of agent-profile-bound steps launched as
   one board task (built in the app's Pipelines editor; the CLI moves them

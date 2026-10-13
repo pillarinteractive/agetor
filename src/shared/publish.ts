@@ -182,11 +182,9 @@ export function publishVisitOver(p: PipelinePublishState | undefined, stepId: st
   return p.seq !== undefined && !activeSeqs.includes(p.seq);
 }
 
-/** The head whose Review approval covers `headSha`: when Agetor merged the
- *  base into the approved head (the change's own diff unchanged) the
- *  published head is that merge, and the approval is of `approvedHead`. Pure. */
+/** Approval is always of the exact head; legacy carry-over is not approval. */
 export function approvedHeadFor(p: Pick<PipelinePublishState, "head" | "approvedHead" | "carried"> | null | undefined, headSha: string): string {
-  return p && p.carried > 0 && p.approvedHead && p.head === headSha ? p.approvedHead : headSha;
+  return headSha;
 }
 
 // ---------------------------------------------------------------------------
@@ -307,8 +305,9 @@ export type BuildCause =
   | { kind: "dirty"; files: string[] }
   | { kind: "unapproved-head"; head: string; approvedHead: string; commits: string[] }
   | { kind: "conflict"; files: string[] }
-  /** Merging the recovered base in would change the change's own diff. */
+  /** The recovered base requires a merge and a fresh independent review. */
   | { kind: "changed-diff" }
+  | { kind: "verification"; error: string }
   | { kind: "ci"; checks: PublishFailedCheck[]; inherited: string[] };
 
 export type PublishAction =
@@ -316,8 +315,6 @@ export type PublishAction =
   | { kind: "advance"; to: PublishStateName; set?: Partial<PipelinePublishState>; say?: string }
   /** Stay. Costs nothing: no agent, no slot, no attempt. */
   | { kind: "wait"; note: string; set?: Partial<PipelinePublishState> }
-  /** Fast-forward the worktree to `commit` (the base merged into the head). */
-  | { kind: "merge-base"; commit: string; baseTip: string; then: PublishStateName }
   | { kind: "push" }
   | { kind: "open-pr" }
   /** Re-run the head's failed (or cancelled) jobs, once per head and reason. */
@@ -346,6 +343,9 @@ export function failingCauses(checks: readonly CheckRunLike[]): PublishFailedChe
 /** The one next action. Pure. */
 export function decidePublish(p: PipelinePublishState, obs: PublishObservation, now: number): PublishAction {
   const base = p.base ?? "the base";
+  if (obs.state !== "verify-head" && p.head && p.approvedHead && p.head !== p.approvedHead) {
+    return { kind: "to-build", cause: { kind: "unapproved-head", head: p.head, approvedHead: p.approvedHead, commits: [] } };
+  }
   if (obs.state === "unreadable") return { kind: "wait", note: `couldn't read ${obs.what} — trying again` };
   if (obs.state !== p.state) return { kind: "wait", note: p.note };
   if (p.tries >= PUBLISH_MAX_TRIES) return { kind: "owner", why: `Agetor tried ${p.tries} times and could not get past "${STATE_NOTE[p.state]}": ${p.note}` };
@@ -358,10 +358,7 @@ export function decidePublish(p: PipelinePublishState, obs: PublishObservation, 
       if (obs.approval.kind === "not-approved") return { kind: "to-build", cause: { kind: "not-approved", why: obs.approval.why } };
       if (obs.dirty.length > 0) return { kind: "to-build", cause: { kind: "dirty", files: obs.dirty } };
       const approved = obs.approval.headSha;
-      // The base merged in by Agetor earlier in this visit is the approved
-      // head's own carry-over, not a new commit to review.
-      const carriedOver = p.carried > 0 && p.approvedHead === approved && p.head === obs.head;
-      if (obs.head !== approved && !carriedOver) {
+      if (obs.head !== approved) {
         return { kind: "to-build", cause: { kind: "unapproved-head", head: obs.head, approvedHead: approved, commits: obs.unreviewed } };
       }
       return { kind: "advance", to: "check-merge", set: { approvedHead: approved, head: obs.head, tree: obs.tree } };
@@ -371,15 +368,9 @@ export function decidePublish(p: PipelinePublishState, obs: PublishObservation, 
       if (obs.contains) return { kind: "advance", to: "hold-base", set: { baseTip: obs.baseTip } };
       if (!obs.merge) return { kind: "wait", note: `couldn't try the merge with ${base} — trying again` };
       if (obs.merge.conflicts) return { kind: "to-build", cause: { kind: "conflict", files: obs.merge.conflicts } };
-      if (!obs.merge.samePatch || !obs.merge.commit) {
-        // Clean, but the base took part of this change: the approved head is
-        // published as it is, and GitHub's CI still tests it merged with the base.
-        return {
-          kind: "advance", to: "hold-base", set: { baseTip: obs.baseTip },
-          say: `${base} moved, and merging it in would change this change's own diff — publishing the approved head as it is`,
-        };
-      }
-      return { kind: "merge-base", commit: obs.merge.commit, baseTip: obs.baseTip, then: "hold-base" };
+      // GitHub tests the clean merged combination; publication keeps the
+      // exact independently approved commit even when the base moved.
+      return { kind: "advance", to: "hold-base", set: { baseTip: obs.baseTip } };
     }
 
     case "hold-base": {
@@ -498,10 +489,8 @@ export function decidePublish(p: PipelinePublishState, obs: PublishObservation, 
       }
       if (!obs.merge) return { kind: "wait", note: `couldn't try the merge with ${base} — trying again` };
       if (obs.merge.conflicts) return { kind: "to-build", cause: { kind: "conflict", files: obs.merge.conflicts } };
-      if (!obs.merge.samePatch || !obs.merge.commit) return { kind: "to-build", cause: { kind: "changed-diff" } };
-      // The merge is a new head: it goes out through `push`, the one place
-      // that pushes, and CI runs on it once.
-      return { kind: "merge-base", commit: obs.merge.commit, baseTip: obs.baseTip, then: "push" };
+      // Refreshing the tested base requires a new commit and new review.
+      return { kind: "to-build", cause: { kind: "changed-diff" } };
     }
   }
 }
@@ -528,9 +517,6 @@ export function applyPublish(p: PipelinePublishState, action: PublishAction, res
       return enter(action.to, action.set, action.say);
     case "wait":
       return { ...p, ...action.set, note: action.note };
-    case "merge-base":
-      if (!result.ok) return failed("merging the base in");
-      return enter(action.then, { head: result.head ?? action.commit, tree: result.tree ?? p.tree, baseTip: action.baseTip, carried: p.carried + 1 });
     case "push":
       return result.ok ? enter("pr") : failed("the push");
     case "open-pr":
@@ -567,6 +553,8 @@ export function publishBuildHandoff(
     reason, next: ctx.next, artifacts: [], openQuestions: [],
   });
   switch (cause.kind) {
+    case "verification":
+      return made("selected local verification failed", cause.error + "\n\nFix the failure in Build and obtain independent review of any new commit.", cause.error);
     case "dirty": {
       const files = cause.files.slice(0, 40).map((f) => `- ${f}`).join("\n");
       return made(
@@ -594,11 +582,10 @@ export function publishBuildHandoff(
       );
     case "changed-diff":
       return made(
-        `${ctx.base} recovered, and merging it in changes this change's own diff`,
-        `CI failed only on checks ${ctx.base} was failing too, and ${ctx.base} is green again. Agetor merges it in itself when that leaves the change's own diff ` +
-          `untouched (\`git patch-id\` of \`git diff origin/${ctx.base}...HEAD\`); here it does not, so the merge needs a look. ` +
-          `\`git fetch origin ${ctx.base}\`, merge origin/${ctx.base} into this branch (a merge commit — never a rebase), check what it did to the change, and commit.`,
-        `merging origin/${ctx.base} changes the change's own diff`,
+        `${ctx.base} recovered; Build must merge it and obtain fresh review`,
+        `CI failed on checks ${ctx.base} was failing too, and ${ctx.base} is green again. Finish never merges or carries approval to a different commit. ` +
+          `Fetch and merge origin/${ctx.base} into this branch in Build, run focused checks and hand the new commit to Review.`,
+        `the recovered origin/${ctx.base} requires a newly reviewed head`,
       );
   }
 }
@@ -619,12 +606,10 @@ export interface PublishFacts {
 
 /** The comment Agetor posts once CI is green: facts only. Pure. */
 export function publishEvidenceComment(f: PublishFacts): string {
-  const carried = f.carried > 0
-    ? `- Approved by Review: \`${f.approvedHead}\`. Agetor merged \`origin/${f.base}\` into it ${f.carried === 1 ? "once" : `${f.carried} times`}; the change's own diff is unchanged (\`git patch-id\` of \`git diff ${f.base}...HEAD\`), so the approval carries over.`
-    : `- Approved by Review: \`${f.approvedHead}\` — the head published.`;
-  const reruns = f.reran.length
-    ? [`- Re-runs requested by Agetor: ${f.reran.map((r) => `${r.why} (\`${short(r.head)}\`)`).join(", ")}`]
-    : [];
+  const reruns = f.reran.map((r) => `- Re-run: ${r.why} on \`${r.head}\``);
+  const carried = f.head === f.approvedHead
+    ? `- Approved by Review: \`${f.approvedHead}\` — the head published.`
+    : `- Review approved \`${f.approvedHead}\`, not this head. Fresh independent review is required; historical carry-over is not approval.`;
   return [
     "### Published by Agetor",
     "",
@@ -641,9 +626,7 @@ export function publishEvidenceComment(f: PublishFacts): string {
 
 /** The Finish step's instructions for its one agent turn. Pure. */
 export function publishWriterBrief(f: PublishFacts & { issueUrl: string | null; factsPosted: boolean; markedReady: boolean }): string {
-  const head = f.carried > 0
-    ? `HEAD ${f.head} is the head Review approved (${f.approvedHead}) with origin/${f.base} merged in by Agetor; the change's own diff is unchanged`
-    : `HEAD ${f.head} is the exact head Review approved`;
+  const head = `HEAD is \`${f.head}\`, independently approved as \`${f.approvedHead}\`. Historical carry-over never grants approval`;
   return [
     "Finish is run by Agetor for this card. Everything mechanical is done; your part is the writing.",
     "",

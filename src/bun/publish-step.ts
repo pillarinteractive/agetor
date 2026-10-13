@@ -12,8 +12,7 @@
  *
  * What it will and will not do to the repository:
  *   - it pushes one commit, by sha, to the card's own branch: the head Review
- *     approved, or that head with the base merged in when the merge is clean
- *     and the change's own diff is unchanged (`mergeProbe`);
+ *     approved, without edits or merges;
  *   - it never force-pushes, never pushes to a base branch
  *     (`PROTECTED_BRANCHES`), never rebases or amends, and never merges the
  *     pull request — the merge queue does that once the card is signed off.
@@ -23,6 +22,8 @@
  * step's agent gets one turn at the end, to write the PR description.
  */
 import type { Handoff, PipelinePublishState, PipelineRunState, Task } from "../shared/types.ts";
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { reviewApprovalMatches, reviewedPipelineShape } from "../shared/pipeline.ts";
 import { newestPerName, failedConclusion, ROLLUP_CHECKS, type CheckRunLike } from "../shared/check-runs.ts";
 import {
@@ -31,7 +32,7 @@ import {
   type BuildCause, type MergeProbe, type PublishAction, type PublishApproval, type PublishFacts, type PublishObservation,
   type PublishResult, type PullSeen,
 } from "../shared/publish.ts";
-import { tasks } from "./db.ts";
+import { dataDir, tasks } from "./db.ts";
 import { recordActivity } from "./activity.ts";
 import {
   createGitHubComment, createGitHubPull, findGitHubPullForBranch, getGitHubRefCheckRuns, rerunGitHubWorkflowRun, run as exec, setGitHubPullDraft,
@@ -57,9 +58,11 @@ export interface GitResult {
 
 async function gitCommand(args: string[], cwd: string, stdin?: string): Promise<GitResult> {
   try {
+    const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
+    delete env.PILLAR_SKIP_HOOKS;
     const p = Bun.spawn(["git", ...args], {
       cwd, stdin: stdin === undefined ? "ignore" : Buffer.from(stdin), stdout: "pipe", stderr: "pipe", timeout: 120_000,
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      env,
     });
     const [stdout, stderr, exitCode] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
     return { ok: exitCode === 0, exitCode, stdout: stdout.trim(), stderr: stderr.trim() };
@@ -73,6 +76,24 @@ async function gitCommand(args: string[], cwd: string, stdin?: string): Promise<
  *  the calls below. */
 export const publishDeps = {
   git: gitCommand,
+  async verify(task: Task): Promise<{ ok: boolean; error?: string }> {
+    const cwd = task.worktreePath!;
+    const script = join(cwd, ".github/scripts/verify_changed.py");
+    if (!existsSync(script)) return { ok: true }; // Other projects keep their own publication checks.
+    const dir = join(dataDir, "pipeline-runs", task.id);
+    mkdirSync(dir, { recursive: true });
+    const log = join(dir, "publish-verification.log");
+    const env = { ...process.env };
+    delete env.PILLAR_VERIFY_SKIP_SUITES;
+    delete env.PILLAR_SKIP_HOOKS;
+    const fd = openSync(log, "w", 0o600);
+    try {
+      const proc = Bun.spawn(["python3", script, "--if-needed"], { cwd, env, stdin: "ignore", stdout: fd, stderr: fd, timeout: 3_600_000 });
+      const code = await proc.exited;
+      return code === 0 ? { ok: true } : { ok: false, error: `verify_changed.py exited ${code}; log: ${log}\n${readFileSync(log, "utf8").split("\n").slice(-40).join("\n")}` };
+    } catch (e) { return { ok: false, error: `Could not run selected verification: ${String(e)}; log: ${log}` }; }
+    finally { closeSync(fd); }
+  },
   base: (checkout: string): Promise<string> => prBase(checkout),
   async findPull(task: Task): Promise<{ ok: true; pull: PullSeen | null } | { ok: false }> {
     const found = await findGitHubPullForBranch({ dir: task.workdir, branch: task.branch! });
@@ -130,13 +151,7 @@ export function publishApproval(task: Pick<Task, "issueUrl">, run: PipelineRunSt
   return { kind: "not-approved", why };
 }
 
-/**
- * Try merging `origin/<base>` into HEAD without touching the worktree or any
- * ref (`merge-tree`, `commit-tree`), and say whether the change's own diff
- * survives it: `git patch-id` of `git diff <base>...HEAD` before against the
- * same for the merge commit, plus the list of files the change touches. Null
- * when git could not answer.
- */
+/** Probe mergeability without writing a commit or moving any ref. */
 export async function mergeProbe(checkout: string, baseTip: string, base: string): Promise<MergeProbe | null> {
   const git = publishDeps.git;
   const tried = await git(["merge-tree", "--write-tree", "--name-only", "HEAD", baseTip], checkout);
@@ -145,19 +160,8 @@ export async function mergeProbe(checkout: string, baseTip: string, base: string
     const files = (tried.stdout.split("\n\n")[0] ?? "").split("\n").slice(1).map((l) => l.trim()).filter(Boolean);
     return { conflicts: [...new Set(files)], samePatch: false, commit: null };
   }
-  const tree = tried.stdout.split("\n")[0]?.trim();
-  if (!tried.ok || !tree) return null;
-  const commit = await git(["commit-tree", tree, "-p", "HEAD", "-p", baseTip, "-m", `Merge remote-tracking branch 'origin/${base}'`, "-m", "Merged by Agetor: the change's own diff is unchanged."], checkout);
-  if (!commit.ok || !commit.stdout) return null;
-  const fingerprint = async (rev: string): Promise<string | null> => {
-    const diff = await git(["diff", "--full-index", `${baseTip}...${rev}`], checkout);
-    const names = await git(["diff", "--name-status", `${baseTip}...${rev}`], checkout);
-    if (!diff.ok || !names.ok) return null;
-    const id = await git(["patch-id", "--stable"], checkout, `${diff.stdout}\n`);
-    return id.ok ? `${id.stdout}\n${names.stdout}` : null;
-  };
-  const [before, after] = [await fingerprint("HEAD"), await fingerprint(commit.stdout)];
-  return { conflicts: null, samePatch: before !== null && before === after, commit: commit.stdout };
+  if (!tried.ok) return null;
+  return { conflicts: null, samePatch: false, commit: null };
 }
 
 /** Check runs of base commits other than the tip, which no longer change. */
@@ -346,6 +350,25 @@ async function perform(task: Task, run: PipelineRunState, p: PipelinePublishStat
     return "stop";
   };
 
+  if (action.kind === "push" || action.kind === "open-pr" || (action.kind === "advance" && p.state === "push" && action.to === "pr")) {
+    const verified = await publishDeps.verify(task);
+    const current = tasks.get(task.id);
+    const visit = current?.pipelineRun?.publish;
+    if (!current || current.archivedAt != null || current.pipelineRun?.status !== "running" ||
+        !visit || visit.state !== p.state || visit.stateSince !== p.stateSince || visit.head !== p.head) return "stop";
+    const head = await git(["rev-parse", "HEAD"], checkout);
+    const status = await git(["status", "--porcelain", "--untracked-files=no"], checkout);
+    if (!verified.ok || !head.ok || head.stdout !== p.head || !status.ok || status.stdout) {
+      const cause: BuildCause = !verified.ok
+        ? { kind: "verification", error: verified.error ?? "selected verification failed" }
+        : { kind: "verification", error: "The worktree or approved head changed during selected verification; review the new head before publication." };
+      const built = await buildHandoff(task, run, p, cause);
+      if (built) await routeFromPublish(task.id, built);
+      else await stopPublishForOwner(task.id, "verification failed and no Build step exists");
+      return "stop";
+    }
+  }
+
   switch (action.kind) {
     case "advance": {
       const next = await store({ ok: true });
@@ -360,26 +383,12 @@ async function perform(task: Task, run: PipelineRunState, p: PipelinePublishStat
       if (next && (p.state === "hold-base" || p.state === "base-red")) say(task.id, `Finish (run by Agetor): ${action.note}`, "warning");
       return "stop";
     }
-    case "merge-base": {
-      const head = await git(["rev-parse", "HEAD"], checkout);
-      const dirty = await git(["status", "--porcelain", "--untracked-files=no"], checkout);
-      if (!head.ok || head.stdout !== p.head || !dirty.ok || dirty.stdout) return failed("the worktree changed since the head was verified");
-      const merged = await git(["merge", "--ff-only", "--quiet", action.commit], checkout);
-      const after = await git(["rev-parse", "HEAD"], checkout);
-      if (!merged.ok || after.stdout !== action.commit) return failed(merged.stderr || "the fast-forward to the merge commit did not apply");
-      const tree = await git(["rev-parse", "HEAD^{tree}"], checkout);
-      const next = await store({ ok: true, head: action.commit, ...(tree.ok ? { tree: tree.stdout } : {}) });
-      if (next) {
-        say(task.id, `Finish (run by Agetor): merged origin/${p.base} into the approved head — the merge is clean and the change's own diff is unchanged, so Review's approval carries over (no agent step)`, "info");
-      }
-      return next ? "again" : "stop";
-    }
     case "push": {
       // Exactly the verified head, by sha, to the card's own branch. Never forced.
       const head = await git(["rev-parse", "HEAD"], checkout);
       if (!p.head || !head.ok || head.stdout !== p.head) return failed("HEAD is no longer the verified head");
       if (!task.branch || PROTECTED_BRANCHES.has(task.branch) || task.branch === p.base) return failed(`refusing to push to "${task.branch}"`);
-      const pushed = await git(["push", "--quiet", "--no-verify", "origin", `${p.head}:refs/heads/${task.branch}`], checkout);
+      const pushed = await git(["push", "--quiet", "origin", `${p.head}:refs/heads/${task.branch}`], checkout);
       if (!pushed.ok) return failed(pushed.stderr || "git push failed");
       const next = await store({ ok: true });
       if (next) say(task.id, `Finish (run by Agetor): pushed ${p.head.slice(0, 8)} to ${task.branch}${p.carried ? ` (the approved head with ${p.base} merged in)` : " — the head Review approved"}`, "info");

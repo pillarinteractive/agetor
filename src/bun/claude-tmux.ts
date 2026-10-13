@@ -6784,7 +6784,7 @@ async function scrapeOnce(state: SessionState): Promise<void> {
 
   const task = tasks.get(state.taskId);
   const parent = task?.pipelineParentId ? tasks.get(task.pipelineParentId) : null;
-  const scoped = parent?.pipelineRun?.snapshot?.decisionPolicy === "planner-recommendation"
+  const scoped = !!parent?.pipelineRun?.snapshot?.decisionPolicy
     && parent.pipelineRun.status === "running" && parent.pipelineRun.active.some((a) => a.taskId === state.taskId);
   const reminderKey = scoped ? environmentReminderKey(match.paneText, match.choices) : null;
   if (reminderKey && await dismissTmuxPrompt(state.taskId, reminderKey, {
