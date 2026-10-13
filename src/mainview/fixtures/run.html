@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Agetor — run view fixtures</title>
+    <script>
+      // Same class-based theming as index.html; here the choice comes from
+      // `?theme=dark` (default light) so a screenshot can ask for either.
+      (function () {
+        var dark = new URLSearchParams(window.location.search).get("theme") === "dark";
+        var root = document.documentElement;
+        if (dark) root.classList.add("dark");
+        root.style.colorScheme = dark ? "dark" : "light";
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./run-fixture.tsx"></script>
+  </body>
+</html>

@@ -41,6 +41,7 @@ export function velocityFixtureReport(now: number, opts: VelocityFixtureOptions 
   const device = add("H", "[Human] Provide the sample device", [], true);
   const names = add("H", "[Human] Agree the widget names", [], true);
   const pricing = add("H", "[Human] Decide the gadget pricing", [], true);
+  const policy = add("H", "[Human] Adopt the observation retention policy", [], true);
   const stage = (code: string, n: number, first: string[]) => {
     const ids: string[] = [];
     for (let i = 0; i < n; i++) ids.push(add(code, `${i % 2 ? "Wire" : "Build"} the ${code === "M01" || code === "M03" ? "widget" : "gadget"} ${NOUN[i % NOUN.length]}`, i === 0 ? first : i < 3 ? [ids[0]!] : [ids[i - 2]!, ids[i - 1]!]));
@@ -50,7 +51,7 @@ export function velocityFixtureReport(now: number, opts: VelocityFixtureOptions 
   const m2 = stage("M02", 10, [m1[7]!]);
   const m3 = stage("M03", 10, [m1[6]!, device]);
   const approve = add("H", "[Human] Approve the gadget dock", [m2[9]!], true);
-  const m4 = stage("M04", 10, [m3[9]!, pricing, approve]);
+  const m4 = stage("M04", 10, [m3[9]!, pricing, approve, policy]);
   if (opts.gate !== false) add("H", "[Human] Publish the main release", [m4[9]!, m4[8]!], true);
 
   // What is complete, in the order it closed.
