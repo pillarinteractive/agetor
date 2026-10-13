@@ -6,7 +6,7 @@ import type { Task, TaskPrStatus } from "../shared/types.ts";
 
 process.env.AGETOR_DATA_DIR ??= mkdtempSync(path.join(tmpdir(), "agetor-pr-watch-"));
 const {
-  PR_FIX_CI_ACTION, PR_REVIEW_ACTION, followUpReady, markInherited, prFollowUpActions, prFollowUpInstructions, rollUpChecks,
+  PR_FIX_CI_ACTION, PR_REVIEW_ACTION, followUpReady, markInherited, newestPerName, prFollowUpActions, prFollowUpInstructions, rollUpChecks,
   shouldAutoFix, staleAgainstBase, tasksToWatch, probeDue, probeEvery, PROBE_EVERY_MS,
 } = await import("./pr-watch.ts");
 
@@ -25,6 +25,78 @@ describe("rollUpChecks", () => {
     const failed = rollUpChecks([run("lint", "completed", "failure"), run("e2e", "completed", "timed_out"), run("test", "queued", null)]);
     expect(failed.checks).toBe("failure");
     expect(failed.failing.map((f) => f.name)).toEqual(["lint", "e2e"]);
+  });
+});
+
+describe("rollUpChecks judges each check name by its newest run", () => {
+  const at = (minute: number) => `2026-10-13T10:${String(minute).padStart(2, "0")}:00Z`;
+  const r = (name: string, status: string, conclusion: string | null, minute: number | null, id = 0) =>
+    ({ name, status, conclusion, htmlUrl: `https://ci/${name}/${id}`, startedAt: minute == null ? null : at(minute), id });
+  const cases: { name: string; runs: ReturnType<typeof r>[]; checks: string; failing?: string[] }[] = [
+    {
+      // 2026-10-13: a second run on the same commit was cancelled by
+      // `cancel-in-progress`; its twin passed, and the PR read "pending" for four hours.
+      name: "a cancelled duplicate beside a newer success passes",
+      runs: [r("required", "completed", "cancelled", 1, 1), r("required", "completed", "success", 2, 2), r("web", "completed", "success", 2, 3)],
+      checks: "success",
+    },
+    {
+      name: "the order GitHub lists them in does not matter",
+      runs: [r("required", "completed", "success", 2, 2), r("required", "completed", "cancelled", 1, 1)],
+      checks: "success",
+    },
+    {
+      name: "the newest run failed after an older success",
+      runs: [r("web", "completed", "success", 1, 1), r("web", "completed", "failure", 5, 2)],
+      checks: "failure",
+      failing: ["web"],
+    },
+    {
+      name: "an older failure beside a newer success passes",
+      runs: [r("web", "completed", "failure", 1, 1), r("web", "completed", "success", 5, 2)],
+      checks: "success",
+    },
+    {
+      name: "the newest run is cancelled and nothing replaced it: not a pass",
+      runs: [r("web", "completed", "success", 1, 1), r("web", "completed", "cancelled", 5, 2), r("lint", "completed", "success", 1, 3)],
+      checks: "pending",
+    },
+    {
+      name: "a cancelled run alone is not a pass",
+      runs: [r("web", "completed", "cancelled", 1, 1)],
+      checks: "pending",
+    },
+    {
+      name: "the newest run is still running",
+      runs: [r("web", "completed", "success", 1, 1), r("web", "in_progress", null, 5, 2)],
+      checks: "pending",
+    },
+    {
+      name: "a queued run with no start time is newer than a finished one",
+      runs: [r("web", "queued", null, null, 2), r("web", "completed", "failure", 1, 1)],
+      checks: "pending",
+    },
+    {
+      name: "equal start times: the higher id wins",
+      runs: [r("web", "completed", "success", 3, 9), r("web", "completed", "cancelled", 3, 4)],
+      checks: "success",
+    },
+  ];
+  for (const c of cases) {
+    test(c.name, () => {
+      const got = rollUpChecks(c.runs);
+      expect(got.checks).toBe(c.checks as TaskPrStatus["checks"]);
+      expect(got.failing.map((f) => f.name)).toEqual(c.failing ?? []);
+    });
+  }
+  test("the failing check's link is the newest run's", () => {
+    const got = rollUpChecks([r("web", "completed", "failure", 1, 1), r("web", "completed", "failure", 5, 2)]);
+    expect(got.failing).toEqual([{ name: "web", url: "https://ci/web/2", alsoOnBase: false }]);
+  });
+  test("runs without a start time or an id keep list order: the later entry of a name wins", () => {
+    expect(rollUpChecks([run("web", "completed", "cancelled"), run("web", "completed", "success")]).checks).toBe("success");
+    expect(newestPerName([run("a", "completed", "success"), run("b", "queued", null), run("a", "completed", "failure")]).map((x) => `${x.name}:${x.conclusion}`))
+      .toEqual(["a:failure", "b:null"]);
   });
 });
 

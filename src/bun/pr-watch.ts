@@ -120,11 +120,52 @@ export function tasksToWatch(
   });
 }
 
-/** Roll a PR's check runs up into one state. */
-export function rollUpChecks(runs: { name: string; status: string; conclusion: string | null; htmlUrl: string | null }[]): {
+/** A check run as the roll-up reads it. `startedAt` and `id` order two runs
+ *  of the same name; both are optional so a caller with neither still works. */
+export interface CheckRunLike {
+  name: string;
+  status: string;
+  conclusion: string | null;
+  htmlUrl: string | null;
+  startedAt?: string | null;
+  id?: number;
+}
+
+/**
+ * The newest run of each check name, in first-seen order. GitHub lists every
+ * check run of a commit: a second workflow run on the same commit (a
+ * re-trigger, or `cancel-in-progress` cutting one short) leaves two runs of
+ * one name, and only the newest says where that check stands. Newest is the
+ * later `startedAt`; a run that has not started yet is newer than any that
+ * has; ties go to the higher `id`, then to the later entry. Pure.
+ */
+export function newestPerName<T extends CheckRunLike>(runs: readonly T[]): T[] {
+  const age = (r: T): number => {
+    const t = r.startedAt ? Date.parse(r.startedAt) : NaN;
+    if (Number.isFinite(t)) return t;
+    return r.status === "completed" ? -Infinity : Infinity;
+  };
+  const newest = new Map<string, T>();
+  for (const r of runs) {
+    const seen = newest.get(r.name);
+    if (!seen) {
+      newest.set(r.name, r);
+      continue;
+    }
+    const a = age(seen), b = age(r);
+    if (b > a || (b === a && (r.id ?? 0) >= (seen.id ?? 0))) newest.set(r.name, r);
+  }
+  return [...newest.values()];
+}
+
+/** Roll a PR's check runs up into one state, judging each check name by its
+ *  newest run: a cancelled or failed older run beside a newer one counts for
+ *  nothing. A name whose newest run is cancelled is still not a pass. */
+export function rollUpChecks(all: readonly CheckRunLike[]): {
   checks: TaskPrStatus["checks"];
   failing: TaskPrStatus["failingChecks"];
 } {
+  const runs = newestPerName(all);
   if (runs.length === 0) return { checks: "none", failing: [] };
   // A cancelled run isn't a code failure — it was superseded (a newer push,
   // or Agetor freeing runners for a merge train). It just isn't verified.
@@ -165,7 +206,7 @@ export function ownFailures(pr: TaskPrStatus | null): TaskPrStatus["failingCheck
 }
 
 /** Aggregate checks that fail whenever any suite does — never a cause. */
-const ROLLUP_CHECKS = new Set(["required"]);
+export const ROLLUP_CHECKS: ReadonlySet<string> = new Set(["required"]);
 
 function same(a: TaskPrStatus | undefined, b: TaskPrStatus): boolean {
   return (
@@ -306,7 +347,7 @@ async function probe(task: Task, reuse: TaskPrStatus | null = null): Promise<Tas
     if (failingChecks.length > 0 && pull.baseRef) {
       const base = await getGitHubRefCheckRuns({ dir, ref: pull.baseRef });
       if (base.ok) {
-        const passing = base.checkRuns.filter((r) => r.status === "completed" && r.conclusion === "success").map((r) => r.name);
+        const passing = newestPerName(base.checkRuns).filter((r) => r.status === "completed" && r.conclusion === "success").map((r) => r.name);
         failingChecks = markInherited(failingChecks, rollUpChecks(base.checkRuns).failing, passing);
       }
     }
