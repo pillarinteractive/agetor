@@ -24,6 +24,7 @@ import type {
   GitHubIssueThreadResult,
   GitProvider,
 } from "../shared/types.ts";
+import type { PipelinePositionView, PipelineReopenResult, PipelineResume, PipelineSteerResult } from "../shared/position.ts";
 import type { AnyRequest, AskQuestionsAnswer } from "../bun/interactions.ts";
 import type { AvailableCommand, AvailableExtension } from "../bun/commands.ts";
 
@@ -491,8 +492,28 @@ export class AgetorClient {
    *  returning the task — 404 unknown parent, 400 not a pipeline task, 409
    *  every other failure (already running, snapshot build failed, …), all
    *  propagating as a thrown `ApiError`. */
-  restartPipeline(taskId: string): Promise<{ runId: string; pending?: true }> {
-    return this.req("POST", `/tasks/${encodeURIComponent(taskId)}/pipeline/restart`, undefined, START_TIMEOUT_MS);
+  restartPipeline(taskId: string, opts?: { fromScratch?: boolean }): Promise<{ runId: string; pending?: true; resumed?: PipelineResume }> {
+    // `fromScratch`: discard the history and start at the first step. Without
+    // it a run with check gates resumes at the first step whose gate is not
+    // satisfied (`resumed` says where); a run without gates is unaffected.
+    return this.req("POST", `/tasks/${encodeURIComponent(taskId)}/pipeline/restart`, opts?.fromScratch ? { fromScratch: true } : undefined, START_TIMEOUT_MS);
+  }
+  /** `GET /tasks/:id/pipeline/position` — where a run with check gates
+   *  stands, and the steps it can be rewound or sent feedback to. Reads only. */
+  getPipelinePosition(taskId: string): Promise<PipelinePositionView> {
+    return this.req("GET", `/tasks/${encodeURIComponent(taskId)}/pipeline/position`, undefined, START_TIMEOUT_MS);
+  }
+  /** `POST /tasks/:id/pipeline/rewind` — void the gate evidence of `stepId`
+   *  and every later step, stop what is running and launch that step. Git and
+   *  the remote are not touched. 409 for a run without check gates. */
+  rewindPipeline(taskId: string, body: { stepId: string }): Promise<PipelineReopenResult> {
+    return this.req("POST", `/tasks/${encodeURIComponent(taskId)}/pipeline/rewind`, body, START_TIMEOUT_MS);
+  }
+  /** `POST /tasks/:id/pipeline/feedback` — record the owner's note, reopen
+   *  the run from `fromStepId` and carry the note in that step's next prompt
+   *  and the later steps'. `invalidate` also voids their evidence. */
+  sendPipelineFeedback(taskId: string, body: { fromStepId: string; note: string; invalidate?: boolean }): Promise<PipelineSteerResult> {
+    return this.req("POST", `/tasks/${encodeURIComponent(taskId)}/pipeline/feedback`, body, START_TIMEOUT_MS);
   }
 
   // ── preferences (cross-session key/value store) ────────────────────────────

@@ -201,15 +201,15 @@ export const USAGE: Record<string, string> = {
   Update a profile. --skill appends to the existing skill list unless
   --clear-skills is also given (then the list is replaced).`,
 
-  pipeline: `usage: agetor pipeline <ls | show <ref> | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> [--name <n>] | retry <task> [--from <task>] | advance <task> [--next <step>… | --finish] [--from <task>] | refresh-instructions <task> | restart <task> | status <task> [--handoffs] | handoff <task> [<step>|--all]>
+  pipeline: `usage: agetor pipeline <ls | show <ref> | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> [--name <n>] | retry <task> [--from <task>] | advance <task> [--next <step>… | --finish] [--from <task>] | refresh-instructions <task> | restart <task> [--from-scratch] | position <task> | rewind <task> --to <step> | feedback <task> --from <step> (--note <text> | --note-file <file|->) [--invalidate] | status <task> [--handoffs] | handoff <task> [<step>|--all]>
 
   Manage pipelines — named graphs of agent-profile-bound steps launched as
   one board task (built in the app's Pipelines editor; the CLI moves them
   around) — and control a pipeline TASK's run.
     ls / show / rm / export / import   take a pipeline <ref> (id, or its
                                         unique case-insensitive name)
-    retry / advance / refresh-instructions / restart / status / handoff
-                                        take a pipeline TASK <ref> (id or
+    retry / advance / refresh-instructions / restart / position / rewind /
+    feedback / status / handoff         take a pipeline TASK <ref> (id or
                                         short-id prefix, like every other
                                         task-targeting command; a hidden
                                         step task's id is refused — target
@@ -260,9 +260,38 @@ export const USAGE: Record<string, string> = {
   prompt and takes the new text at its next launch. Keeps history, findings,
   permissions, holds and resource caps; starts no agents.`,
 
-  "pipeline restart": `usage: agetor pipeline restart <task-id>
+  "pipeline restart": `usage: agetor pipeline restart <task-id> [--from-scratch]
 
-  Restart the pipeline run from its start step, discarding current progress.`,
+  Restart the pipeline run. A run with check gates (pipeline_gates) resumes
+  at the first step whose gate is not satisfied now — steps whose work is
+  still in the worktree are not run again, and the history is kept; 'agetor
+  pipeline position' shows where that is. --from-scratch discards the
+  history and starts at the first step, which is also what a run without
+  gates always does.`,
+
+  "pipeline position": `usage: agetor pipeline position <task-id>
+
+  Print where a run with check gates stands: the steps whose gate is still
+  satisfied, the first one that is not (where a restart resumes) and why,
+  and the steps it can be rewound or sent feedback to. Reads only.`,
+
+  "pipeline rewind": `usage: agetor pipeline rewind <task-id> --to <step-name-or-id>
+
+  Rewind a run with check gates to a step: that step's and every later
+  step's results are voided in the check ledger (appended, never deleted),
+  whatever is running is stopped, and the step is launched with the handoff
+  of the step before it. The history is kept. Git is not touched — no
+  reset, nothing on the remote; the answer says how many commits are not
+  pushed. 409 for a run without check gates.`,
+
+  "pipeline feedback": `usage: agetor pipeline feedback <task-id> --from <step-name-or-id> (--note <text> | --note-file <file|->) [--invalidate]
+
+  Send the owner's feedback to a step of a run with check gates and reopen
+  the run from it. The note is recorded and put in that step's next prompt,
+  and in each later step's until it has finished once since. Without
+  --invalidate it is a refinement: earlier results stand and each of those
+  steps runs once more. With --invalidate their results are voided as a
+  rewind voids them. Git is not touched. 409 for a run without check gates.`,
 
   "pipeline status": `usage: agetor pipeline status <task-id> [--handoffs]
 
