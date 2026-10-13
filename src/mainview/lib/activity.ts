@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "./api";
 import type { CheckLedgerEntry } from "../../shared/types.ts";
+import type { PipelinePositionView } from "../../shared/position.ts";
 
 export type ActivityEntry = Awaited<ReturnType<typeof api.getActivity>>[number];
 
@@ -44,4 +45,26 @@ export function useCheckLedger(taskId: string, refreshKey: string): CheckLedgerE
     };
   }, [taskId, refreshKey]);
   return entries;
+}
+
+/** Where a run with check gates stands (`GET /tasks/:id/pipeline/position`),
+ *  read again whenever `refreshKey` changes; null until read, on a failure,
+ *  and for a run that has never started. */
+export function usePipelinePosition(taskId: string, refreshKey: string): PipelinePositionView | null {
+  const [view, setView] = useState<PipelinePositionView | null>(null);
+  useEffect(() => {
+    let alive = true;
+    if (!refreshKey) {
+      setView(null);
+      return;
+    }
+    api
+      .getPipelinePosition(taskId)
+      .then((r) => alive && setView(r))
+      .catch(() => alive && setView(null));
+    return () => {
+      alive = false;
+    };
+  }, [taskId, refreshKey]);
+  return view;
 }

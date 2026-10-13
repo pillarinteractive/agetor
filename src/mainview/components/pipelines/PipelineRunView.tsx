@@ -5,7 +5,8 @@ import { useConfirm } from "@/components/ui/confirm";
 import { useTheme } from "@/components/theme-provider";
 import { useAgentProfiles } from "@/lib/agent-profiles";
 import { api, ApiError } from "@/lib/api";
-import { useCheckLedger, useTaskActivity } from "@/lib/activity";
+import { useCheckLedger, usePipelinePosition, useTaskActivity } from "@/lib/activity";
+import { resumeOffer } from "../../../shared/position.ts";
 import type { CardAction } from "@/lib/card-state";
 import { useCardStateOf } from "@/lib/use-card-state";
 import { PrContext } from "@/lib/prs";
@@ -648,12 +649,42 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
     [taskId, load],
   );
 
-  const handleRestart = useCallback(async () => {
+  // Where a run with check gates stands — never asked for a run without
+  // them, which restarts, retries and advances exactly as it did.
+  const gatedRun = !!run?.snapshot?.gates && (run.snapshot.gates.steps === true || run.snapshot.gates.publish === true);
+  const positionView = usePipelinePosition(taskId, gatedRun && run ? `${run.stepCount}:${run.status}:${run.endedAt ?? ""}:${run.blocked.length}:${run.active.length}` : "");
+  const reopening = positionView?.gated ? positionView : null;
+
+  /** From the beginning: what every restart was, behind its confirmation. */
+  const handleRestartFromScratch = useCallback(async () => {
     const ok = await confirm({
       title: "Restart this pipeline?",
       description: "This starts a fresh run from the start step. Previous run history will be cleared.",
       confirmLabel: "Restart",
       variant: "destructive",
+    });
+    if (!ok) return;
+    setActionBusy(true);
+    setActionError(null);
+    try {
+      await api.restartPipeline(taskId, { fromScratch: true });
+      await load();
+    } catch (err) {
+      setActionError(err instanceof ApiError ? err.message : "Failed to restart the run.");
+    } finally {
+      setActionBusy(false);
+    }
+  }, [taskId, load, confirm]);
+
+  /** Restart. A run with gates and something to keep resumes at its position
+   *  (asked for in those words); any other run restarts from the beginning. */
+  const handleRestart = useCallback(async () => {
+    const offer = resumeOffer(reopening);
+    if (!offer) return handleRestartFromScratch();
+    const ok = await confirm({
+      title: `Restart from ${offer.stepName}?`,
+      description: `${offer.stepName} runs again, then the steps after it: ${offer.why}. ${offer.kept.join(", ")} ${offer.kept.length === 1 ? "is" : "are"} still satisfied and ${offer.kept.length === 1 ? "is" : "are"} not run again. The run's history is kept.`,
+      confirmLabel: `Restart from ${offer.stepName}`,
     });
     if (!ok) return;
     setActionBusy(true);
@@ -666,7 +697,39 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
     } finally {
       setActionBusy(false);
     }
-  }, [taskId, load, confirm]);
+  }, [taskId, load, confirm, reopening, handleRestartFromScratch]);
+
+  const handleRewind = useCallback(
+    async (stepId: string) => {
+      setActionBusy(true);
+      setActionError(null);
+      try {
+        await api.rewindPipeline(taskId, { stepId });
+        await load();
+      } catch (err) {
+        setActionError(err instanceof ApiError ? err.message : "Failed to rewind the run.");
+      } finally {
+        setActionBusy(false);
+      }
+    },
+    [taskId, load],
+  );
+
+  const handleFeedback = useCallback(
+    async (fromStepId: string, note: string, invalidate: boolean) => {
+      setActionBusy(true);
+      setActionError(null);
+      try {
+        await api.sendPipelineFeedback(taskId, { fromStepId, note, ...(invalidate ? { invalidate: true } : {}) });
+        await load();
+      } catch (err) {
+        setActionError(err instanceof ApiError ? err.message : "Failed to send the feedback.");
+      } finally {
+        setActionBusy(false);
+      }
+    },
+    [taskId, load],
+  );
 
   // The card's own state for this task, from the board's contexts (PRs,
   // leases, live progress, the roadmap): the band below and the board card
@@ -809,6 +872,12 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
         onStop={() => void handleStop()}
         onRestart={() => void handleRestart()}
         onAdvance={(fromTaskId, nextStepIds, handoff) => void handleAdvance(fromTaskId, nextStepIds, handoff)}
+        reopen={reopening ? {
+          view: reopening,
+          onRewind: (stepId) => void handleRewind(stepId),
+          onFeedback: (fromStepId, note, invalidate) => void handleFeedback(fromStepId, note, invalidate),
+          onRestartFromScratch: () => void handleRestartFromScratch(),
+        } : undefined}
         onViewChanges={onDiff ? () => onDiff(task) : undefined}
       />
       <SubagentDetailsDialog
