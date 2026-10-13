@@ -713,6 +713,63 @@ export interface PipelineRunSnapshot {
   capturedAt: number;
   /** Explicit project opt-in; instructions only, never an action approval. */
   decisionPolicy?: "planner-recommendation";
+  /** Check gates this run adopted (`pipeline_gates`, src/shared/publish.ts):
+   *  captured when the run starts, or on an explicit refresh — never by
+   *  itself. `publish`: the pipeline's Finish step is run by Agetor. */
+  gates?: { publish?: true };
+}
+
+/** Where an Agetor-run Finish is (src/shared/publish.ts has the machine):
+ *  verify-head → check-merge → hold-base → push → pr → wait-ci → finalize →
+ *  write, with classify → base-red → refresh off wait-ci when CI fails.
+ *  `agent`: this visit could not be run by Agetor and its agent runs Finish
+ *  as before. */
+export type PublishStateName =
+  | "verify-head" | "check-merge" | "hold-base" | "push" | "pr" | "wait-ci"
+  | "classify" | "base-red" | "refresh" | "finalize" | "write" | "agent";
+
+/**
+ * One visit of a pipeline's Finish step run by Agetor, not by an agent
+ * (`PipelineRunState.publish`). Everything in it is something Agetor
+ * observed or did itself; nothing comes from a handoff except the head Review
+ * approved. While it is held the run carries a run-level `await` block for
+ * the step (it reads as running) and no step task exists.
+ */
+export interface PipelinePublishState {
+  state: PublishStateName;
+  /** The Finish step this visit is of. */
+  stepId: string;
+  /** When the visit began, and when it entered `state`. */
+  since: number;
+  stateSince: number;
+  /** The branch the PR merges into. */
+  base: string | null;
+  /** The head Review approved (`reviewApproval.headSha`). */
+  approvedHead: string | null;
+  /** The commit that is published: `approvedHead`, or that head with the
+   *  base merged into it by Agetor (`carried` times) — never anything else. */
+  head: string | null;
+  tree: string | null;
+  /** `origin/<base>` when last looked at. */
+  baseTip: string | null;
+  pr: { number: number; url: string } | null;
+  /** Re-runs Agetor requested: at most one per head and reason. */
+  reran: { head: string; why: "cancelled" | "infra" | "base-recovered"; at: number }[];
+  /** Failing jobs that also fail on the base (`base-red`). */
+  inherited: string[];
+  /** Times Agetor merged the base into the approved head; the Review
+   *  approval carries over because the change's own diff was unchanged. */
+  carried: number;
+  /** Consecutive failures of the current state's action. */
+  tries: number;
+  /** The head the evidence comment was posted for. */
+  posted?: string;
+  /** The agent execution of this visit: the writer, or the fallback agent. */
+  seq?: number;
+  /** What the writer is told (kept so a launch queued for a slot keeps it). */
+  brief?: string;
+  /** One line for the card. */
+  note: string;
 }
 
 /**
@@ -845,6 +902,9 @@ export interface PipelineRunState {
   /** A step that handed off `blocked` for a reason that clears by itself,
    *  parked in the wait queue. At most one per run. */
   wait?: PipelineBlockWait;
+  /** The Finish visit Agetor is running itself, when the run adopted the
+   *  `publish` gate (`snapshot.gates`). Absent otherwise. */
+  publish?: PipelinePublishState;
 }
 
 /** One step execution with its full final report — a row of `GET

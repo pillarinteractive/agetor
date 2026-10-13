@@ -30,7 +30,7 @@ import {
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
 import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, publishGlobalEvent, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
-import { advancePipeline, cancelPipelineRun, isPipelineStepTask, listBlockWaits, adoptPipelineInstructions, pipelineStepReports, refreshPipelineInstructions, refreshPipelineRuns, releaseSlotWaits, retryPipelineStep, startPipelineRun } from "./pipeline-runner.ts";
+import { advancePipeline, cancelPipelineRun, isPipelineStepTask, listBlockWaits, adoptPipelineGates, adoptPipelineInstructions, pipelineStepReports, refreshPipelineInstructions, refreshPipelineRuns, releaseSlotWaits, retryPipelineStep, startPipelineRun } from "./pipeline-runner.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
 import { accountUsageDays } from "./account-usage.ts";
@@ -4245,7 +4245,11 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           }
           // A run busy launching a step holds its lock for as long as that takes.
           server.timeout(req, 0);
-          return json({ results: await refreshPipelineRuns(req.params.id) }, { headers: corsHeaders(req) });
+          // `{"gates": true}` also adopts check gates (`pipeline_gates`) on
+          // each run: a started run changes its loop only when asked to.
+          const body = await req.json().catch(() => null);
+          const gates = !!body && typeof body === "object" && (body as { gates?: unknown }).gates === true;
+          return json({ results: await refreshPipelineRuns(req.params.id, { gates }) }, { headers: corsHeaders(req) });
         }),
       },
 
@@ -5086,12 +5090,15 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
               !revision(body.expectedCapturedAt) || !revision(body.expectedTemplateUpdatedAt)) {
             return json({ error: "expectedCapturedAt and expectedTemplateUpdatedAt must be non-negative integer revisions when given" }, { status: 400, headers: corsHeaders(req) });
           }
+          // `"gates": true`: adopt check gates (`pipeline_gates`) on this run too.
+          const gates = body.gates === true ? await adoptPipelineGates(req.params.id) : undefined;
+          if (gates && "error" in gates) return json({ error: gates.error }, { status: gates.status, headers: corsHeaders(req) });
           const result = await refreshPipelineInstructions(req.params.id, {
             expectedCapturedAt: body.expectedCapturedAt, expectedTemplateUpdatedAt: body.expectedTemplateUpdatedAt,
           });
           return "error" in result
             ? json({ error: result.error }, { status: result.status, headers: corsHeaders(req) })
-            : json(result, { headers: corsHeaders(req) });
+            : json(gates ? { ...result, gates } : result, { headers: corsHeaders(req) });
         }),
       },
 

@@ -692,7 +692,8 @@ const sanitizeRunSnapshot = (raw: unknown): PipelineRunSnapshot | null => {
   const capturedAt = isFiniteNumber(rec.capturedAt) ? rec.capturedAt : 0;
 
   return { graph, profiles, maxSteps, capturedAt,
-    ...(rec.decisionPolicy === "planner-recommendation" ? { decisionPolicy: "planner-recommendation" as const } : {}) };
+    ...(rec.decisionPolicy === "planner-recommendation" ? { decisionPolicy: "planner-recommendation" as const } : {}),
+    ...(isPlainObject(rec.gates) && rec.gates.publish === true ? { gates: { publish: true as const } } : {}) };
 };
 
 /**
@@ -769,6 +770,52 @@ export const parsePipelineRunState = (raw: string | null): PipelineRunState | nu
           ? [[taskId, retry]] : [];
       })) : undefined,
     wait: sanitizeBlockWait(rec.wait),
+    ...(() => {
+      const publish = sanitizePublish(rec.publish);
+      return publish ? { publish } : {};
+    })(),
+  };
+};
+
+const PUBLISH_STATES = new Set([
+  "verify-head", "check-merge", "hold-base", "push", "pr", "wait-ci", "classify", "base-red", "refresh", "finalize", "write", "agent",
+]);
+const PUBLISH_RERUN_REASONS = new Set(["cancelled", "infra", "base-recovered"]);
+/** An Agetor-run Finish visit (src/shared/publish.ts). An unreadable one is
+ *  dropped: the step's next launch then starts the visit over, and every
+ *  state re-derives what it needs from git and GitHub. */
+const sanitizePublish = (raw: unknown): PipelineRunState["publish"] => {
+  if (!isPlainObject(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.state !== "string" || !PUBLISH_STATES.has(r.state) || typeof r.stepId !== "string" || !r.stepId) return undefined;
+  const sha = (x: unknown) => (typeof x === "string" && /^[0-9a-f]{7,64}$/i.test(x) ? x : null);
+  const text = (x: unknown, max: number) => (typeof x === "string" ? x.slice(0, max) : "");
+  const count = (x: unknown, max: number) => (Number.isSafeInteger(x) && (x as number) >= 0 ? Math.min(x as number, max) : 0);
+  const since = isFiniteNumber(r.since) ? r.since : Date.now();
+  const pr = isPlainObject(r.pr) && Number.isSafeInteger(r.pr.number) && (r.pr.number as number) > 0 && typeof r.pr.url === "string"
+    ? { number: r.pr.number as number, url: r.pr.url.slice(0, 500) } : null;
+  return {
+    state: r.state as NonNullable<PipelineRunState["publish"]>["state"],
+    stepId: r.stepId,
+    since,
+    stateSince: isFiniteNumber(r.stateSince) ? r.stateSince : since,
+    base: typeof r.base === "string" && r.base ? r.base.slice(0, 200) : null,
+    approvedHead: sha(r.approvedHead),
+    head: sha(r.head),
+    tree: sha(r.tree),
+    baseTip: sha(r.baseTip),
+    pr,
+    reran: Array.isArray(r.reran)
+      ? r.reran.flatMap((x) => isPlainObject(x) && typeof x.head === "string" && typeof x.why === "string" && PUBLISH_RERUN_REASONS.has(x.why) && isFiniteNumber(x.at)
+          ? [{ head: x.head.slice(0, 64), why: x.why as "cancelled" | "infra" | "base-recovered", at: x.at }] : []).slice(-12)
+      : [],
+    inherited: Array.isArray(r.inherited) ? r.inherited.filter((x): x is string => typeof x === "string").slice(0, 50).map((x) => x.slice(0, 200)) : [],
+    carried: count(r.carried, 50),
+    tries: count(r.tries, 50),
+    ...(sha(r.posted) ? { posted: sha(r.posted)! } : {}),
+    ...(Number.isSafeInteger(r.seq) && (r.seq as number) > 0 ? { seq: r.seq as number } : {}),
+    ...(typeof r.brief === "string" && r.brief ? { brief: r.brief.slice(0, PIPELINE_LIMITS.instructions) } : {}),
+    note: text(r.note, 500),
   };
 };
 

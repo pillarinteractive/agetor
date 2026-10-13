@@ -46,6 +46,9 @@ import { run as runCommand } from "./github.ts";
 import { waitingOnQuota } from "../shared/autopilot.ts";
 import { decisionPolicyForProject, PIPELINE_DECISIONS_PREF, plannerDecisionInstructions } from "../shared/pipeline-decisions.ts";
 import {
+  PIPELINE_GATES_PREF, initialPublishState, parsePublishGate, publishBlockMessage, publishGateOn, publishStepOf, publishVisitOver,
+} from "../shared/publish.ts";
+import {
   BLOCK_WAIT_PREF,
   classifyBlock,
   escalationLine,
@@ -96,6 +99,7 @@ import {
   incomingSteps,
   isFollowUpStepId,
   normalizeHandoff,
+  reviewedPipelineShape,
   reviewRequiresRepair,
   outgoingSteps,
   capWrapUpStep,
@@ -121,6 +125,7 @@ import type {
   Pipeline,
   PipelineActiveStep,
   PipelineBlock,
+  PipelinePublishState,
   PipelineBlockWait,
   PipelineGraph,
   PipelineJoinArrival,
@@ -1778,6 +1783,232 @@ function holdForArchivedParent(
  * current. Mutates `run` and calls `persist` itself — callers don't need to
  * persist again around this (though doing so is harmless/idempotent).
  */
+// ---------------------------------------------------------------------------
+// Finish run by Agetor (src/shared/publish.ts, src/bun/publish-step.ts)
+// ---------------------------------------------------------------------------
+
+/** Whether the `pipeline_gates` preference names this card's pipeline (and,
+ *  during the trial, the card) right now. */
+export function publishGatePref(parent: Pick<Task, "id" | "pipelineId">, run: Pick<PipelineRunState, "pipelineName">): boolean {
+  const name = (parent.pipelineId ? pipelines.get(parent.pipelineId)?.name : null) ?? run.pipelineName;
+  return publishGateOn(parsePublishGate(preferences.get(PIPELINE_GATES_PREF)), { id: parent.id, pipelineId: parent.pipelineId ?? null, pipelineName: name });
+}
+
+/** The step Agetor runs for this card, or null. Two things must hold: the
+ *  run adopted the gate (`snapshot.gates`, set at run start or by an explicit
+ *  refresh — never by itself) and the preference still names the card, so
+ *  taking a card or a pipeline out of `pipeline_gates` works at once. */
+export function publishStepFor(parent: Pick<Task, "id" | "pipelineId">, run: PipelineRunState): PipelineStep | null {
+  const step = publishStepOf(run.snapshot);
+  return step && publishGatePref(parent, run) ? step : null;
+}
+
+/** Called when a card's Finish is put on hold for Agetor: the publish loop
+ *  (src/bun/publish-step.ts) sets it to take a first look at once instead of
+ *  on its next minute. A hook because that module imports this one. */
+export const publishHooks = { held: (_parentId: string): void => {} };
+
+/** What a launch of `step` is under the gate: `hold` — Agetor runs it, no
+ *  step task; `write` — the visit's one agent turn; null — an ordinary launch. */
+function publishDispatch(parent: Task, run: PipelineRunState, step: PipelineStep): "hold" | "write" | null {
+  if (publishStepFor(parent, run)?.id !== step.id) return null;
+  const p = run.publish;
+  if (!p || publishVisitOver(p, step.id, run.active.map((a) => a.seq))) return "hold";
+  if (p.state === "agent") return null;
+  return p.state === "write" ? "write" : "hold";
+}
+
+/** Park a launch of the publish step as a run-level `await` block: the run
+ *  reads as running and waiting, no step task exists, no slot is taken and
+ *  no step is counted. `pending` keeps the arrivals for the writer's launch. */
+function holdForPublish(parent: Task, run: PipelineRunState, step: PipelineStep, arrivals: PipelineJoinArrival[]): void {
+  if (!run.publish || publishVisitOver(run.publish, step.id, run.active.map((a) => a.seq))) {
+    run.publish = initialPublishState(step.id, Date.now());
+    recordActivity(parent.id, { kind: "step", text: `${step.name} is run by Agetor for this card: it verifies the approved head, pushes once and waits for CI itself`, tone: "info" });
+  } else {
+    // Re-entered by a Retry after Agetor stopped for the owner: the action
+    // that kept failing gets a fresh set of attempts.
+    run.publish.tries = 0;
+  }
+  run.blocked = run.blocked.filter((b) => !(b.taskId === null && b.stepId === step.id));
+  run.blocked.push({ taskId: null, stepId: step.id, kind: "await", message: publishBlockMessage(step.name, run.publish), pending: { stepId: step.id, arrivals } });
+  persist(parent.id, run);
+  publishHooks.held(parent.id);
+}
+
+/** The held publish visit of `parentId`, read fresh — or why there is none. */
+function heldPublish(parentId: string): { parent: Task; run: PipelineRunState; step: PipelineStep; block: PipelineBlock } | { error: string } {
+  const parent = tasks.get(parentId);
+  const run = parent?.pipelineRun;
+  if (!parent || !run?.snapshot || tombstonedPipelineParents.has(parentId) || parent.archivedAt != null) return { error: "the card is gone or archived" };
+  const p = run.publish;
+  const step = p ? run.snapshot.graph.steps.find((s) => s.id === p.stepId) : undefined;
+  const block = p ? run.blocked.find((b) => b.taskId === null && b.stepId === p.stepId && b.kind === "await" && b.pending) : undefined;
+  if (!p || !step || !block || p.state === "write" || p.state === "agent") return { error: "Finish is not held by Agetor" };
+  return { parent, run, step, block };
+}
+
+/**
+ * Change the held publish visit's state under the card's lock. `expect` is
+ * the state the caller observed: if the visit moved on meanwhile (a Retry, a
+ * restart, another pass) nothing is written. Returns the stored state.
+ */
+export function updatePublish(
+  parentId: string,
+  expect: Pick<PipelinePublishState, "state" | "stateSince">,
+  next: PipelinePublishState,
+): Promise<PipelinePublishState | null> {
+  return runExclusive(parentId, async () => {
+    const held = heldPublish(parentId);
+    if ("error" in held) return null;
+    const p = held.run.publish!;
+    if (p.state !== expect.state || p.stateSince !== expect.stateSince) return null;
+    held.run.publish = next;
+    held.block.message = publishBlockMessage(held.step.name, next);
+    persist(parentId, held.run);
+    return next;
+  });
+}
+
+/** A hidden, never-started step row for a Finish visit Agetor ended itself
+ *  (it sent the card back to Build): the history record needs a task, and
+ *  the card's step strip opens it to show what was found. */
+function insertPublishRecordTask(parent: Task, run: PipelineRunState, step: PipelineStep, text: string): string {
+  const profile = step.agentProfileId ? run.snapshot?.profiles[step.agentProfileId] : undefined;
+  const id = randomUUID();
+  const now = Date.now();
+  tasks.insert({
+    id, title: `${run.pipelineName} · ${step.name}`, prompt: text, column: "done",
+    agent: profile?.harness ?? parent.agent, workdir: parent.workdir, isolation: parent.isolation, taskType: parent.taskType,
+    branch: parent.branch, branchSource: parent.branchSource, worktreePath: parent.worktreePath, baseRef: parent.baseRef,
+    prUrl: null, issueUrl: null, mode: profile?.mode ?? parent.mode, model: profile?.model ?? parent.model,
+    effort: profile?.effort ?? parent.effort, fast: profile?.fast ?? false, maxMode: profile?.maxMode ?? false,
+    agentProfileId: profile?.id ?? null, agentProfile: profile ?? null, references: [], backlog: [], draft: null, plans: [],
+    todoProgress: null, runId: null, hasOpenableRun: false, pendingInteractionCount: 0, openTerminalCount: 0,
+    pipelineId: null, pipelineRun: null, pipelineParentId: parent.id, pipelineStepId: step.id,
+    createdAt: now, updatedAt: now, archivedAt: null,
+  });
+  return id;
+}
+
+/**
+ * End the held publish visit by sending the card to another step (Build, on
+ * the "verification failed" edge) with `handoff` as Finish's own. Agetor ran
+ * the visit, so its record is written here: one execution in the step count
+ * and in the edge's `maxTraversals`, exactly what an agent's Finish costs.
+ */
+export function routeFromPublish(
+  parentId: string,
+  input: { toStepId: string; handoff: Handoff; activity: string },
+): Promise<{ ok: true } | { error: string }> {
+  return runExclusive(parentId, async () => {
+    const held = heldPublish(parentId);
+    if ("error" in held) return held;
+    const { parent, run, step, block } = held;
+    const graph = run.snapshot!.graph;
+    const target = graph.steps.find((s) => s.id === input.toStepId);
+    if (!target) return { error: `unknown step id "${input.toStepId}"` };
+    const handoff = normalizeHandoff(input.handoff);
+    const spent = exhaustedEdge(graph, run.history, step.id, [target.id]);
+    if (spent) {
+      // The same limit an agent's choice of this edge meets (`settleStepRun`).
+      const label = spent.edge.label.trim() || target.name;
+      run.blocked = run.blocked.filter((b) => b !== block);
+      upsertBlocked(run, {
+        taskId: null, stepId: step.id, kind: "step-blocked", pending: block.pending,
+        message: `${step.name} (run by Agetor) would take "${label}" again, but this run has already taken that route ${spent.taken} of ${spent.edge.maxTraversals} times — ${handoff.purpose}. Take the card over, or take it out of pipeline_gates and Retry to have its agent run ${step.name}`,
+      });
+      recordActivity(parentId, { kind: "step", tone: "warning", text: `${step.name} → ${target.name} ("${label}") reached its limit of ${spent.edge.maxTraversals} — waiting for you` });
+      persist(parentId, run);
+      return { error: "the route back has reached its limit" };
+    }
+    const seq = ++run.stepCount;
+    const now = Date.now();
+    const taskId = insertPublishRecordTask(parent, run, step, `${step.name} was run by Agetor, not by an agent.\n\n${handoff.purpose}\n\n${handoff.summary}`);
+    run.history.push({
+      seq, stepId: step.id, taskId, startedAt: run.publish!.since, endedAt: now, outcome: "succeeded",
+      handoff, nextStepIds: [target.id], responseKind: "handoff",
+    });
+    run.blocked = run.blocked.filter((b) => b !== block);
+    delete run.publish;
+    recordActivity(parentId, { kind: "step", text: input.activity, tone: "warning" });
+    await launchTarget(parent, run, target, [{ stepId: step.id, seq, handoff }]);
+    persist(parentId, run);
+    return { ok: true as const };
+  });
+}
+
+/**
+ * End the held part of the publish visit by launching the step's agent:
+ * `write` — CI is green, one turn to write the PR description (`brief`
+ * replaces the step's instructions); `agent` — Agetor cannot run this visit
+ * and the agent runs Finish as before.
+ */
+export function launchPublishAgent(
+  parentId: string,
+  input: { mode: "write" | "agent"; brief?: string; activity: string },
+): Promise<{ ok: true } | { error: string }> {
+  return runExclusive(parentId, async () => {
+    const held = heldPublish(parentId);
+    if ("error" in held) return held;
+    const { parent, run, step, block } = held;
+    const now = Date.now();
+    run.publish = { ...run.publish!, state: input.mode, stateSince: now, tries: 0, note: input.activity, ...(input.brief ? { brief: input.brief } : {}) };
+    run.blocked = run.blocked.filter((b) => b !== block);
+    recordActivity(parentId, { kind: "step", text: input.activity, tone: input.mode === "write" ? "success" : "muted" });
+    const previous = (block.pending?.arrivals ?? []).map((a) => ({ stepId: a.fromStepId, seq: a.seq, handoff: a.handoff }));
+    await launchTarget(parent, run, step, previous);
+    persist(parentId, run);
+    return { ok: true as const };
+  });
+}
+
+/** Stop the held publish visit for the owner: the hold becomes an ordinary
+ *  blocked launch of the step, and a Retry resumes the visit where it was. */
+export function stopPublishForOwner(parentId: string, why: string): Promise<boolean> {
+  return runExclusive(parentId, async () => {
+    const held = heldPublish(parentId);
+    if ("error" in held) return false;
+    const { run, step, block } = held;
+    run.blocked = run.blocked.filter((b) => b !== block);
+    upsertBlocked(run, { taskId: null, stepId: step.id, kind: "step-blocked", message: `${step.name} (run by Agetor) needs you: ${why}. Retry resumes it where it stopped`, pending: block.pending });
+    run.publish = { ...run.publish!, note: why };
+    recordActivity(parentId, { kind: "step", text: `${step.name} (run by Agetor) stopped for you: ${why}`, tone: "danger" });
+    persist(parentId, run);
+    return true;
+  });
+}
+
+/**
+ * Adopt (or drop) check gates on a run from the `pipeline_gates` preference
+ * as it stands now — the explicit refresh a running card needs: gates change
+ * behaviour, so saving a pipeline or the preference alone never changes a run
+ * that has started. Takes effect at the step's next launch; a step in
+ * mid-turn is not switched.
+ */
+export function adoptPipelineGates(parentId: string): Promise<{ publish: boolean; changed: boolean } | { error: string; status: 404 | 409 }> {
+  return runExclusive(parentId, async () => {
+    const parent = tasks.get(parentId);
+    if (!parent?.pipelineId || tombstonedPipelineParents.has(parentId)) return { error: "not a pipeline task", status: 404 as const };
+    if (parent.archivedAt != null) return { error: "pipeline task is archived — unarchive it first", status: 409 as const };
+    const run = parent.pipelineRun;
+    if (!run?.snapshot) return { error: "pipeline has never run — it takes the gates when it starts", status: 409 as const };
+    const publish = publishGatePref(parent, run) && !!reviewedPipelineShape(run.snapshot.graph);
+    const had = run.snapshot.gates?.publish === true;
+    if (publish === had) return { publish, changed: false };
+    const { gates: _dropped, ...rest } = run.snapshot;
+    run.snapshot = publish ? { ...rest, gates: { publish: true } } : rest;
+    recordActivity(parentId, {
+      kind: "auto", tone: "info",
+      text: publish
+        ? "Check gates adopted: Finish is run by Agetor from its next launch (pipeline_gates)"
+        : "Check gates dropped: Finish is run by its agent again from its next launch",
+    });
+    persist(parentId, run, { preserveStatus: true });
+    return { publish, changed: true };
+  });
+}
+
 async function launchStep(
   parent: Task,
   run: PipelineRunState,
@@ -1828,6 +2059,16 @@ async function launchStep(
     }
     parent = prepared.parent;
   }
+
+  // Finish run by Agetor (`pipeline_gates`): no step task while it verifies,
+  // pushes and waits — the launch is parked and src/bun/publish-step.ts
+  // carries the visit. Its one agent turn (`write`) comes back through here.
+  const publishing = publishDispatch(parent, run, step);
+  if (publishing === "hold") {
+    holdForPublish(parent, run, step, pendingArrivals);
+    return { ok: false };
+  }
+  const publishBrief = publishing === "write" ? run.publish?.brief : undefined;
 
   // The step cap stops a run that goes round in circles. On an unattended
   // board the first hit extends the allowance by itself (the same
@@ -2028,7 +2269,8 @@ async function launchStep(
 
   const composeArgs = {
     pipelineName: run.pipelineName,
-    step,
+    // The writer's turn of an Agetor-run Finish: the brief is its whole job.
+    step: publishBrief ? { ...step, instructions: publishBrief } : step,
     stepIndex: seq,
     // The wrap-up execution is the one step past the cap.
     stepCap: Math.max(effectiveStepCap(run), seq),
@@ -2047,7 +2289,9 @@ async function launchStep(
 
   // A base branch that moved ahead gets merged in before this step verifies
   // (`pipeline_sync_base`, src/bun/sync-base.ts).
-  const syncNote = await syncBaseNote(parent, step.name).catch(() => null);
+  // Never for the writer of an Agetor-run Finish: the head is published, and
+  // merging is the one thing its turn must not do.
+  const syncNote = publishBrief ? null : await syncBaseNote(parent, step.name).catch(() => null);
   const withSync = (prompt: string) => (syncNote ? `${syncNote}\n\n${prompt}` : prompt);
   const manuallyRouted = previous.some((p) => run.history.some((h) => h.seq === p.seq && h.stepId === p.stepId && h.outcome === "advanced-manually"));
   const withRouting = (prompt: string) => manuallyRouted
@@ -2058,7 +2302,7 @@ async function launchStep(
   const managedRoot=managedPillarRoot(parent.worktreePath??parent.workdir);
   const approvalNote=step.name==='Review'
     ? `\n\nAutomatic sign-off requires explicit independent approval of this exact head and all issue acceptance. Map every acceptance criterion to checked evidence in your summary. In the handoff add "reviewApproval":{"verdict":"approved"|"changes-requested","headSha":"<full 40-character git rev-parse HEAD>","issueUrl":${JSON.stringify(parent.issueUrl??'')},"acceptanceComplete":true|false,"findings":[]}. Only use approved/true/empty findings when all required criteria are met and no finding remains. Otherwise record all findings, set changes-requested/false and choose Build. A succeeded/done review turn or Finish choice is not approval.`
-    :step.name==='Finish'?`\n\nPublish only the exact independently approved head: do not merge, rebase or amend the branch in this step (GitHub CI already tests the pull request merged with its base). A change to reviewed code or a different head requires Build/Review again; passing verification alone is not independent approval.`:'';
+    :step.name==='Finish'&&!publishBrief?`\n\nPublish only the exact independently approved head: do not merge, rebase or amend the branch in this step (GitHub CI already tests the pull request merged with its base). A change to reviewed code or a different head requires Build/Review again; passing verification alone is not independent approval.`:'';
   const withMachineCapacity=(prompt:string)=>managedRoot
     ? `${prompt}\n\n## Machine test capacity\n${HEAVY_INSTRUCTIONS}${approvalNote}`:prompt;
   // Last, so nothing after it reads as taking the wrap-up back.
@@ -2124,6 +2368,10 @@ async function launchStep(
 
   run.active.push({ stepId: step.id, taskId: childId, seq });
   run.history.push({ seq, stepId: step.id, taskId: childId, startedAt: now, endedAt: null, outcome: null, handoff: null, nextStepIds: [] });
+  // The agent execution an Agetor-run Finish visit ends in (`publishVisitOver`).
+  if (run.publish && run.publish.stepId === step.id && (run.publish.state === "write" || run.publish.state === "agent") && run.publish.seq === undefined) {
+    run.publish.seq = seq;
+  }
   if (wrapUp && run.capWrapUp) run.capWrapUp.seq = seq;
   persist(parent.id, run);
 
@@ -2481,6 +2729,9 @@ export async function startPipelineRun(
       snapshot = built.snapshot;
       const decisionPolicy = decisionPolicyForProject(preferences.get(PIPELINE_DECISIONS_PREF), fresh.workdir);
       if (decisionPolicy) snapshot.decisionPolicy = decisionPolicy;
+      // Check gates are captured like the decision policy: a run keeps the
+      // loop it started with until an explicit refresh (`adoptPipelineGates`).
+      if (reviewedPipelineShape(snapshot.graph) && publishGatePref(fresh, { pipelineName: pipeline.name })) snapshot.gates = { publish: true };
     } else if (run.snapshot) {
       // The pipeline row itself is gone (deleted) — the only graph left to
       // run is the one already frozen on this task's previous snapshot.
@@ -2943,6 +3194,8 @@ export async function refreshPipelineInstructions(
 export interface PipelineRunRefreshResult extends PipelineInstructionRefresh {
   taskId: string;
   error?: string;
+  /** Only when the refresh asked for gates (`adoptPipelineGates`). */
+  gates?: { publish: boolean; changed: boolean } | { error: string };
 }
 
 /** Push a template's current instructions into every unarchived, unfinished
@@ -2951,19 +3204,29 @@ export interface PipelineRunRefreshResult extends PipelineInstructionRefresh {
  * Each run is refreshed under its own lock, side by side, so a run busy
  * launching a step delays only itself; one run's failure is that run's
  * `error` and never the others'. */
-export async function refreshPipelineRuns(pipelineId: string): Promise<PipelineRunRefreshResult[]> {
+export async function refreshPipelineRuns(pipelineId: string, opts?: { gates?: boolean }): Promise<PipelineRunRefreshResult[]> {
+  // `gates`: also adopt check gates from `pipeline_gates` as it stands now —
+  // the explicit request a started run needs before its loop changes. A
+  // finished run is included for that alone (a fix round re-enters it).
   const targets = tasks.list({ archived: "none" }).filter((t) => t.pipelineId === pipelineId && !isPipelineStepTask(t) &&
     t.pipelineRun?.snapshot != null &&
-    (t.pipelineRun.status === "running" || t.pipelineRun.status === "blocked" || t.pipelineRun.status === "cancelled"));
+    (t.pipelineRun.status === "running" || t.pipelineRun.status === "blocked" || t.pipelineRun.status === "cancelled" ||
+      (opts?.gates === true && t.pipelineRun.status === "done")));
   return Promise.all(targets.map(async (t): Promise<PipelineRunRefreshResult> => {
     const failed = (error: string) => {
       recordActivity(t.id, { kind: "auto", tone: "warning", text: `Could not update instructions from template: ${error}` });
       return { taskId: t.id, stepIds: [], unmatched: [], skippedPrompts: [], error };
     };
     try {
+      let gates: PipelineRunRefreshResult["gates"];
+      if (opts?.gates) {
+        const adopted = await adoptPipelineGates(t.id);
+        gates = "error" in adopted ? { error: adopted.error } : adopted;
+        if (t.pipelineRun?.status === "done") return { taskId: t.id, stepIds: [], unmatched: [], skippedPrompts: [], gates };
+      }
       const result = await refreshPipelineInstructions(t.id);
-      if ("error" in result) return failed(result.error);
-      return { taskId: t.id, stepIds: result.stepIds, unmatched: result.unmatched, skippedPrompts: result.skippedPrompts };
+      if ("error" in result) return { ...failed(result.error), ...(gates ? { gates } : {}) };
+      return { taskId: t.id, stepIds: result.stepIds, unmatched: result.unmatched, skippedPrompts: result.skippedPrompts, ...(gates ? { gates } : {}) };
     } catch (e) {
       return failed(e instanceof Error ? e.message : String(e));
     }
@@ -3825,6 +4088,15 @@ async function settleStepRun(
 
       const parsedHandoff = classified.handoff!;
       let resolved = resolveNextSteps(graph, activeEntry.stepId, parsedHandoff);
+      // The writer of an Agetor-run Finish only writes: the visit's outcome
+      // was decided by Agetor (CI is green), so its turn ends the step
+      // whatever `next` says.
+      if (run.publish?.state === "write" && run.publish.seq === activeEntry.seq && resolved.kind !== "terminal") {
+        if (parsedHandoff.next?.trim()) {
+          recordActivity(parentId, { kind: "step", tone: "muted", text: `${stepName} named "${parsedHandoff.next}" as the next step — ignored: Agetor ran this ${stepName} and its checks passed` });
+        }
+        resolved = { kind: "terminal" };
+      }
       if(stepName==='Review'&&managedPillarRoot(parent.worktreePath??parent.workdir)&&reviewRequiresRepair(parsedHandoff)) {
         const repair=outgoingSteps(graph,activeEntry.stepId).find(o=>o.step.name==='Build'&&/^(?:changes requested|needs work|fix|repair|rework)$/i.test(o.edge.label.trim()));
         // A completed review can describe downstream owner-only evidence.
