@@ -106,8 +106,9 @@ export function HoldAside({
     </div>
   );
 
+  // A section, not an <aside>: the app's one aside is the run panel.
   return (
-    <aside data-testid="pipeline-run-hold" aria-labelledby="run-hold-title" className={cn(PANEL, "min-w-0 px-4 py-3.5")}>
+    <section data-testid="pipeline-run-hold" aria-labelledby="run-hold-title" className={cn(PANEL, "min-w-0 px-4 py-3.5")}>
       <h3 id="run-hold-title" className="text-sm font-semibold leading-[1.4] text-foreground">
         {held ? "Current hold" : "Run details"}
       </h3>
@@ -243,6 +244,6 @@ export function HoldAside({
           </div>
         </details>
       )}
-    </aside>
+    </section>
   );
 }

@@ -473,7 +473,7 @@ test.describe("velocity", () => {
     rmSync(path.join(backend.dataDir, "roadmap-velocity"), { recursive: true, force: true });
   });
 
-  test("the summary beside the rocket opens the view: progress with its forecast range, where the time goes, cycle time, rework, slots, bottlenecks", async ({ page, backend }, info) => {
+  test("the summary beside the rocket opens the view: the forecast, the roadmap's position, rates, where the time goes, what to move next, capacity", async ({ page, backend }, info) => {
     seedVelocity(backend);
     await openApp(page, backend.bootBase);
     const summary = page.getByTestId("velocity-summary");
@@ -483,59 +483,98 @@ test.describe("velocity", () => {
     await shot(page, "20-velocity-summary.png", info);
 
     await summary.click();
-    const dialog = page.getByTestId("velocity-dialog");
-    await expect(dialog).toBeVisible();
-    await expect(dialog.getByTestId("velocity-subtitle")).toContainText("Roadmap #600 · M02 and M03");
-    await expect(dialog.getByTestId("velocity-tiles")).toContainText("Completed");
-    await expect(dialog.getByTestId("velocity-tiles")).toContainText("of 3"); // slots in use
-    // The burn-up carries the forecast as a shaded range, and says it in words.
-    await expect(dialog.getByTestId("velocity-cone")).toBeVisible();
-    await expect(dialog.getByTestId("velocity-burnup-caption")).toContainText(/M02 and M03: .+ from now at the pace so far/);
-    await expect(dialog.getByTestId("velocity-phase-build")).toBeVisible();
-    await expect(dialog.getByTestId("velocity-phase-merge")).toContainText("CI and merge queue");
-    await expect(dialog.getByTestId("velocity-phase-owner")).toContainText("Held for you");
-    await expect(dialog.getByTestId("velocity-time")).toContainText("Agents working");
-    await expect(dialog.getByTestId("velocity-cycle")).toContainText(/median .+ · p75 .+ · p90 /);
-    await expect(dialog.getByTestId("velocity-rework")).toContainText("review rounds per step");
-    await expect(dialog.getByTestId("velocity-slots")).toContainText("unknown (the app was closed or Autopilot paused)");
-    await expect(dialog.getByTestId("velocity-bottleneck").first()).toContainText("behind it");
-    await expect(dialog.getByTestId("velocity-bottlenecks")).toContainText("held for your sign-off");
-    // The forecast: the scope, the release gate, the whole roadmap — ranges, with what they rest on.
-    await expect(dialog.getByTestId("velocity-forecast-scope")).toContainText("M02 and M03");
-    await expect(dialog.getByTestId("velocity-forecast-gate")).toContainText("the main-release gate");
-    await expect(dialog.getByTestId("velocity-forecast-gate")).toContainText("of yours on the path");
-    await expect(dialog.getByTestId("velocity-forecast-roadmap")).toContainText("the whole roadmap");
-    await expect(dialog.getByTestId("velocity-forecast-notes")).toContainText("An estimate, not a date");
+    const view = page.getByTestId("velocity-view");
+    await expect(view).toBeVisible();
+    // A full view, not a dialog: the board is replaced, and Back returns to it.
+    await expect(page.locator(".kanban-scroll")).toHaveCount(0);
+    await expect(view.getByTestId("velocity-subtitle")).toHaveText(/^Roadmap #600 · snapshot .+ · run started 2\.8d ago$/);
+    // The whole roadmap by default: its forecast as a range, and its own completion.
+    await expect(view.getByTestId("velocity-view-roadmap")).toHaveAttribute("aria-pressed", "true");
+    await expect(view.getByTestId("velocity-forecast-panel")).toContainText("Whole roadmap forecast");
+    await expect(view.getByTestId("velocity-forecast-range")).toHaveText(/(hours|days)/);
+    await expect(view.getByTestId("velocity-forecast-panel")).toContainText("a range, not a promised date");
+    await expect(view.getByTestId("velocity-progress-count")).toHaveText("20 of 43 complete");
+    await expect(view.getByTestId("velocity-rates")).toContainText("Agent steps · run-wide");
+    await expect(view.getByTestId("velocity-tiles")).toContainText("Median cycle time");
+    await expect(view.getByTestId("velocity-tiles")).toContainText("of accumulated task time");
+    await expect(view.getByTestId("velocity-time")).toContainText("Agents working");
+    await expect(view.getByTestId("velocity-time")).toContainText("it is longer than the calendar time that passed");
+    // What to move next: steps behind each, and the counts overlap.
+    await expect(view.getByTestId("velocity-bottleneck").first()).toContainText("behind it");
+    await expect(view.getByTestId("velocity-bottlenecks")).toContainText("These counts overlap");
+    // The seeded steps have no card on this board: the report's state, and no invented reason.
+    await expect(view.getByTestId("velocity-bottlenecks")).toContainText("Held for sign-off");
+    await expect(view.getByTestId("velocity-bottleneck-reason").first()).toHaveAttribute("data-known", "false");
+    await expect(view.getByTestId("velocity-bottleneck-action")).toHaveCount(0);
+    // Capacity: occupied, over all observed time.
+    await expect(view.getByTestId("velocity-occupied")).toContainText("of 3");
+    await expect(view.getByTestId("velocity-slots")).toContainText("All observed time");
+    await expect(view.getByTestId("velocity-slots")).toContainText("An occupied slot may be waiting, not executing.");
+    await expect(view.getByTestId("velocity-slots")).toContainText("went unobserved while the app was closed or Autopilot paused");
     await shot(page, "21-velocity-top-light.png", info);
+
+    // The detail: the burn-up with its shaded range, phases, distributions, every scope's forecast.
+    await view.getByTestId("velocity-method-link").click();
+    await expect(view.getByTestId("velocity-details")).toHaveAttribute("open", "");
+    await expect(view.getByTestId("velocity-cone")).toBeVisible();
+    await expect(view.getByTestId("velocity-burnup-caption")).toContainText(/the whole roadmap: .+ from now at the pace so far/);
+    await expect(view.getByTestId("velocity-phase-build")).toBeVisible();
+    await expect(view.getByTestId("velocity-phase-merge")).toContainText("CI and merge queue");
+    await expect(view.getByTestId("velocity-phase-owner")).toContainText("Held for you");
+    await expect(view.getByTestId("velocity-cycle")).toContainText(/median .+ · p75 .+ · p90 /);
+    await expect(view.getByTestId("velocity-rework")).toContainText("review rounds per step");
+    await expect(view.getByTestId("velocity-slots-hourly")).toContainText("unknown (the app was closed or Autopilot paused)");
+    await expect(view.getByTestId("velocity-forecast-scope")).toContainText("M02 and M03");
+    await expect(view.getByTestId("velocity-forecast-gate")).toContainText("the main-release gate");
+    await expect(view.getByTestId("velocity-forecast-gate")).toContainText("of yours on the path");
+    await expect(view.getByTestId("velocity-forecast-roadmap")).toContainText("the whole roadmap");
+    await expect(view.getByTestId("velocity-forecast-notes")).toContainText("An estimate, not a date");
     await page.setViewportSize(tall);
     await shot(page, "22-velocity-full-light.png", info);
 
     // Every chart has its numbers as a table.
-    await dialog.getByTestId("velocity-burnup").getByText("Show as a table").click();
-    await expect(dialog.getByRole("table", { name: "Steps completed over time" })).toBeVisible();
-    await expect(dialog.getByRole("table", { name: "Time per phase" })).toBeVisible();
-    await expect(dialog.getByRole("img", { name: /of \d+ steps complete/ })).toBeVisible();
+    await view.getByTestId("velocity-burnup").getByText("Show as a table").click();
+    await expect(view.getByRole("table", { name: "Steps completed over time" })).toBeVisible();
+    await expect(view.getByRole("table", { name: "Time per phase" })).toBeVisible();
+    await expect(view.getByRole("img", { name: /of \d+ steps complete/ })).toBeVisible();
+
+    // Back, and Escape, return to the board.
+    await view.getByTestId("velocity-back").click();
+    await expect(page.locator(".kanban-scroll")).toBeVisible();
+    await page.getByTestId("velocity-summary").click();
+    await expect(page.getByTestId("velocity-view")).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(page.getByTestId("velocity-view")).toHaveCount(0);
+    await expect(page.locator(".kanban-scroll")).toBeVisible();
   });
 
-  test("the owner's steps: an assumed time per step changes the forecast; the whole roadmap is one click away", async ({ page, backend }, info) => {
+  test("the release gate: remaining steps and its forecast, never a completion; an assumed time per step of yours changes the range", async ({ page, backend }, info) => {
     seedVelocity(backend);
     await openApp(page, backend.bootBase);
     await page.getByTestId("velocity-summary").click();
-    const dialog = page.getByTestId("velocity-dialog");
+    const view = page.getByTestId("velocity-view");
+    await view.getByTestId("velocity-view-gate").click();
+    await expect(view.getByTestId("velocity-view-gate")).toHaveAttribute("aria-pressed", "true");
+    await expect(view.getByTestId("velocity-forecast-panel")).toContainText("Release gate forecast");
+    await expect(view.getByTestId("velocity-progress-count")).toHaveText(/^\d+ remaining$/);
+    await expect(view.getByTestId("velocity-progress").getByRole("img")).toHaveCount(0);
+    await expect(view.getByTestId("velocity-completion-unavailable")).toContainText("Completion is not supplied for this scope");
+    await expect(view.getByTestId("velocity-tiles").getByText(/run-wide/)).toHaveCount(3);
     // Three of the owner's steps are finished: their median is the default.
-    await expect(dialog.getByTestId("velocity-forecast")).toContainText("the median of the 3 you have finished");
-    const before = await dialog.getByTestId("velocity-forecast-gate").innerText();
-    await dialog.getByTestId("velocity-owner-delay").fill("72");
-    await dialog.getByTestId("velocity-owner-apply").click();
-    await expect(dialog.getByTestId("velocity-forecast")).toContainText("With 3.0d per step of yours");
-    await expect(dialog.getByTestId("velocity-forecast")).toContainText("Your assumption.");
-    expect(await dialog.getByTestId("velocity-forecast-gate").innerText()).not.toBe(before);
-
-    await dialog.getByTestId("velocity-view-roadmap").click();
-    await expect(dialog.getByTestId("velocity-subtitle")).toContainText("the whole roadmap");
-    await expect(dialog.getByTestId("velocity-burnup-caption")).toContainText("the whole roadmap:");
+    await expect(view.getByTestId("velocity-forecast-panel")).toContainText("(the median of the 3 finished)");
+    const before = await view.getByTestId("velocity-forecast-range").innerText();
+    await view.getByTestId("velocity-method-link").click();
+    await expect(view.getByTestId("velocity-forecast")).toContainText("the median of the 3 you have finished");
+    const row = await view.getByTestId("velocity-forecast-gate").innerText();
+    await view.getByTestId("velocity-owner-delay").fill("72");
+    await view.getByTestId("velocity-owner-apply").click();
+    await expect(view.getByTestId("velocity-forecast")).toContainText("With 3.0d per step of yours");
+    await expect(view.getByTestId("velocity-forecast")).toContainText("Your assumption.");
+    await expect(view.getByTestId("velocity-forecast-panel")).toContainText("Assumes 3.0d per human step (your figure)");
+    expect(await view.getByTestId("velocity-forecast-gate").innerText()).not.toBe(row);
+    expect(await view.getByTestId("velocity-forecast-range").innerText()).not.toBe(before);
     await page.setViewportSize(tall);
-    await shot(page, "23-velocity-roadmap-owner-delay.png", info);
+    await shot(page, "23-velocity-gate-owner-delay.png", info);
   });
 
   test("dark theme uses the same tokens", async ({ page, request, backend }, info) => {
@@ -544,8 +583,10 @@ test.describe("velocity", () => {
     await openApp(page, `${backend.bootBase}&theme=dark`);
     await expect(page.locator("html")).toHaveClass(/dark/);
     await page.getByTestId("velocity-summary").click();
-    await expect(page.getByTestId("velocity-cone")).toBeVisible();
+    await expect(page.getByTestId("velocity-forecast-panel")).toBeVisible();
     await shot(page, "24-velocity-top-dark.png", info);
+    await page.getByTestId("velocity-method-link").click();
+    await expect(page.getByTestId("velocity-cone")).toBeVisible();
     await page.setViewportSize(tall);
     await shot(page, "25-velocity-full-dark.png", info);
   });
@@ -556,11 +597,14 @@ test.describe("velocity", () => {
     const summary = page.getByTestId("velocity-summary");
     await expect(summary).toHaveText(/^4 done · [\d.]+\/day$/);
     await summary.click();
-    const dialog = page.getByTestId("velocity-dialog");
-    await expect(dialog.getByTestId("velocity-forecast-none")).toHaveText("3 steps completed with a measured cycle time — not enough for a forecast (it needs 5)");
-    await expect(dialog.getByTestId("velocity-cone")).toHaveCount(0);
-    await expect(dialog.getByTestId("velocity-burnup-caption")).toContainText("not enough for a forecast");
-    await expect(dialog.getByTestId("velocity-cycle")).toContainText("(3 steps)");
+    const view = page.getByTestId("velocity-view");
+    await expect(view.getByTestId("velocity-forecast-range")).toHaveText("Forecast unavailable");
+    await expect(view.getByTestId("velocity-forecast-unavailable")).toHaveText("3 steps completed with a measured cycle time — not enough for a forecast (it needs 5)");
+    await view.getByTestId("velocity-method-link").click();
+    await expect(view.getByTestId("velocity-forecast-none")).toHaveText("3 steps completed with a measured cycle time — not enough for a forecast (it needs 5)");
+    await expect(view.getByTestId("velocity-cone")).toHaveCount(0);
+    await expect(view.getByTestId("velocity-burnup-caption")).toContainText("not enough for a forecast");
+    await expect(view.getByTestId("velocity-cycle")).toContainText("(3 steps)");
     await page.setViewportSize(tall);
     await shot(page, "26-velocity-low-data.png", info);
   });

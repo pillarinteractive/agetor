@@ -271,11 +271,13 @@ The state is never read from the column alone. A card in Running whose step is p
   by itself (*Waiting on CI*, *Waiting on command*, *Auto retry*, and Ready to Merge's *Opening PR*, *Updating
   branch*, *Fixing CI*, *Merging*, *In merge train*); amber for the owner's move (*Needs input*, *Needs you*, *Step
   cap*, *Quiet*, *Review PR*, *Review comments*, *Update branch*, *No PR yet*, *PR closed*, *Draft PR*); red *Failed*
-  and *CI failed*; purple *Merged*; grey *Queued*, *Dependency*, *Stopped*, *Done*. Amber and red cards carry the
+  and *CI failed*; purple *Merged*; grey *Queued*, *Stopped*, *Done*. *Dependency* is blue for a run that has started
+  and is parked on another card or issue (it moves on by itself), grey for a card nothing has run yet (it is queued). Amber and red cards carry the
   colour on their border too. The values are the `--state-*` variables in `src/mainview/index.css`, for both themes.
   Nothing on a card pulses or glows.
-- **The strip** has one segment per step of the run's snapshot, ordered from the start step along the edges; follow-up
-  steps have none. A segment is green only if it comes before the current step and has a succeeded execution, so after
+- **The strip** has one segment per step of the run's snapshot, ordered by how far each step is from the start step
+  (`stepOrder`: the longest way there, leaving out the edges that lead back, so Finish stays last when Understand can
+  also go straight to it); follow-up steps have none. A segment is green only if it comes before the current step and has a succeeded execution, so after
   a loop back the steps ahead read as to do again. No snapshot (a single-agent task, a run not started): no strip.
 - **Elapsed time** is shown only where the data has it: since the active step's latest start, or since a step was
   parked in the wait queue. There is no "blocked for" time, no PR approval and no sign-off state: the board is not
@@ -307,14 +309,51 @@ The state is never read from the column alone. A card in Running whose step is p
   a card that waits on the owner says so in its own state band.
 - **Activity** timeline in the run view (`src/bun/activity.ts`): steps derived from the run's history, plus PR, CI,
   review, merge, lease and auto-fix events appended to `<dataDir>/activity/<taskId>.jsonl` as they happen.
-- The run view header leads with the card's title; a step's panel strip names the card it belongs to. The run view
-  and the run panel themselves are unchanged.
+- A step's panel strip names the card it belongs to. The run panel is unchanged; the run view is described under
+  "The run view" below.
 
 **Trying the cards without a core.** `bun run hmr`, then open `http://localhost:5173/fixtures/board.html`
 (`?theme=dark`, `?case=long`, `?case=backlog`, `?select=t845`): every state through the real components from made-up
 data (`src/mainview/fixtures/`). The page imports no API client and its buttons only report what they stood for. It
 is not an entry of `vite build`, so it is not in the packaged app. `e2e/board-fixtures.spec.ts` runs against it with
 no backend; set `BOARD_SHOTS_DIR` to keep its screenshots.
+
+## The run view (`feat/velocity-and-run-view`)
+
+A double click on a pipeline card (or Open run in the inspector) replaces the board with that card's run. The board
+stays the main view: Back, or Escape, returns to it as it was left — search text, the View menu, where
+`.kanban-scroll` was scrolled to, Done unfolded, the selected card with the focus on it (`boardMemoryRef` and
+`restoreBoard` in `App.tsx`; the board is unmounted meanwhile). `PipelineRunView.tsx` owns the data and the canvas;
+`components/pipelines/run/RunPage.tsx` lays the page out from props and fetches nothing.
+
+- **One state band, the card's own.** `RunPage` is given `cardState(task)` — the same call the board card makes, from
+  the same PR, lease, progress and roadmap contexts, which now wrap every view — so the band's icon, label, colour and
+  reason are the card's. The tile of the step the card is on wears that state too.
+- **Recovery is in the band and nowhere else** (`recoveryControls` in `src/mainview/lib/run-view.ts`). There is one
+  Retry, named for what it does: *Retry <step>*, *Resume <step>* (a stopped run), *Recheck now* (a held input; its
+  tooltip says it is the retry request and also retries other blocked executions), *Extend cap*, or *Retry <step> now*
+  beside the card's own button when the step is retried by itself. All are `POST /tasks/:id/pipeline/retry`. Stop is
+  there while a step is live, without a confirmation (the run can be resumed). *Answer*, *Fix CI*, *Review PR*, *Open
+  dependency* and *Run* go through `App.tsx`'s `onCardAction`, as on the board. A missing or invalid handoff gets no
+  Retry: the band points at Advance.
+- **Restart and Advance are under "Advanced run controls"**, closed by default: *Restart pipeline…* keeps its
+  confirmation, *Advance <step>…* opens the form, whose button is disabled until a next step is picked or "Finish
+  here" is switched on. Nothing on the page skips a blocker, advances a step or merges by default.
+- **Executions, not a fraction.** `executionSummary`: "N executions recorded" (`run.history.length`), per-step
+  counts, the round of a record, loops (a record that hands to a step with an earlier record), several executions at
+  once, and the cap as "step cap 28 of 28". Follow-up steps are listed apart from the graph's.
+- **Pipeline steps** switch between the tiles and "Graph & routing": the React Flow canvas as before, the routes as a
+  list with how often each was taken, and who each step may delegate to — *available* (configured) apart from
+  *running* (observed).
+- **The selected step** has four tabs. *Summary*: its state, the step's own words, its latest handoff. *Transcript*:
+  the final report of its latest execution (`GET /tasks/:id/pipeline/reports?seq=N`) and "Open full transcript",
+  which opens the step's run panel. *Checks* (`checksEvidence`): the current head only from the PR watcher
+  (`TaskPrStatus`, "as of <time> on <sha>"); a live CI wait and the timeline's `ci` entries are listed as what they
+  are, with no head, on a neutral chip — a recorded pass never stands for the current head. No check record exists
+  per step; each row is `{source, status, observedAt, head}` so one can be added. *Files*: what the handoff named;
+  a per-step file list is unavailable, and the task's own diff is one button away.
+- **Current hold**: the retry schedule (only the wait queue has a maximum number of attempts), whether any agent is
+  executing, the PR, the step cap, each block in the step's words.
 
 ## Orchestrator suggestions, layer 1 (`feat/suggestions`)
 
@@ -1057,8 +1096,8 @@ nothing-to-build decision and no audit: the table decides the order.
 ## Velocity: how fast the roadmap run is going (`feat/roadmap-autopilot`)
 
 Tracker order keeps a record of the run and reports on it: the one-line summary beside the rocket ("20 done · 6.0/day ·
-M02 and M03 ≈ 8–20 hours") opens the Velocity view (`VelocityDialog.tsx`; also the **Velocity** button in the Autopilot
-dialog), `agetor roadmap velocity [--json] [--scope current|roadmap] [--owner-delay <hours>]` prints the same, and
+M02 and M03 ≈ 8–20 hours") opens the Velocity view (`VelocityView.tsx`, a full view like the run view; also the
+**Velocity** button in the Autopilot dialog), `agetor roadmap velocity [--json] [--scope current|roadmap] [--owner-delay <hours>]` prints the same, and
 both read `GET /autopilot/roadmap/velocity[?scope=current|roadmap][&ownerDelayHours=n]`. The metrics are pure
 (`src/shared/velocity.ts`); the core keeps the ledger (`src/bun/roadmap-velocity.ts`). No table, no migration.
 
@@ -1137,10 +1176,30 @@ both read `GET /autopilot/roadmap/velocity[?scope=current|roadmap][&ownerDelayHo
 - **`?scope`**: the speed figures (throughput, cycle time, the breakdown, rework, slots) are always the whole run's —
   finished milestones leave the scope, and their history shouldn't go with them. `scope` chooses what the progress
   chart and the bottleneck list cover: the milestones in scope (`current`, the default) or the whole roadmap.
-- **The view**: inline SVG and the app's own tokens (`--info` for agents working, `--warning` for waiting, both also
-  said in words); each chart has its numbers as a table ("Show as a table") and a text alternative.
+- **The view** (`feat/velocity-and-run-view`): `VelocityRoute.tsx` reads the report with `scope=roadmap` and
+  `VelocityView.tsx` lays it out; `src/mainview/lib/velocity-view.ts` holds what it derives, and none of it
+  calculates or forecasts. A switch chooses the forecast scope, *Release gate* or *Whole roadmap*: the range ("a
+  range, not a promised date"), agent and human steps remaining, the assumed time per human step. Completion is shown
+  for the whole roadmap only, from the report's totals; for the gate the view says it is not supplied, and no total is
+  derived from the gate's step number. Rates (24 hours, 3 days, since the start), cycle time, review rounds, the
+  working share and capacity are the whole run's and say "run-wide". "Where time goes" folds the phases into four
+  buckets of accumulated task time (longer than calendar time, since tasks run side by side). "Move these next" joins
+  each bottleneck to its board card and shows that card's `cardState` and button; a step with no card keeps the
+  report's state and an unavailable reason; the counts are "N steps behind it" and overlap. Capacity is slots
+  *occupied* (a slot may be waiting, not executing), averaged over all observed time. The charts (`VelocityCharts.tsx`)
+  are under "Phase timings, distributions and forecast method", in the board's state colours; each has its numbers as
+  a table ("Show as a table") and a text alternative.
 - **Upgrading**: no migration. The first pass after installing (30 s after the core starts) reads every card made from
   a step's issue once, writes the backfill and the first sample, and the summary appears beside the rocket. Going back
   to an older build leaves the two files unread.
 - **Rendered checks**: `e2e/roadmap-board.spec.ts` ("velocity") seeds a synthetic three-day run and draws the view in
   light and dark, with too little data, and with none.
+
+**Trying the two views without a core.** `bun run hmr`, then `http://localhost:5173/fixtures/run.html?case=<name>`
+(executing, ci, dependency, auto-retry, recheck, step-cap, needs-input, failed, cancelled, loop, fanout, done,
+ci-failed, not-started, long; `?theme=dark`, `?tab=checks`, `?presentation=graph`, `?card=1` to draw the task's board
+card beside it) and `/fixtures/velocity.html?case=<name>` (roadmap, no-forecast, no-gate, no-samples, empty;
+`?scope=gate`). Both go through the real components from made-up data (the velocity report through the real
+`computeVelocity`), import no API client, and are not entries of `vite build`. The run fixture has no canvas, which
+needs the core. `e2e/views-fixtures.spec.ts` runs against them with no backend; set `VIEWS_SHOTS_DIR` to keep its
+screenshots. `e2e/board-context.spec.ts` checks, against the real app, that the board comes back as it was.
