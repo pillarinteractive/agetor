@@ -2953,6 +2953,67 @@ export async function runPipelineFollowUp(
   });
 }
 
+/** How many executions one rework round needs room for: Build, Review, Finish. */
+const REWORK_ROUND_STEPS = 3;
+
+/**
+ * Send a FINISHED run back through one of its own steps: a problem found
+ * after the pipeline ended (the merge queue saw CI fail, or the PR conflict
+ * with its base) re-enters the run at Build, so the fix is reviewed and
+ * published by Finish like any other change — where a follow-up
+ * (`runPipelineFollowUp`) would append a one-off step that pushes unreviewed.
+ *
+ * `stepId` is a step of the run's frozen graph; nothing is added to the
+ * snapshot, so the step runs on the prompts and agents the run started with
+ * and its outgoing edges carry the run on (Build → Review → Finish). The
+ * step is handed `handoff` as if `fromStepId` had just sent it — exactly how
+ * Finish's own "verification failed" reaches Build. That arrival carries
+ * `seq: 0`, which no execution has: it names no history record, so no step's
+ * final report is attached to it (Finish's last report said the opposite),
+ * and it survives a queued launch (`pending.arrivals`) unchanged.
+ *
+ * Only a `done` run is re-entered: a blocked or running one is still the
+ * pipeline's own to finish. The step cap is raised just enough for one round
+ * (as a follow-up raises it for its one step); the caller bounds how many
+ * rounds a card gets. Returns the task; whether the run actually left `done`
+ * is the caller's to read from it (a launch queued for a slot has).
+ */
+export async function reworkPipelineRun(
+  parentId: string,
+  input: { stepId: string; fromStepId: string; handoff: Handoff },
+): Promise<{ task: Task } | { error: string; status: 400 | 404 | 409 }> {
+  return runExclusive(parentId, async () => {
+    const parent = tasks.get(parentId);
+    if (!parent || !parent.pipelineId) return { error: "not a pipeline task", status: 404 as const };
+    if (tombstonedPipelineParents.has(parentId)) return { error: "pipeline task no longer exists", status: 404 as const };
+    if (parent.archivedAt != null) return { error: "pipeline task is archived — unarchive it first", status: 409 as const };
+    const run = parent.pipelineRun;
+    if (!run || !run.snapshot) return { error: "pipeline has never run", status: 409 as const };
+    if (run.status !== "done" || run.active.length > 0 || run.blocked.length > 0) {
+      return { error: "a run is sent back through its steps only once it has finished", status: 409 as const };
+    }
+    const graph = run.snapshot.graph;
+    const step = graph.steps.find((s) => s.id === input.stepId);
+    if (!step) return { error: `unknown step id "${input.stepId}"`, status: 400 as const };
+    if (!graph.steps.some((s) => s.id === input.fromStepId)) return { error: `unknown step id "${input.fromStepId}"`, status: 400 as const };
+
+    const ext = Math.max(0, Math.trunc(run.capExtensions ?? 0));
+    if (run.stepCount + REWORK_ROUND_STEPS > effectiveStepCap(run)) {
+      run.snapshot = { ...run.snapshot, maxSteps: Math.ceil((run.stepCount + REWORK_ROUND_STEPS) / (1 + ext)) };
+    }
+    const launched = await launchTarget(parent, run, step, [{ stepId: input.fromStepId, seq: 0, handoff: normalizeHandoff(input.handoff) }]);
+    persist(parentId, run);
+    if (!launched.ok && run.active.every((a) => a.stepId !== step.id)) {
+      const block = run.blocked.find((b) => b.stepId === step.id);
+      // Queued for a slot: it starts by itself — not an error.
+      if (block?.kind !== "slot-wait") {
+        return { error: block?.message ?? `${step.name} could not start`, status: 409 as const };
+      }
+    }
+    return { task: tasks.get(parentId)! };
+  });
+}
+
 /**
  * Stop every currently-running active execution (D9: "Stop on the parent
  * cancels every active execution and returns the parent to ready … active

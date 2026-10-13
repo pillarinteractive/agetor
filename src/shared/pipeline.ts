@@ -1014,6 +1014,32 @@ export function exhaustedEdge(
 }
 
 /**
+ * The Build → Review → Finish shape of a reviewed pipeline, or null. A graph
+ * has it when it holds exactly one step named `Build`, one named `Review` and
+ * one named `Finish` (the names automatic sign-off checks, case-sensitive),
+ * with an edge Build → Review and an edge Review → Finish. `viaEdge` is the
+ * Finish → Build edge when there is one ("verification failed"): the route a
+ * CI failure takes back to Build inside a run. A failure found after the run
+ * finished re-enters the run at Build the same way (src/bun/merge-rework.ts)
+ * instead of running an unreviewed follow-up step; a graph without this shape
+ * keeps follow-ups. Pure.
+ */
+export function reviewedPipelineShape(
+  g: PipelineGraph | null | undefined,
+): { build: PipelineStep; review: PipelineStep; finish: PipelineStep; viaEdge: PipelineEdge | null } | null {
+  if (!g) return null;
+  const only = (name: string): PipelineStep | null => {
+    const hits = g.steps.filter((s) => s.name === name);
+    return hits.length === 1 ? hits[0]! : null;
+  };
+  const build = only("Build"), review = only("Review"), finish = only("Finish");
+  if (!build || !review || !finish) return null;
+  const edge = (from: string, to: string) => g.edges.find((e) => e.from === from && e.to === to) ?? null;
+  if (!edge(build.id, review.id) || !edge(review.id, finish.id)) return null;
+  return { build, review, finish, viaEdge: edge(finish.id, build.id) };
+}
+
+/**
  * Whether a `"status":"blocked"` handoff still routes the run: only when the
  * step had a real choice of where to send the work and made one — several
  * outgoing edges (Review: "changes requested" / "approved") or a step that

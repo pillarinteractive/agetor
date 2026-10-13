@@ -27,6 +27,7 @@ import {
   renderHandoffFile,
   resolveNextSteps,
   resolveStartStep,
+  reviewedPipelineShape,
   splitHandoffMessage,
   stepNameById,
   validatePipelineGraph,
@@ -3012,5 +3013,32 @@ describe("an edge's maxTraversals", () => {
     // A failed execution took no edge.
     expect(exhaustedEdge(g, [h("finish", ["build"]), h("finish", ["build"], "failed")], "finish", ["build"])).toBeNull();
     expect(exhaustedEdge(g, Array.from({ length: 9 }, () => h("review", ["build"])), "review", ["build"])).toBeNull();
+  });
+});
+
+describe("reviewedPipelineShape", () => {
+  test("Build → Review → Finish, with the corrective edge when there is one", () => {
+    const shape = reviewedPipelineShape(changeGraph());
+    expect(shape && [shape.build.id, shape.review.id, shape.finish.id, shape.viaEdge?.id]).toEqual(["build", "review", "finish", "finish-build"]);
+    const noLoop = changeGraph();
+    noLoop.edges = noLoop.edges.filter((e) => e.id !== "finish-build");
+    expect(reviewedPipelineShape(noLoop)?.viaEdge).toBeNull();
+  });
+
+  test("anything else is not that shape", () => {
+    expect(reviewedPipelineShape(null)).toBeNull();
+    const noReview = changeGraph();
+    noReview.steps = noReview.steps.filter((s) => s.id !== "review");
+    noReview.edges = noReview.edges.filter((e) => e.from !== "review" && e.to !== "review");
+    expect(reviewedPipelineShape(noReview)).toBeNull();
+    const renamed = changeGraph();
+    renamed.steps.find((s) => s.id === "review")!.name = "review";
+    expect(reviewedPipelineShape(renamed)).toBeNull();
+    const unlinked = changeGraph();
+    unlinked.edges = unlinked.edges.filter((e) => e.id !== "review-finish");
+    expect(reviewedPipelineShape(unlinked)).toBeNull();
+    const twoBuilds = changeGraph();
+    twoBuilds.steps.push({ ...twoBuilds.steps[1]!, id: "build2" });
+    expect(reviewedPipelineShape(twoBuilds)).toBeNull();
   });
 });

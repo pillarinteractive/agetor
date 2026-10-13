@@ -362,7 +362,19 @@ stopped pipeline) but shows in Backlog (`boardColumnOf`).
   open PR → resolve conflicts → update from base → Fix CI → address review → wait for checks → squash-merge
   (`merge_method` pref). Agetor opens the PR itself (`openPrDirectly`: push, then the API) and starts the Open PR
   follow-up only when that fails; the branch is updated from its base only when GitHub requires it or CI is failing.
-  Each automatic step once per PR head, ≤4 fix-ups per card. A pipeline's fix-up run returns the card to Ready to
+  Each automatic step once per PR head, ≤4 fix-ups per card.
+  A card whose pipeline has steps named Build, Review and Finish (Build → Review → Finish) gets no Fix CI or Resolve
+  conflicts follow-up, which would push a fix nobody reviewed: its sign-off is withdrawn and its run re-enters at Build
+  with the failure as Finish's "verification failed" handoff (failing jobs, run URLs, log tail, or the conflicting
+  files); Review re-reviews, Finish pushes once, and the finished run is signed off again the ordinary way
+  (`src/bun/merge-rework.ts`, `reworkPipelineRun`). A job a runner or the network broke is re-run once instead; the
+  base failing the same checks waits. `merge_queue_rework` preference, default `{"enabled":true,"maxRounds":3}`:
+  after `maxRounds` rounds (or a round that left the head unchanged) the card is held in In Review with a "Held for
+  you" timeline entry, and Autopilot leaves it there until the owner drags it to Ready to Merge again. The PR
+  watcher's automatic Fix CI follows the same rule for these cards.
+  A pipeline edge may carry `maxTraversals` (set through `PATCH /pipelines/:id`; the editor keeps it but has no
+  control for it): a step that chooses the edge once more is held for a person (`exhaustedEdge`), e.g. `2` on
+  Finish → Build. A pipeline's fix-up run returns the card to Ready to
   Merge (runner honours the intent), not In Review. Dragging back to In Review/Backlog withdraws the sign-off (for
   one of Autopilot's cards, for good: `noteSignOffWithdrawn`).
   Merged → Done + issue closed (if the PR says `Fixes`). The column's refresh button is `POST /merge-queue/refresh`.

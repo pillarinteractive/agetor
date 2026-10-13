@@ -45,6 +45,7 @@ import { blockedByFor, blockingFor, dependencyTick, readDependencies, setDepende
 import { activeTrain, mergedViaTrain, trainFor } from "./merge-train.ts";
 import { isPriority, readPriority, setPriority } from "./priority.ts";
 import { setMergeQueued } from "./merge-intent.ts";
+import { noteOwnerSignOff } from "./merge-rework.ts";
 import { KEEP_AWAKE_PREF_KEY, KEEP_SCREEN_ON_PREF_KEY, recheckKeepAwake } from "./keep-awake.ts";
 import { applyAutopilotPatch, applyRoadmapContinue, applyRoadmapResolve, autopilotSnapshot, noteSignOffWithdrawn, requestAutopilotPass, setAutopilotNotifier } from "./autopilot.ts";
 import { departTrainNow, refreshMergeColumn } from "./merge-queue.ts";
@@ -4796,7 +4797,11 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           // into Ready to Merge signs off, out to In Review / Backlog withdraws.
           // The pipeline runner moving a card while a step works on it doesn't.
           if (patch.column && patch.column !== before.column && !before.pipelineParentId) {
-            if (patch.column === "merge") setMergeQueued(before.id, true);
+            if (patch.column === "merge") {
+              setMergeQueued(before.id, true);
+              // The owner's own sign-off: a fresh allowance of fix rounds.
+              noteOwnerSignOff(before.id);
+            }
             else if (patch.column === "review" || patch.column === "backlog" || patch.column === "ready") {
               if (setMergeQueued(before.id, false)) {
                 recordActivity(before.id, { kind: "task", text: "Sign-off withdrawn — moved out of Ready to Merge", tone: "muted" });

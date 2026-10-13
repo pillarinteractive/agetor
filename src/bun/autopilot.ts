@@ -32,6 +32,7 @@ import { run } from "./github.ts";
 import { askThread, taggedJson, type ThreadAnswer } from "./codex-thread.ts";
 import { createTaskFromIssue } from "./issue-queue.ts";
 import { setMergeQueued } from "./merge-intent.ts";
+import { reworkHeld } from "./merge-rework.ts";
 import { describeRiskyFiles, parseRiskyRules, riskyFiles, RISKY_PATHS_PREF, type RiskyRules } from "../shared/risky-paths.ts";
 import { hasConfirmedNoPr, prStatusForTask } from "./pr-watch.ts";
 import { onCardRemoved, startTask, subscribeGlobal, isTaskRunLive } from "./orchestrator.ts";
@@ -556,7 +557,8 @@ const SIGN_OFF_DEPS: SignOffDeps = {
     return files.length > 0 ? files : null;
   },
   rules: () => parseRiskyRules(preferences.get(RISKY_PATHS_PREF)),
-  handsOff: () => new Set(readHandsOff()),
+  // …and cards the merge queue handed back after their fix rounds ran out.
+  handsOff: () => new Set([...readHandsOff(), ...reworkHeld()]),
   signOff(t) {
     setMergeQueued(t.id, true);
     tasks.update(t.id, { column: "merge" });

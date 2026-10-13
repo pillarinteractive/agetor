@@ -4,13 +4,26 @@
  * each signed-off card, the watcher takes the one next step its PR needs:
  *
  *   no PR yet               → run the "Open PR" follow-up (pipelines)
- *   conflicts with the base → run a "Resolve conflicts" follow-up
+ *   conflicts with the base → run a "Resolve conflicts" follow-up (*)
  *   behind the base         → update the branch (GitHub "Update branch")
- *   its own CI failing      → run Fix CI
+ *   its own CI failing      → run Fix CI (*)
  *   unresolved review       → run Address review
  *   checks pending          → wait
  *   green and mergeable     → squash-merge (the repo's convention; pref
  *                             `merge_method` overrides)
+ *
+ * (*) A card whose pipeline has Build, Review and Finish steps gets no such
+ * follow-up — it would push a fix nobody reviewed. Its sign-off is withdrawn
+ * and its run goes back through Build → Review → Finish with the failure as
+ * context, then is signed off again the ordinary way (src/bun/merge-rework.ts,
+ * which also re-runs a job a runner broke instead of "fixing" it, and holds
+ * the card for the owner after `merge_queue_rework.maxRounds` rounds).
+ *
+ * Being behind the base never starts a fix: a green PR merges as it is or
+ * rides a train built on the latest base (whose CI tests the combination),
+ * and the branch is updated — a merge of the base made by GitHub, no agent
+ * and no edit — only when GitHub requires it or CI is failing on a base that
+ * has since fixed it.
  *
  * Each automatic step is taken at most once per PR head, and at most
  * {@link MAX_AUTO_STEPS} times per card before it's left for the user. A
@@ -25,6 +38,7 @@ import { mergeQueue, setMergeQueued } from "./merge-intent.ts";
 import { hasConfirmedNoPr, openPrDirectly, ownFailures, prAgent, prStatusForTask, PR_FIX_CI_ACTION, PR_REVIEW_ACTION, refreshPrsNow } from "./pr-watch.ts";
 import { getGitHubPullMergeability, mergeGitHubPull, updateGitHubPullBranch, setGitHubPullDraft } from "./github.ts";
 import { startFollowUp } from "./pipeline-followups.ts";
+import { noteBaseRed, pruneReworkState, reviewedReworkFor, reworkCiFailure, reworkConflict } from "./merge-rework.ts";
 
 export const MERGE_METHOD_PREF = "merge_method";
 const TICK_MS = 60_000;
@@ -47,6 +61,10 @@ export function nextMergeStep(
   pr: TaskPrStatus | null,
   mergeability: { mergeable: boolean | null; mergeableState: string } | null,
   noPrConfirmed = true,
+  /** The card's fixes go back through Build → Review → Finish
+   *  (`reviewedReworkFor`): a failure of its own is not worth a CI run on an
+   *  updated branch first — Build merges the base as part of the round. */
+  reviewed = false,
 ): MergeStep {
   if (task.column === "running") return { kind: "wait", why: "a fix-up step is running" };
   if (task.column === "blocked") return { kind: "wait", why: "blocked — see the card" };
@@ -70,7 +88,7 @@ export function nextMergeStep(
   // train rebuilds on the latest base anyway) — updating restarts its CI, and
   // with several PRs queued every merge would restart all the others.
   if (mergeability?.mergeableState === "behind") return { kind: "update-branch" };
-  if ((pr.behindBy ?? 0) > 0 && pr.checks === "failure") return { kind: "update-branch" };
+  if ((pr.behindBy ?? 0) > 0 && pr.checks === "failure" && !(reviewed && ownFailures(pr).length > 0)) return { kind: "update-branch" };
   if (pr.checks === "failure") {
     if (ownFailures(pr).length === 0) return { kind: "wait", why: `${pr.baseRef ?? "the base"} is failing the same checks` };
     return followUps ? { kind: "fix-ci" } : { kind: "needs-you", why: `PR #${pr.number} CI failing` };
@@ -106,7 +124,19 @@ function note(task: Task, text: string, tone: "info" | "success" | "warning" | "
 }
 
 async function take(task: Task, pr: TaskPrStatus | null, step: MergeStep): Promise<void> {
-  if (step.kind === "wait") return;
+  if (step.kind === "wait") {
+    // The base is failing this head's checks: not this card's failure. If the
+    // base recovers without a new commit, the jobs are re-run, not "fixed".
+    if (pr?.state === "open" && pr.checks === "failure" && ownFailures(pr).length === 0 && reviewedReworkFor(task)) noteBaseRed(task.id, pr.headSha);
+    return;
+  }
+  // A reviewed pipeline's fix goes back through Build → Review → Finish
+  // (src/bun/merge-rework.ts keeps its own once-per-head and per-card limits).
+  if ((step.kind === "fix-ci" || step.kind === "resolve-conflicts") && pr && reviewedReworkFor(task)) {
+    if (step.kind === "fix-ci") await reworkCiFailure(task, pr);
+    else await reworkConflict(task, pr);
+    return;
+  }
   if (step.kind === "needs-you") {
     note(task, `Can't merge yet: ${step.why}`, "warning");
     return;
@@ -260,6 +290,7 @@ export function departTrainNow(): Promise<{ train: { pr: number; url: string; me
 
 async function tick(now: number): Promise<void> {
   const list = tasks.listLive();
+  pruneReworkState(new Set(list.filter((t) => t.archivedAt == null && t.column !== "done").map((t) => t.id)));
   // In Ready to Merge → signed off. Withdrawing is the user's own move out
   // of the column (server.ts PATCH); a card the pipeline runner parked in In
   // Review / Blocked / Running while a follow-up step works keeps its
@@ -291,7 +322,7 @@ async function tick(now: number): Promise<void> {
       const m = await getGitHubPullMergeability({ dir: t.workdir, number: pr.number }).catch(() => null);
       if (m && m.ok) mergeability = { mergeable: m.mergeable, mergeableState: m.mergeableState };
     }
-    evals.push({ t, pr, mergeability, step: nextMergeStep(t, pr, mergeability, hasConfirmedNoPr(id)) });
+    evals.push({ t, pr, mergeability, step: nextMergeStep(t, pr, mergeability, hasConfirmedNoPr(id), !!reviewedReworkFor(t)) });
   }
 
   // A Fix CI step that blocked only because CI hadn't run yet (runners busy)

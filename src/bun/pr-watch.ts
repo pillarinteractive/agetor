@@ -89,6 +89,13 @@ export function prStatusForTask(taskId: string): TaskPrStatus | null {
   return statuses.get(taskId) ?? null;
 }
 
+/** Read this card's PR in full on the next pass, whatever its last answer
+ *  was: something just changed that no new head announces (failed jobs were
+ *  re-run, so "failure" is about to become "pending"). */
+export function invalidatePrStatus(taskId: string): void {
+  probed.delete(taskId);
+}
+
 /** Done cards already looked up once since startup — so a Done card whose PR
  *  merged before a restart (or that never had one) is asked about once, not
  *  every tick. */
@@ -587,6 +594,19 @@ async function maybeAutoFix(task: Task, pr: TaskPrStatus): Promise<void> {
   const { activeTrain } = await import("./merge-train.ts");
   if (activeTrain()?.members.some((m) => m.taskId === task.id)) return;
   const ledger = readLedger();
+  // A pipeline that reviews its own changes never gets a Fix CI step, which
+  // would push a fix nobody reviewed (src/bun/merge-rework.ts). A signed-off
+  // card is the merge queue's on its next pass; an unfinished run is its own
+  // steps' (Finish waits for CI and routes a failure back to Build); a
+  // finished one waiting in In Review goes back through Build here.
+  const { reviewedReworkFor, reworkCiFailure } = await import("./merge-rework.ts");
+  if (reviewedReworkFor(fresh)) {
+    const { isMergeQueued } = await import("./merge-intent.ts");
+    if (fresh.pipelineRun?.status !== "done" || fresh.column !== "review" || isMergeQueued(fresh.id)) return;
+    if (!shouldAutoFix(fresh, pr, { enabled: autoFixEnabled(fresh, preferences.get(PR_AUTOFIX_PREF)), ledger: {} })) return;
+    await reworkCiFailure(fresh, pr);
+    return;
+  }
   if (!shouldAutoFix(fresh, pr, { enabled: autoFixEnabled(fresh, preferences.get(PR_AUTOFIX_PREF)), ledger })) return;
   const fix = prFollowUpInstructions(PR_FIX_CI_ACTION, pr);
   const agent = prAgent();

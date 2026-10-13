@@ -9,9 +9,10 @@
  * suggestions only highlight a button.
  */
 import type { FollowUpAction, FollowUpPreset, Task } from "../shared/types.ts";
-import { agentProfiles, preferences } from "./db.ts";
+import { agentProfiles, preferences, tasks } from "./db.ts";
 import { runPipelineFollowUp } from "./pipeline-runner.ts";
-import { prFollowUpActions, prFollowUpInstructions, prStatusForTask } from "./pr-watch.ts";
+import { PR_FIX_CI_ACTION, prFollowUpActions, prFollowUpInstructions, prStatusForTask } from "./pr-watch.ts";
+import { reviewedReworkFor, reworkCiFailure } from "./merge-rework.ts";
 
 export const FOLLOW_UPS_PREF = "pipeline_followups";
 const MATCHED_SAMPLE = 3;
@@ -132,6 +133,20 @@ export async function startFollowUp(
   body: { presetId?: unknown; profileId?: unknown; request?: unknown },
 ): Promise<{ task: Task } | { error: string; status: 400 | 404 | 409 }> {
   const request = typeof body.request === "string" ? body.request.trim() : "";
+  // "Fix CI" on a pipeline that reviews its own changes is not a one-off
+  // step that pushes: the card goes back through Build → Review → Finish
+  // (src/bun/merge-rework.ts), whoever asked — the board, an agent, the queue.
+  if (body.presetId === PR_FIX_CI_ACTION) {
+    const task = tasks.get(parentId);
+    const pr = prStatusForTask(parentId);
+    if (task && pr && reviewedReworkFor(task)) {
+      const out = await reworkCiFailure(task, pr);
+      if (out.kind === "round" || out.kind === "rerun") return { task: tasks.get(parentId) ?? task };
+      const why = out.kind === "held" ? "it is held for you after its fix rounds ran out — sign it off again to allow more"
+        : out.kind === "error" ? out.error : out.why;
+      return { error: `this card's fixes go back through Build, Review and Finish, and that could not start: ${why}`, status: 409 };
+    }
+  }
   if (typeof body.presetId === "string" && body.presetId.startsWith("pr:")) {
     const pr = prFollowUpInstructions(body.presetId, prStatusForTask(parentId));
     if (!pr) return { error: "the pull request no longer needs that — refresh", status: 409 };
