@@ -4,7 +4,7 @@ import { preferences, runs, tasks, reservationTransaction } from './db.ts';
 import path from 'node:path';
 import { ciGated, ciSlots, currentSlots, isHeavyStep, setParkedOnRemoteProbe, slotDecision, slotUse, type SlotUse } from './step-slots.ts';
 import { canonicalIssue } from '../shared/canonical-roadmap.ts';
-import { awaitsFor, listAwaits, type AwaitRecord } from './awaits.ts';
+import { awaitsFor, isRemoteWait, listAwaits, type AwaitRecord } from './awaits.ts';
 import {heavyJobs, type HeavyJob} from './heavy-jobs.ts';
 import type {Task} from '../shared/types.ts';
 import { isQuotaPaused } from './usage-limit.ts';
@@ -32,12 +32,7 @@ function abandoned(c:RunnerClaim,isLive:(id:string)=>boolean):boolean {
 }
 export interface OwnerEvidence { cards:Task[]; awaits:AwaitRecord[]; jobs:HeavyJob[]; }
 const evidence=():OwnerEvidence=>({cards:tasks.listLive(),awaits:listAwaits(),jobs:heavyJobs()});
-/** An await that only watches remote work (`ci-wait` polls GitHub CI). It runs
- * nothing on this machine, so a step parked on it holds no agent slot, no
- * verification slot and no card-owner place: the wake-up takes those again. */
-export const isRemoteWait=(a:Pick<AwaitRecord,'cmd'>)=>/(^|[\s/])ci-wait(\s|$)/.test(a.cmd)
-  // The built-in Fix CI step waits with `gh pr checks N --watch`; `gh run watch` is the same thing for one run.
-  ||/(^|[\s/])gh\s+pr\s+checks\b.*\s--watch\b/.test(a.cmd)||/(^|[\s/])gh\s+run\s+watch\b/.test(a.cmd);
+export {isRemoteWait};
 const inside=(root:string,value:string)=>value===root||value.startsWith(root+path.sep);
 // Tell the slot accounting which cards are parked on remote waits only. One
 // read of the awaits per couple of seconds: slotUse asks for every card.
