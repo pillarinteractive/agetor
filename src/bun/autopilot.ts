@@ -481,7 +481,9 @@ export function reviewedPillarPipeline(t:Task,cfg:AutopilotConfig,pr:TaskPrStatu
     ||!t.pipelineId||t.pipelineParentId||!run||run.status!=='done'||(run.endedAt??0)<cfg.autoMergeSince
     ||!/^https:\/\/github\.com\/pillar-interactive\/pillar\/issues\/\d+\/?$/i.test(t.issueUrl??'')
     ||!/^https:\/\/github\.com\/pillar-interactive\/pillar\/pull\/\d+\/?$/i.test(t.prUrl??'')
-    ||pr?.url!==t.prUrl||pr.state!=='open'||pr.draft||pr.baseRef!=='develop'||!pr.headSha)return false;
+    // A draft is not a reason to hold an approved card: Build opens the PR as a draft so CI runs during
+    // Review, and the merge queue marks it ready (merge-queue.ts `mark-ready`).
+    ||pr?.url!==t.prUrl||pr.state!=='open'||pr.baseRef!=='develop'||!pr.headSha)return false;
   const review=graph?.steps.find(s=>s.name==='Review'),finish=graph?.steps.find(s=>s.name==='Finish');
   const profile=review?.agentProfileId?run.snapshot?.profiles[review.agentProfileId]:null;
   if(!review||!finish||profile?.model!=='gpt-6.1-sol')return false;

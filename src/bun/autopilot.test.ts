@@ -1022,7 +1022,9 @@ test('explicit Pillar lifecycle sign-off includes fresh manually created reviewe
  await signOffPass(state,[t],pass.deps,policy);expect(pass.log.signedOff).toEqual([t.id]);
  const held=signOffDeps({[t.id]:['x.ts']},{[t.id]:pr},{handsOff:()=>new Set([t.id])});
  await signOffPass(await roadmapState(),[t],held.deps,policy);expect(held.log.signedOff).toEqual([]);
- for(const bad of [{...pr,baseRef:'main'},{...pr,draft:true},{...pr,state:'closed' as const},{...pr,url:url+'/wrong'}])expect(reviewedPillarPipeline(t,policy,bad)).toBe(false);
+ for(const bad of [{...pr,baseRef:'main'},{...pr,state:'closed' as const},{...pr,url:url+'/wrong'}])expect(reviewedPillarPipeline(t,policy,bad)).toBe(false);
+ // Build opens the PR as a draft; an approved card moves on and the merge queue marks it ready.
+ expect(reviewedPillarPipeline(t,policy,{...pr,draft:true})).toBe(true);
  expect(reviewedPillarPipeline(t,{...policy,autoMergePipelines:false},pr)).toBe(false);
  expect(reviewedPillarPipeline(t,{...policy,autoMergeSince:300},pr)).toBe(false);
  expect(reviewedPillarPipeline({...t,pipelineRun:{...t.pipelineRun!,history:t.pipelineRun!.history.map((h,i)=>i===0?{...h,outcome:'advanced-manually'}:h)}},policy,pr)).toBe(false);

@@ -284,8 +284,10 @@ export function supersedeBlocksBefore(run: PipelineRunState, seq: number): strin
  */
 export { TRANSIENT_RETRY_MAX };
 /** Step-cap extensions an unattended run grants itself before it waits for a
- *  person: a 14-step run goes to 28, then 42, then stops. */
-export const AUTO_CAP_EXTENSIONS = 2;
+ *  person: a 14-step run goes to 28, then stops. Of 285 runs to date, 18
+ *  reached 14 steps and 2 went past 28; every extended run that ended, ended
+ *  done. One extension covers the long review cycles without funding a loop. */
+export const AUTO_CAP_EXTENSIONS = 1;
 const autoRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const launchRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const launchRecoveriesInFlight = new Set<string>();
@@ -1825,7 +1827,7 @@ async function launchStep(
   }
 
   // The step cap stops a run that goes round in circles. On an unattended
-  // board the first hits extend the allowance by themselves (the same
+  // board the first hit extends the allowance by itself (the same
   // extension a person's Retry grants); a run that uses those up as well is
   // the loop the cap exists for, and waits for someone.
   if (

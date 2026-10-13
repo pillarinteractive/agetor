@@ -85,16 +85,16 @@ const blockedRun = async (parentId: string) => {
   })).pipelineRun!;
 };
 
-test("unattended: the step cap extends itself twice, then waits for a person", async () => {
+test("unattended: the step cap extends itself once, then waits for a person", async () => {
   const { AUTO_CAP_EXTENSIONS } = await import("./pipeline-runner.ts");
   const { parentId } = await start(["A", "B"], "done", 2, true);
   const run = await blockedRun(parentId);
-  expect(AUTO_CAP_EXTENSIONS).toBe(2);
-  expect(run.capExtensions).toBe(2);
-  // 2 → 4 → 6 steps, then the loop is left for someone.
-  expect(run.stepCount).toBe(6);
+  expect(AUTO_CAP_EXTENSIONS).toBe(1);
+  expect(run.capExtensions).toBe(1);
+  // 2 → 4 steps, then the loop is left for someone.
+  expect(run.stepCount).toBe(4);
   expect(run.blocked.some((b) => b.kind === "step-cap")).toBe(true);
-  expect(activity(parentId).filter((l) => l.includes("continuing automatically up to")).length).toBe(2);
+  expect(activity(parentId).filter((l) => l.includes("continuing automatically up to")).length).toBe(1);
 });
 
 test("attended: the step cap still blocks at the cap", async () => {
