@@ -802,10 +802,92 @@ out: remove `steps` from the preference. After a rollback to a build without thi
 dropped by that build's reader (the step then reads as running with nothing live until the unsettled-step sweep
 settles it the old way), a record's `gate` is dropped, and the ledger file is left alone.
 
-Not done here: `Retry` does not re-run the checks before giving the step a turn (it gives a turn, then they run);
-position resolution, rewind and steer are Stage 3; the card's strip still colours a segment by a succeeded
-execution; `Review → Build` has no default `maxTraversals`; a `blocked` handoff is honoured as before without its
-checks being run.
+Not done here: the card's strip still colours a segment by a succeeded execution; `Review → Build` has no default
+`maxTraversals`; a `blocked` handoff is honoured as before without its checks being run. (Retry running the checks
+first, position resolution, rewind and feedback came with Stage 3, below.)
+
+## Position, rewind and feedback (`feat/check-gates-stage-3`)
+
+Stage 3 of `docs/plans/check-gated-pipeline.md`. **Only for a run with check gates** — one that adopted `publish` or
+`steps` and that `pipeline_gates` still names. Every other card restarts, retries and advances exactly as before, and
+the routes below answer 409 for it. `src/shared/position.ts` is the pure half (the walk, the void lines, the notes),
+`src/bun/position.ts` reads the worktree and the files, `src/bun/pipeline-runner.ts` acts.
+
+**The position** is the first step whose gate is not satisfied *now*. `resolvePosition` walks the run's forward path
+(`forwardPath`: from the start step, the edge that leads to a step not yet on the path — Review → Finish, not Review →
+Build; where a step has several, or may end the run itself, the one its last finished visit took) and a step is
+satisfied when all of these hold:
+
+| | Still satisfied when | Voided by |
+| --- | --- | --- |
+| every step | it has a finished visit (succeeded, or advanced by the owner) with a handoff, later than the visit that satisfied the step before it | an earlier step running again; a rewind |
+| a step with checks | each required check holds now: a **built-in is recomputed** from the worktree (`tree-clean`, `diff-nonempty`, …); `review-verdict` and `head-approved` are recomputed from the run's own records against HEAD; a **command check** needs a ledger pass for HEAD's commit, its tree and the check's definition that no later fail, waiver or void takes back. No command is ever run to find a position | a new commit (Review and everything after it: the verdict names another head); a dirty tree (Build); a changed check definition (that check); a rewind |
+| Understand (the start step, no gate) | **its earlier handoff is reused** when its prompt carries the card's goal as it is now, word for word, and no change of the card's issue contract was recorded after it finished (`autopilot_card_inputs_v1`, the digests `reconcileCardInputs` keeps for a dispatched card; a card with no such record is judged by the goal alone) | an edited goal; a changed issue body; a rewind to it |
+| a Finish Agetor ran | `run.publish.head` is HEAD and the pull request's `required` check passes for it when read now | a new commit; a failed or still-running check |
+
+A satisfied step whose visit sent the work **back** (Review, "changes requested" for this head; Finish, "verification
+failed") makes the step it named the position, with that visit as the arrival. A moved base voids only what is
+recomputed against it. **Changed instruction text voids nothing**: text is not evidence — use Rewind. A run whose
+`steps` gate is off but whose `publish` gate is on is judged by the default checks for Build and Review. A graph that
+fans out or joins has no position (`unsupported`), and restarts from the beginning.
+
+**Restart resumes.** `POST /tasks/:id/pipeline/restart` on a gated run re-snapshots the template (as a restart does)
+and launches the position's step with the handoff of the step before it. The run is the same run: history, step
+numbers, the ledger and the handoff files are kept, only what was still under way is stopped, and the step cap is
+raised just enough for the steps from there to the end. The answer carries
+`resumed: {stepId, stepName, why, kept: […]}`; the timeline says "Restarted. Resumes at Review — …; Understand, Build
+are still satisfied and are not run again". When everything is satisfied it refuses (409, "there is nothing to
+resume — rewind to a step to redo it, or restart from the beginning"). **From the beginning** is
+`{"fromScratch": true}` in the body (`agetor pipeline restart <task> --from-scratch`): history emptied, a new
+generation, the start step — what every restart was, and what an ungated run, a position on the start step or an
+`unsupported` graph still gets. `GET /tasks/:id/pipeline/position` reads the position without starting anything
+(`{gated, position, line, steps: [{id, name, reached}]}`), and a `{"gates": true}` refresh includes the same line as
+`position`.
+
+**Rewind.** `POST /tasks/:id/pipeline/rewind` with `{"stepId": "<step id>"}`
+(`agetor pipeline rewind <task> --to <step>`): the gate evidence of that step and of every step after it on the path
+is voided **by appending** `void` lines to the ledger — one per step with check id `(step)`, which voids its visits
+up to that step number, and one per check that had a result, with that result's key so a `skipWhen` pass is not reused
+either. Nothing in the ledger is rewritten. A Finish Agetor is holding is dropped (it verifies the head again from the
+start), whatever is running is stopped (its visit ends `cancelled` and stays in the history; its step row is
+archived), and the step is launched with the handoff of the step before it. **Git is never touched**: no reset, no
+branch change, nothing on the remote. The answer says what was voided and stopped and
+`unpushed: {count, head, remoteHead}` — the commits the remote does not have, as last fetched. A step the run has not
+reached (the step before it has no finished visit) is refused.
+
+**Feedback (steer).** `POST /tasks/:id/pipeline/feedback` with
+`{"fromStepId": "<step id>", "note": "…", "invalidate": false}`
+(`agetor pipeline feedback <task> --from <step> --note "…" | --note-file <file|-> [--invalidate]`): the note is
+appended to `<data dir>/pipeline-runs/<card>/feedback-<generation>.jsonl`, the run is reopened from that step as a
+rewind reopens it, and the step's next prompt gets `## Feedback from the owner` with the note — as does each later
+step's, until that step has finished a visit launched after the note (Build reads it once, then Review, then Finish;
+a later Build ↔ Review round does not repeat it). Without `invalidate` nothing is voided: it is a refinement, the
+prompt says so, and earlier results stand. With `invalidate` the evidence is voided exactly as a rewind voids it.
+The writer of an Agetor-run Finish and the wrap-up at the step cap never carry a note. At most 8,000 characters;
+the newest five notes that still apply are shown.
+
+**Retry runs the checks first.** The owner's Retry (`POST /tasks/:id/pipeline/retry`, the Retry buttons, the CLI) on
+a step that stopped with `check-failed` judges the turn it ended on again by checks run now — the settle that judged
+it the first time. They pass (the owner fixed the worktree, GitHub answers again): the run moves on with what the
+step handed off, and **no turn is spent**. One still fails: the step gets a check-feedback turn with the output,
+under a new allowance of `maxTurns`. A stop for any other reason, a visit launched without the gate, and every
+internal retry (the wait queue, automatic retries, the feedback fallback) are the ordinary retry, unchanged.
+
+**The run view** has, under Advanced run controls for a gated run: the position line; "Restart from <step>…" (asks,
+not destructive) beside "Restart from the beginning…" (the existing destructive confirmation); "Rewind to a step…"
+and "Send feedback from a step…", each a closed form that picks no step for you and sends nothing until its own
+button is pressed. The inspector's "Restart pipeline…" is unchanged and always means from the beginning.
+
+Sign-off marks: a restart that resumed, a rewind and feedback each mark a taken-back sign-off and a merge-queue hold
+as "reopened by the owner", so they lapse when the redone run finishes at a new head (see "A hold does not outlive
+its run" above).
+
+Not done here: a drag to Running / a plain Run on a stopped gated run is still the ordinary retry (only the Retry
+route runs the checks first); feedback to a step that is live is not sent into its session — it reopens the run from
+that step like any other (the step panel's message box still talks to a live step); a refinement visit gets the
+step's ordinary turn allowance, not a single turn; the card's strip still colours a segment by a succeeded execution,
+not by the position; fan-out and join graphs; and position resolution reads GitHub only for a Finish Agetor ran — an
+agent-run Finish is judged by its finished visit alone.
 
 ## Priority cards (`feat/priority-cards`)
 
