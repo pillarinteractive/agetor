@@ -16,7 +16,15 @@
  *      Done and closes its issue.
  *
  * If the train's CI fails (or a member changes, or it conflicts), the train is
- * disbanded: its PR closed, its members merged one by one as before.
+ * disbanded: its PR closed, its members handled one by one.
+ *
+ * The fresh rule (`merge_queue_fresh`, on unless "false"): a green PR merges
+ * by itself only when its checks are fresh — its head contains the base's
+ * tip, so CI tested what will land. A green PR that is behind the base rides
+ * a train instead, alone when it has no company (a train of one), and the
+ * members of a train whose CI failed are each re-tested as a train of one
+ * rather than merged on their old results. One extra CI run per lone stale
+ * PR; a failed train of N costs up to N more.
  *
  * State lives in preferences (`merge_train_state`, `merged_via_train`); config
  * in `merge_train` = {"enabled": true, "windowMin": 10, "max": 6}.
@@ -32,6 +40,20 @@ import { moveMergedTaskToDone } from "./orchestrator.ts";
 import { setMergeQueued } from "./merge-intent.ts";
 
 export const MERGE_TRAIN_PREF = "merge_train";
+/** "false" turns the fresh rule off: a green PR that is behind its base then
+ *  merges as it is, and a failed train's members merge one at a time. */
+export const MERGE_FRESH_PREF = "merge_queue_fresh";
+export function freshRuleOn(raw: string | null | undefined = preferences.get(MERGE_FRESH_PREF)): boolean {
+  return raw?.trim().toLowerCase() !== "false";
+}
+
+/** Whether a PR's green result is about what would land: its head contains
+ *  the base's tip, so the commit CI tested is the merge result whatever the
+ *  base was when the run started (a re-run tests the old merge commit, which
+ *  is why run times cannot answer this). Unknown distance counts as stale. Pure. */
+export function freshAgainstBase(pr: Pick<TaskPrStatus, "behindBy">): boolean {
+  return pr.behindBy === 0;
+}
 const STATE_PREF = "merge_train_state";
 const VIA_PREF = "merged_via_train";
 
@@ -118,9 +140,10 @@ export function manualTrainEligible(pr: TaskPrStatus | null, mergeability: { mer
   return true;
 }
 
-/** Should these ready cards leave now as a train? Pure. */
-export function shouldDepart(readySince: number[], cfg: TrainConfig, now: number): boolean {
-  if (!cfg.enabled || readySince.length < 2) return false;
+/** Should these ready cards leave now as a train? `min` is 1 for a lone
+ *  stale PR under the fresh rule. Pure. */
+export function shouldDepart(readySince: number[], cfg: TrainConfig, now: number, min = 2): boolean {
+  if (!cfg.enabled || readySince.length < Math.max(1, min)) return false;
   return readySince.length >= cfg.max || now - Math.min(...readySince) >= cfg.windowMin * 60_000;
 }
 
@@ -130,13 +153,17 @@ export function trainTitle(members: Pick<TrainMember, "pr">[]): string {
 
 export function trainBody(members: Pick<TrainMember, "pr" | "title">[], base: string): string {
   return [
-    `Merges ${members.length} signed-off pull requests into \`${base}\` as one batch, so CI runs once for all of them.`,
+    members.length === 1
+      ? `Re-tests one signed-off pull request on the latest \`${base}\` before it merges: its own checks ran against an older \`${base}\`.`
+      : `Merges ${members.length} signed-off pull requests into \`${base}\` as one batch, so CI runs once for all of them.`,
     "",
     ...members.map((m) => `- #${m.pr} — ${m.title}`),
     "",
     `Each PR is one squashed commit here, \`<title> (#n)\`. Agetor merges this PR with **rebase**, so \`${base}\` keeps one commit per PR, then closes the originals with a link back here and closes their issues.`,
     "",
-    "If CI fails, Agetor closes this train and merges the PRs one at a time instead.",
+    members.length === 1
+      ? "If CI fails, Agetor closes this train and the pull request is updated from the base so the failure shows on it."
+      : "If CI fails, Agetor closes this train and handles the PRs one at a time instead.",
   ].join("\n");
 }
 
@@ -148,8 +175,9 @@ async function prTitle(dir: string, n: number, fallback: string): Promise<string
 }
 
 /** Build, push and open a train for `ready` (all one project + base). Returns
- *  the train, or null when fewer than two PRs survived the squash. */
-export async function buildTrain(ready: { task: Task; pr: TaskPrStatus }[]): Promise<Train | null> {
+ *  the train, or null when fewer than `min` PRs survived the squash (two;
+ *  one for a train of one under the fresh rule). */
+export async function buildTrain(ready: { task: Task; pr: TaskPrStatus }[], min = 2): Promise<Train | null> {
   const project = ready[0]!.task.workdir;
   const base = ready[0]!.pr.baseRef ?? "develop";
   const id = Date.now().toString(36);
@@ -166,11 +194,11 @@ export async function buildTrain(ready: { task: Task; pr: TaskPrStatus }[]): Pro
       headSha: pr.headSha ?? null,
     })),
   );
-  const { members, dropped } = await assembleTrain(project, base, branch, dir, candidates);
+  const { members, dropped } = await assembleTrain(project, base, branch, dir, candidates, min);
   for (const d of dropped) {
-    recordActivity(d.member.taskId, { kind: "auto", text: `Left out of a merge train (${d.why}) — merging on its own`, tone: "muted" });
+    recordActivity(d.member.taskId, { kind: "auto", text: `Left out of a merge train (${d.why}) — ${freshRuleOn() ? "handled" : "merging"} on its own`, tone: "muted" });
   }
-  if (members.length < 2) {
+  if (members.length < Math.max(1, min)) {
     await git(["push", "--quiet", "--no-verify", "origin", "--delete", branch], project);
     return null;
   }
@@ -186,7 +214,9 @@ export async function buildTrain(ready: { task: Task; pr: TaskPrStatus }[]): Pro
     const cancelled = await cancelBranchRuns(project, m.branch).catch(() => 0);
     recordActivity(m.taskId, {
       kind: "auto",
-      text: `Joined merge train #${train.pr} with ${members.length - 1} other PR(s)${cancelled ? ` — cancelled ${cancelled} pending CI run(s) of its own so the train goes first` : ""}`,
+      text: members.length === 1
+        ? `Riding merge train #${train.pr} alone: its own checks ran against an older ${base}, so CI tests what will land before it merges (one extra CI run)`
+        : `Joined merge train #${train.pr} with ${members.length - 1} other PR(s)${cancelled ? ` — cancelled ${cancelled} pending CI run(s) of its own so the train goes first` : ""}`,
       tone: "info",
       url: train.url,
     });
@@ -198,7 +228,8 @@ export async function buildTrain(ready: { task: Task; pr: TaskPrStatus }[]): Pro
  * The git half of building a train: a branch from `origin/<base>` with each
  * candidate squashed into ONE commit "<title> (#n)", in order. A candidate
  * that conflicts with what's already on the train, or adds nothing, is
- * dropped. Pushes the branch when two or more made it. Exported for tests.
+ * dropped. Pushes the branch when `min` or more made it (two; one for a train
+ * of one). Exported for tests.
  */
 export async function assembleTrain(
   project: string,
@@ -206,6 +237,7 @@ export async function assembleTrain(
   branch: string,
   dir: string,
   candidates: TrainMember[],
+  min = 2,
 ): Promise<{ members: TrainMember[]; dropped: { member: TrainMember; why: string }[] }> {
   await git(["fetch", "--quiet", "origin", base, ...candidates.map((c) => c.branch)], project);
   const added = await git(["worktree", "add", "--quiet", "-B", branch, dir, `origin/${base}`], project);
@@ -233,7 +265,7 @@ export async function assembleTrain(
       const head = await git(["rev-parse", `origin/${c.branch}`], dir);
       members.push(head.ok && head.stdout.trim() ? { ...c, headSha: head.stdout.trim() } : c);
     }
-    if (members.length >= 2) {
+    if (members.length >= Math.max(1, min)) {
       // --no-verify: the repo's pre-push hook (lint, vet, tests) re-checks
       // changes each PR's CI already passed, and can fail on the machine's
       // load; the train's own CI is the check that counts.
@@ -247,11 +279,27 @@ export async function assembleTrain(
   return { members, dropped };
 }
 
-/** Members of a disbanded train merge one at a time — remembered per PR head,
- *  so a fresh push can ride a later train. */
+/** Members of a disbanded train are handled one at a time — remembered per
+ *  PR head, so a fresh push can ride a later train. Under the fresh rule
+ *  "one at a time" is a train of one for a PR behind its base. */
 const trainSkip = new Set<string>();
 export function skipsTrain(pr: TaskPrStatus): boolean {
   return trainSkip.has(`${pr.number}:${pr.headSha ?? ""}`);
+}
+/** Keep this PR head out of shared trains (it conflicts with the others). */
+export function markRidesAlone(pr: Pick<TaskPrStatus, "number" | "headSha">): void {
+  trainSkip.add(`${pr.number}:${pr.headSha ?? ""}`);
+}
+/** PR heads whose train of one failed CI: green alone, red on the latest
+ *  base. Another train would fail the same way; the merge queue updates the
+ *  branch so the failure shows on the PR itself. */
+const failedAlone = new Set<string>();
+export function trainFailedAlone(pr: Pick<TaskPrStatus, "number" | "headSha">): boolean {
+  return failedAlone.has(`${pr.number}:${pr.headSha ?? ""}`);
+}
+export function resetTrainMarksForTests(): void {
+  trainSkip.clear();
+  failedAlone.clear();
 }
 
 /**
@@ -320,14 +368,31 @@ export async function replaceTrain(t: Train): Promise<void> {
   clearTrain(t.id);
 }
 
-async function disband(t: Train, why: string, prs: Map<string, TaskPrStatus | null>): Promise<void> {
-  await closeGitHubPull({ dir: t.project, number: t.pr, comment: `Disbanding this merge train: ${why}. Agetor merges these PRs one at a time instead.` });
+/** What a member is told when its train disbands. Pure; exported for tests. */
+export function disbandNote(t: Pick<Train, "pr" | "members" | "base">, why: string, opts: { fresh: boolean; ciFailed: boolean }): string {
+  const head = `Merge train #${t.pr} disbanded (${why})`;
+  if (!opts.fresh) return `${head} — merging on its own`;
+  if (t.members.length === 1) {
+    return opts.ciFailed
+      ? `${head}: this PR passes alone but fails on the latest ${t.base} — updating its branch so the failure shows on the PR`
+      : `${head} — handled on its own`;
+  }
+  return opts.ciFailed
+    ? `${head} — each of its ${t.members.length} PRs is re-tested alone on the latest ${t.base} before it merges (up to ${t.members.length} more CI runs, one at a time)`
+    : `${head} — handled on its own (re-tested first if it is behind ${t.base})`;
+}
+
+async function disband(t: Train, why: string, prs: Map<string, TaskPrStatus | null>, ciFailed = false): Promise<void> {
+  const fresh = freshRuleOn();
+  await closeGitHubPull({ dir: t.project, number: t.pr, comment: `Disbanding this merge train: ${why}. Agetor ${fresh ? "handles" : "merges"} these PRs one at a time instead.` });
   await cancelBranchRuns(t.project, t.branch).catch(() => 0);
   await git(["push", "--quiet", "--no-verify", "origin", "--delete", t.branch], t.project);
   for (const m of t.members) {
     const pr = prs.get(m.taskId);
-    trainSkip.add(`${m.pr}:${pr?.headSha ?? m.headSha ?? ""}`);
-    recordActivity(m.taskId, { kind: "auto", text: `Merge train #${t.pr} disbanded (${why}) — merging on its own`, tone: "warning", url: t.url });
+    const key = `${m.pr}:${pr?.headSha ?? m.headSha ?? ""}`;
+    trainSkip.add(key);
+    if (fresh && ciFailed && t.members.length === 1) failedAlone.add(key);
+    recordActivity(m.taskId, { kind: "auto", text: disbandNote(t, why, { fresh, ciFailed }), tone: "warning", url: t.url });
   }
   clearTrain(t.id);
 }
@@ -397,7 +462,7 @@ export async function advanceTrain(t: Train, prs: Map<string, TaskPrStatus | nul
   if (!checks.ok) return "waiting";
   const { checks: state } = rollUpChecks(checks.checkRuns);
   if (state === "failure") {
-    await disband(t, "its CI failed", prs);
+    await disband(t, "its CI failed", prs, true);
     return "disbanded";
   }
   if (state !== "success") return "waiting";

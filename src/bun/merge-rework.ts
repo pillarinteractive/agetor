@@ -43,7 +43,7 @@ import { getGitHubPullChecks, rerunGitHubWorkflowRun, run as exec } from "./gith
 import { setMergeQueued } from "./merge-intent.ts";
 import { pipelineUpdateColumn } from "./orchestrator.ts";
 import { reworkPipelineRun } from "./pipeline-runner.ts";
-import { invalidatePrStatus, ownFailures } from "./pr-watch.ts";
+import { invalidatePrStatus, newestPerName, ownFailures } from "./pr-watch.ts";
 
 export const MERGE_REWORK_PREF = "merge_queue_rework";
 const STATE_PREF = "merge_queue_rework_state";
@@ -333,7 +333,7 @@ export const reworkDeps = {
   async failureDetails(task: Task, pr: TaskPrStatus): Promise<CiFailureDetails> {
     const own = ownFailures(pr);
     const live = await getGitHubPullChecks({ dir: task.workdir, number: pr.number });
-    const conclusions = new Map(live.ok ? live.checkRuns.map((r) => [r.name, r.conclusion] as const) : []);
+    const conclusions = new Map(live.ok ? newestPerName(live.checkRuns).map((r) => [r.name, r.conclusion] as const) : []);
     const checks: FailedCheck[] = own.map((c) => ({ name: c.name, url: c.url, conclusion: conclusions.get(c.name) ?? null, runId: runIdFromCheckUrl(c.url) }));
     const logs: CiFailureDetails["logs"] = [];
     for (const runId of [...new Set(checks.map((c) => c.runId).filter((n): n is number => n != null))].slice(0, 2)) {
