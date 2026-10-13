@@ -14,8 +14,16 @@
  * → epoch ms), so steps created while it lasts start on the backup directly
  * instead of failing on the limited harness first, and a core restart keeps
  * that. With no reset time in the limit message the window is 15 minutes.
+ *
+ * Optional early switch: `"atPercent": 92` moves new steps to the backup as
+ * soon as the harness's latest usage snapshot shows a meter at or above that
+ * percentage, instead of waiting for the limit message. `"meters"` names the
+ * meter ids that count (for example ["session", "weekly_all"]); without it
+ * every meter that is not scoped to one model counts. A meter whose reset
+ * time has passed is ignored, so steps return to the primary harness once
+ * the window resets. Steps already running are not moved.
  */
-import { harnesses, preferences } from "./db.ts";
+import { harnesses, harnessUsage, preferences } from "./db.ts";
 
 export const QUOTA_FALLBACK_PREF = "quota_fallback";
 export const QUOTA_FALLBACK_UNTIL_PREF = "quota_fallback_until";
@@ -26,6 +34,10 @@ export interface QuotaFallbackConfig {
   enabled: boolean;
   from: string[];
   harness: string;
+  /** Switch new steps to the backup at this usage percentage (1..100). */
+  atPercent?: number;
+  /** Meter ids that count toward `atPercent`; default: every unscoped meter. */
+  meters?: string[];
 }
 
 export function parseQuotaFallback(raw: string | null | undefined): QuotaFallbackConfig | null {
@@ -35,7 +47,9 @@ export function parseQuotaFallback(raw: string | null | undefined): QuotaFallbac
     const harness = typeof v.harness === "string" ? v.harness.trim() : "";
     const from = Array.isArray(v.from) ? v.from.filter((s: unknown): s is string => typeof s === "string" && !!s.trim()) : ["claude-code"];
     if (v.enabled !== true || !harness || from.length === 0) return null;
-    return { enabled: true, from, harness };
+    const atPercent = typeof v.atPercent === "number" && v.atPercent >= 1 && v.atPercent <= 100 ? v.atPercent : undefined;
+    const meters = Array.isArray(v.meters) ? v.meters.filter((s: unknown): s is string => typeof s === "string" && !!s.trim()) : [];
+    return { enabled: true, from, harness, ...(atPercent !== undefined ? { atPercent } : {}), ...(atPercent !== undefined && meters.length ? { meters } : {}) };
   } catch {
     return null;
   }
@@ -75,8 +89,25 @@ export function quotaLimited(agent: string, now: number = Date.now()): boolean {
   return (readUntil()[agent] ?? 0) > now;
 }
 
+/** Whether `agent`'s latest usage snapshot shows a counted meter at or above
+ *  the configured `atPercent`. False without a threshold, without a usable
+ *  snapshot, or when every such meter's window has already reset. */
+export function usageAtThreshold(agent: string, now: number = Date.now()): boolean {
+  const config = parseQuotaFallback(preferences.get(QUOTA_FALLBACK_PREF));
+  if (!config || config.atPercent === undefined) return false;
+  const snapshot = harnessUsage.get(agent);
+  if (!snapshot || snapshot.status !== "ok" || !Array.isArray(snapshot.meters)) return false;
+  return snapshot.meters.some((m) => {
+    if (!m || typeof m.usedPercent !== "number") return false;
+    if (config.meters ? !config.meters.includes(m.id) : !!m.scope) return false;
+    if (m.resetsAtMs != null && m.resetsAtMs <= now) return false;
+    return m.usedPercent >= config.atPercent!;
+  });
+}
+
 /** The harness a new step for `agent` should start on right now: the backup
- *  while a remembered limit lasts and a backup applies, otherwise `agent`. */
+ *  while a remembered limit lasts or usage is at the configured threshold,
+ *  and a backup applies; otherwise `agent`. */
 export function harnessDuringLimit(agent: string, now: number = Date.now()): string {
-  return quotaLimited(agent, now) ? (fallbackHarnessFor(agent) ?? agent) : agent;
+  return quotaLimited(agent, now) || usageAtThreshold(agent, now) ? (fallbackHarnessFor(agent) ?? agent) : agent;
 }
