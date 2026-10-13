@@ -53,6 +53,10 @@ reattaches to them. Roll back by quitting, moving the previous app from `~/.aget
 and restoring the database backup only if the new build ran a migration. A build that adds a migration makes the database
 unreadable by older builds, so call that out before installing.
 
+`install:local` installs the archive `build:local` last produced; it does not build. Run both, or the board keeps the
+old code. After the swap it prunes `~/.agetor/backups/` to the newest three app bundles and five database copies (a
+bundle a process still has as its working directory is kept), so a rollback reaches at most five installs back.
+
 ## Going upstream
 
 Ask the user before pushing a branch or opening a PR: both are public. Upstream PRs target `alamops/agetor` `main`, come
@@ -230,6 +234,10 @@ The top bar's sun button (`keepScreenOn` preference, off by default) also keeps 
 
 ## Knowing what each card is doing (`feat/board-clarity`)
 
+The status strip above the board (`SystemStrip`) and the filter row (`KanbanFilters`) are unmounted since 2026-10-13,
+ahead of a redesign of the cards and the card view. Both files remain. Search and the archived view were in the
+filter row, so the board has neither until the redesign.
+
 - **Status line** under every card title (`src/mainview/lib/card-status.ts`): the step and how long it's been running,
   what it waits on (lab, base-branch CI), the PR's state, or the result headline; ⓘ when it needs you.
 - **Needs you** (`src/mainview/components/kanban/NeedsYouBar.tsx`): a card that waits on the user says so on its own
@@ -325,6 +333,17 @@ suggestion rules are gone.
   outgoing edges that may also end the run by handing off `next: null`. Pillar's Finish uses it with a
   "verification failed" edge back to Fix (Bugfix) / Build (Feature), so a failing final check loops back instead of
   blocking (bounded by maxSteps).
+
+### An unattended run that reaches its step cap finishes once (`fix/step-cap-wrap-up`)
+
+A planner-recommendation run that reaches its step cap after the automatic extension is used no longer waits for a
+person. It launches the step the run ends through (`capWrapUpStep` in `src/shared/pipeline.ts`: the one step with no
+outgoing edge, or `canFinish`) in place of the requested step, with the same arrivals and an added prompt section
+(`capWrapUpSection`): publish as usual, do not hand back, file one GitHub issue per unresolved finding and list them
+in the PR, and say so when the head is published unapproved. `run.capWrapUp` records it; it happens once per run, and
+a second cap hit blocks with `step-cap` as before. Attended runs are unchanged. If the cap arrives on a launch of
+Build or Review, the head Finish publishes has not been approved; auto-merge still needs an approving Review for
+that head.
 
 ## Card dependencies (`feat/card-dependencies`)
 
@@ -489,6 +508,17 @@ So an unattended board keeps going:
   `/Applications/Agetor.app` when `~/.agetor/keepalive-enabled` exists, no app process is running and the last exit
   wasn't a quit the user approved (`~/.agetor/keepalive-quit`, written on an approved quit and cleared on launch). At
   most 5 reopens an hour. Off until `agetor keepalive on`.
+
+### Switching harness before the limit, and a notice that asks nothing
+
+`quota_fallback` preference, e.g. `{"enabled":true,"from":["claude-code"],"harness":"claude-deepseek","atPercent":92}`:
+new steps whose harness is in `from` launch on `harness` once a usage meter reaches `atPercent` (`usageAtThreshold`),
+instead of only after the limit is hit. Running steps are not moved.
+
+Claude Code shows a notice when its requests go through a gateway that has not adopted the auto-mode classifier
+billing change. It offers no choices and only waits for Enter. `gatewayBillingNoticeKey`
+(`src/bun/optional-claude-prompt.ts`) matches its exact sentences and sends Enter, with a timeline entry; anything
+else on screen is left for a person.
 
 ## Unfinished steps stay put; the next step gets the whole report (`feat/roadmap-autopilot`)
 
