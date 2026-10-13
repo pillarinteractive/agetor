@@ -97,6 +97,22 @@ describe("cardState — one case per state", () => {
     expect(state(task({ pipelineRun: slot }))).toMatchObject({ state: "queued", label: "Queued", reason: "Starts when a slot frees up", action: null, step: { name: "Build" } });
   });
 
+  test("Finish run by Agetor: waiting on CI, waiting on the base, and publishing, never Queued", () => {
+    const held = (publish: Record<string, unknown>) => task({ pipelineRun: run({
+      history: [rec(1, "understand"), rec(2, "build"), rec(3, "review")],
+      blocked: [{ taskId: null, stepId: "finish", kind: "await", message: "Agetor is running Finish" }],
+      publish: { stepId: "finish", tries: 0, carried: 0, ...publish },
+    } as never) });
+    const url = "https://github.com/o/r/pull/7";
+    expect(state(held({ state: "wait-ci", note: "Waiting for required on abc1234" }), { pr: pr({ url }) }))
+      .toMatchObject({ state: "waiting", label: "Waiting on CI", reason: "Waiting for required on abc1234", action: { kind: "view-pr", label: "Inspect CI" }, step: { name: "Finish" } });
+    expect(state(held({ state: "base-red", note: "develop fails required too" }), { pr: pr({ url }) }))
+      .toMatchObject({ state: "waiting", label: "Waiting on base", reason: "develop fails required too", action: { kind: "view-pr", label: "Inspect PR" } });
+    expect(state(held({ state: "push" }))).toMatchObject({ state: "working", label: "Publishing", action: null });
+    // An agent runs this visit as before: the ordinary rules apply.
+    expect(state(held({ state: "agent" })).label).not.toBe("Publishing");
+  });
+
   test("Working: an active step that is not parked; elapsed runs from its latest start", () => {
     const s = state(task({ pipelineRun: run(building) }));
     expect(s).toMatchObject({ kind: "working", state: "working", label: "Working", icon: "activity", reason: "Agent is working", elapsedMs: 2 * MIN, action: null, step: { id: "build", name: "Build", round: null } });

@@ -295,6 +295,20 @@ export function cardState(task: Task, ctx: CardStateContext): CardState {
   if (run) {
     if (run.status === "running") {
       const holds = lease.holds.length ? ` · holds ${lease.holds.join(", ")}` : "";
+      // Finish run by Agetor itself (src/shared/publish.ts): while it is held no
+      // step task exists, so say what Agetor is doing or waiting for.
+      const publish = run.publish;
+      if (publish && publish.state !== "agent" && run.active.length === 0) {
+        step = stepOf(run, publish.stepId);
+        const note = publish.note?.trim();
+        if (publish.state === "wait-ci" || publish.state === "classify") {
+          return make("waiting", "waiting-ci", "Waiting on CI", note || "Agetor is waiting for CI on the pull request", viewPr("Inspect CI"));
+        }
+        if (publish.state === "hold-base" || publish.state === "base-red" || publish.state === "refresh") {
+          return make("waiting", "awaiting", "Waiting on base", note || "The base branch fails the same check — Agetor re-tests when it passes", viewPr("Inspect PR"));
+        }
+        return make("working", "working", "Publishing", note || "Agetor is publishing the approved commit");
+      }
       // Steps queued for a free slot (src/bun/step-slots.ts): nothing is executing.
       const queued = run.blocked.filter((b) => b.kind === "slot-wait");
       if (queued.length > 0 && run.active.length === 0) {
