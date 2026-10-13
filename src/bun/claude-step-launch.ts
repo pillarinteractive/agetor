@@ -136,7 +136,7 @@ export function claudeStepArgsForTask(taskId: string): string[] {
     const usesSkills = (task.agentProfile?.skills?.length ?? 0) > 0;
     const parent = tasks.get(task.pipelineParentId);
     return claudeStepLaunchArgs(config, stepNameOfTask(task, parent), usesSkills,
-      parent?.pipelineRun?.snapshot?.decisionPolicy === "planner-recommendation");
+      !!parent?.pipelineRun?.snapshot?.decisionPolicy);
   } catch {
     return [];
   }

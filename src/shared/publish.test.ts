@@ -122,15 +122,15 @@ describe("decidePublish: one action from the state and what Agetor observed", ()
       obs: { state: "verify-head", dirty: ["src/a.ts"], head: HEAD, tree: "t", approval: { kind: "approved", headSha: APPROVED }, unreviewed: [] }, want: "to-build:dirty" },
     { name: "verify-head: a commit after the approval → Build", p: state("verify-head"),
       obs: { state: "verify-head", dirty: [], head: MERGED, tree: "t", approval: { kind: "approved", headSha: APPROVED }, unreviewed: ["c0ffee1 fix: late"] }, want: "to-build:unapproved-head" },
-    { name: "verify-head: the base Agetor merged in earlier is the approved head carried over", p: state("verify-head", { head: MERGED, carried: 1 }),
-      obs: { state: "verify-head", dirty: [], head: MERGED, tree: "t", approval: { kind: "approved", headSha: APPROVED }, unreviewed: ["m merge"] }, want: "advance:check-merge" },
+    { name: "verify-head: legacy carried approval cannot approve a different head", p: state("verify-head", { head: MERGED, carried: 1 }),
+      obs: { state: "verify-head", dirty: [], head: MERGED, tree: "t", approval: { kind: "approved", headSha: APPROVED }, unreviewed: ["m merge"] }, want: "to-build:unapproved-head" },
     { name: "verify-head: Review did not approve → Build", p: state("verify-head"),
       obs: { state: "verify-head", dirty: [], head: HEAD, tree: "t", approval: { kind: "not-approved", why: "its verdict is \"changes-requested\"" }, unreviewed: [] }, want: "to-build:not-approved" },
     { name: "verify-head: no reviewApproval at all → the agent runs Finish as before", p: state("verify-head"),
       obs: { state: "verify-head", dirty: [], head: HEAD, tree: "t", approval: { kind: "none" }, unreviewed: [] }, want: "agent" },
     // check-merge
     { name: "check-merge: the head already contains the base tip", p: state("check-merge"), obs: { state: "check-merge", baseTip: TIP, contains: true, merge: null }, want: "advance:hold-base" },
-    { name: "check-merge: the base moved, clean merge, same diff → Agetor merges it in", p: state("check-merge"), obs: { state: "check-merge", baseTip: TIP2, contains: false, merge: clean }, want: "merge-base" },
+    { name: "check-merge: the base moved, clean merge, same diff → Agetor merges it in", p: state("check-merge"), obs: { state: "check-merge", baseTip: TIP2, contains: false, merge: clean }, want: "advance:hold-base" },
     { name: "check-merge: conflicts → Build", p: state("check-merge"), obs: { state: "check-merge", baseTip: TIP2, contains: false, merge: { conflicts: ["a.ts"], samePatch: false, commit: null } }, want: "to-build:conflict" },
     { name: "check-merge: clean but the change's diff would differ → publish the approved head as it is", p: state("check-merge"),
       obs: { state: "check-merge", baseTip: TIP2, contains: false, merge: { conflicts: null, samePatch: false, commit: MERGED } }, want: "advance:hold-base" },
@@ -193,7 +193,7 @@ describe("decidePublish: one action from the state and what Agetor observed", ()
     { name: "base-red: the base passes it now → refresh, by itself", p: state("base-red", { inherited: ["web"] }), obs: { state: "base-red", baseTip: TIP2, baseCommits: [[check("web", "success")]] }, want: "advance:refresh" },
     { name: "base-red: one of two inherited jobs still fails → stay", p: state("base-red", { inherited: ["web", "lab"] }), obs: { state: "base-red", baseTip: TIP2, baseCommits: [[check("web", "success"), check("lab", "failure", 1, 2)]] }, want: "wait" },
     // refresh (owner decision 1)
-    { name: "refresh: the base moved, clean merge, same diff → Agetor merges it in", p: state("refresh"), obs: { state: "refresh", baseTip: TIP2, contains: false, merge: clean }, want: "merge-base" },
+    { name: "refresh: the base moved, clean merge, same diff → Agetor merges it in", p: state("refresh"), obs: { state: "refresh", baseTip: TIP2, contains: false, merge: clean }, want: "to-build:changed-diff" },
     { name: "refresh: the merge conflicts → Build, as today", p: state("refresh"), obs: { state: "refresh", baseTip: TIP2, contains: false, merge: { conflicts: ["a.ts"], samePatch: false, commit: null } }, want: "to-build:conflict" },
     { name: "refresh: the merge changes the change's own diff → Build, as today", p: state("refresh"), obs: { state: "refresh", baseTip: TIP2, contains: false, merge: { conflicts: null, samePatch: false, commit: MERGED } }, want: "to-build:changed-diff" },
     { name: "refresh: the base recovered with no new commit → re-run the failed jobs", p: state("refresh"), obs: { state: "refresh", baseTip: TIP, contains: true, merge: null }, want: "rerun:base-recovered" },
@@ -246,14 +246,7 @@ describe("applyPublish: an action's result folded into the state", () => {
     const failed = applyPublish(state("push", { tries: 1 }), { kind: "push" }, { ok: false, error: "remote: rejected\n  (hook declined)" }, NOW);
     expect(failed).toMatchObject({ state: "push", tries: 2, note: `the push failed (attempt 2 of ${PUBLISH_MAX_TRIES}): remote: rejected (hook declined)` });
   });
-  test("merging the base in: the published head becomes the merge and the approval is carried", () => {
-    const next = applyPublish(state("refresh"), { kind: "merge-base", commit: MERGED, baseTip: TIP2, then: "push" }, { ok: true, head: MERGED, tree: "f".repeat(40) }, NOW);
-    expect(next).toMatchObject({ state: "push", head: MERGED, approvedHead: APPROVED, carried: 1, baseTip: TIP2, tree: "f".repeat(40) });
-    expect(approvedHeadFor(next, MERGED)).toBe(APPROVED);
-    expect(approvedHeadFor(next, HEAD)).toBe(HEAD); // some other head is only itself
-    expect(approvedHeadFor(state("wait-ci"), HEAD)).toBe(HEAD);
-    expect(approvedHeadFor(undefined, HEAD)).toBe(HEAD);
-  });
+
   test("a re-run is remembered per head and reason, and the visit waits for CI again", () => {
     const next = applyPublish(state("classify"), { kind: "rerun", why: "infra", reason: "x" }, { ok: true }, NOW);
     expect(next).toMatchObject({ state: "wait-ci", reran: [{ head: HEAD, why: "infra", at: NOW }] });
@@ -303,7 +296,7 @@ describe("what Build, the writer and the pull request are told", () => {
   test("the evidence comment is Agetor's facts, and says when the approval was carried over", () => {
     const body = publishEvidenceComment(facts);
     expect(body).toContain(`Head: \`${MERGED}\``);
-    expect(body).toContain(`Approved by Review: \`${APPROVED}\`. Agetor merged \`origin/develop\` into it once`);
+    expect(body).toContain("Fresh independent review is required");
     expect(body).toContain("- web: success — https://ci/1");
     expect(publishEvidenceComment({ ...facts, head: APPROVED, carried: 0 })).toContain("the head published");
   });
@@ -313,7 +306,7 @@ describe("what Build, the writer and the pull request are told", () => {
     expect(brief).toContain("Do not push, commit, merge, rebase or amend");
     expect(brief).toContain('"next": null');
     expect(brief).toContain("https://github.com/o/r/pull/7");
-    expect(brief).toContain("with origin/develop merged in by Agetor");
+    expect(brief).toContain("Historical carry-over never grants approval");
   });
 });
 

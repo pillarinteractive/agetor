@@ -115,6 +115,17 @@ export async function cmdPipeline(args: string[], flags: Flags): Promise<void> {
       }
       return;
     }
+    case "edit": {
+      const ref = args[1], file = args[3];
+      if (!ref || args[2] !== "--file" || !file || args.length !== 4) throw new Error("usage: agetor pipeline edit <ref> --file <pipeline.json|->");
+      const parsed = parsePipelineFile(file === "-" ? await Bun.stdin.text() : readFileSync(file, "utf8"));
+      if (!parsed.ok) throw new Error(`invalid pipeline file: ${parsed.error}`);
+      const pipeline = await resolvePipeline(client, ref);
+      const updated = await client.updatePipeline(pipeline.id, parsed.input);
+      if (flags.json) return printJson(updated);
+      out(`${c.green("✓")} updated pipeline ${c.bold(updated.name)} — existing runs retain their frozen snapshot`);
+      return;
+    }
     case "import": {
       const file = args[1];
       if (!file) throw usageError("pipeline import");

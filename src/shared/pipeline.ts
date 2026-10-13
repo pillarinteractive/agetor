@@ -1332,17 +1332,9 @@ export function capWrapUpSection(input: { stepCap: number; issueUrl?: string | n
   const issue = input.issueUrl ? `this card's issue (${input.issueUrl})` : "this card's issue";
   const pr = input.prUrl ? `its pull request (${input.prUrl})` : "its pull request";
   return [
-    "## Step cap reached — wrap up this run",
-    `This run reached its ${input.stepCap}-step cap, so this is its last step. No earlier step will run again; ` +
-      "what is still open is handed to people as GitHub issues instead.",
-    "- Publish the branch as this step normally does (push it, and open or update the pull request). Do not merge it.",
-    "- Do not hand back to an earlier step: finish the run from here, whatever the incoming reports ask for.",
-    "- For every unresolved finding, failed check or blocker in the incoming reports, file one GitHub issue " +
-      `(\`gh issue create\`) that states the problem and the evidence, and references ${issue} and ${pr}.`,
-    "- List those issue numbers in the pull request description and in your handoff summary.",
-    "- If nothing is unresolved, say so in the pull request description and in the handoff, and file no issue.",
-    "Publishing here is not approval: if the incoming reports do not approve this exact head, say in the pull " +
-      "request description that it is published unapproved at the step cap.",
+    "## Step cap reached — this run is parked",
+    `The ${input.stepCap}-step allowance is exhausted. Preserve unresolved findings and evidence for ${issue}${pr ? ` and ${pr}` : ""}.`,
+    "Do not publish, approve, defer blockers or mark acceptance complete. Wait for an explicit retry allowance.",
   ].join("\n");
 }
 
@@ -1702,8 +1694,8 @@ export function composeStepPrompt(input: {
   }
 
   parts.push("## Delegation");
-  // Codex has no subagent tool; a persona list there would only invite the
-  // agent to emulate one on its own (expensive) model.
+  // The runner knows Claude's Agent delegation protocol. Other harnesses
+  // investigate directly until their delegation capabilities are supported.
   const canDelegate = !input.parentHarnessKind || input.parentHarnessKind === "claude-code";
   if (input.subagentProfiles.length > 0 && canDelegate) {
     parts.push(
@@ -1739,7 +1731,7 @@ export function composeStepPrompt(input: {
       );
     }
   } else {
-    parts.push("Do not spawn subagents for this step.");
+    parts.push("Do not spawn subagents for this step. Any Scout delegation requested elsewhere is conditional on supported tools and this step\'s permission; investigate directly with narrow reads instead.");
   }
 
   parts.push("## Working economically");

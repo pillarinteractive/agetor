@@ -1678,3 +1678,23 @@ test("cmdPipeline handoff: prints the picked step's full report; --json returns 
   currentClient = makeClient({ listTasks: async () => [stepTask] });
   await expect(cmdPipeline(["handoff", "step-task-9"], flags)).rejects.toThrow("target that id instead");
 });
+
+test("edit updates the same template without creating a pipeline", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "agetor-policy-edit-"));
+  try {
+    const file = path.join(dir, "pipeline.json");
+    const pipeline = makePipeline({ graph: twoStepGraph() });
+    const payload = { name: pipeline.name, description: pipeline.description, graph: pipeline.graph, maxSteps: pipeline.maxSteps };
+    payload.graph.steps[0]!.instructions = "New current instructions";
+    const { writeFileSync } = await import("node:fs");
+    writeFileSync(file, JSON.stringify(payload));
+    let received: unknown;
+    currentClient = makeClient({ listPipelines: async () => [pipeline], updatePipeline: async (id, input) => {
+      expect(id).toBe(pipeline.id); received = input; return { ...pipeline, ...input };
+    } });
+    await cmdPipeline(["edit", pipeline.id, "--file", file], jsonFlags);
+    expect(received).toMatchObject(payload);
+    expect(jsonOutputs[0]).toMatchObject({ id: pipeline.id });
+    await expect(cmdPipeline(["edit", pipeline.id], jsonFlags)).rejects.toThrow("usage:");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

@@ -1383,11 +1383,11 @@ describe("capWrapUpStep / capWrapUpSection", () => {
 
   test("the section names the cap, the issue and the pull request", () => {
     const text = capWrapUpSection({ stepCap: 34, issueUrl: "https://example.test/issues/7", prUrl: "https://example.test/pull/9" });
-    expect(text.startsWith("## Step cap reached — wrap up this run\n")).toBe(true);
-    expect(text).toContain("reached its 34-step cap");
-    expect(text).toContain("`gh issue create`");
+    expect(text.startsWith("## Step cap reached — this run is parked\n")).toBe(true);
+    expect(text).toContain("34-step allowance is exhausted");
+    expect(text).toContain("Do not publish, approve, defer blockers");
     expect(text).toContain("this card's issue (https://example.test/issues/7) and its pull request (https://example.test/pull/9)");
-    expect(capWrapUpSection({ stepCap: 34, issueUrl: null })).toContain("references this card's issue and its pull request.");
+    expect(capWrapUpSection({ stepCap: 34, issueUrl: null })).toContain("Wait for an explicit retry allowance.");
   });
 });
 

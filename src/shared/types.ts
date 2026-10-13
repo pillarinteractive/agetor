@@ -820,7 +820,7 @@ export interface PipelineRunSnapshot {
   profiles: Record<string, AgentProfileSnapshot>;
   capturedAt: number;
   /** Explicit project opt-in; instructions only, never an action approval. */
-  decisionPolicy?: "planner-recommendation";
+  decisionPolicy?: "planner-recommendation" | "agent-followups";
   /** Check gates this run adopted (`pipeline_gates`, src/shared/publish.ts):
    *  captured when the run starts, or on an explicit refresh — never by
    *  itself. `publish`: the pipeline's Finish step is run by Agetor. `steps`:
@@ -992,13 +992,8 @@ export interface PipelineRunState {
    *  effectiveStepCap} in `src/shared/pipeline.ts`. Undefined/0 before the
    *  first extension. */
   capExtensions?: number;
-  /** Set once an unattended run reached its step cap with its automatic
-   *  extension used up and was finished through its terminal step instead
-   *  of blocking (`capWrapUpStep`; see `launchStep` in
-   *  src/bun/pipeline-runner.ts). `fromStepId` is the step whose launch hit
-   *  the cap; `seq` is the wrap-up execution, absent until its step task
-   *  exists (a launch still queued for a slot has none yet). One per run:
-   *  the cap blocks as usual after it. */
+  /** Historical wrap-up metadata, retained for inspection only. It grants
+   * no allowance, publication permission or gate exemption. */
   capWrapUp?: { at: number; fromStepId: string; seq?: number };
   /** An automatic retry of a step that failed for a reason a person can't
    *  fix — a usage limit (`quota`: waits for the reset, never gives up) or a

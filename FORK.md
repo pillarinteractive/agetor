@@ -4,6 +4,10 @@ This checkout is `pillarinteractive/agetor`, a fork of `alamops/agetor`. The sam
 Agetor, so a change here can reach a board that is running real agents. Follow this workflow; it keeps development and
 the live board apart.
 
+# Current instruction policy (2026-10-13)
+
+See [the reviewed pipeline policy](docs/plans/instruction-policy.md). Review is read-only; Finish publishes the exact approved SHA after selected local verification and required CI; caps park instead of publishing wrap-ups. Pillar uses agent-managed, deduplicated issues per decision. This policy supersedes historical descriptions below of automatic cap extensions, approval carried across merges, and CI-only publication verification.
+
 ## Layout
 
 | Where | Data | What it's for |

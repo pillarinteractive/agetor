@@ -342,50 +342,13 @@ describe("a red base", () => {
     gh.checks.set(fixed, GREEN);
     await publishCard(card.id, later);
 
-    // Owner decision 1: Agetor merged the base in — clean, the change's own
-    // diff unchanged — pushed that, and Review's approval carries over.
-    const run = runOf(card);
-    const merged = await repos.remote("claude/x");
-    expect(merged).not.toBe(repos.head);
-    expect(run.publish).toMatchObject({ state: "wait-ci", head: merged, approvedHead: repos.head, carried: 1, baseTip: fixed });
-    expect((await sh(repos.repo, "git", "rev-list", "--parents", "-n", "1", merged!)).split(" ")).toEqual([merged!, repos.head, fixed]);
-    expect(await sh(repos.repo, "git", "diff", "--name-only", `${fixed}...${merged}`)).toBe("a.txt\nfeature.txt");
-    expect(await sh(repos.repo, "git", "status", "--porcelain")).toBe("");
-    expect(await sh(repos.repo, "git", "rev-parse", "HEAD")).toBe(merged!);
-    expect(await repos.remote("develop")).toBe(fixed);
-    expectNothingSpent(card);
-
-    // Green on the merged head: finished. The approval Autopilot checks is
-    // the head Review saw, which the published head carries.
-    gh.checks.set(merged!, GREEN);
-    await publishCard(card.id, later + MIN);
-    expect(stateOf(card)).toBe("write");
-    expect(gh.comments[0]).toContain(`Approved by Review: \`${repos.head}\`. Agetor merged \`origin/develop\` into it once`);
-  }, 120_000);
-
-  test("the base recovers without a new commit: the failed jobs are re-run once, nothing is pushed", async () => {
-    const repos = await makeRepos();
-    fakeGitHub(repos);
-    const card = makeCard(repos.repo, approvalHandoff(repos.head));
-    await publishCard(card.id, T0);
-    gh.checks.set(repos.head, RED);
-    gh.checks.set(repos.baseTip, RED);
-    await publishCard(card.id, T0 + MIN);
-    expect(stateOf(card)).toBe("base-red");
-
-    gh.checks.set(repos.baseTip, [...RED, check("web", "success", 9, 3), check("required", "success", 9, 4)]);
-    await publishCard(card.id, T0 + 10 * MIN);
-    expect(runOf(card).publish).toMatchObject({ state: "wait-ci", head: repos.head, carried: 0, reran: [{ head: repos.head, why: "base-recovered", at: T0 + 10 * MIN }] });
-    expect(gh.reruns.sort()).toEqual([9001, 9002]);
-    expect(await repos.remote("claude/x")).toBe(repos.head);
-    expectNothingSpent(card);
-
-    // The re-run fails again while the base passes: now it is the change's own.
-    await publishCard(card.id, T0 + 20 * MIN);
+    // A recovered base is merged by Build, then independently reviewed.
     const run = runOf(card);
     expect(run.publish).toBeUndefined();
-    expect(run.history.at(-1)).toMatchObject({ stepId: card.finish.id, outcome: "succeeded", nextStepIds: [card.build.id] });
-    expect(gh.reruns).toHaveLength(2);
+    expect(run.history.at(-1)!.handoff!.summary).toContain("Finish never merges");
+    expect(await repos.remote("claude/x")).toBe(repos.head);
+    expect(await sh(repos.repo, "git", "rev-parse", "HEAD")).toBe(repos.head);
+
   }, 60_000);
 
   test("the recovered base conflicts with the change: back to Build with the files, as today", async () => {
@@ -443,10 +406,10 @@ describe("the base moved before the first push", () => {
     const moved = await repos.moveBase("z.txt", "base, moved\n");
     const card = makeCard(repos.repo, approvalHandoff(repos.head));
     await publishCard(card.id, T0);
-    const pushed = await repos.remote("claude/x");
-    expect(runOf(card).publish).toMatchObject({ state: "wait-ci", head: pushed, approvedHead: repos.head, carried: 1, baseTip: moved });
-    expect((await sh(repos.repo, "git", "rev-list", "--parents", "-n", "1", pushed!)).split(" ")).toEqual([pushed!, repos.head, moved]);
-    expect(gh.opened[0]!.title).toBe("feat: the change"); // named after the change, not the merge
+    expect(await repos.remote("claude/x")).toBe(repos.head);
+    expect(runOf(card).publish).toMatchObject({ state: "wait-ci", head: repos.head, approvedHead: repos.head, carried: 0, baseTip: moved });
+    expect(await sh(repos.repo, "git", "rev-parse", "HEAD")).toBe(repos.head);
+    expectNothingSpent(card);
   }, 60_000);
 
   test("a conflict goes to Build before anything is pushed", async () => {
@@ -673,7 +636,7 @@ test("the draft description never says Fixes: that is the writer's to decide", (
   expect(publishDraftBody(null, null)).not.toContain("#");
 });
 
-test("automatic sign-off accepts the head Agetor carried the approval over to, and no other", () => {
+test("automatic sign-off rejects legacy carried approval for a different head", () => {
   const approved = "a".repeat(40), merged = "c".repeat(40);
   const review = newStep({ name: "Review", agentProfileId: "rev" });
   const finish = newStep({ name: "Finish", agentProfileId: "fin" });
@@ -695,7 +658,7 @@ test("automatic sign-off accepts the head Agetor carried the approval over to, a
   const carried = { ...initialPublishState(finish.id, 0), state: "write" as const, approvedHead: approved, head: merged, carried: 1 };
   expect(reviewedPillarPipeline(card(undefined), cfg, pr(approved))).toBe(true);
   expect(reviewedPillarPipeline(card(undefined), cfg, pr(merged))).toBe(false);
-  expect(reviewedPillarPipeline(card(carried), cfg, pr(merged))).toBe(true);
+  expect(reviewedPillarPipeline(card(carried), cfg, pr(merged))).toBe(false);
   expect(reviewedPillarPipeline(card(carried), cfg, pr("d".repeat(40)))).toBe(false);
   expect(reviewedPillarPipeline(card({ ...carried, carried: 0 }), cfg, pr(merged))).toBe(false);
 });
@@ -742,3 +705,44 @@ test("the writer: the step's agent gets the brief in place of Finish's instructi
     await deleteTask(card.id).catch(() => undefined);
   }
 }, 60_000);
+
+test("local verification failure returns to Build without publishing", async () => {
+  const repos = await makeRepos();
+  fakeGitHub(repos);
+  const card = makeCard(repos.repo, approvalHandoff(repos.head));
+  publishDeps.verify = async () => ({ ok: false, error: "named regression failed" });
+  await publishCard(card.id, T0);
+  expect(await repos.remote("claude/x")).toBeNull();
+  expect(await sh(repos.repo, "git", "rev-parse", "HEAD")).toBe(repos.head);
+  expect(runOf(card).publish).toBeUndefined();
+  expect(runOf(card).history.at(-1)!.handoff!.summary).toContain("named regression failed");
+});
+
+test("verification cannot mutate the reviewed head and publish it", async () => {
+  const repos = await makeRepos();
+  fakeGitHub(repos);
+  const card = makeCard(repos.repo, approvalHandoff(repos.head));
+  publishDeps.verify = async () => {
+    writeFileSync(path.join(repos.repo, "feature.txt"), "unreviewed change");
+    await sh(repos.repo, "git", "add", "feature.txt");
+    await sh(repos.repo, "git", "commit", "-qm", "fix: unreviewed");
+    return { ok: true };
+  };
+  await publishCard(card.id, T0);
+  expect(await repos.remote("claude/x")).toBeNull();
+  expect(runOf(card).history.at(-1)!.handoff!.summary).toContain("changed during selected verification");
+});
+
+test("cancellation during selected verification prevents publication", async () => {
+  const repos = await makeRepos();
+  fakeGitHub(repos);
+  const card = makeCard(repos.repo, approvalHandoff(repos.head));
+  publishDeps.verify = async () => {
+    const run = runOf(card);
+    tasks.setPipelineRun(card.id, { ...run, status: "cancelled" });
+    return { ok: true };
+  };
+  await publishCard(card.id, T0);
+  expect(await repos.remote("claude/x")).toBeNull();
+  expect(runOf(card).status).toBe("cancelled");
+});
