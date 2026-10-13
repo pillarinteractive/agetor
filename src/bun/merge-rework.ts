@@ -86,6 +86,11 @@ export interface ReworkEntry {
   baseRed?: string;
   /** Held for the owner: no more rounds, and Autopilot leaves it in In Review. */
   held?: boolean;
+  /** The run the hold is about (`PipelineRunState.startedAt`), and whether
+   *  the owner reopened that run since: a hold does not outlive its run
+   *  (`signOffMarkLapsed`). Absent on a hold recorded by an older build. */
+  heldRun?: number;
+  reopened?: boolean;
 }
 
 function readState(): Record<string, ReworkEntry> {
@@ -103,6 +108,8 @@ function readState(): Record<string, ReworkEntry> {
         ...(rerun && typeof rerun.head === "string" && typeof rerun.at === "number" ? { rerun: { head: rerun.head, at: rerun.at } } : {}),
         ...(typeof e.baseRed === "string" ? { baseRed: e.baseRed } : {}),
         ...(e.held === true ? { held: true } : {}),
+        ...(typeof e.heldRun === "number" && Number.isFinite(e.heldRun) ? { heldRun: e.heldRun } : {}),
+        ...(e.reopened === true ? { reopened: true } : {}),
       };
     }
     return out;
@@ -131,6 +138,23 @@ export function reworkHeld(): string[] {
 /** The owner signed the card off by hand: a fresh allowance of rounds. */
 export function noteOwnerSignOff(taskId: string): void {
   if (readState()[taskId]) writeEntry(taskId, null);
+}
+
+/** What a card's hold is about, for `signOffMarkLapsed`; null when it is not
+ *  held. A hold from a build that did not record its run is given `run` (the
+ *  card's run as it is now) the first time it is asked about. */
+export function reworkHoldMark(taskId: string, run: number | null): { run: number | null; head: string | null; reopened?: boolean } | null {
+  const entry = readState()[taskId];
+  if (!entry?.held) return null;
+  if (entry.heldRun === undefined && run != null) writeEntry(taskId, { ...entry, heldRun: run });
+  return { run: entry.heldRun ?? run, head: entry.lastHead ?? null, ...(entry.reopened ? { reopened: true } : {}) };
+}
+
+/** The owner sent the held card's run back through its steps (a restart from
+ *  a step, a rewind, feedback): the hold is about a run that is being redone. */
+export function noteRunReopened(taskId: string): void {
+  const entry = readState()[taskId];
+  if (entry?.held && !entry.reopened) writeEntry(taskId, { ...entry, reopened: true });
 }
 
 /** Forget cards that are gone (merged, archived, deleted). */
@@ -393,7 +417,9 @@ function say(taskId: string, text: string, tone: "info" | "warning" | "danger" |
  *  withdrawn, for the owner. Says so once. */
 function hold(task: Task, pr: Pick<TaskPrStatus, "number">, entry: ReworkEntry, what: string, why: string): ReworkOutcome {
   if (entry.held) return { kind: "held" };
-  writeEntry(task.id, { ...entry, held: true });
+  const heldRun = tasks.get(task.id)?.pipelineRun?.startedAt ?? task.pipelineRun?.startedAt;
+  const { reopened: _reopened, ...rest } = entry;
+  writeEntry(task.id, { ...rest, held: true, ...(heldRun != null ? { heldRun } : {}) });
   setMergeQueued(task.id, false);
   if (tasks.get(task.id)?.column === "merge") pipelineUpdateColumn(task.id, null, "review");
   say(
