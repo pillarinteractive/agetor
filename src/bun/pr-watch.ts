@@ -656,6 +656,14 @@ export function prFollowUpInstructions(actionId: string, pr: TaskPrStatus | null
   const push =
     "Commit the fixes (conventional commits) and push them to this task's branch so the PR updates — " +
     "never force-push and never push to main or develop. Put the PR URL in the handoff artifacts.";
+  // These steps run with nobody watching: say what needs no permission, so a
+  // step doesn't stop the card to ask for it.
+  const standing =
+    "\n\nYou need no permission for any of this: pushing to this task's own branch, re-running a cancelled or flaky " +
+    "CI workflow (`gh run rerun <run-id>`), or merging the base branch into this branch to clear a conflict. Never hand " +
+    "off as blocked to ask for those, and never wait for someone to confirm a routine choice: take the option you judge " +
+    "best, say so in the handoff, and carry on. Hand off as blocked only for missing credentials or access, a destructive " +
+    "or irreversible action, or anything that touches main, a release or production.";
   const own = ownFailures(pr);
   if (actionId === PR_FIX_CI_ACTION && pr.checks === "failure" && own.length > 0) {
     const list = own.map((c) => `- ${c.name}${c.url ? ` (${c.url})` : ""}`).join("\n");
@@ -668,15 +676,16 @@ export function prFollowUpInstructions(actionId: string, pr: TaskPrStatus | null
       instructions:
         `CI is failing on pull request #${pr.number} (${pr.url}). Failing checks this PR caused:\n${list}${inheritedNote}\n\n` +
         "Read the failing logs (`gh pr checks " + pr.number + "`, `gh run view <run-id> --log-failed`), find the root cause, " +
-        "and fix it with the smallest correct change. Reproduce only the failing check locally (its command from the CI log or " +
-        "AGENTS.md), then run the project's scoped check (`python3 .github/scripts/verify_changed.py --if-needed` in Pillar) — " +
-        "not the whole suite; CI re-runs everything when you push. " +
+        "and fix it with the smallest correct change. Reproduce only the one failing test locally when that helps (its command " +
+        "from the CI log); don't run whole suites, lint, type checks or builds here — CI runs everything when you push. " +
+        "A check that was cancelled, or failed before its steps ran, is not a code failure: re-run it. " +
         "If a failure is unrelated to this branch (flaky or infrastructure), say so with evidence instead of changing code. " +
         push +
         // CI that hasn't run yet (runners busy, queued) is a wait, not a block.
         "\n\nAfter you push, or whenever CI is queued or still running, don't hand off as blocked: wait for it with " +
         "`~/.agetor/bin/agetor-await \"CI for PR #" + pr.number + "\" -- gh pr checks " + pr.number + " --watch --interval 60` " +
-        "and end your turn. Agetor wakes you when the checks finish; then hand off on the actual result.",
+        "and end your turn. Agetor wakes you when the checks finish; then hand off on the actual result." +
+        standing,
     };
   }
   if (actionId === PR_REVIEW_ACTION && pr.unresolvedThreads > 0) {
@@ -686,10 +695,11 @@ export function prFollowUpInstructions(actionId: string, pr: TaskPrStatus | null
         `Pull request #${pr.number} (${pr.url}) has ${pr.unresolvedThreads} unresolved review thread(s). ` +
         "Read them (`gh pr view " + pr.number + " --comments`, and `gh api repos/{owner}/{repo}/pulls/" + pr.number + "/comments` " +
         "for line comments). Address each: change the code where the reviewer is right, or reply on the thread explaining why " +
-        "not (`gh api` / `gh pr comment`). Don't resolve threads yourself — the reviewer does. Verify only what you changed " +
-        "(`python3 .github/scripts/verify_changed.py --if-needed` in Pillar); CI runs the rest when you push. " +
+        "not (`gh api` / `gh pr comment`). Don't resolve threads yourself — the reviewer does. Don't run whole suites, lint, " +
+        "type checks or builds here; CI verifies the change when you push. " +
         push +
-        " In the handoff, list each thread and what you did about it.",
+        " In the handoff, list each thread and what you did about it." +
+        standing,
     };
   }
   return null;

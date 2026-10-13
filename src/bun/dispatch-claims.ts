@@ -2,7 +2,7 @@
 import { randomUUID } from 'node:crypto';
 import { preferences, runs, tasks, reservationTransaction } from './db.ts';
 import path from 'node:path';
-import { ciGated, ciSlots, currentSlots, isHeavyStep, slotDecision, slotUse, type SlotUse } from './step-slots.ts';
+import { ciGated, ciSlots, currentSlots, isHeavyStep, setParkedOnRemoteProbe, slotDecision, slotUse, type SlotUse } from './step-slots.ts';
 import { canonicalIssue } from '../shared/canonical-roadmap.ts';
 import { awaitsFor, listAwaits, type AwaitRecord } from './awaits.ts';
 import {heavyJobs, type HeavyJob} from './heavy-jobs.ts';
@@ -35,8 +35,21 @@ const evidence=():OwnerEvidence=>({cards:tasks.listLive(),awaits:listAwaits(),jo
 /** An await that only watches remote work (`ci-wait` polls GitHub CI). It runs
  * nothing on this machine, so a step parked on it holds no agent slot, no
  * verification slot and no card-owner place: the wake-up takes those again. */
-export const isRemoteWait=(a:Pick<AwaitRecord,'cmd'>)=>/(^|[\s/])ci-wait(\s|$)/.test(a.cmd);
+export const isRemoteWait=(a:Pick<AwaitRecord,'cmd'>)=>/(^|[\s/])ci-wait(\s|$)/.test(a.cmd)
+  // The built-in Fix CI step waits with `gh pr checks N --watch`; `gh run watch` is the same thing for one run.
+  ||/(^|[\s/])gh\s+pr\s+checks\b.*\s--watch\b/.test(a.cmd)||/(^|[\s/])gh\s+run\s+watch\b/.test(a.cmd);
 const inside=(root:string,value:string)=>value===root||value.startsWith(root+path.sep);
+// Tell the slot accounting which cards are parked on remote waits only. One
+// read of the awaits per couple of seconds: slotUse asks for every card.
+let awaitsCache:{at:number;list:AwaitRecord[]}|null=null;
+const recentAwaits=()=>{const now=Date.now();if(!awaitsCache||now-awaitsCache.at>2_000)awaitsCache={at:now,list:listAwaits()};return awaitsCache.list;};
+export function parkedOnRemoteOnly(card:Pick<Task,'worktreePath'>,awaits:AwaitRecord[]=recentAwaits()):boolean {
+  if(!card.worktreePath)return false;
+  const root=path.resolve(card.worktreePath);
+  const outstanding=awaits.filter(a=>!a.finished&&!a.notified&&!!a.cwd&&inside(root,path.resolve(a.cwd)));
+  return outstanding.length>0&&outstanding.every(isRemoteWait);
+}
+setParkedOnRemoteProbe(card=>parkedOnRemoteOnly(card));
 function ownerForCwd(cwd:string,list:Task[]):string|null {
   if(!cwd)return null;
   const t=list.filter(t=>t.worktreePath&&inside(path.resolve(t.worktreePath),path.resolve(cwd))).sort((a,b)=>b.worktreePath!.length-a.worktreePath!.length)[0];

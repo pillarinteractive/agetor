@@ -94,12 +94,21 @@ export function currentSlots(): StepSlots {
  *  last slot while the first is still spawning. A live step that's only
  *  waiting — on the user (a question/permission card) or on claude's
  *  usage-limit pause (`isQuotaPaused`) — isn't working the machine, so it
- *  doesn't count. */
+ *  doesn't count; neither does a step parked on a remote wait (CI). */
+let parkedOnRemoteProbe: (card: Task) => boolean = () => false;
+/** How `slotUse` learns that a card's outstanding awaits only watch remote
+ *  work (CI). Set by dispatch-claims.ts, which knows the awaits; a setter
+ *  because awaits.ts imports this module. */
+export function setParkedOnRemoteProbe(probe: (card: Task) => boolean): void {
+  parkedOnRemoteProbe = probe;
+}
+
 export function slotUse(
   isLive: (taskId: string) => boolean,
   slots: StepSlots = currentSlots(),
   list: Task[] = tasks.listLive(),
   quotaPaused: (taskId: string) => boolean = isQuotaPaused,
+  parkedOnRemote: (card: Task) => boolean = parkedOnRemoteProbe,
 ): SlotUse {
   let total = 0;
   let heavy = 0;
@@ -113,6 +122,10 @@ export function slotUse(
         const settled = run.history.find((h) => h.taskId === a.taskId && h.seq === a.seq)?.outcome != null;
         const blocked = run.blocked.some((b) => b.taskId === a.taskId);
         if (!isLive(a.taskId) && (settled || blocked)) continue;
+        // Ended its turn to wait for CI: its session may still be open, but
+        // it is working neither an agent nor this machine, so a Fix CI or
+        // Finish parked on GitHub must not keep the next one from starting.
+        if (run.blocked.some((b) => b.taskId === a.taskId && b.kind === "await") && parkedOnRemote(t)) continue;
         if (waiting(a.taskId)) continue;
         total++;
         const name = run.snapshot?.graph.steps.find((s) => s.id === a.stepId)?.name ?? "";

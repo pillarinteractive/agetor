@@ -283,6 +283,9 @@ export function supersedeBlocksBefore(run: PipelineRunState, seq: number): strin
  * Stop the user pressed never comes through here. Callers persist `run`.
  */
 export { TRANSIENT_RETRY_MAX };
+/** Step-cap extensions an unattended run grants itself before it waits for a
+ *  person: a 14-step run goes to 28, then 42, then stops. */
+export const AUTO_CAP_EXTENSIONS = 2;
 const autoRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const launchRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const launchRecoveriesInFlight = new Set<string>();
@@ -1821,6 +1824,23 @@ async function launchStep(
     parent = prepared.parent;
   }
 
+  // The step cap stops a run that goes round in circles. On an unattended
+  // board the first hits extend the allowance by themselves (the same
+  // extension a person's Retry grants); a run that uses those up as well is
+  // the loop the cap exists for, and waits for someone.
+  if (
+    run.stepCount >= effectiveStepCap(run) &&
+    snapshot.decisionPolicy === "planner-recommendation" &&
+    (run.capExtensions ?? 0) < AUTO_CAP_EXTENSIONS
+  ) {
+    const before = effectiveStepCap(run);
+    run.capExtensions = (run.capExtensions ?? 0) + 1;
+    recordActivity(parent.id, {
+      kind: "step",
+      text: `Reached the ${before}-step cap — continuing automatically up to ${effectiveStepCap(run)} (${run.capExtensions} of ${AUTO_CAP_EXTENSIONS} automatic extensions)`,
+      tone: "warning",
+    });
+  }
   if (run.stepCount >= effectiveStepCap(run)) {
     upsertBlocked(run, {
       taskId: null,
@@ -2199,6 +2219,7 @@ async function retryActiveExecutions(
   if (targets.length === 0) return { error: "nothing to retry" };
 
   let first: { runId: string; pending?: true } | null = null;
+  let queued = 0;
   for (const t of targets) {
     run.blocked = run.blocked.filter((b) => b.taskId !== t.taskId);
     const started = await startTask(t.taskId).catch((error:unknown)=>({error:error instanceof Error?error.message:String(error)}));
@@ -2211,6 +2232,7 @@ async function retryActiveExecutions(
       // above (no block, left alone) rather than recording a step-failed
       // block against a turn that's actually in flight.
       if (isStartTaskLiveRefusal(started.error)) continue;
+      if (isCapacityRefusal(started.error)) queued++;
       recordLaunchRefusal(parent.id,run,t.taskId,t.stepId,started.error);
     } else {
       if (run.launchRetries) delete run.launchRetries[t.taskId];
@@ -2219,7 +2241,8 @@ async function retryActiveExecutions(
   }
   checkJoinIncomplete(run);
   persist(parent.id, run);
-  return first ?? { error: "retry failed for every blocked step" };
+  // Queued is not failed: the step starts by itself when a place frees.
+  return first ?? { error: queued > 0 ? "queued for a free slot — the step starts by itself" : "retry failed for every blocked step" };
 }
 
 /** Re-attempt every run-level `pending` block (`step-cap`/`profile-missing`/
@@ -3163,6 +3186,12 @@ function attemptHandoffReminderOrBlock(input: {
       kind: blockKind,
       message: `still no valid handoff after one reminder — ${baseMessage}`,
     });
+    // Nothing here needs a person: the step simply ended without saying
+    // what happens next. On an unattended board, start it again (bounded,
+    // with backoff) before leaving the block for someone.
+    if (run.snapshot?.decisionPolicy === "planner-recommendation") {
+      scheduleAutoRetry(parentId, run, activeEntry.stepId, null, "ended without a handoff");
+    }
     checkJoinIncomplete(run);
     persist(parentId, run);
     return null;

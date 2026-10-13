@@ -89,8 +89,10 @@ const CONFLICTS_REQUEST = (base: string) =>
   `Resolve merge conflicts with ${base}\n\n` +
   `This pull request conflicts with \`origin/${base}\`; resolve it so it can be reviewed and merged as it is. ` +
   `Merge \`origin/${base}\` into this branch (a merge commit — don't rebase, never push to \`${base}\`), resolve each ` +
-  "conflict keeping both sides' intent, run the project's verification for what changed, commit and push the branch. " +
-  'If a conflict can\'t be resolved without a product decision, hand off as blocked and say which. Otherwise hand off with "next": null.';
+  "conflict keeping both sides' intent, commit and push the branch; CI verifies the result, so don't run whole suites, " +
+  "lint, type checks or builds here. You need no permission to push to this task's own branch or to merge the base into it. " +
+  "When two sides can't both be kept, take the option you judge best, say which and why in the handoff, and carry on; " +
+  'hand off as blocked only when resolving it would discard someone else\'s work you cannot reconstruct. Otherwise hand off with "next": null.';
 
 /** Steps already taken: `<taskId>:<step>:<headSha>` — one try per head. */
 const taken = new Set<string>();

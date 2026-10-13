@@ -61,6 +61,10 @@ test('isRemoteWait matches the ci-wait helper by name only', () => {
   expect(isRemoteWait({ cmd: 'ci-wait --timeout 30 ' })).toBe(true);
   expect(isRemoteWait({ cmd: 'python3 .github/scripts/verify_changed.py --if-needed ' })).toBe(false);
   expect(isRemoteWait({ cmd: 'sh not-ci-wait-at-all.sh ' })).toBe(false);
+  // The built-in Fix CI step's own wait, and a single run's.
+  expect(isRemoteWait({ cmd: 'gh pr checks 1405 --watch --interval 60 ' })).toBe(true);
+  expect(isRemoteWait({ cmd: 'gh run watch 38312317049 ' })).toBe(true);
+  expect(isRemoteWait({ cmd: 'gh pr checks 1405 ' })).toBe(false);
 });
 
 test('a step parked on CI holds no card-owner place and no slot', () => {
@@ -139,4 +143,32 @@ test('below the CI cap steps start as usual', () => {
   const parent = card({ column: 'running' });
   const child = card({ column: 'ready', pipelineParentId: parent.id, pipelineStepId: 's' });
   expect(reserveRunner(child.id, 'Build', () => false, parent.id, ev)).toEqual({ ok: true });
+});
+
+test('a heavy step parked on CI holds no slot, even with its session still open', async () => {
+  const { slotUse } = await import('./step-slots.ts');
+  const { parkedOnRemoteOnly } = await import('./dispatch-claims.ts');
+  const slots = { max: 20, heavy: { max: 1, steps: ['Fix CI'] } };
+  const card = (blockKind: string | null) => ({
+    id: 'p', archivedAt: null, column: 'running', worktreePath: '/w/p',
+    pipelineRun: {
+      active: [{ taskId: 's', stepId: 'fix', seq: 1 }], history: [],
+      blocked: blockKind ? [{ taskId: 's', stepId: 'fix', kind: blockKind, message: '' }] : [],
+      snapshot: { graph: { steps: [{ id: 'fix', name: 'Fix CI (#1) · auto 1/2' }] } },
+    },
+  }) as never;
+  const live = () => true;
+  const aw = (cmd: string, cwd = '/w/p') => ({ id: 'a', dir: '', label: 'ci', cwd, cmd, startedAt: 0, pid: 1, exitCode: null, finished: false, notified: false });
+  const use = (blockKind: string | null, awaits: ReturnType<typeof aw>[]) =>
+    slotUse(live, slots, [card(blockKind)], () => false, (c) => parkedOnRemoteOnly(c, awaits));
+  // Working: counts.
+  expect(use(null, [])).toEqual({ total: 1, heavy: 1 });
+  // Parked on GitHub: does not.
+  expect(use('await', [aw('gh pr checks 1 --watch --interval 60 ')])).toEqual({ total: 0, heavy: 0 });
+  expect(use('await', [aw('/Users/x/.agetor/bin/ci-wait ')])).toEqual({ total: 0, heavy: 0 });
+  // Parked on a local command, or on CI and a local command: still counts.
+  expect(use('await', [aw('lab/vm/plab cycle ')])).toEqual({ total: 1, heavy: 1 });
+  expect(use('await', [aw('ci-wait '), aw('pnpm test ')])).toEqual({ total: 1, heavy: 1 });
+  // Another card's CI wait says nothing about this one.
+  expect(use('await', [aw('ci-wait ', '/w/other')])).toEqual({ total: 1, heavy: 1 });
 });
