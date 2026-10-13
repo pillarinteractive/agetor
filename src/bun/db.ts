@@ -459,6 +459,7 @@ const isPlainObject = (x: unknown): x is Record<string, unknown> =>
 const PIPELINE_RUN_STATUSES = new Set<string>(["idle", "running", "blocked", "done", "cancelled"]);
 const PIPELINE_BLOCK_KINDS = new Set<string>([
   "step-failed", "step-blocked", "handoff-missing", "handoff-invalid", "step-cap", "profile-missing", "join-incomplete", "slot-wait", "await",
+  "check-failed",
 ]);
 
 /** A stored `Handoff` is trusted structurally, not deeply — it was produced
@@ -586,6 +587,27 @@ const sanitizeStepReminder = (raw: unknown): NonNullable<PipelineStepRecord["rem
   };
 };
 
+const STEP_GATE_STATES = new Set<string>(["checking", "feedback", "passed", "exhausted", "owner"]);
+
+/** {@link PipelineStepRecord.gate} — where a gated visit stands. A malformed
+ *  one collapses to absent: the visit's feedback turns are then counted from
+ *  zero again, which costs at most a few extra turns and never skips a check
+ *  (the checks themselves are recomputed from the worktree every time). */
+const sanitizeStepGate = (raw: unknown): PipelineStepRecord["gate"] => {
+  if (!isPlainObject(raw)) return undefined;
+  const { state, turns, max, failed, at, composed } = raw as Record<string, unknown>;
+  if (typeof state !== "string" || !STEP_GATE_STATES.has(state)) return undefined;
+  const count = (x: unknown) => (Number.isSafeInteger(x) && (x as number) >= 0 ? Math.min(x as number, 1000) : 0);
+  return {
+    state: state as NonNullable<PipelineStepRecord["gate"]>["state"],
+    turns: count(turns),
+    max: count(max),
+    failed: Array.isArray(failed) ? failed.filter((x): x is string => typeof x === "string").slice(0, 50).map((x) => x.slice(0, 80)) : [],
+    at: isFiniteNumber(at) ? at : 0,
+    ...(composed === true ? { composed: true as const } : {}),
+  };
+};
+
 /** One completed/cancelled execution in `PipelineRunState.history` — dropped
  *  wholesale when its identity fields (`stepId`/`taskId`/`seq`/`startedAt`)
  *  are malformed, since a history entry with no usable identity can't be
@@ -619,6 +641,10 @@ const sanitizeStepRecord = (raw: unknown): PipelineStepRecord | null => {
     ...(isFiniteNumber(rec.turnStartedAt) ? { turnStartedAt: rec.turnStartedAt } : {}),
     ...(Number.isSafeInteger(rec.reportThroughEventId) && (rec.reportThroughEventId as number) >= 0
       ? { reportThroughEventId: rec.reportThroughEventId as number } : {}),
+    ...(() => {
+      const gate = sanitizeStepGate(rec.gate);
+      return gate ? { gate } : {};
+    })(),
   };
 };
 
@@ -693,7 +719,12 @@ const sanitizeRunSnapshot = (raw: unknown): PipelineRunSnapshot | null => {
 
   return { graph, profiles, maxSteps, capturedAt,
     ...(rec.decisionPolicy === "planner-recommendation" ? { decisionPolicy: "planner-recommendation" as const } : {}),
-    ...(isPlainObject(rec.gates) && rec.gates.publish === true ? { gates: { publish: true as const } } : {}) };
+    ...(() => {
+      // Each gate is kept only as the literal `true` the runner wrote.
+      const g = isPlainObject(rec.gates) ? rec.gates : {};
+      const gates = { ...(g.publish === true ? { publish: true as const } : {}), ...(g.steps === true ? { steps: true as const } : {}) };
+      return Object.keys(gates).length > 0 ? { gates } : {};
+    })() };
 };
 
 /**

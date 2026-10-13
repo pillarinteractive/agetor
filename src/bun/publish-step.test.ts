@@ -642,15 +642,15 @@ describe("the switch", () => {
     const card = makeCard(repos.repo, approvalHandoff(repos.head), { gates: false });
     // The preference names the card, but the run started without the gate.
     expect(runOf(card).snapshot!.gates).toBeUndefined();
-    expect(await adoptPipelineGates(card.id)).toEqual({ publish: true, changed: true });
+    expect(await adoptPipelineGates(card.id)).toEqual({ publish: true, steps: false, changed: true });
     expect(runOf(card).snapshot!.gates).toEqual({ publish: true });
-    expect(await adoptPipelineGates(card.id)).toEqual({ publish: true, changed: false });
+    expect(await adoptPipelineGates(card.id)).toEqual({ publish: true, steps: false, changed: false });
     preferences.set(PIPELINE_GATES_PREF, "{}");
-    expect(await adoptPipelineGates(card.id)).toEqual({ publish: false, changed: true });
+    expect(await adoptPipelineGates(card.id)).toEqual({ publish: false, steps: false, changed: true });
     expect(runOf(card).snapshot!.gates).toBeUndefined();
     // A trial list that does not name the card leaves it out.
     preferences.set(PIPELINE_GATES_PREF, JSON.stringify({ publish: { pipelines: ["Change"], cards: [card.id] } }));
-    expect(await adoptPipelineGates(card.id)).toEqual({ publish: true, changed: true });
+    expect(await adoptPipelineGates(card.id)).toEqual({ publish: true, steps: false, changed: true });
   }, 60_000);
 
   test("the visit's state survives the run's sanitizer; an unreadable one is dropped", () => {

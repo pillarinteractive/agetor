@@ -46,8 +46,11 @@ import { run as runCommand } from "./github.ts";
 import { waitingOnQuota } from "../shared/autopilot.ts";
 import { decisionPolicyForProject, PIPELINE_DECISIONS_PREF, plannerDecisionInstructions } from "../shared/pipeline-decisions.ts";
 import {
-  PIPELINE_GATES_PREF, initialPublishState, parsePublishGate, publishBlockMessage, publishGateOn, publishStepOf, publishVisitOver,
+  PIPELINE_GATES_PREF, initialPublishState, parsePipelineGate, publishBlockMessage, publishGateOn, publishStepOf, publishVisitOver,
+  type PipelineGateName,
 } from "../shared/publish.ts";
+import { composedHandoff, exhaustedHandoff, gateFailureLine, gateVerdict, type CheckResult } from "../shared/checks.ts";
+import { recordWaivedChecks, runStepChecks } from "./check-runner.ts";
 import {
   BLOCK_WAIT_PREF,
   classifyBlock,
@@ -89,6 +92,7 @@ import {
   blockedHandoffChoosesNext,
   classifyStepResponse,
   composeBlockedResumeNote,
+  composeCheckFeedback,
   composeHandoffReminder,
   composeLimitResumeNote,
   composeStepPrompt,
@@ -108,10 +112,13 @@ import {
   renderReportFile,
   resolveNextSteps,
   resolveStartStep,
+  stepGate,
   stepNameById,
   stepReportFromMessages,
   validatePipelineGraph,
+  updatedPipelineGates,
   updatedPipelineInstructions,
+  type StepGate,
 } from "../shared/pipeline.ts";
 import { promptByteOverage } from "../shared/prompt-limits.ts";
 import { appendReferences } from "../shared/refs.ts";
@@ -135,6 +142,7 @@ import type {
   PipelineStep,
   PipelineStepRecord,
   PipelineStepReport,
+  StepCheck,
   Task,
   TaskPrStatus,
   TaskReference,
@@ -1788,10 +1796,25 @@ function holdForArchivedParent(
 // ---------------------------------------------------------------------------
 
 /** Whether the `pipeline_gates` preference names this card's pipeline (and,
- *  during the trial, the card) right now. */
-export function publishGatePref(parent: Pick<Task, "id" | "pipelineId">, run: Pick<PipelineRunState, "pipelineName">): boolean {
+ *  during the trial, the card) for `gate` right now. */
+function gatePref(gate: PipelineGateName, parent: Pick<Task, "id" | "pipelineId">, run: Pick<PipelineRunState, "pipelineName">): boolean {
   const name = (parent.pipelineId ? pipelines.get(parent.pipelineId)?.name : null) ?? run.pipelineName;
-  return publishGateOn(parsePublishGate(preferences.get(PIPELINE_GATES_PREF)), { id: parent.id, pipelineId: parent.pipelineId ?? null, pipelineName: name });
+  return publishGateOn(parsePipelineGate(preferences.get(PIPELINE_GATES_PREF), gate), { id: parent.id, pipelineId: parent.pipelineId ?? null, pipelineName: name });
+}
+
+export function publishGatePref(parent: Pick<Task, "id" | "pipelineId">, run: Pick<PipelineRunState, "pipelineName">): boolean {
+  return gatePref("publish", parent, run);
+}
+
+/** The gate `step` is judged by for this card, or null. As with `publish`,
+ *  two things must hold: the run adopted the `steps` gate (`snapshot.gates`,
+ *  at run start or by an explicit refresh — never by itself) and the
+ *  preference still names the card, so taking a card or a pipeline out of
+ *  `pipeline_gates` works at once: its steps advance on their handoffs again
+ *  from the next turn that ends. */
+export function stepGateFor(parent: Pick<Task, "id" | "pipelineId">, run: PipelineRunState, step: PipelineStep): StepGate | null {
+  const gate = stepGate(run.snapshot, step);
+  return gate && gatePref("steps", parent, run) ? gate : null;
 }
 
 /** The step Agetor runs for this card, or null. Two things must hold: the
@@ -1986,7 +2009,7 @@ export function stopPublishForOwner(parentId: string, why: string): Promise<bool
  * that has started. Takes effect at the step's next launch; a step in
  * mid-turn is not switched.
  */
-export function adoptPipelineGates(parentId: string): Promise<{ publish: boolean; changed: boolean } | { error: string; status: 404 | 409 }> {
+export function adoptPipelineGates(parentId: string): Promise<{ publish: boolean; steps: boolean; changed: boolean } | { error: string; status: 404 | 409 }> {
   return runExclusive(parentId, async () => {
     const parent = tasks.get(parentId);
     if (!parent?.pipelineId || tombstonedPipelineParents.has(parentId)) return { error: "not a pipeline task", status: 404 as const };
@@ -1994,18 +2017,35 @@ export function adoptPipelineGates(parentId: string): Promise<{ publish: boolean
     const run = parent.pipelineRun;
     if (!run?.snapshot) return { error: "pipeline has never run — it takes the gates when it starts", status: 409 as const };
     const publish = publishGatePref(parent, run) && !!reviewedPipelineShape(run.snapshot.graph);
-    const had = run.snapshot.gates?.publish === true;
-    if (publish === had) return { publish, changed: false };
+    const steps = gatePref("steps", parent, run);
+    const had = { publish: run.snapshot.gates?.publish === true, steps: run.snapshot.gates?.steps === true };
+    // With the `steps` gate the run also takes each step's goal, checks and
+    // turn allowance from the template as they stand now (never its text).
+    const template = steps ? pipelines.get(parent.pipelineId)?.graph : undefined;
+    const graph = template ? updatedPipelineGates(run.snapshot.graph, template) : run.snapshot.graph;
+    if (publish === had.publish && steps === had.steps && graph === run.snapshot.graph) return { publish, steps, changed: false };
     const { gates: _dropped, ...rest } = run.snapshot;
-    run.snapshot = publish ? { ...rest, gates: { publish: true } } : rest;
-    recordActivity(parentId, {
-      kind: "auto", tone: "info",
-      text: publish
-        ? "Check gates adopted: Finish is run by Agetor from its next launch (pipeline_gates)"
-        : "Check gates dropped: Finish is run by its agent again from its next launch",
-    });
+    const gates = { ...(publish ? { publish: true as const } : {}), ...(steps ? { steps: true as const } : {}) };
+    run.snapshot = { ...rest, graph, ...(publish || steps ? { gates } : {}) };
+    if (publish !== had.publish) {
+      recordActivity(parentId, {
+        kind: "auto", tone: "info",
+        text: publish
+          ? "Check gates adopted: Finish is run by Agetor from its next launch (pipeline_gates)"
+          : "Check gates dropped: Finish is run by its agent again from its next launch",
+      });
+    }
+    if (steps !== had.steps || graph !== rest.graph) {
+      const gated = graph.steps.filter((st) => stepGate({ graph, gates }, st)).map((st) => st.name);
+      recordActivity(parentId, {
+        kind: "auto", tone: "info",
+        text: steps
+          ? `Check gates adopted: ${gated.join(", ") || "no step"} advance${gated.length === 1 ? "s" : ""} on checks Agetor runs, from the next launch (pipeline_gates)`
+          : "Check gates dropped: steps advance on their handoffs again",
+      });
+    }
     persist(parentId, run, { preserveStatus: true });
-    return { publish, changed: true };
+    return { publish, steps, changed: true };
   });
 }
 
@@ -2267,6 +2307,7 @@ async function launchStep(
     .map((id) => snapshot.profiles[id])
     .filter((p): p is AgentProfileSnapshot => p !== undefined);
 
+  const stepChecks = publishBrief || wrapUp ? null : stepGateFor(parent, run, step);
   const composeArgs = {
     pipelineName: run.pipelineName,
     // The writer's turn of an Agetor-run Finish: the brief is its whole job.
@@ -2282,6 +2323,10 @@ async function launchStep(
     subagentCap: step.subagents.cap,
     parentHarnessKind: profile.harnessKind,
     parallelSiblings,
+    // What the step will be judged by (`pipeline_gates`), so its agent knows.
+    // Not the writer of an Agetor-run Finish or a wrap-up at the cap: neither
+    // is gated when its turn ends.
+    gate: stepChecks ? { goal: stepChecks.goal, checks: stepChecks.checks, issueUrl: parent.issueUrl } : null,
   };
   // M10: step tasks carry the parent's own references plus every handoff
   // file this launch just wrote.
@@ -2732,6 +2777,7 @@ export async function startPipelineRun(
       // Check gates are captured like the decision policy: a run keeps the
       // loop it started with until an explicit refresh (`adoptPipelineGates`).
       if (reviewedPipelineShape(snapshot.graph) && publishGatePref(fresh, { pipelineName: pipeline.name })) snapshot.gates = { publish: true };
+      if (gatePref("steps", fresh, { pipelineName: pipeline.name })) snapshot.gates = { ...snapshot.gates, steps: true };
     } else if (run.snapshot) {
       // The pipeline row itself is gone (deleted) — the only graph left to
       // run is the one already frozen on this task's previous snapshot.
@@ -2914,6 +2960,7 @@ export async function advancePipeline(
           (b.kind === "handoff-missing" ||
             b.kind === "handoff-invalid" ||
             b.kind === "step-blocked" ||
+            b.kind === "check-failed" ||
             (b.kind === "step-failed" && !isTaskRunLive(b.taskId))),
       );
       const joinBlocks = run.blocked.filter((b) => b.taskId === null && b.kind === "join-incomplete");
@@ -3007,6 +3054,15 @@ export async function advancePipeline(
       handoffInput.next = fallbackNextName;
     }
     const handoff = normalizeHandoff(handoffInput);
+
+    // Advancing past a gate the step did not pass is a waiver, and is
+    // recorded as one: a waived check never reads as a pass.
+    const waivedStep = graph.steps.find((s) => s.id === activeEntry.stepId);
+    const waivedGate = waivedStep && run.blocked.some((b) => b.taskId === targetTaskId && b.kind === "check-failed") ? stepGate(run.snapshot, waivedStep) : null;
+    if (waivedStep && waivedGate && historyEntry?.gate?.failed.length) {
+      recordWaivedChecks({ parent, run, step: waivedStep, seq: activeEntry.seq, checks: waivedGate.checks, ids: historyEntry.gate.failed });
+      recordActivity(parentId, { kind: "step", tone: "warning", text: `Advanced past ${waivedStep.name}'s failing checks (${historyEntry.gate.failed.join(", ")}) — recorded as waived` });
+    }
 
     run.active = run.active.filter((a) => a.taskId !== targetTaskId);
     removeBlockedFor(run, targetTaskId);
@@ -3195,7 +3251,7 @@ export interface PipelineRunRefreshResult extends PipelineInstructionRefresh {
   taskId: string;
   error?: string;
   /** Only when the refresh asked for gates (`adoptPipelineGates`). */
-  gates?: { publish: boolean; changed: boolean } | { error: string };
+  gates?: { publish: boolean; steps: boolean; changed: boolean } | { error: string };
 }
 
 /** Push a template's current instructions into every unarchived, unfinished
@@ -3575,6 +3631,7 @@ function reminderBlockKind(reason: HandoffReminderReason): "handoff-missing" | "
  * loop; other refusals keep their ordinary blocked disposition.
  */
 interface PendingReminder {
+  kind?: "reminder";
   parentId: string;
   taskId: string;
   runId: string;
@@ -3585,6 +3642,60 @@ interface PendingReminder {
   baseMessage: string;
   reminderText: string;
 }
+
+/**
+ * A gated step's turn ended and its checks have to be run (src/bun/
+ * check-runner.ts). Like the reminder's send, that happens with the
+ * per-parent lock RELEASED — a command check may take minutes, and Stop,
+ * Retry and every other card-level route must not queue behind it. The
+ * locked settle body marks the execution (`checksInFlight`), hands this
+ * back, and is entered again with the results ({@link evaluatePendingChecks}):
+ * it re-derives the turn's classification, which is the same for the same
+ * turn, and this time decides.
+ */
+interface PendingChecks {
+  kind: "checks";
+  parentId: string;
+  taskId: string;
+  runId: string;
+  seq: number;
+  stepId: string;
+  checks: StepCheck[];
+  /** The handoff of the turn being judged; null when it wrote none. */
+  handoff: Handoff | null;
+  /** The turn the checks are for (`PipelineStepRecord.turnStartedAt`). */
+  turnStartedAt: number | null;
+}
+
+/** A failed check's feedback, to be sent into the step's own session once
+ *  the lock is released ({@link deliverCheckFeedback}). */
+interface PendingFeedback {
+  kind: "feedback";
+  parentId: string;
+  taskId: string;
+  runId: string;
+  seq: number;
+  stepId: string;
+  stepName: string;
+  text: string;
+  /** This feedback turn, from 1, of `max`. */
+  turn: number;
+  max: number;
+  failed: string[];
+  /** What the gate found, for the block if the feedback cannot be sent. */
+  found: string;
+}
+
+type SettleFollowUp = PendingReminder | PendingChecks | PendingFeedback;
+
+/** What the checks came to for a settle entered again with them. */
+type GateResults = ({ results: CheckResult[] } | { error: string }) & { turnStartedAt: number | null };
+
+/** Step task ids whose checks are being run outside the lock, with the turn
+ *  they are for. A second settle of that same turn (its `review` column
+ *  event and its `run-status` event both reach the settle body) is dropped;
+ *  one for another turn is kept in `deferredSettles`. */
+const checksInFlight = new Map<string, number | null>();
 
 /** Step task ids whose one automatic reminder is mid-send outside the lock.
  *  A second settle for the same execution arriving in that window — the
@@ -3740,13 +3851,7 @@ async function deliverHandoffReminder(p: PendingReminder): Promise<void> {
     // sent — settle it now rather than leave the step running forever.
     // Only when the step is idle again — the reply really finished. A step
     // still working on the reminder settles through its own run-status event.
-    const deferred = deferredSettles.get(p.taskId);
-    deferredSettles.delete(p.taskId);
-    const step = tasks.get(p.taskId);
-    if (deferred && step?.column === "review" && !isTaskRunLive(p.taskId)) {
-      const entry = tasks.get(p.parentId)?.pipelineRun?.history.find((h) => h.taskId === p.taskId && h.seq === p.seq);
-      if (entry && entry.outcome == null && step.runId===deferred.runId) void handleRunStatus(p.taskId, deferred.runId, deferred.status);
-    }
+    settleDeferred(p.parentId, p.taskId, p.seq);
   }
 }
 
@@ -3884,7 +3989,9 @@ async function settleStepRun(
   taskId: string,
   runId: string,
   status: "succeeded" | "failed" | "cancelled" | "orphaned",
-): Promise<PendingReminder | null> {
+  /** The results of the checks an earlier pass of this same settle asked for. */
+  checked?: GateResults,
+): Promise<SettleFollowUp | null> {
   try {
     const parent = tasks.get(parentId);
     if (!parent || !parent.pipelineRun || !parent.pipelineRun.snapshot) return null;
@@ -3903,6 +4010,16 @@ async function settleStepRun(
       deferredSettles.set(taskId, { runId, status });
       return null;
     }
+    // Its checks are being run outside the lock: the pass that comes back
+    // with their results decides. Results for a turn that is no longer the
+    // one on record are dropped, and this pass asks again.
+    const turnNow = historyEntry?.turnStartedAt ?? null;
+    if (checksInFlight.has(taskId) && !checked) {
+      if (checksInFlight.get(taskId) !== turnNow) deferredSettles.set(taskId, { runId, status });
+      return null;
+    }
+    if (checked && isTaskRunLive(taskId)) return null;
+    const judged = checked && checked.turnStartedAt === turnNow ? checked : null;
 
     if (status === "succeeded") {
       // One-shot handoff reminder (owner request, `docs/plans/pipelines.md`):
@@ -3954,7 +4071,144 @@ async function settleStepRun(
         }
       }
 
-      if (classified.kind === "handoff-missing" || classified.kind === "handoff-invalid") {
+      // The step's gate (`pipeline_gates`, src/shared/checks.ts): with one,
+      // the step is finished when its required checks pass, not when its
+      // handoff says so. Never for the writer of an Agetor-run Finish (CI
+      // already decided that visit) or the wrap-up at the step cap (it
+      // publishes what there is).
+      const stepObj = graph.steps.find((s) => s.id === activeEntry.stepId);
+      const gate = stepObj && run.publish?.seq !== activeEntry.seq && run.capWrapUp?.seq !== activeEntry.seq
+        ? stepGateFor(parent, run, stepObj) : null;
+      /**
+       * Judge the turn by the gate. `return`: the settle ends here — with the
+       * checks to run, the feedback to send, or a block already recorded.
+       * `pass`: every required check is met. `fresh`: still failing after
+       * the visit's feedback turns; the visit ends and the step gets its one
+       * fresh session, with `handoff` (the failures) as its arrival.
+       */
+      const judgeGate = (handoff: Handoff | null):
+        | { kind: "return"; value: SettleFollowUp | null }
+        | { kind: "pass"; passed: string[] }
+        | { kind: "fresh"; handoff: Handoff } => {
+        const g = gate!;
+        // This turn was already judged and is the owner's (the column and
+        // run-status events both settle one turn); a Retry clears the block.
+        if (run.blocked.some((b) => b.taskId === taskId && b.kind === "check-failed")) return { kind: "return", value: null };
+        const prior = historyEntry?.gate;
+        if (!judged) {
+          checksInFlight.set(taskId, turnNow);
+          if (historyEntry) {
+            historyEntry.gate = {
+              state: "checking", turns: prior?.turns ?? 0,
+              // Sent back in by the owner after a stop: a new allowance.
+              max: prior?.state === "owner" ? prior.turns + g.maxTurns : (prior?.max ?? g.maxTurns),
+              failed: prior?.failed ?? [], at: Date.now(),
+            };
+          }
+          persist(parentId, run);
+          return { kind: "return", value: { kind: "checks", parentId, taskId, runId, seq: activeEntry.seq, stepId: activeEntry.stepId, checks: g.checks, handoff, turnStartedAt: turnNow } };
+        }
+        const turns = prior?.turns ?? 0;
+        const max = prior?.max ?? g.maxTurns;
+        const setGate = (state: NonNullable<PipelineStepRecord["gate"]>["state"], failed: string[]) => {
+          if (historyEntry) historyEntry.gate = { state, turns, max, failed, at: Date.now() };
+        };
+        const forOwner = (message: string, failed: string[]): { kind: "return"; value: null } => {
+          upsertBlocked(run, { taskId, stepId: activeEntry.stepId, kind: "check-failed", message });
+          setGate("owner", failed);
+          // What the step said stays readable (and is what Advance passes on).
+          if (historyEntry && handoff) historyEntry.handoff = handoff;
+          recordActivity(parentId, { kind: "step", tone: "danger", text: message });
+          checkJoinIncomplete(run);
+          persist(parentId, run);
+          return { kind: "return", value: null };
+        };
+        if ("error" in judged) {
+          return forOwner(`step "${stepName}" finished, but its checks could not be run: ${judged.error} — Retry gives the step a turn and runs them again`, prior?.failed ?? []);
+        }
+        const verdict = gateVerdict(judged.results);
+        if (verdict.state === "pass") {
+          setGate("passed", []);
+          return { kind: "pass", passed: judged.results.filter((r) => r.check.required).map((r) => r.check.id) };
+        }
+        const failedIds = [...verdict.failed, ...verdict.unmet].map((r) => r.check.id);
+        const found = gateFailureLine(verdict);
+        // Nothing failed, but a required check could not be evaluated (git or
+        // GitHub did not answer, a required check is still running): not the
+        // step's to fix, so no turn is spent on it.
+        if (verdict.state === "halt") {
+          return forOwner(`step "${stepName}" finished, but a required check could not be evaluated: ${found} — nothing was sent back to the step; Retry gives it a turn and runs the checks again, Advance moves on without them`, failedIds);
+        }
+        if (turns < max) {
+          // The same refusals as the handoff reminder: never send into a run
+          // that is gone, archived or being stopped.
+          const parentFresh = tasks.get(parentId);
+          const skip = tombstonedPipelineParents.has(parentId) || !parentFresh ? "the pipeline task no longer exists"
+            : parentFresh.archivedAt != null ? "the pipeline task is archived"
+            : tasks.get(taskId)?.archivedAt != null ? "the step task is archived"
+            : isDeliberateWholeRunStop(run, taskId) ? "the pipeline run is stopping" : null;
+          if (skip) return forOwner(`step "${stepName}" finished with required checks failing: ${found} (not sent back to the step — ${skip})`, failedIds);
+          remindersInFlight.add(taskId);
+          setGate("checking", failedIds);
+          checkJoinIncomplete(run);
+          persist(parentId, run);
+          return {
+            kind: "return",
+            value: {
+              kind: "feedback", parentId, taskId, runId, seq: activeEntry.seq, stepId: activeEntry.stepId, stepName, turn: turns + 1, max, failed: failedIds, found,
+              text: composeCheckFeedback({
+                stepName, goal: g.goal, turn: turns + 1, maxTurns: max, failed: verdict.failed, unmet: verdict.unmet, hadHandoff: handoff !== null,
+                outgoing: outgoingSteps(graph, activeEntry.stepId).map((o) => ({ name: o.step.name, label: o.edge.label })),
+                transition: stepObj?.transition ?? "choose", canFinish: stepObj?.canFinish === true,
+              }),
+            },
+          };
+        }
+        // Out of turns. One fresh session of the same step, with the failures
+        // as its arrival — unless this visit is that fresh session.
+        const previousVisit = run.history.filter((h) => h.stepId === activeEntry.stepId && h.seq < activeEntry.seq).sort((a, b) => b.seq - a.seq)[0];
+        if (previousVisit?.gate?.state !== "exhausted") {
+          setGate("exhausted", failedIds);
+          return { kind: "fresh", handoff: normalizeHandoff(exhaustedHandoff({ stepName, turns, failed: verdict.failed, unmet: verdict.unmet, lastWords: handoff?.summary || assistantText })) };
+        }
+        return forOwner(
+          `step "${stepName}" still fails its required checks after ${turns} feedback turn${turns === 1 ? "" : "s"} and one fresh session: ${found} — fix it in the worktree and Retry, or Advance past the checks`,
+          failedIds,
+        );
+      };
+      /** Set when the gate, not the step's handoff, decides what is passed on. */
+      let composed: Handoff | null = null;
+      let freshSession: Handoff | null = null;
+      let gateJudged = false;
+
+      // A handoff still missing after the one reminder: the checks decide.
+      // When they pass and there is one way forward, the run advances with a
+      // handoff Agetor composes from the step's last words; it is never the
+      // owner's problem that a step forgot the block. (A Review cannot pass
+      // this way: without a handoff there is no verdict to check.)
+      if (gate && (classified.kind === "handoff-missing" || classified.kind === "handoff-invalid") && historyEntry?.reminder?.delivered) {
+        const outcome = judgeGate(null);
+        if (outcome.kind === "return") return outcome.value;
+        gateJudged = true;
+        if (outcome.kind === "fresh") {
+          freshSession = outcome.handoff;
+        } else {
+          const said = stepFinalReport(taskId, historyEntry.startedAt, null, { includeUnstructured: true });
+          const draft = composedHandoff({ stepName, next: null, passed: outcome.passed, finalMessage: said?.messages.slice(-2).join("\n\n") ?? assistantText });
+          const route = resolveNextSteps(graph, activeEntry.stepId, draft);
+          if (route.kind === "steps" || route.kind === "terminal") {
+            composed = normalizeHandoff({ ...draft, next: route.kind === "steps" && route.stepIds.length === 1 ? stepNameById(graph, route.stepIds[0]!) : null });
+            if (historyEntry.gate) historyEntry.gate.composed = true;
+            recordActivity(parentId, {
+              kind: "step", tone: "warning",
+              text: `${stepName} ended without a handoff, also after its reminder; its required checks pass (${outcome.passed.join(", ")}) — moving on with a handoff composed by Agetor`,
+            });
+          }
+          // Several ways forward and no handoff to choose one: as before.
+        }
+      }
+
+      if (!composed && !freshSession && (classified.kind === "handoff-missing" || classified.kind === "handoff-invalid")) {
         // Not blocked yet — attempt the ONE automatic reminder as an
         // ordinary follow-up turn on the step's own run, rather than
         // blocking the run over a step that may simply have forgotten the
@@ -3975,7 +4229,7 @@ async function settleStepRun(
         });
       }
 
-      if (classified.kind === "user-ask") {
+      if (classified.kind === "user-ask" && !composed && !freshSession) {
         // Medium 4: the step's task already reflects a pending interaction
         // through the ordinary interactions/column machinery — but a
         // pending card must still surface as a retryable block on the
@@ -4069,7 +4323,7 @@ async function settleStepRun(
         return null;
       }
 
-      if (classified.kind !== "handoff" && !blockedButRouted) {
+      if (classified.kind !== "handoff" && !blockedButRouted && !composed && !freshSession) {
         // Defensive: `classifyStepResponse` only returns "error"/
         // "cancelled" for the failed/cancelled/orphaned run statuses,
         // never for "succeeded" — this can't actually be reached, but
@@ -4086,8 +4340,17 @@ async function settleStepRun(
         return null;
       }
 
-      const parsedHandoff = classified.handoff!;
-      let resolved = resolveNextSteps(graph, activeEntry.stepId, parsedHandoff);
+      // A step that handed off: its required checks have to pass before the
+      // handoff is passed on. One that fails goes back to this same step.
+      if (gate && !gateJudged) {
+        const outcome = judgeGate(classified.handoff!);
+        if (outcome.kind === "return") return outcome.value;
+        if (outcome.kind === "fresh") freshSession = outcome.handoff;
+      }
+      // What is passed on: the step's handoff; the one Agetor composed for a
+      // step that wrote none; or the failures, to the step's fresh session.
+      const parsedHandoff = freshSession ?? composed ?? classified.handoff!;
+      let resolved = freshSession ? { kind: "steps" as const, stepIds: [activeEntry.stepId] } : resolveNextSteps(graph, activeEntry.stepId, parsedHandoff);
       // The writer of an Agetor-run Finish only writes: the visit's outcome
       // was decided by Agetor (CI is green), so its turn ends the step
       // whatever `next` says.
@@ -4097,7 +4360,7 @@ async function settleStepRun(
         }
         resolved = { kind: "terminal" };
       }
-      if(stepName==='Review'&&managedPillarRoot(parent.worktreePath??parent.workdir)&&reviewRequiresRepair(parsedHandoff)) {
+      if(!freshSession&&stepName==='Review'&&managedPillarRoot(parent.worktreePath??parent.workdir)&&reviewRequiresRepair(parsedHandoff)) {
         const repair=outgoingSteps(graph,activeEntry.stepId).find(o=>o.step.name==='Build'&&/^(?:changes requested|needs work|fix|repair|rework)$/i.test(o.edge.label.trim()));
         // A completed review can describe downstream owner-only evidence.
         // Do not turn that completed verdict into an execution hold. The
@@ -4116,7 +4379,7 @@ async function settleStepRun(
           checkJoinIncomplete(run);persist(parentId,run);return null;
         }
       }
-      if (resolved.kind === "ambiguous" || resolved.kind === "unknown") {
+      if (!freshSession && (resolved.kind === "ambiguous" || resolved.kind === "unknown")) {
         // Low: a parsed handoff whose `next` didn't resolve to a real
         // outgoing step is a malformed handoff, not a valid one — override
         // the `"handoff"` stamp `classifyStepResponse` gave this execution
@@ -4146,7 +4409,7 @@ async function settleStepRun(
       // Build after a CI failure). Once the run has taken it that often, the
       // step's choice is kept in history and the run waits for a person, who
       // can Advance it by hand; it is never routed onward or retried here.
-      if (resolved.kind === "steps") {
+      if (resolved.kind === "steps" && !freshSession) {
         const spent = exhaustedEdge(graph, run.history, activeEntry.stepId, resolved.stepIds);
         if (spent) {
           if (historyEntry) historyEntry.handoff = parsedHandoff;
@@ -4180,11 +4443,18 @@ async function settleStepRun(
       if (historyEntry) {
         historyEntry.endedAt = Date.now();
         freezeStepReport(historyEntry);
-        historyEntry.outcome = "succeeded";
+        // A visit ended for a fresh session did not pass its gate.
+        historyEntry.outcome = freshSession ? "failed" : "succeeded";
         historyEntry.handoff = parsedHandoff;
         historyEntry.nextStepIds = nextStepIds;
       }
       pipelineUpdateColumn(taskId, runId, "done");
+      if (freshSession) {
+        recordActivity(parentId, {
+          kind: "step", tone: "warning",
+          text: `${stepName} still fails its required checks after ${historyEntry?.gate?.turns ?? 0} feedback turn(s) (${(historyEntry?.gate?.failed ?? []).join(", ")}) — starting it once more in a fresh session, with the failures as its arrival`,
+        });
+      }
 
       if (wholeRunStop) {
         // M-R2: a step that finished cleanly AFTER the user stopped the
@@ -4200,7 +4470,7 @@ async function settleStepRun(
         for (const nid of nextStepIds) {
           const targetStep = graph.steps.find((s) => s.id === nid);
           if (!targetStep) continue;
-          if (targetStep.join === "all") {
+          if (targetStep.join === "all" && !freshSession) {
             const arrivals = addJoinArrival(run.joins[nid]?.arrivals ?? [], {
               fromStepId: activeEntry.stepId,
               seq: activeEntry.seq,
@@ -4256,7 +4526,7 @@ async function settleStepRun(
       for (const nid of nextStepIds) {
         const targetStep = graph.steps.find((s) => s.id === nid);
         if (!targetStep) continue;
-        if (targetStep.join === "all") {
+        if (targetStep.join === "all" && !freshSession) {
           const arrivals = addJoinArrival(run.joins[nid]?.arrivals ?? [], {
             fromStepId: activeEntry.stepId,
             seq: activeEntry.seq,
@@ -4436,7 +4706,167 @@ async function handleRunStatus(
     return null;
   });
   // L-R7: the reminder's send happens with the lock RELEASED.
-  if (pending) await deliverHandoffReminder(pending);
+  await afterSettle(pending);
+}
+
+/** Carry out what a settle left to do once its lock is released: run the
+ *  step's checks and enter the settle again with them, or send a reminder or
+ *  a check's feedback into the step's session. */
+async function afterSettle(first: SettleFollowUp | null): Promise<void> {
+  let next = first;
+  // One evaluation leads to at most one send. It is asked for again only
+  // when the turn it judged was replaced meanwhile; the bound is a backstop.
+  for (let i = 0; next && i < 4; i++) {
+    if (next.kind === "checks") {
+      next = await evaluatePendingChecks(next);
+    } else if (next.kind === "feedback") {
+      await deliverCheckFeedback(next);
+      return;
+    } else {
+      await deliverHandoffReminder(next);
+      return;
+    }
+  }
+  if (next?.kind === "checks") checksInFlight.delete(next.taskId);
+}
+
+/** A settle that arrived while this execution's checks or a send were in
+ *  flight, for a turn that has really ended: settle it now. */
+function settleDeferred(parentId: string, taskId: string, seq: number): void {
+  const deferred = deferredSettles.get(taskId);
+  deferredSettles.delete(taskId);
+  const step = tasks.get(taskId);
+  if (deferred && step?.column === "review" && !isTaskRunLive(taskId)) {
+    const entry = tasks.get(parentId)?.pipelineRun?.history.find((h) => h.taskId === taskId && h.seq === seq);
+    if (entry && entry.outcome == null && step.runId === deferred.runId) void handleRunStatus(taskId, deferred.runId, deferred.status);
+  }
+}
+
+/** Run the checks a settle asked for, with no lock held, and enter that
+ *  settle again with what they came to. */
+async function evaluatePendingChecks(p: PendingChecks): Promise<SettleFollowUp | null> {
+  let outcome: GateResults;
+  try {
+    const parent = tasks.get(p.parentId);
+    const run = parent?.pipelineRun;
+    const step = run?.snapshot?.graph.steps.find((s) => s.id === p.stepId);
+    if (!parent || !run || !step || tombstonedPipelineParents.has(p.parentId)) {
+      checksInFlight.delete(p.taskId);
+      return null;
+    }
+    outcome = { results: await runStepChecks({ parent, run, step, seq: p.seq, checks: p.checks, handoff: p.handoff }), turnStartedAt: p.turnStartedAt };
+  } catch (err) {
+    outcome = { error: err instanceof Error ? err.message : String(err), turnStartedAt: p.turnStartedAt };
+  }
+  // The mark is cleared under the lock, right before the settle that uses
+  // the results — which may set it again, when it has to ask once more.
+  const next = await runExclusive(p.parentId, async () => {
+    checksInFlight.delete(p.taskId);
+    return settleStepRun(p.parentId, p.taskId, p.runId, "succeeded", outcome);
+  }).catch((err) => {
+    console.warn(`[agetor] pipeline runner failed settling task ${p.taskId} with its check results:`, err);
+    checksInFlight.delete(p.taskId);
+    return null;
+  });
+  // A send that follows settles what was deferred itself, once it is done.
+  if (!next) settleDeferred(p.parentId, p.taskId, p.seq);
+  return next;
+}
+
+/**
+ * Send a failed check's feedback into the step's own session, with no lock
+ * held (L-R7), then stamp the outcome: delivered — the visit has spent one of
+ * its feedback turns and the step is working again; the turn settles through
+ * the same settle path and its checks are run again. When the message cannot
+ * be delivered the step is started again instead (the same step task, as the
+ * wait queue does), which also spends the turn; when that fails too, the
+ * failure is the owner's.
+ */
+async function deliverCheckFeedback(p: PendingFeedback): Promise<void> {
+  try {
+    await deliverCheckFeedbackInner(p);
+  } finally {
+    settleDeferred(p.parentId, p.taskId, p.seq);
+  }
+}
+
+async function deliverCheckFeedbackInner(p: PendingFeedback): Promise<void> {
+  const newerActive = () => {
+    const step = tasks.get(p.taskId), current = step?.runId ? runs.get(step.runId) : null;
+    return !!step?.runId && step.runId !== p.runId && (isTaskRunLive(p.taskId) || current?.status === "running" || current?.status === "orphaned");
+  };
+  if (newerActive()) {
+    await runExclusive(p.parentId, async () => { remindersInFlight.delete(p.taskId); });
+    return;
+  }
+  let sent: Awaited<ReturnType<typeof sendInput>>;
+  try {
+    sent = await sendInput(p.runId, p.text);
+  } catch (err) {
+    sent = { delivered: false, reason: err instanceof Error ? err.message : String(err) };
+  }
+  const count = `check-feedback turn ${p.turn} of ${p.max}`;
+  /** Stamp the spent turn on the visit, under the lock. */
+  const spend = (run: PipelineRunState) => {
+    const h = run.history.find((x) => x.taskId === p.taskId && x.seq === p.seq);
+    if (h) h.gate = { state: "feedback", turns: p.turn, max: p.max, failed: p.failed, at: Date.now() };
+  };
+  const restart = await runExclusive(p.parentId, async () => {
+    remindersInFlight.delete(p.taskId);
+    try {
+      const parent = tasks.get(p.parentId);
+      const run = parent?.pipelineRun;
+      if (!parent || !run) return false;
+      if (sent.delivered) {
+        spend(run);
+        appendRunStatusLine(p.taskId, p.runId, `required checks failed (${p.failed.join(", ")}) — sent back to this step: ${count}`);
+        recordActivity(p.parentId, { kind: "step", tone: "warning", text: `${p.stepName} did not pass its checks (${p.found}) — sent back to ${p.stepName} in its own session (${count})` });
+        checkJoinIncomplete(run);
+        persist(p.parentId, run);
+        return false;
+      }
+      if (sent.withheld && sent.savedToBacklog) {
+        try {
+          const item = tasks.get(p.taskId)?.backlog.find((b) => b.text === p.text);
+          if (item) backlog.remove(p.taskId, item.id);
+        } catch {
+          // best-effort
+        }
+      }
+      // A Retry or Advance that landed while the send was in flight already
+      // decided this execution's fate.
+      return run.active.some((a) => a.taskId === p.taskId && a.seq === p.seq) && !newerActive();
+    } catch (err) {
+      persistReconcileFailure(p.parentId, p.taskId, err);
+      return false;
+    }
+  }).catch(() => false);
+  if (!restart || sent.delivered) return;
+
+  const why = sent.reason.slice(0, 160);
+  const relaunched = await retryPipelineStep(p.parentId, { taskId: p.taskId }).catch((e: unknown) => ({ error: String(e) }));
+  await runExclusive(p.parentId, async () => {
+    const parent = tasks.get(p.parentId);
+    const run = parent?.pipelineRun;
+    if (!parent || !run || !run.active.some((a) => a.taskId === p.taskId && a.seq === p.seq)) return;
+    const queued = "error" in relaunched && run.blocked.some((b) => b.taskId === p.taskId && b.kind === "slot-wait");
+    if (!("error" in relaunched) || queued) {
+      // Started again (or queued for a slot and started by itself): the turn is spent.
+      spend(run);
+      recordActivity(p.parentId, { kind: "step", tone: "warning", text: `${p.stepName} did not pass its checks (${p.found}); the feedback could not be sent into its session (${why}) — ${queued ? "queued to start" : "started"} the step again instead (${count})` });
+    } else {
+      upsertBlocked(run, {
+        taskId: p.taskId, stepId: p.stepId, kind: "check-failed",
+        message: `step "${p.stepName}" finished with required checks failing: ${p.found} — it could not be sent back to the step (${why}; restart: ${relaunched.error.slice(0, 160)})`,
+      });
+      const h = run.history.find((x) => x.taskId === p.taskId && x.seq === p.seq);
+      if (h?.gate) h.gate = { ...h.gate, state: "owner", failed: p.failed, at: Date.now() };
+    }
+    checkJoinIncomplete(run);
+    persist(p.parentId, run);
+  }).catch((err) => {
+    console.warn(`[agetor] pipeline runner failed stamping check feedback for task ${p.taskId}:`, err);
+  });
 }
 
 type ColumnGlobalEvent = Extract<GlobalEvent, { kind: "column" }>;
@@ -4458,7 +4888,7 @@ async function handleColumnChange(
   // L-R1: same bail as `handleRunStatus`.
   if (tombstonedPipelineParents.has(parentId)) return;
 
-  let pending: PendingReminder | null = null;
+  let pending: SettleFollowUp | null = null;
   await runExclusive(parentId, async () => {
     try {
       // Major 2: re-read the parent fresh (same rationale as
@@ -4552,6 +4982,7 @@ async function handleColumnChange(
         // same outcome arriving twice.
         if (isTaskRunLive(taskId)) return;
         if (remindersInFlight.has(taskId)) return;
+        if (checksInFlight.has(taskId)) return;
         const historyEntry = run.history.find((h) => h.taskId === taskId && h.seq === activeEntry.seq);
         if (historyEntry && historyEntry.outcome !== null) return;
         const latest = runs.listForTask(taskId)[0];
@@ -4566,7 +4997,7 @@ async function handleColumnChange(
     console.warn(`[agetor] pipeline runner failed handling column change for task ${taskId}:`, err);
   });
   // L-R7: the reminder's send happens with the lock RELEASED.
-  if (pending) await deliverHandoffReminder(pending);
+  await afterSettle(pending);
 }
 
 // ---------------------------------------------------------------------------
