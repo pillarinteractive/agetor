@@ -88,29 +88,78 @@ test("instruction refresh preserves history/holds/profiles/caps, starts no agent
   await until(() => tasks.get(parent.id)?.pipelineRun?.status === "done");
 });
 
-test("refresh refuses a live execution and leaves its instructions untouched", async () => {
+/** A second execution of the fixture's step, held live the way a turn with
+ *  background subagents still running is (`isTaskRunLive`) — a state the
+ *  rows decide, so nothing here races an agent. `release()` settles it. */
+async function liveSibling(parentId: string) {
+  const { tasks, runs, subagents } = await import("./db.ts");
+  const { isTaskRunLive } = await import("./orchestrator.ts");
+  const run = tasks.get(parentId)!.pipelineRun!;
+  const stopped = tasks.get(run.active[0]!.taskId)!;
+  const id = randomUUID();
+  const runId = randomUUID();
+  const subagentId = randomUUID();
+  tasks.insert({ ...stopped, id, runId, column: "running" });
+  runs.insert({ ...runs.get(stopped.runId!)!, id: runId, taskId: id, status: "succeeded" });
+  subagents.insertIfAbsent({ id: subagentId, taskId: id, runId, parentKind: "subagent", agentType: "Explore",
+    description: "still working", spawnDepth: 1, sourcePath: "/tmp/agent.jsonl", status: "running", startedAt: Date.now(), endedAt: null });
+  expect(isTaskRunLive(id)).toBe(true);
+  expect(isTaskRunLive(stopped.id)).toBe(false);
+  return { id, prompt: tasks.get(id)!.prompt, release: () => {
+    subagents.setStatus(subagentId, "completed", Date.now());
+    tasks.update(id, { column: "review" });
+    expect(isTaskRunLive(id)).toBe(false);
+  } };
+}
+
+test("a running run is refreshed: the snapshot changes, the live step keeps its prompt until its retry, the waiting step's prompt is rewritten", async () => {
   const { tasks } = await import("./db.ts");
-  const { refreshPipelineInstructions } = await import("./pipeline-runner.ts");
-  const { parent, template } = await fixture(true);
-  const result = await refreshPipelineInstructions(parent.id, {
-    expectedCapturedAt: parent.pipelineRun!.snapshot!.capturedAt, expectedTemplateUpdatedAt: template.updatedAt,
-  });
-  expect(result).toMatchObject({ status: 409 });
-  expect(tasks.get(parent.id)!.pipelineRun!.snapshot).toEqual(parent.pipelineRun!.snapshot);
+  const { refreshPipelineInstructions, retryPipelineStep } = await import("./pipeline-runner.ts");
+  const { parent, template, step } = await fixture();
+  const stoppedId = parent.pipelineRun!.active[0]!.taskId;
+  const stoppedPrompt = tasks.get(stoppedId)!.prompt;
+  const live = await liveSibling(parent.id);
+  // The stopped execution only waits for a free slot, so the run is running.
+  const before = { ...parent.pipelineRun!, status: "running" as const,
+    active: [...parent.pipelineRun!.active, { stepId: step.id, taskId: live.id, seq: 2 }],
+    blocked: [{ taskId: stoppedId, stepId: step.id, kind: "slot-wait" as const, message: "waiting for a free slot" }] };
+  tasks.setPipelineRun(parent.id, before);
+  const next = template.graph.steps[0]!.instructions;
+
+  const result = await refreshPipelineInstructions(parent.id);
+  if ("error" in result) throw new Error(result.error);
+  expect(result).toMatchObject({ stepIds: [step.id], unmatched: [], skippedPrompts: [] });
+  const after = result.task.pipelineRun!;
+  expect(after.snapshot!.graph.steps[0]!.instructions).toBe(next);
+  expect(after.active).toEqual([before.active[0]!, { ...before.active[1]!, staleInstructions: step.instructions }]);
+  expect({ ...after, snapshot: before.snapshot, active: before.active }).toEqual(before);
+  expect(tasks.get(live.id)!.prompt).toBe(live.prompt);
+  expect(tasks.get(stoppedId)!.prompt).toBe(stoppedPrompt.replace(step.instructions, next));
+  const { readLogged } = await import("./activity.ts");
+  expect(readLogged(parent.id).map((a) => a.text).join("\n")).toContain("picking the new one up at the next launch: Review");
+
+  // Once that execution has stopped, its retry launches the new text.
+  live.release();
+  tasks.setPipelineRun(parent.id, { ...after, status: "blocked", active: [after.active[1]!],
+    blocked: [{ taskId: live.id, stepId: step.id, kind: "step-failed", message: "stopped" }] });
+  const retry = await retryPipelineStep(parent.id, { taskId: live.id });
+  if ("error" in retry) throw new Error(retry.error);
+  expect(tasks.get(live.id)!.prompt).toBe(live.prompt.replace(step.instructions, next));
+  await until(() => tasks.get(parent.id)?.pipelineRun?.status === "done");
 });
 
-test("refresh refuses quota recovery after its timer is claimed and before the unlocked resumed turn finishes", async () => {
+test("a refresh during quota recovery applies instead of being refused", async () => {
   const { tasks } = await import("./db.ts");
   const { fireAutoRetry, refreshPipelineInstructions } = await import("./pipeline-runner.ts");
-  const { parent, template } = await fixture(false, "quota-blocked");
+  const { parent, template, step } = await fixture(false, "quota-blocked");
   const before = parent.pipelineRun!;
   const [recovery, refresh] = await Promise.all([
     fireAutoRetry(parent.id, before.autoRetry!.at!),
-    refreshPipelineInstructions(parent.id, { expectedCapturedAt: before.snapshot!.capturedAt, expectedTemplateUpdatedAt: template.updatedAt }),
+    refreshPipelineInstructions(parent.id),
   ]);
   expect(recovery).toBe(true);
-  expect(refresh).toMatchObject({ status: 409, error: expect.stringContaining("recovery") });
-  expect(tasks.get(parent.id)!.pipelineRun!.snapshot).toEqual(before.snapshot);
+  expect(refresh).toMatchObject({ stepIds: [step.id] });
+  expect(tasks.get(parent.id)!.pipelineRun!.snapshot!.graph.steps[0]!.instructions).toBe(template.graph.steps[0]!.instructions);
 });
 
 test("instruction refresh preserves literal dollar replacement syntax in both snapshot and stopped prompt", async () => {
@@ -129,23 +178,54 @@ test("instruction refresh preserves literal dollar replacement syntax in both sn
   expect(result.task.pipelineRun!.snapshot!.graph.steps[0]!.instructions).toBe(instructions);
 });
 
-test("refresh rejects stale revisions, changed topology/agents, scheduled recovery and modified step prompts", async () => {
+test("revisions are checked only when given; a template with other agents still refreshes; waits, timers and edited prompts are preserved", async () => {
   const { tasks, pipelines } = await import("./db.ts");
   const { refreshPipelineInstructions } = await import("./pipeline-runner.ts");
   const { parent, template, step } = await fixture();
   const before = parent.pipelineRun!;
-  const call = (expectedTemplateUpdatedAt = pipelines.get(template.id)!.updatedAt) => refreshPipelineInstructions(parent.id, {
-    expectedCapturedAt: before.snapshot!.capturedAt, expectedTemplateUpdatedAt,
-  });
-  expect(await call(template.updatedAt - 1)).toMatchObject({ status: 409, error: expect.stringContaining("changed") });
-  pipelines.update(template.id, { graph: { ...template.graph, steps: [{ ...step, agentProfileId: "different" }] } });
-  expect(await call()).toMatchObject({ status: 409, error: expect.stringContaining("agent assignments") });
-  pipelines.update(template.id, { graph: template.graph });
-  tasks.setPipelineRun(parent.id, { ...before, autoRetry: { stepId: step.id, kind: "quota", attempt: 1, at: Date.now() + 60000, reason: "usage exhausted" } });
-  expect(await call()).toMatchObject({ status: 409, error: expect.stringContaining("recovery") });
-  expect(tasks.get(parent.id)!.pipelineRun!.autoRetry!.kind).toBe("quota");
-  tasks.setPipelineRun(parent.id, before);
-  tasks.update(before.active[0]!.taskId, { prompt: "A manually changed prompt" });
-  expect(await call()).toMatchObject({ status: 409, error: expect.stringContaining("prompt") });
-  expect(tasks.get(parent.id)!.pipelineRun).toEqual(before);
+  const childId = before.active[0]!.taskId;
+  const edit = (instructions: string, patch: Partial<typeof step> = {}) =>
+    pipelines.update(template.id, { graph: { ...template.graph, steps: [{ ...step, ...patch, instructions }] } })!;
+  const snapshot = () => tasks.get(parent.id)!.pipelineRun!.snapshot!;
+
+  // A named revision that no longer matches still refuses; either may be left out.
+  expect(await refreshPipelineInstructions(parent.id, { expectedTemplateUpdatedAt: template.updatedAt - 1 }))
+    .toMatchObject({ status: 409, error: expect.stringContaining("changed") });
+  expect(await refreshPipelineInstructions(parent.id, { expectedCapturedAt: before.snapshot!.capturedAt - 1 }))
+    .toMatchObject({ status: 409, error: expect.stringContaining("changed") });
+  expect(snapshot()).toEqual(before.snapshot!);
+  expect(await refreshPipelineInstructions(parent.id, { expectedCapturedAt: before.snapshot!.capturedAt }))
+    .toMatchObject({ stepIds: [step.id] });
+
+  // The template's agent, name and routing moved on; the run keeps its own.
+  edit("Second text", { agentProfileId: "different", name: "Renamed", transition: "all", canFinish: true });
+  expect(await refreshPipelineInstructions(parent.id, {})).toMatchObject({ stepIds: [step.id], unmatched: [], skippedPrompts: [] });
+  expect(snapshot().graph.steps[0]).toEqual({ ...before.snapshot!.graph.steps[0]!, instructions: "Second text" });
+  expect(tasks.get(childId)!.prompt).toContain("\n\n## Your step\n\nSecond text\n\n");
+
+  // A scheduled recovery and a wait in the queue are no reason to refuse, and both survive.
+  const held = { ...tasks.get(parent.id)!.pipelineRun!,
+    autoRetry: { stepId: step.id, kind: "quota" as const, attempt: 1, at: Date.now() + 3_600_000, reason: "usage exhausted" },
+    wait: { stepId: step.id, taskId: childId, category: "resource" as const, source: "declared" as const, what: "the lab lease", ref: null,
+      reason: "lease held elsewhere", state: "waiting" as const, since: 1, attempt: 1, max: 5, at: null, deadline: 2, tried: [] } };
+  tasks.setPipelineRun(parent.id, held);
+  const stored = tasks.get(parent.id)!.pipelineRun!;
+  expect(stored.wait).toEqual(held.wait);
+  edit("Third text");
+  expect(await refreshPipelineInstructions(parent.id)).toMatchObject({ stepIds: [step.id] });
+  const refreshed = tasks.get(parent.id)!.pipelineRun!;
+  expect({ ...refreshed, snapshot: stored.snapshot }).toEqual(stored);
+  expect(tasks.get(childId)!.prompt).toContain("\n\n## Your step\n\nThird text\n\n");
+
+  // A hand-edited prompt is kept and reported; the snapshot is updated anyway.
+  tasks.update(childId, { prompt: "A manually changed prompt" });
+  edit("Fourth text");
+  expect(await refreshPipelineInstructions(parent.id)).toMatchObject({ stepIds: [step.id], skippedPrompts: [childId] });
+  expect(snapshot().graph.steps[0]!.instructions).toBe("Fourth text");
+  expect(tasks.get(childId)!.prompt).toBe("A manually changed prompt");
+
+  // What cannot be done is still refused.
+  expect(await refreshPipelineInstructions("missing")).toMatchObject({ status: 404 });
+  pipelines.delete(template.id);
+  expect(await refreshPipelineInstructions(parent.id)).toMatchObject({ status: 404, error: expect.stringContaining("template") });
 });

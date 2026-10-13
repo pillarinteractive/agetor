@@ -473,11 +473,11 @@ const sanitizeStoredHandoff = (raw: unknown): Handoff | null => (isPlainObject(r
  *  either way. */
 const sanitizeActiveStep = (raw: unknown): PipelineActiveStep | null => {
   if (!isPlainObject(raw)) return null;
-  const { stepId, taskId, seq } = raw as Record<string, unknown>;
+  const { stepId, taskId, seq, staleInstructions } = raw as Record<string, unknown>;
   if (typeof stepId !== "string" || !stepId) return null;
   if (typeof taskId !== "string" || !taskId) return null;
   if (!isFiniteNumber(seq)) return null;
-  return { stepId, taskId, seq };
+  return { stepId, taskId, seq, ...(typeof staleInstructions === "string" ? { staleInstructions } : {}) };
 };
 
 const sanitizeJoinArrival = (raw: unknown): PipelineJoinArrival | null => {

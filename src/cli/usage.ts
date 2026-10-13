@@ -254,10 +254,11 @@ export const USAGE: Record<string, string> = {
 
   "pipeline refresh-instructions": `usage: agetor pipeline refresh-instructions <task-id>
 
-  Apply the current template's step instructions to a blocked or cancelled
-  run without restarting it. Requires unchanged topology and agent assignments,
-  no live execution, pending interaction or automatic recovery. Keeps history,
-  findings, permissions, holds and resource caps; starts no agents.`,
+  Apply the current template's step instructions to a started run without
+  restarting it, whatever its state. Steps are matched by id; the run keeps
+  its own topology and agent assignments. A step that is executing keeps its
+  prompt and takes the new text at its next launch. Keeps history, findings,
+  permissions, holds and resource caps; starts no agents.`,
 
   "pipeline restart": `usage: agetor pipeline restart <task-id>
 

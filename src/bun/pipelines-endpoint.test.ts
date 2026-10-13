@@ -9,7 +9,7 @@
 // in-process fake driver (no tmux, no real CLI) so the step-guard tests can
 // actually start a pipeline run.
 import { test, expect, beforeAll, afterAll, beforeEach } from "bun:test";
-import { mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -554,14 +554,16 @@ test("GET /tasks/:id/pipeline on a plain (non-pipeline) task → 400", async () 
   expect((await res.json()).error).toContain("not a pipeline task");
 });
 
-test("refresh-instructions requires authentication and checked revision fields", async () => {
+test("refresh-instructions requires authentication; revisions are optional but checked for shape when given", async () => {
   expect((await fetch(`${BASE}/tasks/missing/pipeline/refresh-instructions`, { method: "POST" })).status).toBe(401);
-  for (const body of [null, [], {}, { expectedCapturedAt: "1", expectedTemplateUpdatedAt: 1 }]) {
+  for (const body of [null, [], { expectedCapturedAt: "1", expectedTemplateUpdatedAt: 1 }, { expectedTemplateUpdatedAt: -1 }]) {
     const res = await call("/tasks/missing/pipeline/refresh-instructions", { method: "POST", body: JSON.stringify(body) });
     expect(res.status).toBe(400);
   }
-  const res = await call("/tasks/missing/pipeline/refresh-instructions", { method: "POST", body: JSON.stringify({ expectedCapturedAt: 1, expectedTemplateUpdatedAt: 1 }) });
-  expect(res.status).toBe(404);
+  for (const body of [{}, { expectedCapturedAt: 1 }, { expectedCapturedAt: 1, expectedTemplateUpdatedAt: 1 }]) {
+    const res = await call("/tasks/missing/pipeline/refresh-instructions", { method: "POST", body: JSON.stringify(body) });
+    expect(res.status).toBe(404);
+  }
 });
 
 test("refresh-instructions updates a stopped snapshot without clearing its cap hold or starting a task", async () => {
@@ -585,6 +587,100 @@ test("refresh-instructions updates a stopped snapshot without clearing its cap h
   expect(updated.task.pipelineRun!.blocked).toEqual(run.blocked);
   expect(updated.task.pipelineRun!.snapshot!.maxSteps).toBe(14);
   expect(updated.task.pipelineRun!.active).toEqual([]);
+});
+
+/** One card per run state on `pipeline`, each (but the never-started one)
+ *  holding a snapshot of the template as it is now. */
+async function runsInEveryState(pipeline: Pipeline) {
+  const { tasks } = await import("./db.ts");
+  const stepId = pipeline.graph.steps[0]!.id;
+  const make = async (status: "running" | "blocked" | "cancelled" | "done" | "idle", archived = false) => {
+    const task = await createTask({ pipelineId: pipeline.id });
+    if (status !== "idle") {
+      tasks.setPipelineRun(task.id, { ...task.pipelineRun!, status,
+        // `slot-wait` keeps a run running; `step-cap` is an owner hold.
+        blocked: status === "running" ? [{ taskId: null, stepId, kind: "slot-wait" as const, message: "waiting for a free slot" }]
+          : status === "blocked" ? [{ taskId: null, stepId, kind: "step-cap" as const, message: "resource budget exhausted" }] : [],
+        snapshot: { graph: pipeline.graph, profiles: {}, maxSteps: 14, capturedAt: 100 },
+      });
+    }
+    if (archived) db.run(`UPDATE tasks SET archived_at = ? WHERE id = ?`, [Date.now(), task.id]);
+    return task.id;
+  };
+  return {
+    running: await make("running"), blocked: await make("blocked"), cancelled: await make("cancelled"),
+    done: await make("done"), idle: await make("idle"), archived: await make("blocked", true),
+  };
+}
+const snapshotText = async (taskId: string) =>
+  (await import("./db.ts")).tasks.get(taskId)!.pipelineRun!.snapshot?.graph.steps[0]!.instructions;
+
+test("PATCH /pipelines/:id with edited instructions is adopted by running, blocked and cancelled runs; idle, done and archived are left", async () => {
+  const { tasks } = await import("./db.ts");
+  const { pipelineAdoptionsSettled } = await import("./pipeline-runner.ts");
+  const { readLogged } = await import("./activity.ts");
+  const profile = await createProfile();
+  const other = await createProfile({ name: "Another Agent" });
+  const pipeline = await createPipeline(profile.id);
+  const ids = await runsInEveryState(pipeline);
+  const before = Object.fromEntries(Object.entries(ids).map(([k, id]) => [k, tasks.get(id)!.pipelineRun!]));
+
+  // An edit that leaves the step text alone starts nothing.
+  expect((await call(`/pipelines/${pipeline.id}`, { method: "PATCH", body: JSON.stringify({ description: "renamed" }) })).status).toBe(200);
+  await pipelineAdoptionsSettled();
+  expect(await snapshotText(ids.running)).toBe(pipeline.graph.steps[0]!.instructions);
+
+  // The same PATCH also moves the step to another agent — no reason to refuse.
+  const res = await call(`/pipelines/${pipeline.id}`, { method: "PATCH", body: JSON.stringify({ graph: { ...pipeline.graph,
+    steps: pipeline.graph.steps.map((s) => ({ ...s, agentProfileId: other.id, instructions: "updated instructions" })) } }) });
+  expect(res.status).toBe(200);
+  await pipelineAdoptionsSettled();
+
+  for (const key of ["running", "blocked", "cancelled"] as const) {
+    const run = tasks.get(ids[key])!.pipelineRun!;
+    expect(run.snapshot!.graph.steps[0]).toEqual({ ...pipeline.graph.steps[0]!, instructions: "updated instructions" });
+    expect({ ...run, snapshot: before[key]!.snapshot }).toEqual(before[key]!);
+    expect(readLogged(ids[key]).filter((a) => a.text.startsWith("Updated instructions from template for Step 1"))).toHaveLength(1);
+  }
+  for (const key of ["done", "idle", "archived"] as const) {
+    expect(tasks.get(ids[key])!.pipelineRun).toEqual(before[key]!);
+    expect(readLogged(ids[key])).toEqual([]);
+  }
+});
+
+test("POST /pipelines/:id/refresh-runs returns one result per unfinished run, and one run's failure does not stop the rest", async () => {
+  const { tasks, pipelines } = await import("./db.ts");
+  const { pipelineRunsDir } = await import("./pipeline-runner.ts");
+  expect((await fetch(`${BASE}/pipelines/missing/refresh-runs`, { method: "POST" })).status).toBe(401);
+  expect((await call("/pipelines/missing/refresh-runs", { method: "POST" })).status).toBe(404);
+
+  const profile = await createProfile();
+  const pipeline = await createPipeline(profile.id);
+  const ids = await runsInEveryState(pipeline);
+  const stepId = pipeline.graph.steps[0]!.id;
+  // The blocked run no longer has the template's step, only one of its own.
+  const own = { ...pipeline.graph.steps[0]!, id: randomUUID(), name: "Retired" };
+  const blockedRun = tasks.get(ids.blocked)!.pipelineRun!;
+  tasks.setPipelineRun(ids.blocked, { ...blockedRun, snapshot: { ...blockedRun.snapshot!, graph: { steps: [own], edges: [], startStepId: own.id } } });
+  // The cancelled run cannot write its audit file: its data directory is a file.
+  mkdirSync(path.dirname(pipelineRunsDir(ids.cancelled)), { recursive: true });
+  writeFileSync(pipelineRunsDir(ids.cancelled), "in the way");
+  // Edited without the PATCH route, the way yesterday's template edit reached no run.
+  pipelines.update(pipeline.id, { graph: { ...pipeline.graph,
+    steps: pipeline.graph.steps.map((s) => ({ ...s, instructions: "updated instructions" })) } });
+
+  const res = await call(`/pipelines/${pipeline.id}/refresh-runs`, { method: "POST" });
+  expect(res.status).toBe(200);
+  const { results } = await res.json() as { results: { taskId: string; stepIds: string[]; unmatched: string[]; skippedPrompts: string[]; error?: string }[] };
+  const byTask = new Map(results.map((r) => [r.taskId, r]));
+  expect([...byTask.keys()].sort()).toEqual([ids.running, ids.blocked, ids.cancelled].sort());
+  expect(byTask.get(ids.running)).toEqual({ taskId: ids.running, stepIds: [stepId], unmatched: [], skippedPrompts: [] });
+  expect(byTask.get(ids.blocked)).toEqual({ taskId: ids.blocked, stepIds: [], unmatched: [own.id], skippedPrompts: [] });
+  expect(byTask.get(ids.cancelled)).toEqual({ taskId: ids.cancelled, stepIds: [], unmatched: [], skippedPrompts: [], error: expect.any(String) });
+  expect(await snapshotText(ids.running)).toBe("updated instructions");
+  expect(await snapshotText(ids.cancelled)).toBe(pipeline.graph.steps[0]!.instructions);
+  expect(await snapshotText(ids.done)).toBe(pipeline.graph.steps[0]!.instructions);
+  expect(await snapshotText(ids.archived)).toBe(pipeline.graph.steps[0]!.instructions);
 });
 
 test("GET /tasks/:id/pipeline on an unknown task → 404", async () => {

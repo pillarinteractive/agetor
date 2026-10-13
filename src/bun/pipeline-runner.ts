@@ -184,7 +184,7 @@ export function initialPipelineRunState(p: Pipeline): PipelineRunState {
  */
 const parentChains = new Map<string, Promise<unknown>>();
 // Recovery deliberately sends outside the parent lock. Keep its claim until
-// that send/relaunch finishes so instruction edits cannot slip into the gap.
+// that send/relaunch finishes so a second recovery cannot slip into the gap.
 const recoveriesInFlight = new Set<string>();
 function runExclusive<T>(parentId: string, fn: () => Promise<T>): Promise<T> {
   const prev = (parentChains.get(parentId) ?? Promise.resolve()) as Promise<unknown>;
@@ -2259,6 +2259,7 @@ async function retryActiveExecutions(
   let queued = 0;
   for (const t of targets) {
     run.blocked = run.blocked.filter((b) => b.taskId !== t.taskId);
+    adoptDeferredInstructions(run, t);
     const started = await startTask(t.taskId).catch((error:unknown)=>({error:error instanceof Error?error.message:String(error)}));
     if ("error" in started) {
       // L-R2: `startTask`'s own double-start guards ("task is already
@@ -2808,57 +2809,107 @@ export async function advancePipeline(
   });
 }
 
-/** Explicitly adopt a template's instruction edits without restarting the
- * run. No agent is launched, no verdict/hold is cleared, and profiles/caps
- * stay frozen. The caller names both revisions it inspected. */
+/** The generated `## Your step` section of a step prompt, as
+ *  `composeStepPrompt` writes it for `instructions`. */
+function stepSection(instructions: string): string {
+  return `\n\n## Your step\n\n${instructions.trim() ? instructions : "(no additional instructions)"}\n\n`;
+}
+
+/** `prompt` with its `## Your step` section swapped from `before` to `after`,
+ *  or null when that section is not there exactly once — a hand-edited or
+ *  ambiguous prompt is left for its owner rather than guessed at. */
+function withStepInstructions(prompt: string, before: string, after: string): string | null {
+  const needle = stepSection(before);
+  const at = prompt.indexOf(needle);
+  if (at < 0 || at !== prompt.lastIndexOf(needle)) return null;
+  return prompt.replace(needle, () => stepSection(after));
+}
+
+/** A Retry re-launches the execution's existing prompt. If an instruction
+ *  refresh left that prompt alone because the step was live, bring it up to
+ *  the snapshot's text now. The caller persists `run`. */
+function adoptDeferredInstructions(run: PipelineRunState, active: PipelineActiveStep): void {
+  const stale = active.staleInstructions;
+  if (stale === undefined) return;
+  delete active.staleInstructions;
+  const step = run.snapshot?.graph.steps.find((s) => s.id === active.stepId);
+  const child = tasks.get(active.taskId);
+  if (!step || !child || stale === step.instructions) return;
+  const prompt = withStepInstructions(child.prompt, stale, step.instructions);
+  if (prompt !== null) tasks.update(child.id, { prompt });
+}
+
+/** What an instruction refresh did to one run: `stepIds` changed in the
+ *  snapshot, `unmatched` are the run's steps the template no longer has, and
+ *  `skippedPrompts` are the step TASK ids whose stopped prompt could not be
+ *  rewritten (see {@link refreshPipelineInstructions}). */
+export interface PipelineInstructionRefresh {
+  stepIds: string[];
+  unmatched: string[];
+  skippedPrompts: string[];
+}
+
+/** Adopt a template's instruction edits without restarting the run, in any
+ * state: the snapshot takes the template's text for every step both have, so
+ * every later launch uses it. No agent is launched or interrupted, no
+ * verdict, hold, wait or count is touched, and topology/profiles/caps stay
+ * the run's own. A step task that is not executing has its generated
+ * `## Your step` section rewritten so its Retry runs the new text; a live
+ * one keeps its prompt (the agent already has it) and is rewritten at its
+ * next Retry. Only what cannot be done is refused: no pipeline, archived, no
+ * snapshot, no or invalid template — and a revision the caller named that no
+ * longer matches. A hand-edited step prompt is skipped and reported. */
 export async function refreshPipelineInstructions(
   parentId: string,
-  opts: { expectedCapturedAt: number; expectedTemplateUpdatedAt: number },
-): Promise<{ task: Task; stepIds: string[] } | { error: string; status: 400 | 404 | 409 }> {
+  opts?: { expectedCapturedAt?: number; expectedTemplateUpdatedAt?: number },
+): Promise<({ task: Task } & PipelineInstructionRefresh) | { error: string; status: 400 | 404 | 409 }> {
   return runExclusive(parentId, async () => {
     const parent = tasks.get(parentId);
     if (!parent?.pipelineId || tombstonedPipelineParents.has(parentId)) {
       return { error: "not a pipeline task", status: 404 as const };
     }
+    if (parent.archivedAt != null) {
+      return { error: "pipeline task is archived — unarchive it first", status: 409 as const };
+    }
     const run = parent.pipelineRun;
-    if (parent.archivedAt != null || !run?.snapshot || !["blocked", "cancelled"].includes(run.status)) {
-      return { error: "instructions can only be refreshed on a blocked or cancelled, unarchived run", status: 409 as const };
-    }
-    if (recoveriesInFlight.has(parentId)) {
-      return { error: "automatic recovery is still in flight — instructions were not changed", status: 409 as const };
-    }
-    if (run.active.some((a) => isTaskRunLive(a.taskId) || isTaskRunCancelling(a.taskId) || remindersInFlight.has(a.taskId))) {
-      return { error: "a pipeline execution is still live — instructions were not changed", status: 409 as const };
-    }
-    if (run.autoRetry?.at != null || run.wait || run.active.some((a) => listPendingForTask(a.taskId).length > 0)) {
-      return { error: "recovery or an interaction is pending — resolve that hold before refreshing instructions", status: 409 as const };
+    if (!run?.snapshot) {
+      return { error: "pipeline has never run — it takes the template's instructions when it starts", status: 409 as const };
     }
     const template = pipelines.get(parent.pipelineId);
     if (!template) return { error: "pipeline template no longer exists", status: 404 as const };
-    if (run.snapshot.capturedAt !== opts.expectedCapturedAt || template.updatedAt !== opts.expectedTemplateUpdatedAt) {
+    // Optimistic concurrency for a caller that showed someone a diff first;
+    // a caller that names no revision just applies the template as it is.
+    if ((opts?.expectedCapturedAt !== undefined && run.snapshot.capturedAt !== opts.expectedCapturedAt) ||
+        (opts?.expectedTemplateUpdatedAt !== undefined && template.updatedAt !== opts.expectedTemplateUpdatedAt)) {
       return { error: "run or template changed — inspect the current instructions before refreshing", status: 409 as const };
     }
     const validated = validatePipelineGraph(template.graph);
     if (!validated.ok) return { error: `pipeline graph is invalid: ${validated.error}`, status: 400 as const };
     const updated = updatedPipelineInstructions(run.snapshot.graph, validated.graph);
-    if ("error" in updated) return { error: updated.error, status: 409 as const };
-    if (updated.stepIds.length === 0) return { task: parent, stepIds: [] };
+    if (updated.stepIds.length === 0) return { task: parent, stepIds: [], unmatched: updated.unmatched, skippedPrompts: [] };
 
-    // A retry re-launches the existing step task's prompt. Refresh that
-    // generated instruction section too, preserving its goal/reports and
-    // refusing a hand-edited or ambiguous prompt instead of guessing.
+    // A retry re-launches the existing step task's prompt, so refresh its
+    // generated instruction section too, preserving its goal/reports. A live
+    // execution's prompt is already with the agent: remember the text it
+    // carries and leave it until that execution is next launched.
     const promptUpdates: { taskId: string; prompt: string }[] = [];
-    for (const active of run.active.filter((a) => updated.stepIds.includes(a.stepId))) {
-      const child = tasks.get(active.taskId);
-      const before = run.snapshot.graph.steps.find((s) => s.id === active.stepId)!;
-      const after = updated.graph.steps.find((s) => s.id === active.stepId)!;
-      const needle = `\n\n## Your step\n\n${before.instructions.trim() ? before.instructions : "(no additional instructions)"}\n\n`;
-      if (!child || !child.prompt.includes(needle) || child.prompt.indexOf(needle) !== child.prompt.lastIndexOf(needle)) {
-        return { error: "step prompt was changed or is ambiguous — instructions were not changed", status: 409 as const };
+    const skippedPrompts: string[] = [];
+    const liveStepIds = new Set<string>();
+    const active = run.active.map((a): PipelineActiveStep => {
+      const { staleInstructions, ...entry } = a;
+      const after = updated.graph.steps.find((s) => s.id === a.stepId);
+      const carried = staleInstructions ?? run.snapshot!.graph.steps.find((s) => s.id === a.stepId)?.instructions;
+      if (!after || carried === undefined || carried === after.instructions) return entry;
+      if (isTaskRunLive(a.taskId) || isTaskRunCancelling(a.taskId) || remindersInFlight.has(a.taskId)) {
+        liveStepIds.add(a.stepId);
+        return { ...entry, staleInstructions: carried };
       }
-      const replacement = `\n\n## Your step\n\n${after.instructions.trim() ? after.instructions : "(no additional instructions)"}\n\n`;
-      promptUpdates.push({ taskId: child.id, prompt: child.prompt.replace(needle, () => replacement) });
-    }
+      const child = tasks.get(a.taskId);
+      const prompt = child ? withStepInstructions(child.prompt, carried, after.instructions) : null;
+      if (prompt !== null) promptUpdates.push({ taskId: a.taskId, prompt });
+      else if (child) skippedPrompts.push(a.taskId);
+      return entry;
+    });
     const now = Math.max(Date.now(), run.snapshot.capturedAt + 1);
     const auditPath = join(pipelineRunsDir(parentId), `instruction-update-${randomUUID()}.json`);
     mkdirSync(pipelineRunsDir(parentId), { recursive: true });
@@ -2868,18 +2919,74 @@ export async function refreshPipelineInstructions(
         before: run.snapshot!.graph.steps.find((s) => s.id === id)!.instructions,
         after: updated.graph.steps.find((s) => s.id === id)!.instructions,
       })),
+      unmatched: updated.unmatched, liveStepIds: [...liveStepIds], skippedPrompts,
     }, null, 2));
     const snapshot = { ...run.snapshot, graph: updated.graph, capturedAt: now };
     db.transaction(() => {
       for (const update of promptUpdates) tasks.update(update.taskId, { prompt: update.prompt });
-      tasks.setPipelineRun(parentId, { ...run, snapshot });
+      tasks.setPipelineRun(parentId, { ...run, active, snapshot });
     })();
+    const names = (ids: Iterable<string>) => [...ids].map((id) => stepNameById(updated.graph, id)).join(", ");
     recordActivity(parentId, { kind: "auto", tone: "info",
-      text: `Updated instructions from template for ${updated.stepIds.map((id) => stepNameById(updated.graph, id)).join(", ")}; history and holds preserved. Audit: ${auditPath}` });
+      text: `Updated instructions from template for ${names(updated.stepIds)}; history and holds preserved.` +
+        (liveStepIds.size > 0 ? ` Still running on the earlier text, picking the new one up at the next launch: ${names(liveStepIds)}.` : "") +
+        (skippedPrompts.length > 0 ? ` ${skippedPrompts.length} stopped step prompt(s) were edited by hand and kept as they are.` : "") +
+        (updated.unmatched.length > 0 ? ` Not in the template, left unchanged: ${names(updated.unmatched)}.` : "") +
+        ` Audit: ${auditPath}` });
     publishGlobalEvent({ kind: "pipeline", taskId: parentId, status: run.status,
       activeStepIds: run.active.map((a) => a.stepId), stepCount: run.stepCount, ts: now });
-    return { task: tasks.get(parentId)!, stepIds: updated.stepIds };
+    return { task: tasks.get(parentId)!, stepIds: updated.stepIds, unmatched: updated.unmatched, skippedPrompts };
   });
+}
+
+/** One run's outcome in {@link refreshPipelineRuns}. */
+export interface PipelineRunRefreshResult extends PipelineInstructionRefresh {
+  taskId: string;
+  error?: string;
+}
+
+/** Push a template's current instructions into every unarchived, unfinished
+ * run of it (running, blocked or cancelled) — a never-started card snapshots
+ * the template when it starts and a finished one has nothing left to launch.
+ * Each run is refreshed under its own lock, side by side, so a run busy
+ * launching a step delays only itself; one run's failure is that run's
+ * `error` and never the others'. */
+export async function refreshPipelineRuns(pipelineId: string): Promise<PipelineRunRefreshResult[]> {
+  const targets = tasks.list({ archived: "none" }).filter((t) => t.pipelineId === pipelineId && !isPipelineStepTask(t) &&
+    t.pipelineRun?.snapshot != null &&
+    (t.pipelineRun.status === "running" || t.pipelineRun.status === "blocked" || t.pipelineRun.status === "cancelled"));
+  return Promise.all(targets.map(async (t): Promise<PipelineRunRefreshResult> => {
+    const failed = (error: string) => {
+      recordActivity(t.id, { kind: "auto", tone: "warning", text: `Could not update instructions from template: ${error}` });
+      return { taskId: t.id, stepIds: [], unmatched: [], skippedPrompts: [], error };
+    };
+    try {
+      const result = await refreshPipelineInstructions(t.id);
+      if ("error" in result) return failed(result.error);
+      return { taskId: t.id, stepIds: result.stepIds, unmatched: result.unmatched, skippedPrompts: result.skippedPrompts };
+    } catch (e) {
+      return failed(e instanceof Error ? e.message : String(e));
+    }
+  }));
+}
+
+// Adoptions started by a template edit and not yet finished.
+const adoptionsInFlight = new Set<Promise<unknown>>();
+
+/** Start {@link refreshPipelineRuns} for an edited template and return at
+ * once: the edit's response must not wait behind a run that holds its lock
+ * while a step launches. */
+export function adoptPipelineInstructions(pipelineId: string): void {
+  const adoption = refreshPipelineRuns(pipelineId).catch((e: unknown) => {
+    console.warn(`[agetor] pipeline ${pipelineId}: adopting edited instructions failed:`, e);
+  });
+  adoptionsInFlight.add(adoption);
+  void adoption.finally(() => adoptionsInFlight.delete(adoption));
+}
+
+/** Resolves once every adoption started so far has finished. */
+export async function pipelineAdoptionsSettled(): Promise<void> {
+  while (adoptionsInFlight.size > 0) await Promise.all(adoptionsInFlight);
 }
 
 /** Retry currently blocked executions and pending launches. Never starts a

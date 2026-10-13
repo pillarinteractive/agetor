@@ -660,6 +660,11 @@ export interface PipelineActiveStep {
   /** This execution's position in `history` / overall step-cap accounting
    *  (1-based, monotonically increasing per run). */
   seq: number;
+  /** The step text this execution's prompt still carries, set when an
+   *  instruction refresh found the step live and left its prompt alone
+   *  (`refreshPipelineInstructions`). The next refresh or Retry of this
+   *  execution rewrites the prompt from it and clears it. */
+  staleInstructions?: string;
 }
 
 /** One incoming arrival recorded against a `join: "all"` step while it

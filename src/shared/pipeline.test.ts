@@ -2776,23 +2776,55 @@ describe("blockedHandoffChoosesNext", () => {
 });
 
 describe("updatedPipelineInstructions", () => {
-  const { updatedPipelineInstructions } = require("./pipeline.ts") as typeof import("./pipeline.ts");
+  const { updatedPipelineInstructions, FOLLOW_UP_STEP_PREFIX } = require("./pipeline.ts") as typeof import("./pipeline.ts");
   const graph = makeGraph({ steps: [makeStep({ id: "review", instructions: "old" })], startStepId: "review" });
   test("only instructions change; the run's positions and ordering stay intact", () => {
     const template = { ...graph, steps: [{ ...graph.steps[0]!, instructions: "new", position: { x: 99, y: 99 } }] };
     expect(updatedPipelineInstructions(graph, template)).toEqual({
-      graph: { ...graph, steps: [{ ...graph.steps[0]!, instructions: "new" }] }, stepIds: ["review"],
+      graph: { ...graph, steps: [{ ...graph.steps[0]!, instructions: "new" }] }, stepIds: ["review"], unmatched: [],
     });
     expect(graph.steps[0]!.instructions).toBe("old");
   });
-  test("agent, delegation, routing, name and finish changes cannot ride an instruction refresh", () => {
+  test("a template whose agents, delegation, routing, names, edges or start changed still hands over its instructions; the run keeps its own", () => {
     for (const patch of [
       { agentProfileId: "another" }, { subagents: { profileIds: ["another"], cap: null } },
       { transition: "all" as const }, { join: "all" as const }, { name: "Ship" }, { canFinish: true },
     ]) {
-      expect(updatedPipelineInstructions(graph, { ...graph, steps: [{ ...graph.steps[0]!, ...patch }] })).toHaveProperty("error");
+      expect(updatedPipelineInstructions(graph, { ...graph, steps: [{ ...graph.steps[0]!, ...patch, instructions: "new" }] })).toEqual({
+        graph: { ...graph, steps: [{ ...graph.steps[0]!, instructions: "new" }] }, stepIds: ["review"], unmatched: [],
+      });
     }
-    expect(updatedPipelineInstructions(graph, { ...graph, startStepId: null })).toHaveProperty("error");
+    const run = makeGraph({
+      steps: [makeStep({ id: "build", agentProfileId: "opus", instructions: "old build" }), makeStep({ id: "review", agentProfileId: "gpt", instructions: "old review" })],
+      edges: [makeEdge({ id: "e1", from: "build", to: "review", label: "ready" })], startStepId: "build",
+    });
+    const template = makeGraph({
+      steps: [makeStep({ id: "review", agentProfileId: "opus", instructions: "new review" }), makeStep({ id: "build", agentProfileId: "gpt", instructions: "new build" })],
+      edges: [makeEdge({ id: "e2", from: "review", to: "build", label: "changes requested" })], startStepId: "review",
+    });
+    const updated = updatedPipelineInstructions(run, template);
+    expect(updated.stepIds).toEqual(["build", "review"]);
+    expect(updated.graph).toEqual({ ...run, steps: [{ ...run.steps[0]!, instructions: "new build" }, { ...run.steps[1]!, instructions: "new review" }] });
+  });
+  test("steps only in the run keep their text and are reported; template-only and follow-up steps are not", () => {
+    const run = makeGraph({
+      steps: [
+        makeStep({ id: "build", instructions: "old build" }), makeStep({ id: "retired", instructions: "retired text" }),
+        makeStep({ id: `${FOLLOW_UP_STEP_PREFIX}1`, instructions: "what the owner asked afterwards" }),
+      ],
+      startStepId: "build",
+    });
+    const template = makeGraph({
+      steps: [
+        makeStep({ id: "build", instructions: "new build" }), makeStep({ id: "added", instructions: "added text" }),
+        makeStep({ id: `${FOLLOW_UP_STEP_PREFIX}1`, instructions: "a template can never own this id" }),
+      ],
+      startStepId: "build",
+    });
+    expect(updatedPipelineInstructions(run, template)).toEqual({
+      graph: { ...run, steps: [{ ...run.steps[0]!, instructions: "new build" }, run.steps[1]!, run.steps[2]!] },
+      stepIds: ["build"], unmatched: ["retired"],
+    });
   });
 });
 

@@ -30,7 +30,7 @@ import {
 } from "./db.ts";
 import { refreshOne } from "./usage/poller.ts";
 import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, publishGlobalEvent, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
-import { advancePipeline, cancelPipelineRun, isPipelineStepTask, listBlockWaits, pipelineStepReports, refreshPipelineInstructions, releaseSlotWaits, retryPipelineStep, startPipelineRun } from "./pipeline-runner.ts";
+import { advancePipeline, cancelPipelineRun, isPipelineStepTask, listBlockWaits, adoptPipelineInstructions, pipelineStepReports, refreshPipelineInstructions, refreshPipelineRuns, releaseSlotWaits, retryPipelineStep, startPipelineRun } from "./pipeline-runner.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
 import { accountUsageDays } from "./account-usage.ts";
@@ -4203,6 +4203,15 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
 
           try {
             const updated = pipelines.update(req.params.id, patch);
+            // Edited step text reaches the runs already started from this
+            // template too. Not awaited: each run adopts it under its own
+            // lock, which a launching step can hold for a while.
+            if (updated && current.graph.steps.some((s) => {
+              const next = updated.graph.steps.find((n) => n.id === s.id);
+              return next !== undefined && next.instructions !== s.instructions;
+            })) {
+              adoptPipelineInstructions(updated.id);
+            }
             return updated
               ? json(withPipelineTaskCount(updated), { headers: corsHeaders(req) })
               : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
@@ -4223,6 +4232,20 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           return removed
             ? json({ ok: true }, { headers: corsHeaders(req) })
             : json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+        }),
+      },
+
+      // Push the template's current instructions into every unfinished run
+      // of it, on demand — the same adoption a PATCH that edits step text
+      // starts by itself, awaited here so the caller gets each run's result.
+      "/pipelines/:id/refresh-runs": {
+        POST: authed(async (req) => {
+          if (!pipelines.get(req.params.id)) {
+            return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          }
+          // A run busy launching a step holds its lock for as long as that takes.
+          server.timeout(req, 0);
+          return json({ results: await refreshPipelineRuns(req.params.id) }, { headers: corsHeaders(req) });
         }),
       },
 
@@ -5056,12 +5079,16 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       "/tasks/:id/pipeline/refresh-instructions": {
         POST: authed(async (req) => {
           const body = await req.json().catch(() => null);
+          // Both revisions are optional: a caller that inspected the run
+          // names them, one that just wants the template applied sends {}.
+          const revision = (v: unknown) => v === undefined || (Number.isSafeInteger(v) && (v as number) >= 0);
           if (!body || typeof body !== "object" || Array.isArray(body) ||
-              !Number.isSafeInteger(body.expectedCapturedAt) || body.expectedCapturedAt < 0 ||
-              !Number.isSafeInteger(body.expectedTemplateUpdatedAt) || body.expectedTemplateUpdatedAt < 0) {
-            return json({ error: "expectedCapturedAt and expectedTemplateUpdatedAt must be non-negative integer revisions" }, { status: 400, headers: corsHeaders(req) });
+              !revision(body.expectedCapturedAt) || !revision(body.expectedTemplateUpdatedAt)) {
+            return json({ error: "expectedCapturedAt and expectedTemplateUpdatedAt must be non-negative integer revisions when given" }, { status: 400, headers: corsHeaders(req) });
           }
-          const result = await refreshPipelineInstructions(req.params.id, body);
+          const result = await refreshPipelineInstructions(req.params.id, {
+            expectedCapturedAt: body.expectedCapturedAt, expectedTemplateUpdatedAt: body.expectedTemplateUpdatedAt,
+          });
           return "error" in result
             ? json({ error: result.error }, { status: result.status, headers: corsHeaders(req) })
             : json(result, { headers: corsHeaders(req) });

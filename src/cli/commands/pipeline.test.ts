@@ -1133,7 +1133,7 @@ test("cmdPipeline refresh-instructions supplies inspected revisions and never st
   currentClient = makeClient({ listTasks: async () => [t], getPipeline: async () => template,
     refreshPipelineInstructions: async (id, body) => {
       calls.push({ id, body });
-      return { task: t, stepIds: [] };
+      return { task: t, stepIds: [], unmatched: [], skippedPrompts: [] };
     },
   });
   await cmdPipeline(["refresh-instructions", "parent-1"], flags);

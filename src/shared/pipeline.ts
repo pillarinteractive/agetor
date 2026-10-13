@@ -1084,25 +1084,29 @@ export function blockedHandoffChoosesNext(g: PipelineGraph, fromStepId: string, 
     /^(?:changes requested|verification failed|needs work|fix|repair|rework|retry)$/i.test(o.edge.label.trim()));
 }
 
-/** Copy only step instructions from a compatible template. Preserve the
- * run's topology, agent assignments, delegation, positions and resource cap. */
+/**
+ * Copy step instructions from the template onto the run's own graph, for
+ * every step id present in both. Nothing else is taken from the template and
+ * nothing about it can refuse the copy: the run keeps its topology, agent
+ * assignments, delegation, names, positions and resource cap, so a template
+ * whose agents, edges or routing were edited since the run started still
+ * hands over its prompts. A step only in the run keeps its text; a step only
+ * in the template is ignored. `stepIds` are the steps whose text changed;
+ * `unmatched` are the run's own steps the template no longer has (for the
+ * caller to report). A follow-up step (`isFollowUpStepId`) was never part of
+ * a template: it is never matched and never reported.
+ */
 export function updatedPipelineInstructions(graph: PipelineGraph, template: PipelineGraph):
-  { graph: PipelineGraph; stepIds: string[] } | { error: string } {
-  const shape = (g: PipelineGraph) => JSON.stringify({
-    startStepId: g.startStepId,
-    steps: g.steps.map((s) => ({
-      id: s.id, name: s.name, agentProfileId: s.agentProfileId,
-      subagents: s.subagents, transition: s.transition, join: s.join, canFinish: s.canFinish === true,
-    })).sort((a, b) => a.id.localeCompare(b.id)),
-    edges: g.edges.map((e) => ({ id: e.id, from: e.from, to: e.to, label: e.label }))
-      .sort((a, b) => a.id.localeCompare(b.id)),
-  });
-  if (shape(graph) !== shape(template)) {
-    return { error: "template topology or agent assignments changed — only instructions can be refreshed" };
-  }
+  { graph: PipelineGraph; stepIds: string[]; unmatched: string[] } {
   const instructions = new Map(template.steps.map((s) => [s.id, s.instructions]));
-  const stepIds = graph.steps.filter((s) => s.instructions !== instructions.get(s.id)).map((s) => s.id);
-  return { graph: { ...graph, steps: graph.steps.map((s) => ({ ...s, instructions: instructions.get(s.id)! })) }, stepIds };
+  const matched = (s: PipelineStep) => !isFollowUpStepId(s.id) && instructions.has(s.id);
+  const stepIds = graph.steps.filter((s) => matched(s) && s.instructions !== instructions.get(s.id)).map((s) => s.id);
+  const unmatched = graph.steps.filter((s) => !isFollowUpStepId(s.id) && !instructions.has(s.id)).map((s) => s.id);
+  return {
+    graph: { ...graph, steps: graph.steps.map((s) => (matched(s) ? { ...s, instructions: instructions.get(s.id)! } : s)) },
+    stepIds,
+    unmatched,
+  };
 }
 
 /**
