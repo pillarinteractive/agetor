@@ -1344,6 +1344,30 @@ describe("capWrapUpStep / capWrapUpSection", () => {
     expect(resolveNextSteps(g, "finish", null)).toEqual({ kind: "terminal" });
   });
 
+  // The shape of "Change: Understand, Build, Review, Finish" as the board
+  // runs it: Understand may end a card that needs no change (`canFinish`),
+  // and so may Finish. Two ends used to mean "none", and the cap blocked.
+  test("Change's graph: Understand can finish too, and Finish is still the wrap-up", () => {
+    const understand = { ...makeStep({ id: "understand", name: "Understand" }), canFinish: true };
+    const g = makeGraph({
+      steps: [understand, build, review, { ...finish, canFinish: true }],
+      edges: [
+        { id: "understand-build", from: "understand", to: "build", label: "build" },
+        { id: "understand-finish", from: "understand", to: "finish", label: "trivial change made" },
+        { id: "build-review", from: "build", to: "review", label: "" },
+        { id: "review-build", from: "review", to: "build", label: "changes requested" },
+        { id: "review-finish", from: "review", to: "finish", label: "approved" },
+        { id: "finish-build", from: "finish", to: "build", label: "verification failed" },
+      ],
+    });
+    expect(capWrapUpStep(g)?.id).toBe("finish");
+  });
+
+  test("two ends that lead to each other, or to neither, are not a wrap-up", () => {
+    const a = { ...makeStep({ id: "a", name: "A" }), canFinish: true }, b = { ...makeStep({ id: "b", name: "B" }), canFinish: true };
+    expect(capWrapUpStep(makeGraph({ steps: [a, b], edges: [edge("a", "b"), edge("b", "a")] }))).toBeNull();
+  });
+
   test("follow-up steps are not counted", () => {
     const g = makeGraph({ steps: [build, review, finish, makeStep({ id: "followup-1", name: "Follow-up" })], edges: loops });
     expect(capWrapUpStep(g)?.id).toBe("finish");

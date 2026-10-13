@@ -122,7 +122,7 @@ test("attended: a step that never hands off waits for a person", async () => {
 });
 
 /** Build → Review → Finish (may end the run, or go back to Build); Review and Finish each choose `reviewNext`/`finishNext`. */
-async function startTemplate(reviewNext: string, finishNext: string, maxSteps: number, unattended: boolean) {
+async function startTemplate(reviewNext: string, finishNext: string, maxSteps: number, unattended: boolean, opts?: { understand?: boolean }) {
   const { createTask, startTask } = await import("./orchestrator.ts");
   const { agentProfiles, pipelines, preferences } = await import("./db.ts");
   const { newStep } = await import("../shared/pipeline.ts");
@@ -135,15 +135,22 @@ async function startTemplate(reviewNext: string, finishNext: string, maxSteps: n
   });
   const step = (name: string, next: string) => newStep({ name, agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:${next}` });
   const build = step("Build", "Review"), review = step("Review", reviewNext), finish = { ...step("Finish", finishNext), canFinish: true };
+  // With `understand`: the shape of the board's "Change" pipeline, whose
+  // first step may also end the run ("trivial change made").
+  const understand = { ...step("Understand", "Build"), canFinish: true };
   const graph = {
-    steps: [build, review, finish],
+    steps: [...(opts?.understand ? [understand] : []), build, review, finish],
     edges: [
+      ...(opts?.understand ? [
+        { id: "understand-build", from: understand.id, to: build.id, label: "build" },
+        { id: "understand-finish", from: understand.id, to: finish.id, label: "trivial change made" },
+      ] : []),
       { id: "build-review", from: build.id, to: review.id, label: "" },
       { id: "review-build", from: review.id, to: build.id, label: "changes requested" },
       { id: "review-finish", from: review.id, to: finish.id, label: "approved" },
       { id: "finish-build", from: finish.id, to: build.id, label: "verification failed" },
     ],
-    startStepId: build.id,
+    startStepId: opts?.understand ? understand.id : build.id,
   };
   const pipeline = pipelines.insert({ name: `unattended-${randomUUID()}`, graph, maxSteps });
   const created = await createTask({ title: "unattended", prompt: "goal", workdir, isolation: "none", pipelineId: pipeline.id });
@@ -151,7 +158,7 @@ async function startTemplate(reviewNext: string, finishNext: string, maxSteps: n
   parents.push(created.task.id);
   const started = await startTask(created.task.id);
   if ("error" in started) throw new Error(started.error);
-  return { parentId: created.task.id, build, review, finish };
+  return { parentId: created.task.id, understand, build, review, finish };
 }
 
 const WRAP_UP_HEADING = "## Step cap reached — wrap up this run";
@@ -216,6 +223,23 @@ test("unattended: the cap reached on the launch of another step launches the ter
   expect(again.capWrapUp).toMatchObject({ fromStepId: build.id, seq: 5 });
   expect(again.blocked.some((b) => b.kind === "step-cap")).toBe(true);
   expect(wrapUpLines(parentId).length).toBe(1);
+});
+
+// Card #1269: 28 of 28 steps with Review pending blocked on the cap, because a
+// graph whose first step may also finish the run had "two ends" and so no
+// wrap-up step.
+test("unattended: Change's graph (Understand may finish too) is wrapped up through Finish, with Review pending", async () => {
+  const { tasks } = await import("./db.ts");
+  // Understand, Build, Review (cap 2 → 4), Build; the Review that follows
+  // meets the cap and Finish runs in its place.
+  const { parentId, understand, build, review, finish } = await startTemplate("Build", "done", 2, true, { understand: true });
+  const done = await waitFor(() => (tasks.get(parentId)?.pipelineRun?.status === "done" ? tasks.get(parentId)! : null));
+  const run = done.pipelineRun!;
+  expect(run.history.map((h) => h.stepId)).toEqual([understand.id, build.id, review.id, build.id, finish.id]);
+  expect(run.capWrapUp).toMatchObject({ fromStepId: review.id, seq: 5 });
+  expect(run.blocked).toEqual([]);
+  expect(tasks.get(run.history[4]!.taskId)!.prompt).toContain(WRAP_UP_HEADING);
+  expect(wrapUpLines(parentId)).toEqual(["Reached the 4-step cap — finishing through Finish and filing issues for what is unresolved"]);
 });
 
 test("attended: the cap blocks on the terminal step's launch too, with no wrap-up", async () => {
