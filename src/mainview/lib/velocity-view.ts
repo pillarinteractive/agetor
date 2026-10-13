@@ -10,7 +10,7 @@
 import type { LeaseStatus, Task, TaskPrStatus, TaskProgress } from "../../shared/types.ts";
 import type { RoadmapCardInfo } from "../../shared/roadmap.ts";
 import { fmtDuration, fmtPct, targetRange, type ForecastTarget, type VelocityBottleneck, type VelocityPhase, type VelocityReport } from "../../shared/velocity.ts";
-import { CARD_STATE_ICON, cardState, clockTime, type CardAction, type CardState, type CardStateIcon, type CardStateTone } from "./card-state.ts";
+import { CARD_STATE_ICON, cardState, clockTime, formatElapsed, type CardAction, type CardState, type CardStateIcon, type CardStateTone } from "./card-state.ts";
 import { leaseInfoForTask } from "./leases.ts";
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
@@ -222,7 +222,8 @@ export function bottleneckRows(report: VelocityReport, tasks: Task[], ctx: Bottl
       reasonKnown: state != null,
       dependents: b.successors,
       dependentsLabel: b.successors > 0 ? `${plural(b.successors, "step")} behind it` : "no step behind it",
-      timing: (task ? retryTiming(task) : null) ?? waited ?? started,
+      // A card speaks for itself (the report's snapshot can be older than the board).
+      timing: task ? (retryTiming(task) ?? (state?.elapsedMs != null ? `${state.state === "working" || state.kind === "quiet" ? "Running" : "Waiting"} for ${formatElapsed(state.elapsedMs)}` : started)) : (waited ?? started),
       task,
       // A card with no move of its own can still be opened.
       action: state ? (state.action ?? { kind: "open", label: "Open" }) : null,

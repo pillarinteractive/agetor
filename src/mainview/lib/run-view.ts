@@ -129,7 +129,8 @@ function tileState(run: PipelineRunState, stepId: string, steps: Task[], task: T
   const latest = [...run.history].filter((r) => r.stepId === stepId).sort((a, b) => b.seq - a.seq)[0];
   switch (latest?.outcome) {
     case "succeeded":
-      return tile("working", "Handed off");
+      // Green with a check, not the pulse: it handed off, it is not executing.
+      return { tone: "working", label: "Handed off", icon: "check" };
     case "advanced-manually":
       return tile("queued", "Advanced manually");
     case "failed":
@@ -481,4 +482,35 @@ export function checksEvidence(input: { pr: TaskPrStatus | null; run: PipelineRu
       ? "A recorded pass is history: it does not show that the current head passes. Only the first row speaks for the current head."
       : "Only the first row speaks for the current head. No check record is kept per step.";
   return { current, recorded, note };
+}
+
+// ── Words ─────────────────────────────────────────────────────────────────
+
+/** "42s", "12m 40s", "3h 18m", "2d 4h". An execution's elapsed time, which
+ *  can include waits. */
+export function formatSpan(ms: number): string {
+  if (ms < 0) return "—";
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${s % 60}s`;
+  const h = Math.floor(m / 60);
+  if (h < 48) return `${h}h ${m % 60}m`;
+  return `${Math.floor(h / 24)}d ${h % 24}h`;
+}
+
+/** A record's outcome in the view's words. A handoff is not a merge. */
+export function outcomeLabel(record: Pick<PipelineStepRecord, "outcome" | "nextStepIds">, graph: PipelineGraph | null): string {
+  switch (record.outcome) {
+    case "succeeded":
+      return record.nextStepIds.length > 0 ? `Handed off to ${[...new Set(record.nextStepIds)].map((id) => nameIn(graph, id)).join(", ")}` : "Handed off · end of pipeline";
+    case "advanced-manually":
+      return "Advanced manually";
+    case "failed":
+      return "Failed";
+    case "cancelled":
+      return "Stopped";
+    default:
+      return "No outcome yet";
+  }
 }

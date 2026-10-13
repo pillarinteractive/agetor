@@ -1,18 +1,15 @@
-import { levelOf, whyStopped } from "@/lib/board-health";
-import { cn } from "@/lib/utils";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { ReactFlow, ReactFlowProvider, Background, BackgroundVariant, Controls, useNodesState, useEdgesState } from "@xyflow/react";
-import { AnimatePresence, motion } from "motion/react";
-import { ArrowLeft, ChevronDown, RotateCcw, Square, Workflow } from "lucide-react";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Switch } from "@/components/ui/switch";
-import { Textarea } from "@/components/ui/textarea";
 import { useConfirm } from "@/components/ui/confirm";
-import { MultiSearchSelect, type MultiSearchSelectItem } from "@/components/ui/multi-search-select";
 import { useTheme } from "@/components/theme-provider";
 import { useAgentProfiles } from "@/lib/agent-profiles";
 import { api, ApiError } from "@/lib/api";
+import { useTaskActivity } from "@/lib/activity";
+import type { CardAction } from "@/lib/card-state";
+import { useCardStateOf } from "@/lib/use-card-state";
+import { PrContext } from "@/lib/prs";
+import { hasLiveExecution } from "@/lib/run-view";
 import { subscribePipelineGlobalEvents } from "@/lib/pipeline-events";
 import {
   edgeVisualState,
@@ -31,28 +28,22 @@ import {
   toSubagentFlowEdges,
   toSubagentFlowNodes,
   type EdgeVisualState,
-  type ResponseKindTone,
   type StepFlowEdge,
   type StepFlowNode,
   type StepVisualState,
   type SubagentFlowEdge,
   type SubagentFlowNode,
   type SubagentSatellite,
-  latestRecordForTask,
-  runResultRecords,
 } from "@/lib/pipelines";
 import { HandoffCard } from "./HandoffCard";
 import { FollowUpPanel } from "./FollowUpPanel";
-import { ActivityTimeline } from "./ActivityTimeline";
-import { LiveProgressPanel } from "./LiveProgressPanel";
-import { pipelineStepProgress, stepNameById } from "../../../shared/pipeline.ts";
+import { RunPage } from "./run/RunPage";
+import type { RunDelegate } from "./run/StepTiles";
 import type {
   Handoff,
-  PipelineBlockKind,
   PipelineGraph,
   PipelineRunState,
   PipelineRunStatus,
-  PipelineStepRecord,
   Subagent,
   Task,
 } from "../../../shared/types.ts";
@@ -123,58 +114,6 @@ function isTerminalRunStatus(status: PipelineRunStatus): boolean {
   return status === "done" || status === "cancelled";
 }
 
-const STATUS_LABEL: Record<PipelineRunStatus, string> = {
-  idle: "Not started",
-  running: "Running",
-  blocked: "Blocked",
-  done: "Done",
-  cancelled: "Cancelled",
-};
-
-const STATUS_CLASSES: Record<PipelineRunStatus, string> = {
-  idle: "bg-muted text-muted-foreground",
-  running: "bg-info/10 text-info",
-  blocked: "bg-warning/10 text-warning",
-  done: "bg-success/10 text-success",
-  cancelled: "bg-muted text-muted-foreground",
-};
-
-/** Background/foreground pair for a {@link responseKindLabel}/reminder chip,
- *  keyed by `ResponseKindTone` — mirrors `STATUS_CLASSES` above. */
-const TONE_CLASSES: Record<ResponseKindTone, string> = {
-  success: "bg-success/10 text-success",
-  warning: "bg-warning/10 text-warning",
-  danger: "bg-danger/10 text-danger",
-  muted: "bg-muted text-muted-foreground",
-};
-
-/** Statuses from which a run can be restarted from its start step,
- *  discarding the prior history — mirrors the server's own gate. */
-const RESTARTABLE_STATUSES: PipelineRunStatus[] = ["done", "cancelled", "blocked"];
-
-/** Block kinds Retry can re-attempt — everything except a missing/invalid
- *  handoff, which Retry can't fix (re-running the same step reproduces the
- *  same non-handoff, or the same malformed one) — those need Advance. */
-const RETRY_BLOCK_KINDS: PipelineBlockKind[] = [
-  "step-failed",
-  "step-blocked",
-  "step-cap",
-  "profile-missing",
-  "join-incomplete",
-];
-/** Block kinds Advance can resolve by manually picking (or skipping) the
- *  next step(s) — a missing/invalid handoff, an incomplete join the user
- *  wants to force past, a step reported as blocked, or (for a task-level
- *  block, `taskId != null`) a step that was stopped — Advance lets the
- *  user skip past it instead of only retrying the same step. */
-const ADVANCE_BLOCK_KINDS: PipelineBlockKind[] = [
-  "handoff-missing",
-  "handoff-invalid",
-  "join-incomplete",
-  "step-blocked",
-  "step-failed",
-];
-
 interface PipelineRunViewProps {
   taskId: string;
   /** Open a step task's panel — optionally landing on one of its helpers'
@@ -183,40 +122,20 @@ interface PipelineRunViewProps {
   onBack: () => void;
   /** Offered as "Edit in Settings" from a satellite's details. */
   onOpenSettingsAgents?: (profileId?: string) => void;
-}
-
-function formatClockTime(ts: number): string {
-  return new Date(ts).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
-}
-
-function formatDuration(ms: number): string {
-  if (ms < 0) return "—";
-  const totalSeconds = Math.round(ms / 1000);
-  if (totalSeconds < 60) return `${totalSeconds}s`;
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  return `${minutes}m ${seconds}s`;
-}
-
-/** Any execution's step task is actively running, or blocked with a
- *  genuinely pending interaction — used to decide whether Stop should be
- *  offered. A `blocked` column with nothing pending (e.g. it already got
- *  answered and is between ticks) has nothing left to stop. Distinct from
- *  `run.status === "running"`: a run can be mid-block on one branch while
- *  another branch is still actively executing. */
-function hasLiveExecution(steps: Task[], run: { active: { taskId: string }[] } | null): boolean {
-  if (!run) return false;
-  return run.active.some((entry) => {
-    const stepTask = steps.find((t) => t.id === entry.taskId);
-    if (!stepTask) return false;
-    if (stepTask.column === "running") return true;
-    return stepTask.column === "blocked" && stepTask.pendingInteractionCount > 0;
-  });
+  /** The board card's button for this task (App.tsx `onCardAction`): Fix CI,
+   *  Review PR, Open dependency and Run behave here as they do on the board. */
+  onCardAction: (t: Task, action: CardAction) => void;
+  /** The task's changes against its base (the board's diff dialog). */
+  onDiff?: (t: Task) => void;
 }
 
 /**
- * Full-page, live-animated view of one pipeline TASK's run: the active step
- * pulses, traversed edges paint, and a token travels the edge on each
+ * Full-page view of one pipeline TASK's run. This component owns the data
+ * and the canvas; `RunPage` (./run/RunPage.tsx) lays the page out: the
+ * state band with the run's recovery actions, the step tiles, the selected
+ * step, what holds the run, activity and history. The canvas is one of the
+ * two presentations of the steps ("Graph & routing"): there the active step
+ * is marked, traversed edges paint, and a token travels the edge on each
  * handoff — via `stepVisualState`/`edgeVisualState`/`latestTransition`
  * (`src/mainview/lib/pipelines.ts`). Self-sufficient: fetches its own data
  * (`GET /tasks/:id/pipeline`), refetches on relevant global events (D12)
@@ -258,7 +177,7 @@ function hasLiveExecution(steps: Task[], run: { active: { taskId: string }[] } |
  * re-render (and therefore `<StoreUpdater>`'s own `setEdges`/`setNodes`
  * sync) entirely when a poll turns up nothing new to paint.
  */
-export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgents }: PipelineRunViewProps) {
+export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgents, onCardAction, onDiff }: PipelineRunViewProps) {
   const { resolved } = useTheme();
   const { profiles: liveProfiles, loaded: liveProfilesLoaded } = useAgentProfiles();
   const confirm = useConfirm();
@@ -269,7 +188,6 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionBusy, setActionBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
-  const [showGoal, setShowGoal] = useState(false);
   const [notStartedStepName, setNotStartedStepName] = useState<string | null>(null);
   // The satellite whose details dialog is open (by node id — re-resolved
   // against the freshly-derived satellites every render, so the dialog
@@ -445,10 +363,6 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
   }, [hasRun, runPipelineId, snapshotCapturedAt]);
 
   const effectiveGraph = run?.snapshot?.graph ?? pipelineGraph;
-  const progress = run ? pipelineStepProgress(run) : null;
-  // A finished run's outcome, shown first so the user doesn't have to know
-  // which step to open.
-  const resultRecords = runResultRecords(run);
 
   // Latest refs for values the effects below read but must NOT depend on
   // directly (their object identity churns every poll/render even when
@@ -754,6 +668,54 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
     }
   }, [taskId, load, confirm]);
 
+  // The card's own state for this task, from the board's contexts (PRs,
+  // leases, live progress, the roadmap): the band below and the board card
+  // read the same `cardState`, so they cannot say different things.
+  const stateOf = useCardStateOf();
+  const prs = useContext(PrContext);
+  const activity = useTaskActivity(taskId, run ? `${run.stepCount}:${run.status}:${run.endedAt ?? ""}:${run.blocked.length}` : "");
+
+  // A step's full final report, read on demand for the Transcript tab
+  // (`GET /tasks/:id/pipeline/reports?seq=N`): the run state keeps only the
+  // handoff block. Keyed by execution, and read again once an open
+  // execution has ended.
+  const [reports, setReports] = useState<Map<number, string | null>>(() => new Map());
+  const reportReadRef = useRef(new Map<number, number | null>());
+  const onNeedReport = useCallback(
+    (seq: number) => {
+      const endedAt = runRef.current?.history.find((r) => r.seq === seq)?.endedAt ?? null;
+      const read = reportReadRef.current;
+      if (read.has(seq) && read.get(seq) === endedAt) return;
+      read.set(seq, endedAt);
+      api
+        .getPipelineReport(taskId, seq)
+        .then((r) => aliveRef.current && setReports((prev) => new Map(prev).set(seq, r.reports[0]?.report ?? null)))
+        .catch(() => {
+          // Left unread, so opening the tab again asks again.
+          read.delete(seq);
+        });
+    },
+    [taskId],
+  );
+
+  const profileName = useCallback((id: string | null) => resolveProfile(id).profile?.name ?? null, [resolveProfile]);
+  // Who each step may delegate to (configured: available) and who is
+  // running for it now (observed: running) — two different facts.
+  const delegates = useMemo<RunDelegate[]>(() => {
+    const byStep = new Map<string, RunDelegate>();
+    for (const sat of satellites) {
+      const d = byStep.get(sat.stepId) ?? { stepId: sat.stepId, available: [], running: [] };
+      const name = (sat.profileId ? profileName(sat.profileId) : null) ?? sat.label ?? "a deleted profile";
+      if (sat.kind === "profile") d.available.push(name);
+      if (sat.visual === "working") d.running.push(name);
+      byStep.set(sat.stepId, d);
+    }
+    return [...byStep.values()];
+  }, [satellites, profileName]);
+
+  const renderHandoff = useCallback((handoff: Handoff) => <HandoffCard handoff={handoff} />, []);
+  const openUrl = useCallback((url: string) => void api.openExternal(url).catch(() => {}), []);
+
   if (loadError && !task) {
     return (
       <div className="flex h-full w-full flex-col items-center justify-center gap-3 text-sm text-danger">
@@ -773,512 +735,105 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
     );
   }
 
-  const candidates = (effectiveGraph?.steps ?? []).map((s) => ({ value: s.id, label: s.name }));
-  const showStop = hasLiveExecution(steps, run);
-  const showRestart = RESTARTABLE_STATUSES.includes(run.status);
-  // An active execution whose step task already finished (board column
-  // `review`) but the pipeline hasn't advanced past it — e.g. `transition:
-  // "choose"` with no agent-emitted handoff yet resolved. Distinct from
-  // `run.blocked`: nothing failed, it's just waiting on a manual decision.
-  // Excludes any execution that ALSO has a `run.blocked` entry (by
-  // `taskId`) — that execution already renders its own Advance form in the
-  // blocked section above, so listing it here too would show two Advance
-  // forms for the same execution (Minor 8).
-  const reviewActive = run.active.flatMap((active) => {
-    const stepTask = steps.find((t) => t.id === active.taskId);
-    if (!stepTask || stepTask.column !== "review") return [];
-    const alreadyBlocked = run.blocked.some((b) => b.taskId != null && b.taskId === active.taskId);
-    if (alreadyBlocked) return [];
-    return [{ active, task: stepTask }];
-  });
-
-  return (
-    <div data-testid="pipeline-run-view" className="flex h-full min-h-0 w-full flex-col">
-      <div className="flex flex-wrap items-center gap-2 border-b border-border bg-card px-4 py-2.5">
-        <Button type="button" variant="ghost" size="sm" data-testid="pipeline-run-back" onClick={onBack} className="gap-1.5">
-          <ArrowLeft className="size-4" aria-hidden />
-          Back to board
-        </Button>
-        {/* The card's own title leads — it's what the user knows the work by;
-         *  the pipeline it runs is secondary. */}
-        <span className="flex min-w-0 flex-col">
-          <span data-testid="pipeline-run-title" className="truncate text-sm font-semibold" title={task.title}>
-            {task.title}
-          </span>
-          <span className="flex min-w-0 items-center gap-1 text-[11px] text-muted-foreground">
-            <Workflow className="size-3 shrink-0" aria-hidden />
-            <span className="truncate">{run.pipelineName}</span>
-          </span>
-        </span>
-        <Badge
-          variant="secondary"
-          data-testid="pipeline-run-status"
-          className={`border-transparent font-normal ${STATUS_CLASSES[run.status]}`}
-        >
-          {STATUS_LABEL[run.status]}
-        </Badge>
-        {progress && <span className="text-xs text-muted-foreground">{progress.label}</span>}
-        <div className="ml-auto flex items-center gap-2">
-          {actionError && <span className="text-xs text-danger">{actionError}</span>}
-          {showStop && (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              data-testid="pipeline-run-stop"
-              disabled={actionBusy}
-              onClick={() => void handleStop()}
-              className="gap-1.5"
-            >
-              <Square className="size-3.5" aria-hidden />
-              Stop
-            </Button>
-          )}
-          {(run.status === "blocked" || run.status === "cancelled") && (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              data-testid="pipeline-run-retry"
-              disabled={actionBusy}
-              onClick={() => void handleRetry()}
-              className="gap-1.5"
-            >
-              <RotateCcw className="size-3.5" aria-hidden />
-              Retry
-            </Button>
-          )}
-          {showRestart && (
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              data-testid="pipeline-run-restart"
-              disabled={actionBusy}
-              onClick={() => void handleRestart()}
-              className="gap-1.5"
-            >
-              <RotateCcw className="size-3.5" aria-hidden />
-              Restart
-            </Button>
-          )}
-        </div>
-      </div>
-      <WhyStopped task={task} busy={actionBusy} onRetry={() => void handleRetry()} />
-
-      <div className="relative flex min-h-0 flex-1">
-        <div ref={canvasRef} className="relative min-w-0 flex-1">
-          <ReactFlowProvider>
-            <PipelineCanvasContext.Provider value={canvasContextValue}>
-              <ReactFlow<CanvasNode, CanvasEdge>
-                nodes={canvasNodes}
-                edges={canvasEdges}
-                nodeTypes={NODE_TYPES}
-                edgeTypes={EDGE_TYPES}
-                onNodeClick={onNodeClick}
-                nodesDraggable={false}
-                nodesConnectable={false}
-                // Read-only canvas with no `onNodesChange`: React Flow's
-                // selection would be a dead affordance (a `select` change
-                // it can never apply, plus a stray selection ring). Clicks
-                // still reach `onNodeClick` — selection isn't a
-                // prerequisite for it.
-                elementsSelectable={false}
-                fitView
-                colorMode={resolved}
-                proOptions={{ hideAttribution: true }}
-              >
-                <Background variant={BackgroundVariant.Dots} gap={16} size={1} />
-                <Controls showInteractive={false} />
-              </ReactFlow>
-            </PipelineCanvasContext.Provider>
-          </ReactFlowProvider>
-          <SubagentDetailsDialog
-            open={detailsSatellite != null}
-            onClose={() => setDetailsNodeId(null)}
-            satellite={detailsSatellite}
-            stepName={detailsStep?.name ?? ""}
-            cap={detailsStep?.subagents.cap ?? null}
-            profile={detailsProfile.profile}
-            profileDeleted={detailsProfile.profileDeleted}
-            onOpenTranscript={
-              detailsStepTask
-                ? (subagentId) => {
-                    setDetailsNodeId(null);
-                    onOpenTask(detailsStepTask, { subagentId });
-                  }
-                : undefined
-            }
-            onOpenStep={
-              detailsStepTask
-                ? () => {
-                    setDetailsNodeId(null);
-                    onOpenTask(detailsStepTask);
-                  }
-                : undefined
-            }
-            onOpenSettingsAgents={onOpenSettingsAgents}
-          />
-          {notStartedStepName && (
-            <div
-              data-testid="pipeline-run-node-not-started"
-              className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 rounded-md border border-border bg-card px-3 py-1.5 text-xs text-muted-foreground shadow-sm"
-            >
-              "{notStartedStepName}" hasn't started yet.
-            </div>
-          )}
-        </div>
-
-        <div className="w-96 shrink-0 overflow-y-auto border-l border-border bg-card p-3">
-          <LiveProgressPanel taskId={taskId} />
-          {resultRecords.length > 0 && (
-            <div data-testid="pipeline-run-result" className="mb-3 flex flex-col gap-2">
-              <p className="text-xs font-medium text-muted-foreground">Result</p>
-              {resultRecords.map((record) => {
-                const stepName = effectiveGraph ? stepNameById(effectiveGraph, record.stepId) : record.stepId;
-                const stepTask = steps.find((t) => t.id === record.taskId) ?? null;
-                return (
-                  <div key={record.seq} className="flex flex-col gap-1.5">
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="min-w-0 truncate text-xs font-medium">{stepName}</span>
-                      {stepTask && (
-                        <Button
-                          type="button"
-                          variant="outline"
-                          size="sm"
-                          data-testid="pipeline-run-open-step"
-                          onClick={() => onOpenTask(stepTask)}
-                          className="h-6 shrink-0 px-2 text-[11px]"
-                        >
-                          Open step
-                        </Button>
-                      )}
-                    </div>
-                    <HandoffCard handoff={record.handoff!} />
-                  </div>
-                );
-              })}
-            </div>
-          )}
-
-          {(run.status === "done" || (run.status === "blocked" && !hasLiveExecution(steps, run))) && (
-            <FollowUpPanel
-              taskId={taskId}
-              refreshKey={`${run.stepCount}:${run.endedAt ?? ""}`}
-              onStarted={() => void load()}
-            />
-          )}
-
-          <div className="mb-3">
-            <button
-              type="button"
-              data-testid="pipeline-run-goal-toggle"
-              onClick={() => setShowGoal((v) => !v)}
-              className="flex w-full items-center justify-between gap-2 rounded-md border border-border px-2.5 py-1.5 text-left text-xs font-medium text-muted-foreground hover:bg-accent/40"
-            >
-              Goal
-              <ChevronDown className={`size-3.5 shrink-0 transition-transform ${showGoal ? "rotate-180" : ""}`} aria-hidden />
-            </button>
-            {showGoal && (
-              <p data-testid="pipeline-run-goal" className="mt-1.5 whitespace-pre-wrap rounded-md bg-muted p-2 text-xs text-foreground">
-                {task.prompt}
-              </p>
-            )}
-          </div>
-
-          {run.blocked.length > 0 && (
-            <div data-testid="pipeline-run-blocked" className="mb-3 flex flex-col gap-2">
-              <AnimatePresence initial={false}>
-                {run.blocked.map((entry, index) => {
-                  const stepName = entry.stepId && effectiveGraph ? stepNameById(effectiveGraph, entry.stepId) : entry.stepId;
-                  const stepTask = entry.taskId ? (steps.find((t) => t.id === entry.taskId) ?? null) : null;
-                  // A step that handed off as blocked explains itself in its
-                  // handoff — show that formatted instead of the one-line
-                  // message the runner flattened it into.
-                  const blockHandoff = entry.kind === "step-blocked" ? latestRecordForTask(run, entry.taskId)?.handoff ?? null : null;
-                  return (
-                    <motion.div
-                      // Index-prefixed: two run-level blocks of the same
-                      // kind (e.g. two `step-failed` holds while the parent
-                      // was archived) share every other field.
-                      key={`${index}:${entry.kind}:${entry.stepId ?? entry.taskId ?? "run"}`}
-                      initial={{ opacity: 0, y: -4 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      exit={{ opacity: 0 }}
-                      className={
-                        entry.kind === "slot-wait" || entry.kind === "await"
-                          ? "rounded-md border border-info/40 bg-info/10 p-2.5"
-                          : "rounded-md border border-warning/40 bg-warning/10 p-2.5"
-                      }
-                    >
-                      <p className={`text-xs font-medium ${entry.kind === "slot-wait" || entry.kind === "await" ? "text-info" : "text-warning"}`}>
-                        {stepName ? `${stepName} — ` : ""}
-                        {entry.kind === "slot-wait" ? "queued — starts when a slot frees up" : entry.kind === "await" ? "waiting on a long command — wakes when it finishes" : entry.kind}
-                      </p>
-                      {blockHandoff ? (
-                        <HandoffCard handoff={blockHandoff} className="mt-1.5" />
-                      ) : (
-                        <p className="mt-0.5 text-xs text-muted-foreground">{entry.message}</p>
-                      )}
-                      <div className="mt-2 flex flex-wrap items-center gap-2">
-                        {stepTask && (
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="sm"
-                            data-testid="pipeline-run-open-step"
-                            onClick={() => onOpenTask(stepTask)}
-                            className="h-7 text-xs"
-                          >
-                            Open step
-                          </Button>
-                        )}
-                        {RETRY_BLOCK_KINDS.includes(entry.kind) && (
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="sm"
-                            data-testid="pipeline-run-retry-entry"
-                            disabled={actionBusy}
-                            onClick={() => void handleRetry(entry.taskId ?? undefined)}
-                            className="h-7 text-xs"
-                          >
-                            Retry
-                          </Button>
-                        )}
-                      </div>
-                      {ADVANCE_BLOCK_KINDS.includes(entry.kind) &&
-                        (entry.kind !== "step-failed" || entry.taskId != null) && (
-                        <AdvanceForm
-                          candidates={candidates}
-                          busy={actionBusy}
-                          onSubmit={(nextStepIds, handoff) => void handleAdvance(entry.taskId, nextStepIds, handoff)}
-                        />
-                      )}
-                    </motion.div>
-                  );
-                })}
-              </AnimatePresence>
-            </div>
-          )}
-
-          {reviewActive.length > 0 && (
-            <div data-testid="pipeline-run-review" className="mb-3 flex flex-col gap-2">
-              <p className="text-xs font-medium text-muted-foreground">Awaiting review</p>
-              <AnimatePresence initial={false}>
-                {reviewActive.map(({ active, task: stepTask }) => {
-                  const stepName = effectiveGraph ? stepNameById(effectiveGraph, active.stepId) : active.stepId;
-                  return (
-                    <motion.div
-                      key={`active-review:${active.taskId}`}
-                      initial={{ opacity: 0, y: -4 }}
-                      animate={{ opacity: 1, y: 0 }}
-                      exit={{ opacity: 0 }}
-                      className="rounded-md border border-info/40 bg-info/10 p-2.5"
-                    >
-                      <p className="text-xs font-medium text-info">{stepName} — finished, awaiting next step</p>
-                      <div className="mt-2 flex flex-wrap items-center gap-2">
-                        <Button
-                          type="button"
-                          variant="outline"
-                          size="sm"
-                          data-testid="pipeline-run-open-step"
-                          onClick={() => onOpenTask(stepTask)}
-                          className="h-7 text-xs"
-                        >
-                          Open step
-                        </Button>
-                      </div>
-                      <AdvanceForm
-                        candidates={candidates}
-                        busy={actionBusy}
-                        onSubmit={(nextStepIds, handoff) => void handleAdvance(active.taskId, nextStepIds, handoff)}
-                      />
-                    </motion.div>
-                  );
-                })}
-              </AnimatePresence>
-            </div>
-          )}
-
-          <ActivityTimeline taskId={taskId} refreshKey={`${run.stepCount}:${run.status}:${run.endedAt ?? ""}:${run.blocked.length}`} />
-
-          <div>
-            <p className="mb-1.5 text-xs font-medium text-muted-foreground">History</p>
-            {run.history.length === 0 ? (
-              <p className="text-xs text-muted-foreground">No steps have run yet.</p>
-            ) : (
-              <ul data-testid="pipeline-run-history" className="flex flex-col gap-1.5">
-                {[...run.history].reverse().map((record) => (
-                  <HistoryRow key={record.seq} record={record} graph={effectiveGraph} />
-                ))}
-              </ul>
-            )}
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function AdvanceForm({
-  candidates,
-  busy,
-  onSubmit,
-}: {
-  candidates: { value: string; label: string }[];
-  busy: boolean;
-  onSubmit: (nextStepIds: string[] | null, handoff?: Partial<Handoff>) => void;
-}) {
-  const [selected, setSelected] = useState<string[]>([]);
-  const [finishHere, setFinishHere] = useState(false);
-  const [purpose, setPurpose] = useState("");
-  const [summary, setSummary] = useState("");
-
-  const items: MultiSearchSelectItem[] = candidates;
-
-  const submit = () => {
-    const handoff = purpose.trim() || summary.trim() ? { purpose: purpose.trim(), summary: summary.trim() } : undefined;
-    onSubmit(finishHere ? null : selected, handoff);
-  };
-
-  return (
-    <div data-testid="pipeline-run-advance" className="mt-2 flex flex-col gap-2 rounded-md border border-border bg-background p-2">
-      <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
-        <Switch checked={finishHere} onCheckedChange={setFinishHere} data-testid="pipeline-run-advance-finish" />
-        Finish here (no next step)
-      </label>
-      {!finishHere && (
-        <MultiSearchSelect
-          values={selected}
-          onChange={setSelected}
-          items={items}
-          emptyLabel="Pick next step(s)…"
-          placeholder="Search steps…"
-        />
-      )}
-      <Textarea
-        value={purpose}
-        onChange={(e) => setPurpose(e.target.value)}
-        placeholder="Purpose (optional)"
-        className="min-h-[44px] text-xs"
-      />
-      <Textarea
-        value={summary}
-        onChange={(e) => setSummary(e.target.value)}
-        placeholder="Summary (optional)"
-        className="min-h-[44px] text-xs"
-      />
-      <Button
-        type="button"
-        size="sm"
-        className="h-7 text-xs"
-        disabled={busy || (!finishHere && selected.length === 0)}
-        onClick={submit}
-      >
-        Advance
-      </Button>
-    </div>
-  );
-}
-
-function HistoryRow({ record, graph }: { record: PipelineStepRecord; graph: PipelineGraph | null }) {
-  const [open, setOpen] = useState(false);
-  const stepName = graph ? stepNameById(graph, record.stepId) : record.stepId;
-  const duration = record.endedAt != null ? formatDuration(record.endedAt - record.startedAt) : "—";
-  const kindInfo = responseKindLabel(record.responseKind);
-
-  return (
-    <li data-testid="pipeline-run-history-row" className="rounded-md border border-border p-2">
-      <button
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-center justify-between gap-2 text-left text-xs"
-      >
-        <span className="min-w-0 truncate">
-          #{record.seq} {stepName}
-        </span>
-        <span className="shrink-0 text-muted-foreground">
-          {record.outcome ?? "…"} · {duration}
-        </span>
-      </button>
-      {(kindInfo || record.reminder) && (
-        <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-          {kindInfo && (
-            <span
-              data-testid="pipeline-run-response-kind"
-              data-kind={record.responseKind}
-              className={`inline-flex items-center rounded-full px-1.5 py-0.5 text-[10px] font-medium ${TONE_CLASSES[kindInfo.tone]}`}
-            >
-              {kindInfo.text}
-            </span>
-          )}
-          {record.reminder && (
-            <span
-              data-testid="pipeline-run-reminder"
-              title={record.reminder.detail}
-              data-delivered={record.reminder.delivered !== false}
-              className={`inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-medium ${
-                record.reminder.delivered === false ? TONE_CLASSES.danger : TONE_CLASSES.warning
-              }`}
-            >
-              {record.reminder.delivered === false ? "Reminder failed" : "Reminder sent"} ·{" "}
-              {formatClockTime(record.reminder.at)}
-            </span>
-          )}
-        </div>
-      )}
-      {open && record.handoff && (
-        <div data-testid="pipeline-run-history-handoff" className="mt-2">
-          <HandoffCard handoff={record.handoff} />
-        </div>
-      )}
-    </li>
-  );
-}
-
-/** The first thing a stopped card says: a light (red stays until someone acts,
- *  yellow clears by itself), the cause in a few words, what clears it, and the
- *  step's own explanation. Nothing when the card is moving. */
-function WhyStopped({ task, busy, onRetry }: { task: Task; busy: boolean; onRetry: () => void }) {
-  const [all, setAll] = useState(false);
-  const why = whyStopped(task);
-  if (!why) return null;
-  const red = levelOf(why.cause) === "blocked";
-  const shown = all ? why.lines : why.lines.slice(0, 2);
-  return (
-    <div data-testid="pipeline-run-why" data-cause={why.cause} className="flex items-start gap-3 border-b border-border bg-muted/30 px-4 py-2.5 text-sm">
-      <span aria-hidden className={cn("mt-1.5 inline-block size-2.5 shrink-0 rounded-full", red ? "bg-red-500" : "bg-amber-400")} />
-      <div className="min-w-0 flex-1">
-        <p>
-          <span className="font-medium">{why.title}</span>
-          {why.step && <span className="text-muted-foreground"> · {why.step}</span>}
-          <span className="text-muted-foreground"> — {why.clears}</span>
-        </p>
-        {shown.length > 0 && (
-          <ul className="mt-1 flex max-w-[90ch] flex-col gap-0.5 text-xs text-muted-foreground">
-            {shown.map((line, i) => (
-              <li key={i} className="break-words">
-                {line}
-              </li>
-            ))}
-          </ul>
-        )}
-        {why.lines.length > 2 && (
-          <button
-            type="button"
-            onClick={() => setAll((v) => !v)}
-            className="mt-1 rounded text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+  const canvas = (
+    <div ref={canvasRef} className="relative h-full w-full">
+      <ReactFlowProvider>
+        <PipelineCanvasContext.Provider value={canvasContextValue}>
+          <ReactFlow<CanvasNode, CanvasEdge>
+            nodes={canvasNodes}
+            edges={canvasEdges}
+            nodeTypes={NODE_TYPES}
+            edgeTypes={EDGE_TYPES}
+            onNodeClick={onNodeClick}
+            nodesDraggable={false}
+            nodesConnectable={false}
+            // Read-only canvas with no `onNodesChange`: React Flow's
+            // selection would be a dead affordance (a `select` change
+            // it can never apply, plus a stray selection ring). Clicks
+            // still reach `onNodeClick` — selection isn't a
+            // prerequisite for it.
+            elementsSelectable={false}
+            fitView
+            colorMode={resolved}
+            proOptions={{ hideAttribution: true }}
           >
-            {all ? "Show less" : `Show all ${why.lines.length} lines`}
-          </button>
-        )}
-      </div>
-      {why.action === "retry" && (
-        <Button type="button" size="sm" data-testid="pipeline-run-why-retry" disabled={busy} onClick={onRetry} className="shrink-0">
-          Retry
-        </Button>
+            <Background variant={BackgroundVariant.Dots} gap={16} size={1} />
+            <Controls showInteractive={false} />
+          </ReactFlow>
+        </PipelineCanvasContext.Provider>
+      </ReactFlowProvider>
+      {notStartedStepName && (
+        <div
+          data-testid="pipeline-run-node-not-started"
+          className="pointer-events-none absolute bottom-3 left-1/2 -translate-x-1/2 rounded-md border border-border bg-card px-3 py-1.5 text-xs text-muted-foreground shadow-sm"
+        >
+          "{notStartedStepName}" hasn't started yet.
+        </div>
       )}
     </div>
+  );
+
+  return (
+    <>
+      <RunPage
+        task={task}
+        steps={steps}
+        graph={effectiveGraph}
+        state={stateOf(task)}
+        pr={prs.get(task.id) ?? null}
+        now={Date.now()}
+        activity={activity}
+        reports={reports}
+        onNeedReport={onNeedReport}
+        delegates={delegates}
+        profileName={profileName}
+        busy={actionBusy}
+        error={actionError ?? (loadError ? `Could not refresh the run: ${loadError}` : null)}
+        canvas={canvas}
+        // Offered once the run is done, or blocked with nothing executing.
+        followUp={
+          run.status === "done" || (run.status === "blocked" && !hasLiveExecution(steps, run)) ? (
+            <FollowUpPanel taskId={taskId} refreshKey={`${run.stepCount}:${run.endedAt ?? ""}`} onStarted={() => void load()} />
+          ) : null
+        }
+        renderHandoff={renderHandoff}
+        responseKind={responseKindLabel}
+        onBack={onBack}
+        onOpenTask={onOpenTask}
+        onOpenUrl={openUrl}
+        onCardAction={(action) => onCardAction(task, action)}
+        onRetry={(stepTaskId) => void handleRetry(stepTaskId)}
+        onStop={() => void handleStop()}
+        onRestart={() => void handleRestart()}
+        onAdvance={(fromTaskId, nextStepIds, handoff) => void handleAdvance(fromTaskId, nextStepIds, handoff)}
+        onViewChanges={onDiff ? () => onDiff(task) : undefined}
+      />
+      <SubagentDetailsDialog
+        open={detailsSatellite != null}
+        onClose={() => setDetailsNodeId(null)}
+        satellite={detailsSatellite}
+        stepName={detailsStep?.name ?? ""}
+        cap={detailsStep?.subagents.cap ?? null}
+        profile={detailsProfile.profile}
+        profileDeleted={detailsProfile.profileDeleted}
+        onOpenTranscript={
+          detailsStepTask
+            ? (subagentId) => {
+                setDetailsNodeId(null);
+                onOpenTask(detailsStepTask, { subagentId });
+              }
+            : undefined
+        }
+        onOpenStep={
+          detailsStepTask
+            ? () => {
+                setDetailsNodeId(null);
+                onOpenTask(detailsStepTask);
+              }
+            : undefined
+        }
+        onOpenSettingsAgents={onOpenSettingsAgents}
+      />
+    </>
   );
 }

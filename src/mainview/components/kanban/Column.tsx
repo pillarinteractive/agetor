@@ -43,6 +43,11 @@ interface Props {
   /** Right-click on a card within this column — forwarded verbatim to every
    *  `TaskCard`. See `TaskCard`'s doc comment for the payload shape. */
   onContextMenu?: (t: Task, pos: { x: number; y: number }) => void;
+  /** A folding column (Done) starts unfolded, and says when it folds or
+   *  unfolds: the board is unmounted while a full-page view is open, and
+   *  App.tsx puts it back as it was (`boardMemoryRef`). Read on mount only. */
+  initialExpanded?: boolean;
+  onExpandedChange?: (expanded: boolean) => void;
 }
 
 /** Array is considered unchanged when same length and every element is the
@@ -60,10 +65,10 @@ function sameTasks(a: Task[], b: Task[]): boolean {
 /** Done keeps piling up; show the newest few and fold the rest. */
 const COLLAPSE_AFTER: Partial<Record<ColumnId, number>> = { done: 5 };
 
-function ColumnImpl({ id, label, tasks, homeDir, onCancel, onDelete, onSelect, onOpen, onAction, onDiff, onMarkDone, onArchive, onUnarchive, emptyHint, selectedTaskId, inspectedTaskId, onContextMenu, onMergeTogether, onRefresh }: Props) {
+function ColumnImpl({ id, label, tasks, homeDir, onCancel, onDelete, onSelect, onOpen, onAction, onDiff, onMarkDone, onArchive, onUnarchive, emptyHint, selectedTaskId, inspectedTaskId, onContextMenu, onMergeTogether, onRefresh, initialExpanded, onExpandedChange }: Props) {
   const [refreshing, setRefreshing] = useState(false);
   const { setNodeRef, isOver } = useDroppable({ id });
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(initialExpanded ?? false);
   const limit = COLLAPSE_AFTER[id];
   const sorted = limit ? [...tasks].sort((a, b) => b.updatedAt - a.updatedAt) : tasks;
   const shown = limit && !expanded ? sorted.slice(0, limit) : sorted;
@@ -149,7 +154,12 @@ function ColumnImpl({ id, label, tasks, homeDir, onCancel, onDelete, onSelect, o
         {limit && sorted.length > limit && (
           <button
             type="button"
-            onClick={() => setExpanded((v) => !v)}
+            data-testid="column-fold"
+            aria-expanded={expanded}
+            onClick={() => {
+              setExpanded(!expanded);
+              onExpandedChange?.(!expanded);
+            }}
             className="rounded-md border border-dashed border-board-line px-2 py-1.5 text-xs text-muted-foreground hover:bg-board-card hover:text-foreground"
           >
             {expanded ? "Show fewer" : `Show ${hidden} more`}
@@ -198,5 +208,6 @@ export const Column = memo(ColumnImpl, (prev, next) => (
   prev.onContextMenu === next.onContextMenu &&
   prev.onMergeTogether === next.onMergeTogether &&
   prev.onRefresh === next.onRefresh &&
+  prev.onExpandedChange === next.onExpandedChange &&
   sameTasks(prev.tasks, next.tasks)
 ));

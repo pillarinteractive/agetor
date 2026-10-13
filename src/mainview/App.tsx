@@ -53,7 +53,7 @@ import { autopilotLabel } from "../shared/autopilot.ts";
 import { velocitySummary, type VelocityAnswer } from "../shared/velocity.ts";
 import { IssuesPage } from "@/components/issues/IssuesPage";
 import { AutopilotDialog } from "@/components/kanban/AutopilotDialog";
-import { VelocityDialog } from "@/components/kanban/VelocityDialog";
+import { VelocityRoute } from "@/components/kanban/VelocityRoute";
 import { BlockedByDialog } from "@/components/kanban/BlockedByDialog";
 import { AgentIcon } from "@/components/kanban/AgentIcon";
 import { Column } from "@/components/kanban/Column";
@@ -217,7 +217,8 @@ const ICON_BY_ACTION: Record<TaskMenuAction, LucideIcon> = {
  * pipelines list (`pipelineId: null`) or the canvas editor for one pipeline
  * (`editing: true`, `pipelineId` the pipeline being edited or `null` for a
  * blank draft); `pipeline-run` is the full-page live run view for one
- * pipeline TASK (`taskId`, not a pipeline id). The header/NewTaskForm/
+ * pipeline TASK (`taskId`, not a pipeline id); `velocity` is the roadmap
+ * run's velocity (VelocityView.tsx). The header/NewTaskForm/
  * dialogs/RunPanel/context menu stay mounted regardless of `view` — only
  * `<main>`'s board-vs-page content swaps.
  */
@@ -225,6 +226,7 @@ type AppView =
   | { kind: "board" }
   | { kind: "pipelines"; pipelineId: string | null; editing: boolean }
   | { kind: "pipeline-run"; taskId: string }
+  | { kind: "velocity" }
   | { kind: "issues" };
 
 /**
@@ -389,6 +391,22 @@ function AppInner() {
   useEffect(() => { viewRef.current = view; }, [view]);
   const pipelineEditorDirtyRef = useRef(pipelineEditorDirty);
   useEffect(() => { pipelineEditorDirtyRef.current = pipelineEditorDirty; }, [pipelineEditorDirty]);
+  // The board as it was when a full-page view replaced it: where
+  // `.kanban-scroll` was scrolled to, and whether Done was unfolded. The
+  // board is unmounted while another view is up, so `navigate` notes these
+  // on the way out and `restoreBoard` puts them back when it mounts again.
+  // The search text, the View menu's choice and the selected card are App
+  // state and survive by themselves.
+  const boardMemoryRef = useRef({ left: 0, top: 0, expandedDone: false });
+  const leaveBoard = useCallback(() => {
+    const scroller = document.querySelector<HTMLElement>(".kanban-scroll");
+    if (!scroller) return;
+    boardMemoryRef.current.left = scroller.scrollLeft;
+    boardMemoryRef.current.top = scroller.scrollTop;
+  }, []);
+  const onDoneExpanded = useCallback((expanded: boolean) => {
+    boardMemoryRef.current.expandedDone = expanded;
+  }, []);
   /** Central app-level navigation: switches `view`, confirming first when
    *  leaving the pipeline editor with unsaved changes. Every `view` change
    *  that isn't PipelineEditor's own `onBack`/`onSaved` callback (which
@@ -398,6 +416,7 @@ function AppInner() {
    *  discard the draft. */
   const navigate = useCallback((next: AppView) => {
     const current = viewRef.current;
+    if (current.kind === "board" && next.kind !== "board") leaveBoard();
     if (current.kind === "pipelines" && current.editing && pipelineEditorDirtyRef.current) {
       void confirm({
         title: "Discard unsaved pipeline changes?",
@@ -412,7 +431,7 @@ function AppInner() {
       return;
     }
     setView(next);
-  }, [confirm]);
+  }, [confirm, leaveBoard]);
   /** Switch the app-level `view` to a pipeline TASK's live run view — the
    *  card-open / context-menu / RunPanel-strip destination for a pipeline
    *  parent task (D5/D7, `docs/plans/pipelines.md`). Declared this early
@@ -1591,10 +1610,11 @@ function AppInner() {
       clearInterval(timer);
     };
   }, [autopilotKey, autopilotOpen]);
-  // How fast the roadmap run is going (VelocityDialog.tsx): one line beside
-  // the rocket, refreshed with the status it sits next to.
-  const [velocityOpen, setVelocityOpen] = useState(false);
+  // How fast the roadmap run is going: one line beside the rocket, refreshed
+  // with the status it sits next to. It opens the Velocity view
+  // (VelocityView.tsx), which reads its own, fuller report.
   const [velocity, setVelocity] = useState<VelocityAnswer | null>(null);
+  const velocityShown = view.kind === "velocity";
   const roadmapTracker = autopilot?.config.roadmap?.issue ?? null;
   const roadmapFetchedAt = autopilot?.state.roadmap?.fetchedAt ?? 0;
   useEffect(() => {
@@ -1607,7 +1627,7 @@ function AppInner() {
       alive = false;
       clearInterval(timer);
     };
-  }, [roadmapTracker, roadmapFetchedAt, velocityOpen]);
+  }, [roadmapTracker, roadmapFetchedAt, velocityShown]);
   const roadmapCards = useMemo(() => roadmapCardInfo(autopilot), [autopilot]);
   // What each roadmap step's card waits on and blocks: the lines drawn when
   // a card is hovered (BlockerLines.tsx).
@@ -1960,6 +1980,30 @@ function AppInner() {
       }
     }
   }, [openTask, start, viewPullRequest, openTaskById, surfaceError, refresh]);
+  /** Back from the run view or the Velocity view. Through `navigate`, like
+   *  every other way to the board. */
+  const backToBoard = useCallback(() => navigate({ kind: "board" }), [navigate]);
+  /** The board mounting again after a full-page view: scroll it to where it
+   *  was and give the selected card the focus back, without scrolling to
+   *  it (the scroll just restored is where the user left the board). A ref
+   *  callback, so it runs with the board's DOM in place, before paint. */
+  const inspectedIdRef = useRef(inspectedId);
+  inspectedIdRef.current = inspectedId;
+  const restoreBoard = useCallback((scroller: HTMLDivElement | null) => {
+    if (!scroller) return;
+    const { left, top } = boardMemoryRef.current;
+    scroller.scrollLeft = left;
+    scroller.scrollTop = top;
+    const id = inspectedIdRef.current;
+    if (id) scroller.querySelector<HTMLElement>(`[data-task-id="${CSS.escape(id)}"]`)?.focus({ preventScroll: true });
+  }, []);
+  /** A "move these next" row's button in the Velocity view: the card's own
+   *  action. The one that only points at the card (Inspect retry) selects
+   *  it and goes to the board, where the inspector shows it. */
+  const onVelocityAction = useCallback((t: Task, action: CardAction) => {
+    onCardAction(t, action);
+    if (action.kind === "inspect") navigate({ kind: "board" });
+  }, [onCardAction, navigate]);
   /** Restart a pipeline from its first step — the inspector's button. Asks
    *  first, in the words the run view's own Restart uses. */
   const restartPipelineRun = useCallback(async (t: Task) => {
@@ -2360,7 +2404,8 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
             <button
               type="button"
               data-testid="velocity-summary"
-              onClick={() => setVelocityOpen(true)}
+              aria-pressed={velocityShown}
+              onClick={() => navigate({ kind: "velocity" })}
               title="Velocity of the roadmap run — throughput, where the time goes, forecast"
               className="hidden max-w-[22rem] truncate rounded-md px-2 py-1 text-xs tabular-nums text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring md:block"
             >
@@ -2420,8 +2465,13 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         </div>
       </header>
       <div className="flex min-h-0 flex-1">
+        {/* The board's shared contexts wrap every view, not the board alone:
+            the run view and the Velocity view read a card's state from the
+            same PRs, leases, progress and roadmap the card itself does. */}
         <ProgressContext.Provider value={progress}>
         <RoadmapCardsContext.Provider value={roadmapCards}>
+        <LeaseContext.Provider value={leases}>
+        <PrContext.Provider value={prs}>
         <main className="flex min-w-0 flex-1 flex-col">
           {/* Chrome that stays mounted regardless of `view` (D5,
               docs/plans/pipelines.md): update/tmux banners and the global
@@ -2471,10 +2521,8 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                     horizontally can't carry the card off-screen with it (an
                     abs-positioned descendant of a scrolling containing block
                     scrolls along with it — the previous bug). */}
-                <LeaseContext.Provider value={leases}>
-                <PrContext.Provider value={prs}>
                 <div className="relative flex-1">
-                  <div className="kanban-scroll absolute inset-0 overflow-x-scroll">
+                  <div ref={restoreBoard} className="kanban-scroll absolute inset-0 overflow-x-scroll">
                     <DndContext sensors={sensors} onDragEnd={onDragEnd}>
                       <div className="flex min-h-full min-w-full gap-[9px] px-3 pb-3.5 pt-3">
                         {COLUMNS.map((c) => (
@@ -2499,6 +2547,8 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                             onContextMenu={openTaskMenu}
                             onMergeTogether={c.id === "merge" ? mergeTogether : undefined}
                             onRefresh={c.id === "merge" ? refreshMerge : undefined}
+                            initialExpanded={c.id === "done" ? boardMemoryRef.current.expandedDone : undefined}
+                            onExpandedChange={c.id === "done" ? onDoneExpanded : undefined}
                           />
                         ))}
                       </div>
@@ -2554,8 +2604,6 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                     escapeCloses={selected === null}
                   />
                 )}
-                </PrContext.Provider>
-                </LeaseContext.Provider>
               </motion.div>
             )}
 
@@ -2568,7 +2616,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                 transition={{ duration: 0.18 }}
                 className="flex min-h-0 flex-1 flex-col"
               >
-                <IssuesPage projects={projects} onBack={() => setView({ kind: "board" })} onOpenTask={openTaskById} />
+                <IssuesPage projects={projects} onBack={() => navigate({ kind: "board" })} onOpenTask={openTaskById} />
               </motion.div>
             )}
 
@@ -2637,12 +2685,29 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                     setSelected(t);
                   }}
                   onOpenSettingsAgents={openSettingsAgents}
-                  onBack={() => setView({ kind: "board" })}
+                  onCardAction={onCardAction}
+                  onDiff={setDiffTask}
+                  onBack={backToBoard}
                 />
+              </motion.div>
+            )}
+
+            {view.kind === "velocity" && (
+              <motion.div
+                key="velocity"
+                initial={{ opacity: 0, y: 8 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -8 }}
+                transition={{ duration: 0.18 }}
+                className="flex min-h-0 flex-1 flex-col"
+              >
+                <VelocityRoute tasks={tasks} onBack={backToBoard} onAction={onVelocityAction} />
               </motion.div>
             )}
           </AnimatePresence>
         </main>
+        </PrContext.Provider>
+        </LeaseContext.Provider>
         </RoadmapCardsContext.Provider>
         </ProgressContext.Provider>
       </div>
@@ -2654,10 +2719,9 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
         onClose={() => setAutopilotOpen(false)}
         onVelocity={() => {
           setAutopilotOpen(false);
-          setVelocityOpen(true);
+          navigate({ kind: "velocity" });
         }}
       />
-      <VelocityDialog open={velocityOpen} onClose={() => setVelocityOpen(false)} />
       <RunPanel
         task={selected}
         stickyUserMessages={stickyUserMessages}

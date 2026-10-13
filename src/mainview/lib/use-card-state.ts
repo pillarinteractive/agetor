@@ -21,6 +21,23 @@ export function useCardState(task: Task): CardState {
   });
 }
 
+/** `useCardState` for a task that isn't known when the component renders
+ *  (the run view loads its own): the same contexts, applied on call. */
+export function useCardStateOf(): (task: Task, now?: number) => CardState {
+  const leases = useContext(LeaseContext);
+  const prs = useContext(PrContext);
+  const progress = useContext(ProgressContext);
+  const roadmap = useContext(RoadmapCardsContext);
+  return (task, now = Date.now()) =>
+    cardState(task, {
+      pr: prs.get(task.id) ?? null,
+      lease: leaseInfoForTask(task, leases),
+      now,
+      progressActive: progress.some((p) => p.taskId === task.id && p.active),
+      roadmap: roadmap.get(task.id) ?? null,
+    });
+}
+
 /** A column's summary line: its cards counted by state. */
 export function useColumnSummary(tasks: Task[]): string {
   const leases = useContext(LeaseContext);
