@@ -46,6 +46,7 @@ import { activeTrain, mergedViaTrain, trainFor } from "./merge-train.ts";
 import { isPriority, readPriority, setPriority } from "./priority.ts";
 import { setMergeQueued } from "./merge-intent.ts";
 import { noteOwnerSignOff } from "./merge-rework.ts";
+import { recordPromptDismissal } from "./interaction-audit.ts";
 import { KEEP_AWAKE_PREF_KEY, KEEP_SCREEN_ON_PREF_KEY, recheckKeepAwake } from "./keep-awake.ts";
 import { applyAutopilotPatch, applyRoadmapContinue, applyRoadmapResolve, autopilotSnapshot, noteSignOffWithdrawn, requestAutopilotPass, setAutopilotNotifier } from "./autopilot.ts";
 import { departTrainNow, refreshMergeColumn } from "./merge-queue.ts";
@@ -6037,7 +6038,7 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
       // it as the user's keypress and dismisses the modal.
       "/tmux-prompts/:id/answer": {
         POST: authed(async (req) => {
-          const body = (await req.json().catch(() => ({}))) as { key?: unknown; reject?: unknown };
+          const body = (await req.json().catch(() => ({}))) as { key?: unknown; reject?: unknown; reason?: unknown };
           const pending = findTmuxPromptById(req.params.id);
           if (!pending) {
             // Either the prompt was auto-cancelled (scraper saw the pane
@@ -6074,6 +6075,9 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             await sendModalKeys(pending.taskId, ["Escape"]);
             markTmuxPromptAnswered(pending.taskId, pending.fingerprint);
             const ok = answerTmuxPrompt(req.params.id, { key: "__external__" });
+            // A dismissal is allowed only if it is logged: what the prompt
+            // showed and why it was dismissed (`reason`, from the caller).
+            if (ok) recordPromptDismissal(pending, typeof body.reason === "string" ? body.reason : null);
             return json({ ok }, { headers: corsHeaders(req) });
           }
           const key = typeof body.key === "string" ? body.key : "";

@@ -1966,7 +1966,7 @@ export const api = {
   /** Answer a tmux-pane-scraped REPL prompt. `key` must be one of the
    *  keys advertised on the request — the server validates against the
    *  recorded set before injecting keystrokes via `tmux send-keys`. */
-  answerTmuxPrompt: (id: string, body: { key: string } | { reject: true }) =>
+  answerTmuxPrompt: (id: string, body: { key: string } | { reject: true; reason?: string }) =>
     j<{ ok: boolean }>(`/tmux-prompts/${id}/answer`, {
       method: "POST",
       body: JSON.stringify(body),

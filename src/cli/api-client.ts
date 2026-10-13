@@ -217,7 +217,7 @@ export class AgetorClient {
   }
   answerTmuxPrompt(
     id: string,
-    body: { key?: string; reject?: boolean },
+    body: { key?: string; reject?: boolean; reason?: string },
   ): Promise<{ ok: boolean; error?: string }> {
     return this.req("POST", `/tmux-prompts/${id}/answer`, body);
   }
