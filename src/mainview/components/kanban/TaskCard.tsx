@@ -1,8 +1,7 @@
 import { memo } from "react";
 import { useDraggable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, CircleAlert, FolderOpen, GitCompare, GitPullRequest, ListTodo, Link2, Lock, LockOpen, Zap, MessageCircleQuestion, PauseCircle, Play, Square, Trash2 } from "lucide-react";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Activity, Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, CircleAlert, CircleDashed, CircleX, Clock3, GitCompare, GitMerge, ListTodo, Link2, Lock, LockOpen, Zap, PauseCircle, Square, Trash2, type LucideIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { abbreviateHome, cn } from "@/lib/utils";
 import { taskTypeIcon } from "@/lib/task-type-icon";
@@ -11,10 +10,12 @@ import { taskTypeMeta, type Task } from "../../../shared/types.ts";
 import { isTaskFxPaused } from "../../../shared/fx-recovery.ts";
 import { shortPipelineName } from "@/components/pipelines/PipelineBadge";
 import { useTaskLeaseInfo } from "@/lib/leases";
-import { prBadge, useTaskPr } from "@/lib/prs";
-import { cardStatus } from "@/lib/card-status";
+import { useTaskPr } from "@/lib/prs";
+import { formatElapsed, type CardAction, type CardStateIcon } from "@/lib/card-state";
+import { useCardState } from "@/lib/use-card-state";
+import { columnLabel } from "@/lib/column-labels";
 import { ordinal } from "../../../shared/block-reason.ts";
-import { progressFraction, progressLine, useRoadmapCard, useTaskProgress } from "@/lib/progress";
+import { progressFraction, progressLine, useTaskProgress } from "@/lib/progress";
 import { blockerColor, prNumberFromUrl, shortCardName, splitCardTitle } from "@/lib/card-names";
 
 // The theme's --destructive is a dark fill meant for buttons (30% lightness
@@ -22,13 +23,29 @@ import { blockerColor, prNumberFromUrl, shortCardName, splitCardTitle } from "@/
 const DANGER_TEXT = "text-red-600 dark:text-red-400";
 
 
+/** The state band's icon. A state reads by its label and this icon; the
+ *  colour only repeats it. */
+export const STATE_ICONS: Record<CardStateIcon, LucideIcon> = {
+  activity: Activity,
+  clock: Clock3,
+  alert: CircleAlert,
+  x: CircleX,
+  merge: GitMerge,
+  dashed: CircleDashed,
+};
+
 interface Props {
   task: Task;
   homeDir: string;
-  onStart: (t: Task) => void;
   onCancel: (t: Task) => void;
   onDelete: (t: Task) => void;
+  /** A single click, or Enter/Space on the focused card: select it, which
+   *  opens the inspector under the board (App.tsx `inspectedId`). */
+  onSelect: (t: Task) => void;
+  /** A double click: the full view (run panel, or a pipeline's run view). */
   onOpen: (t: Task) => void;
+  /** The card's one button (src/mainview/lib/card-state.ts `CardAction`). */
+  onAction: (t: Task, action: CardAction) => void;
   onDiff: (t: Task) => void;
   onMarkDone: (t: Task) => void;
   onArchive: (t: Task) => void;
@@ -38,13 +55,15 @@ interface Props {
    *  user is actively watching the task (messages streamed while open are
    *  marked seen on close, not shown as unread in the meantime). */
   isOpen?: boolean;
+  /** True when this card is the one the inspector shows. */
+  selected?: boolean;
   /** Right-click (or keyboard menu-key) on the card. `pos` is where App.tsx's
    *  task context menu should anchor — omitted entirely when the caller
    *  doesn't wire it up (no menu to open). */
   onContextMenu?: (t: Task, pos: { x: number; y: number }) => void;
 }
 
-function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDiff, onMarkDone, onArchive, onUnarchive, isOpen, onContextMenu }: Props) {
+function TaskCardImpl({ task, homeDir, onCancel, onDelete, onSelect, onOpen, onAction, onDiff, onMarkDone, onArchive, onUnarchive, isOpen, selected, onContextMenu }: Props) {
   const archived = task.archivedAt != null;
   // `fx-paused-badge`'s live countdown (see the badge below) — called
   // unconditionally, before any conditional return, so hook order stays
@@ -56,11 +75,11 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
   const fxAutoResumeCountdown = useCountdown(fxAutoResumeAt);
   const lease = useTaskLeaseInfo(task);
   const pr = useTaskPr(task.id);
-  const prInfo = pr ? prBadge(pr) : null;
   // Live lab/E2E run progress in this card's checkout (src/bun/progress-watch.ts).
   const progress = useTaskProgress(task.id);
-  // One plain sentence: what the card is doing, or what it's waiting on.
-  const status = cardStatus(task, { pr, lease, now: Date.now(), progressActive: progress.some((p) => p.active), roadmap: useRoadmapCard(task.id) });
+  // The card's state, step and button: read from the run, the PR and the
+  // leases (src/mainview/lib/card-state.ts), not from the column it is in.
+  const state = useCardState(task);
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: task.id,
     // Archived cards are immutable until unarchived — block drag-to-column so
@@ -72,98 +91,68 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
     ? { transform: CSS.Translate.toString(transform) }
     : undefined;
 
-  // Button precedence: Answer > Stop > Open > Run.
-  //  - Answer when at least one interaction (AskUserQuestion / ExitPlanMode /
-  //    tool-approval) is pending OR codex flipped the task to
-  //    `blocked` via the approval-prompt heuristic. Opens the run panel; Stop
-  //    moves to a trailing icon slot so the user can still cancel.
-  //  - Stop while the agent process is live (running OR blocked-awaiting-user).
-  //  - Open once any run has reached succeeded/running/orphaned — there's
-  //    something worth re-reading; Run stays reachable from inside the panel.
-  //  - Run otherwise (no openable history yet, or only failed/cancelled).
   const active = task.column === "running" || task.column === "blocked";
-  // A pipeline PARENT never gets its own `runId`/`hasOpenableRun` — only its
-  // step tasks do — so `hasOpenableRun` alone would forever gate the button
-  // on "Run" even once the pipeline has actually executed. Once any step
-  // execution has landed in `pipelineRun.history`, there's something worth
-  // opening the run view for; Retry/Restart live there, not on the card
-  // (M15, docs/plans/pipelines.md review). Mirrored in `buildTaskContextMenu`.
-  const hasOpenablePipelineRun = !!task.pipelineRun && task.pipelineRun.history.length > 0;
-  const openable = task.hasOpenableRun || hasOpenablePipelineRun;
   // Stop is only honoured server-side for a pipeline PARENT while its run
   // is genuinely `running` (`POST /tasks/:id/pipeline/cancel` 409s
   // otherwise — e.g. a `blocked` run with nothing live), so the card's Stop
   // gates on `pipelineRun.status`, not the column (L-A1). Mirrored in
   // `buildTaskContextMenu`. Every other task keeps the column-based rule.
   const stoppable = task.pipelineId ? task.pipelineRun?.status === "running" : active;
-  // Combine structured interactions with codex's narrative `blocked` signal.
-  // The latter has no answerable payload — the user resolves it from the run
-  // panel — but it represents the same "waiting on you" state to the user.
-  // When the only signal is `blocked` (no structured questions), we label the
-  // call-to-action "Review" instead of "Answer" to avoid promising a Q&A flow
-  // the panel can't deliver.
-  const pendingCount = task.pendingInteractionCount;
-  // A card waiting on another card (src/bun/dependencies.ts) moves on by
-  // itself when that lands — it isn't waiting on the user.
-  const waitingOnCards = (task.blockedBy ?? []).some((d) => !d.satisfied);
-  const blocked = task.column === "blocked" && !waitingOnCards;
-  const awaiting = pendingCount > 0 || blocked;
-  const awaitingLabel =
-    pendingCount > 1 ? `Answer (${pendingCount})`
-    : pendingCount === 1 ? "Answer"
-    : "Review";
-
-  // The one button a card shows: the user's next move, if there is one.
-  // Running work and finished/merging cards need nothing from the user.
-  const notStarted = !openable && !active && !archived && (task.column === "backlog" || task.column === "ready");
-  const primary = archived ? (
-    <Button size="sm" variant="secondary" className="h-7" onClick={() => onOpen(task)}>
-      <FolderOpen className="size-3" /> Open
-    </Button>
-  ) : awaiting ? (
-    <Button
-      size="sm"
-      className="h-7 gap-1 bg-amber-500 text-amber-950 hover:bg-amber-500/90 focus-visible:ring-amber-500"
-      onClick={() => onOpen(task)}
-      title={pendingCount > 0 ? "Open run panel to answer" : "Agent is waiting on you — open it"}
-    >
-      <MessageCircleQuestion className="size-3" />
-      {awaitingLabel}
-      <ArrowRight className="size-3" />
-    </Button>
-  ) : notStarted ? (
-    <Button size="sm" className="h-7" onClick={() => onStart(task)}>
-      <Play className="size-3" /> Run
-    </Button>
-  ) : task.column === "review" ? (
-    <Button size="sm" variant="secondary" className="h-7" onClick={() => onOpen(task)}>
-      <FolderOpen className="size-3" /> Review
-    </Button>
-  ) : null;
 
   const type = taskTypeMeta(task.taskType);
   const TypeIcon = taskTypeIcon(type.icon);
+  const StateIcon = STATE_ICONS[state.icon];
   const runningSubagents = task.runningSubagents ?? 0;
   const title = splitCardTitle(task.title);
   const prNumber = pr?.number ?? prNumberFromUrl(task.prUrl);
   const waitingTags = (task.blockedBy ?? []).filter((d) => !d.satisfied);
+  const action = state.action;
+  // Who is (or was last) on it: the current step's agent for a pipeline, with
+  // the pipeline's name beside it; the task's own agent otherwise.
+  const run = task.pipelineRun;
+  const stepProfileId = run?.snapshot?.graph.steps.find((s) => s.id === state.step?.id)?.agentProfileId;
+  const stepAgent = stepProfileId ? run?.snapshot?.profiles[stepProfileId]?.name : undefined;
+  const owner = run ? (stepAgent ?? shortPipelineName(run.pipelineName)) : (task.agentProfile?.name ?? task.agent);
+  const stepText = state.step ? `${state.step.name}${state.step.round ? `, round ${state.step.round}` : ""}` : task.pipelineId ? "not started" : "none";
+  const showFxPaused = isTaskFxPaused(task) && !!task.fxRecovery;
+  const hasChips =
+    !archived &&
+    (task.priority || waitingTags.length > 0 || (task.blocking?.length ?? 0) > 0 || lease.holds.length > 0 || lease.waiting.length > 0 || runningSubagents > 0 || showFxPaused ||
+      (!!task.todoProgress && task.todoProgress.total > 0 && task.column === "running"));
 
   return (
-    <Card
+    <div
       ref={setNodeRef}
       style={style}
       // Lets the board's blocker lines (BlockerLines.tsx) find this card.
       data-task-id={task.id}
+      data-testid="task-card"
+      // Names the state once; the band, the strip and the button below read
+      // its colours from here (index.css `[data-state]`).
+      data-state={state.state}
+      data-state-kind={state.kind}
+      data-selected={selected ? "true" : undefined}
       className={cn(
-        "group relative cursor-grab select-none border-border/60 border-l-4 hover:border-border transition-colors",
-        type.borderClass,
+        "group relative cursor-grab select-none rounded-lg border border-board-line bg-board-card text-card-foreground",
+        // `[outline-style:solid]`, not `outline`: tailwind-merge (in `cn`)
+        // reads `outline` and `outline-2` as the same property and keeps one.
+        "focus-visible:outline-2 focus-visible:outline-offset-[3px] focus-visible:outline-ring focus-visible:[outline-style:solid]",
+        // The two states that wait on a person carry their colour on the frame too.
+        (state.state === "needs" || state.state === "failed") && "border-state",
+        selected && "outline-2 outline-offset-1 outline-state-waiting [outline-style:solid]",
         isDragging && "opacity-50",
-        awaiting && "ring-2 ring-warning/60 ring-offset-2 ring-offset-background",
         archived && "cursor-default opacity-60",
       )}
-      // `onClick` (open) stays untouched by the addition below — a
-      // right-click never opens the panel, only `onContextMenu` fires for it.
-      onClick={() => onOpen(task)}
+      // A right-click never selects or opens, only `onContextMenu` fires for it.
+      onClick={() => onSelect(task)}
+      onDoubleClick={() => onOpen(task)}
+      // Enter or Space on the card itself selects it, like a click. Keys
+      // pressed on a button inside the card are that button's.
+      onKeyDown={(e) => {
+        if (e.target !== e.currentTarget || (e.key !== "Enter" && e.key !== " ")) return;
+        e.preventDefault();
+        onSelect(task);
+      }}
       // dnd-kit's `useDraggable` above is unaffected by right-click: its
       // `PointerSensor` bails on `event.button !== 0`, so a right-click can
       // never arm a drag — `{...listeners}` and this handler don't fight.
@@ -192,46 +181,94 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
       }}
       {...listeners}
       {...attributes}
+      aria-label={`${task.title}. Status: ${columnLabel(task.column)}. Step: ${stepText}. State: ${state.label}. ${state.reason}`}
+      aria-pressed={!!selected}
     >
       {task.unread && !isOpen && (
-        // Static dot for "has assistant messages you haven't read yet" —
-        // deliberately unanimated (the amber awaiting-pulse ring is the only
-        // animated attention state). Pinned to the corner so it coexists
-        // with that ring (an outline) without visual conflict, and sits
-        // above the header's row-1 harness badge in the DOM/paint order.
+        // Static dot for "has assistant messages you haven't read yet".
+        // Pinned to the corner, outside the frame, so it reads on any state
+        // band and never sits under the selection outline's 1px offset.
         <span
-          // -1.5 offsets keep the dot's background halo clear of the
-          // awaiting state's ring-offset outline instead of notching it.
-          className="absolute -top-1.5 -right-1.5 size-2.5 rounded-full bg-info ring-2 ring-background"
+          className="absolute -right-1.5 -top-1.5 z-10 size-2.5 rounded-full bg-info ring-2 ring-background"
           title="New messages"
           role="img"
           aria-label="New messages"
         />
       )}
-      <CardHeader className="space-y-1 p-3 pb-2">
-        <div className="flex items-start gap-1.5">
-          <TypeIcon className={cn("mt-0.5 size-3.5 shrink-0", type.iconClass)} aria-label={type.label} />
-          <CardTitle
-            className="min-w-0 flex-1 break-words text-[13px] font-semibold leading-snug line-clamp-3"
-            title={[task.title, task.branch && `branch ${task.branch}`, task.model && `model ${task.model}`, abbreviateHome(task.workdir, homeDir)].filter(Boolean).join("\n")}
-          >
-            {title.issue && <span className="mr-1 font-mono font-medium text-muted-foreground">#{title.issue}</span>}
-            {prNumber != null && (
-              <span className="mr-1 font-mono font-medium text-muted-foreground" data-testid="card-pr-number" title={`Pull request #${prNumber}`}>
-                {title.issue ? "→ " : ""}PR #{prNumber}
-              </span>
-            )}
-            {title.text}
-          </CardTitle>
+      {/* State: what is happening right now. Label and icon carry it; the
+       *  colour repeats it. */}
+      <div data-testid="card-state" className="flex items-center gap-1.5 rounded-t-[7px] bg-state-bg p-[9px] text-xs font-[650] leading-[1.3] text-state">
+        <StateIcon className="size-[15px] shrink-0" aria-hidden />
+        <span className="min-w-0 truncate">{state.label}</span>
+      </div>
+      <div className="px-[9px] pb-2 pt-[9px]">
+        <div className="mb-2 flex items-center justify-between gap-1.5 text-[11px] tabular-nums text-muted-foreground">
+          <span className="flex min-w-0 items-center gap-1">
+            <TypeIcon className={cn("size-3 shrink-0", type.iconClass)} aria-label={type.label} />
+            {title.issue && <span>#{title.issue}</span>}
+          </span>
+          {prNumber != null && (
+            <span className="shrink-0" data-testid="card-pr-number" title={`Pull request #${prNumber}`}>
+              PR {prNumber}
+            </span>
+          )}
         </div>
-        {/* Dependency tags: a card that blocks others wears its own color
-         *  ("blocks 3"); each card waiting on it wears that same color with its
-         *  short name ("#214"). */}
-        {!archived && (task.priority || waitingTags.length > 0 || (task.blocking?.length ?? 0) > 0) && (
-          <div className="flex flex-wrap items-center gap-1">
+        <h3
+          className="mb-1.5 line-clamp-2 min-h-[34px] text-xs font-semibold leading-[1.4] [overflow-wrap:anywhere]"
+          title={[task.title, task.branch && `branch ${task.branch}`, task.model && `model ${task.model}`, abbreviateHome(task.workdir, homeDir)].filter(Boolean).join("\n")}
+        >
+          {title.text}
+        </h3>
+        {/* Step: where the pipeline is. A task without a pipeline has none. */}
+        <div data-testid="card-step" className="flex items-center gap-[5px] text-[11px] text-muted-foreground">
+          {state.step ? (
+            <>
+              <span>Step</span>
+              <strong className="min-w-0 truncate font-semibold text-foreground">{state.step.name}</strong>
+              {state.step.round != null && <span className="shrink-0">· round {state.step.round}</span>}
+            </>
+          ) : (
+            <span>{task.pipelineId ? "Step not started" : "No pipeline"}</span>
+          )}
+          {state.elapsedMs != null && (
+            <span className="ml-auto shrink-0 tabular-nums" title={state.state === "working" || state.kind === "quiet" ? "Running for" : "Waiting for"}>
+              {formatElapsed(state.elapsedMs)}
+            </span>
+          )}
+        </div>
+        {state.strip && (
+          <div
+            data-testid="card-strip"
+            role="img"
+            aria-label={`Pipeline steps: ${state.strip.map((s) => `${s.name} ${s.status === "todo" ? "to do" : s.status}`).join(", ")}`}
+            className="my-2 grid grid-flow-col auto-cols-fr gap-1"
+          >
+            {state.strip.map((s) => (
+              <span
+                key={s.id}
+                data-status={s.status}
+                title={`${s.name}${s.status === "current" ? " · current step" : s.status === "done" ? " · done" : ""}`}
+                className={cn("h-1 rounded-[1px]", s.status === "done" ? "bg-state-working" : s.status === "current" ? "bg-state" : "bg-state-neutral")}
+              />
+            ))}
+          </div>
+        )}
+        <p
+          data-testid="card-status"
+          title={state.reason}
+          className={cn("line-clamp-2 min-h-[31px] text-[11px] leading-[1.4] text-muted-foreground [overflow-wrap:anywhere]", !state.strip && "mt-2")}
+        >
+          {state.reason}
+        </p>
+        {/* Facts that are true whatever the state: priority, what it blocks
+         *  or waits on, leases, background agents. A card that blocks others
+         *  wears its own color ("blocks 3"); each card waiting on it wears
+         *  that same color with its short name ("#214"). */}
+        {hasChips && (
+          <div className="mt-1.5 flex flex-wrap items-center gap-1 text-[11px] text-muted-foreground">
             {task.priority && (
               <span
-                className="inline-flex items-center gap-1 rounded-md bg-warning/15 px-1.5 py-0.5 text-[11px] font-semibold text-warning ring-1 ring-warning/40"
+                className="inline-flex items-center gap-1 rounded-md bg-warning/15 px-1.5 py-0.5 font-semibold text-warning ring-1 ring-warning/40"
                 data-testid="priority-tag"
                 title="Priority: takes a slot straight away and goes first for the lab"
               >
@@ -241,7 +278,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
             )}
             {(task.blocking?.length ?? 0) > 0 && (
               <span
-                className={cn("inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-semibold ring-1", blockerColor(task.id))}
+                className={cn("inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 font-semibold ring-1", blockerColor(task.id))}
                 data-testid="blocks-tag"
                 title={`Blocks: ${task.blocking!.map((b) => b.title).join(", ")}`}
               >
@@ -252,7 +289,7 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
             {waitingTags.map((d) => (
               <span
                 key={d.taskId}
-                className={cn("inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-semibold ring-1", blockerColor(d.taskId))}
+                className={cn("inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 font-semibold ring-1", blockerColor(d.taskId))}
                 data-testid="blocked-by-chip"
                 title={`Waiting on "${d.title}" — ${d.detail}`}
               >
@@ -260,36 +297,53 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
                 waits on {d.ref ?? shortCardName(d.title)}
               </span>
             ))}
-          </div>
-        )}
-        {!archived && (
-          <p
-            data-testid="card-status"
-            data-tone={status.tone}
-            title={status.needsYou ? `Needs you: ${status.needsYou.reason}` : status.line}
-            className={cn(
-              "flex items-start gap-1 text-xs leading-snug",
-              status.tone === "danger" && DANGER_TEXT,
-              status.tone === "warning" && "text-warning",
-              status.tone === "success" && "text-success",
-              status.tone === "info" && "text-info",
-              status.tone === "muted" && "text-muted-foreground",
+            {lease.holds.map((label) => (
+              <span key={label} className="flex items-center gap-0.5 text-info" data-testid="lease-badge" title={`Holds the ${label} lease`}>
+                <Lock className="size-3" />
+                {label}
+              </span>
+            ))}
+            {lease.waiting.map((w) => (
+              <span
+                key={w.label}
+                className={cn("flex items-center gap-0.5", w.free ? "text-success" : "text-warning")}
+                data-testid="lease-wait-hint"
+                title={w.free ? `${w.label} is free` : `${w.label} held by ${w.heldBy}`}
+              >
+                {w.free ? <LockOpen className="size-3" /> : <Lock className="size-3" />}
+                {ordinal(w.position)} in line
+              </span>
+            ))}
+            {runningSubagents > 0 && (
+              <span className="flex items-center gap-0.5" title={`${runningSubagents} background task${runningSubagents > 1 ? "s" : ""} running`}>
+                <Bot className="size-3" />
+                {runningSubagents}
+              </span>
             )}
-          >
-            {status.needsYou && <CircleAlert className="mt-0.5 size-3 shrink-0" aria-label="Needs you" />}
-            <span className="line-clamp-2">{status.line}</span>
-          </p>
+            {task.todoProgress && task.todoProgress.total > 0 && task.column === "running" && (
+              <span className="flex items-center gap-0.5" title={`${task.todoProgress.completed} of ${task.todoProgress.total} tasks done`}>
+                <ListTodo className="size-3" />
+                {task.todoProgress.completed}/{task.todoProgress.total}
+              </span>
+            )}
+            {showFxPaused && (
+              <span className="flex items-center gap-0.5 text-warning" data-testid="fx-paused-badge" title={fxPausedBadgeTitle(task.fxRecovery!)}>
+                <PauseCircle className="size-3" />
+                {fxPausedBadgeText(task.fxRecovery!, fxAutoResumeCountdown)}
+              </span>
+            )}
+          </div>
         )}
         {!archived &&
           progress.map((p) => {
             const line = progressLine(p);
             const fraction = p.active ? progressFraction(p.counts) : null;
             return (
-              <div key={`${p.project}:${p.label}`} data-testid="card-progress" className="flex flex-col gap-1">
+              <div key={`${p.project}:${p.label}`} data-testid="card-progress" className="mt-1.5 flex flex-col gap-1">
                 <p
                   title={p.current ?? line.text}
                   className={cn(
-                    "truncate text-xs leading-snug",
+                    "truncate text-[11px] leading-snug",
                     line.tone === "danger" && DANGER_TEXT,
                     line.tone === "success" && "text-success",
                     line.tone === "info" && "text-info",
@@ -310,64 +364,42 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
               </div>
             );
           })}
-      </CardHeader>
-      <CardContent className="p-3 pt-0">
-        {/* One row: the button for the user's next move (only when there is
-         *  one), then a few quiet facts. Everything else is on hover (the
-         *  strip at the top right) or in the right-click menu. */}
-        <div className="flex min-h-6 items-center gap-2" onClick={(e) => e.stopPropagation()}>
-          {primary}
-          <div className="ml-auto flex min-w-0 items-center gap-1.5 text-[11px] text-muted-foreground">
-            {lease.holds.map((label) => (
-              <span key={label} className="flex items-center gap-0.5 text-info" data-testid="lease-badge" title={`Holds the ${label} lease`}>
-                <Lock className="size-3" />
-                {label}
-              </span>
-            ))}
-            {lease.waiting.map((w) => (
-              <span
-                key={w.label}
-                className={cn("flex items-center gap-0.5", w.free ? "text-success" : "text-warning")}
-                data-testid="lease-wait-hint"
-                title={w.free ? `${w.label} is free` : `${w.label} held by ${w.heldBy}`}
-              >
-                {w.free ? <LockOpen className="size-3" /> : <Lock className="size-3" />}
-                {ordinal(w.position)} in line
-              </span>
-            ))}
-            {pr && prInfo && !status.line.includes(`#${pr.number}`) && (
-              <span className="flex items-center gap-0.5" data-testid="pr-badge" data-tone={prInfo.tone} title={prInfo.title}>
-                <GitPullRequest className="size-3" />#{pr.number}
-              </span>
-            )}
-            {runningSubagents > 0 && (
-              <span className="flex items-center gap-0.5" title={`${runningSubagents} background task${runningSubagents > 1 ? "s" : ""} running`}>
-                <Bot className="size-3" />
-                {runningSubagents}
-              </span>
-            )}
-            {task.todoProgress && task.todoProgress.total > 0 && task.column === "running" && (
-              <span className="flex items-center gap-0.5" title={`${task.todoProgress.completed} of ${task.todoProgress.total} tasks done`}>
-                <ListTodo className="size-3" />
-                {task.todoProgress.completed}/{task.todoProgress.total}
-              </span>
-            )}
-            {isTaskFxPaused(task) && task.fxRecovery && (
-              <span className="flex items-center gap-0.5 text-warning" data-testid="fx-paused-badge" title={fxPausedBadgeTitle(task.fxRecovery)}>
-                <PauseCircle className="size-3" />
-                {fxPausedBadgeText(task.fxRecovery, fxAutoResumeCountdown)}
-              </span>
-            )}
-            <span className="truncate" title={task.pipelineRun ? task.pipelineRun.pipelineName : task.agentProfile?.name ?? task.agent} data-testid="task-card-pipeline">
-              {task.pipelineRun ? shortPipelineName(task.pipelineRun.pipelineName) : (task.agentProfile?.name ?? task.agent)}
-            </span>
-          </div>
+      </div>
+      {/* The footer is the user's next move when there is one, and otherwise
+       *  who is on the card. Everything else is on hover (the strip at the
+       *  top right), in the right-click menu, or in the inspector. */}
+      {action ? (
+        <button
+          type="button"
+          data-testid="card-action"
+          data-action={action.kind}
+          aria-label={`${action.label}: ${title.issue ? `#${title.issue}` : title.text}`}
+          className="flex min-h-8 w-full items-center justify-between gap-1 rounded-b-[7px] bg-state-bg px-[9px] py-2 text-left text-[11px] font-semibold text-state hover:brightness-95 focus-visible:outline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-state dark:hover:brightness-110"
+          onClick={(e) => {
+            e.stopPropagation();
+            onAction(task, action);
+          }}
+          // A double click on the button is two presses of the button, not
+          // a request to open the card.
+          onDoubleClick={(e) => e.stopPropagation()}
+        >
+          <span className="min-w-0 truncate">{action.label}</span>
+          <ArrowRight className="size-[13px] shrink-0" aria-hidden />
+        </button>
+      ) : (
+        <div className="flex justify-between gap-1.5 border-t border-board-line px-[9px] py-[7px] text-[11px] text-muted-foreground">
+          <span className="truncate" title={run ? run.pipelineName : owner} data-testid="task-card-pipeline">
+            {owner}
+          </span>
+          {run && stepAgent && <span className="max-w-[45%] shrink-0 truncate">{shortPipelineName(run.pipelineName)}</span>}
         </div>
-      </CardContent>
-      {/* Secondary actions, on hover/focus only. */}
+      )}
+      {/* Secondary actions, on hover/focus only. After the footer in the
+       *  document, so Tab goes from the card to its button first. */}
       <div
-        className="absolute right-1.5 top-1.5 flex items-center gap-0.5 rounded-md border border-border/60 bg-card/95 p-0.5 opacity-0 shadow-sm transition-opacity group-hover:opacity-100 focus-within:opacity-100"
+        className="absolute right-1 top-1 flex items-center gap-0.5 rounded-md border border-board-line bg-board-card p-0.5 opacity-0 shadow-sm transition-opacity group-hover:opacity-100 focus-within:opacity-100"
         onClick={(e) => e.stopPropagation()}
+        onDoubleClick={(e) => e.stopPropagation()}
       >
         {!archived && stoppable && (
           <Button size="icon" variant="ghost" className="size-6" onClick={() => onCancel(task)} title="Stop">
@@ -396,29 +428,15 @@ function TaskCardImpl({ task, homeDir, onStart, onCancel, onDelete, onOpen, onDi
           <Trash2 className="size-3" />
         </Button>
       </div>
-      {/* The "waiting on you" glow. A separate overlay whose OPACITY pulses,
-          rather than animating `filter: drop-shadow` on the card itself:
-          filter animations re-rasterize the whole card on the CPU every
-          frame (60–120 Hz, for as long as the card is awaiting), whereas an
-          opacity animation is compositor-only. The shadow is static and
-          paints outside the overlay's box, so the overlay is invisible over
-          the card's own content and `pointer-events-none` keeps clicks and
-          drags untouched. */}
-      {awaiting && (
-        <span
-          aria-hidden
-          className="pointer-events-none absolute inset-0 rounded-[inherit] animate-awaiting-pulse motion-reduce:animate-none"
-          style={{ boxShadow: "0 0 14px hsl(var(--warning) / 0.85)" }}
-        />
-      )}
-    </Card>
+    </div>
   );
 }
 
 // Default shallow-props comparator is correct here (unlike Column, which
 // needs a custom comparator for its array prop): `task` is a single object
 // whose identity App.tsx's `reconcileById` preserves across polls when
-// unchanged, and every other prop is either a primitive (`homeDir`) or a
+// unchanged, and every other prop is either a primitive (`homeDir`,
+// `isOpen`, `selected`) or a
 // `useCallback`-stabilized handler. dnd-kit's `useDraggable` lives inside
 // the component body, so memoizing the outer function doesn't interfere
 // with drag state — that's driven by dnd-kit's own context, not props.

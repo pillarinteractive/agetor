@@ -74,6 +74,7 @@ export default {
           DEFAULT: "var(--state)",
           bg: "var(--state-bg)",
           working: "var(--state-working)",
+          waiting: "var(--state-waiting)",
           neutral: "var(--state-queued-bg)",
         },
         lane: "var(--lane)",

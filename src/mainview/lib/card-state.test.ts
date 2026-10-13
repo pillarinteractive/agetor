@@ -163,7 +163,7 @@ describe("cardState — one case per state", () => {
 
   test("Stopped: grey, and the button resumes the stopped step — it does not restart the pipeline", () => {
     const stopped = run({ status: "cancelled", active: building.active, history: [rec(1, "understand"), rec(2, "build", { outcome: "cancelled" })] });
-    expect(state(task({ column: "ready", pipelineRun: stopped }))).toMatchObject({ kind: "stopped", state: "queued", label: "Stopped", reason: "Stopped at Build", action: { kind: "retry", label: "Resume Build", stepTaskId: "s2" } });
+    expect(state(task({ column: "ready", pipelineRun: stopped }))).toMatchObject({ kind: "stopped", state: "queued", label: "Stopped", reason: "Stopped at Build", action: { kind: "retry", label: "Resume Build", stepTaskId: null } });
   });
 
   test("CI failed: a finished pipeline whose own checks fail gets the fix-CI button; another card only opens", () => {

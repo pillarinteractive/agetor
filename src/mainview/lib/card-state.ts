@@ -67,6 +67,7 @@ export type CardStateKind =
 export type CardAction =
   | { kind: "open"; label: string }
   | { kind: "run"; label: string }
+  /** `stepTaskId`: which blocked execution, when the block names one. */
   | { kind: "retry"; label: string; stepTaskId: string | null }
   | { kind: "inspect"; label: string }
   | { kind: "view-pr"; label: string; url: string }
@@ -116,7 +117,7 @@ function sansPr(line: string): string {
   return rest === line ? line : rest.charAt(0).toUpperCase() + rest.slice(1);
 }
 
-const clockTime = (ts: number) => new Date(ts).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+export const clockTime = (ts: number) => new Date(ts).toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
 
 /**
  * The pipeline's steps as equal segments, ordered from the start step along
@@ -364,12 +365,8 @@ export function cardState(task: Task, ctx: CardStateContext): CardState {
     }
 
     if (run.status === "cancelled") {
-      const stoppedTask = run.active[0]?.taskId ?? null;
-      return make("queued", "stopped", "Stopped", step ? `Stopped at ${step.name}` : "Stopped", {
-        kind: "retry",
-        label: step ? `Resume ${step.name}` : "Resume step",
-        stepTaskId: stoppedTask,
-      });
+      // The server picks the stopped execution itself (as Retry in the run view does).
+      return make("queued", "stopped", "Stopped", step ? `Stopped at ${step.name}` : "Stopped", { kind: "retry", label: step ? `Resume ${step.name}` : "Resume step", stepTaskId: null });
     }
 
     // Finished: lead with the PR when there is one, else the result.

@@ -26,6 +26,7 @@ import {
   X,
   Link2,
   Rocket,
+  Search,
   Sun,
   SunDim,
   Zap,
@@ -33,13 +34,19 @@ import {
 } from "lucide-react";
 import { api, type AgentModelMap, type HarnessModelMap } from "@/lib/api";
 import { Button } from "@/components/ui/button";
-import { boardColumnOf, clampFontSizePercent, COLUMNS, USAGE_SUPPORTED_KINDS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type HarnessQuota, type LeaseStatus, type Project, type TaskPrStatus, type TaskProgress, type Task, type TaskType } from "../shared/types.ts";
+import { boardColumnOf, clampFontSizePercent, COLUMNS, USAGE_SUPPORTED_KINDS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type HarnessQuota, type LeaseStatus, type Project, type TaskPrStatus, type TaskProgress, type Task } from "../shared/types.ts";
 import { parseIssueUrl } from "../shared/issue-task.ts";
 import { isPipelineColumnRunnerOwned } from "../shared/pipeline.ts";
 import { LeaseContext } from "@/lib/leases";
 import { PrContext } from "@/lib/prs";
 import { ProgressContext, RoadmapCardsContext } from "@/lib/progress";
 import { roadmapCardInfo, roadmapLinkInfo } from "@/lib/card-status";
+import type { CardAction } from "@/lib/card-state";
+import { columnLabel } from "@/lib/column-labels";
+import { IDENTIFIER_INPUT_PROPS } from "@/lib/identifier-input";
+import { Input } from "@/components/ui/input";
+import { Select } from "@/components/ui/select";
+import { CardInspector } from "@/components/kanban/CardInspector";
 import { BlockerLines } from "@/components/kanban/BlockerLines";
 import { NextMilestonePrompt } from "@/components/kanban/NextMilestonePrompt";
 import { autopilotLabel } from "../shared/autopilot.ts";
@@ -164,6 +171,10 @@ function ErrorToast({ error, onDismiss }: { error: string | null; onDismiss: () 
 /** Muted one-line hints shown in empty columns while onboarding's checklist
  *  is visible (see `Column`'s `emptyHint` prop). Review/done intentionally
  *  have no entry — an empty Review/Done column needs no explanation. */
+/** The follow-up preset that fixes a PR's own failing checks
+ *  (src/bun/pr-watch.ts `PR_FIX_CI_ACTION`; the webview can't import it). */
+const PR_FIX_CI_PRESET = "pr:fix-ci";
+
 const EMPTY_COLUMN_HINT: Partial<Record<ColumnId, string>> = {
   backlog: "Ideas you haven't queued yet, and runs to go again",
   running: "Agents working right now",
@@ -270,11 +281,11 @@ function AppInner() {
   const [error, setError] = useState<string | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
   const [textQuery, setTextQuery] = useState("");
-  const [repoFilter, setRepoFilter] = useState<string[]>([]);
-  const [statusFilter, setStatusFilter] = useState<ColumnId[]>([]);
   const [archivedView, setArchivedView] = useState<"active" | "all" | "archived">("active");
-  const [harnessFilter, setHarnessFilter] = useState<string[]>([]);
-  const [typeFilter, setTypeFilter] = useState<TaskType[]>([]);
+  // The card the inspector under the board shows (CardInspector.tsx): set by
+  // a click on a card, cleared by Escape or the inspector's close button.
+  // Separate from `selected`, which is the task open in the run panel.
+  const [inspectedId, setInspectedId] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   // Missing preference intentionally resolves to sticky so existing users
   // retain the last-sent-message reminder until they opt into the standard
@@ -1438,9 +1449,7 @@ function AppInner() {
     [tasks],
   );
 
-  // Text + repo filter applied here; status filter narrows the rendered
-  // columns (not the task list) so an unselected status disappears entirely
-  // rather than rendering an empty column.
+  // The top bar's search box and its View menu (active / all / archived).
   const visibleTasks = useMemo(() => {
     const q = textQuery.trim().toLowerCase();
     return tasks.filter((t) => {
@@ -1456,30 +1465,13 @@ function AppInner() {
         const hay = `${t.title}\n${t.prompt}\n${t.workdir}\n${t.branch ?? ""}${prNum ? `\npr #${prNum} pr ${prNum}` : ""}`.toLowerCase();
         if (!hay.includes(q)) return false;
       }
-      if (repoFilter.length > 0 && !repoFilter.includes(t.workdir)) return false;
-      if (harnessFilter.length > 0 && !harnessFilter.includes(t.agent)) return false;
-      if (typeFilter.length > 0 && !typeFilter.includes(t.taskType)) return false;
       if (archivedView === "active" && t.archivedAt != null) return false;
       if (archivedView === "archived" && t.archivedAt == null) return false;
       return true;
     });
-  }, [tasks, textQuery, repoFilter, harnessFilter, typeFilter, archivedView]);
-
-  const visibleColumns = useMemo(
-    () => (statusFilter.length === 0 ? COLUMNS : COLUMNS.filter((c) => statusFilter.includes(c.id))),
-    [statusFilter],
-  );
-
-  // Distinct harness ids referenced by any (non-step) task — feeds the
-  // harness filter so ids belonging to removed harnesses still show up as
-  // filter options. Computed over `nonStepTasks` (m4) so a pipeline's
-  // hidden step tasks — which can run under a different harness per step —
-  // can't add filter options for harnesses the user never launched a
-  // visible task on.
-  const taskAgentIds = useMemo(
-    () => Array.from(new Set(nonStepTasks.map((t) => t.agent))),
-    [nonStepTasks],
-  );
+  }, [tasks, textQuery, archivedView]);
+  // The inspected card, while it is still on the board as filtered.
+  const inspected = useMemo(() => (inspectedId ? (visibleTasks.find((t) => t.id === inspectedId) ?? null) : null), [visibleTasks, inspectedId]);
 
   // --- Onboarding derivation (pure lib/onboarding.ts, thin wiring here) ---
   const enabledHarnessIds = useMemo(
@@ -1912,6 +1904,81 @@ function AppInner() {
     setGithubOpen(true);
   }, []);
 
+  // --- Card actions (the cards' own button and the inspector) -------------
+  // A click selects a card and opens the inspector; the full view stays a
+  // double click, or "Open run" in the inspector.
+  const selectCard = useCallback((t: Task) => setInspectedId(t.id), []);
+  const closeInspector = useCallback(() => setInspectedId(null), []);
+  // Cards with a retry or a fix-CI request in flight. Both start agents, so
+  // a second press before the first has answered must not start them twice.
+  const cardActionBusyRef = useRef<Set<string>>(new Set());
+  /** One dispatcher for every card's button, on the handlers the rest of
+   *  the app already uses. Stable identity — passed to `Column`/`TaskCard`,
+   *  both memoized. `retry` resumes the step that stopped (the same request
+   *  as dropping a blocked card on Running); it never restarts the run. */
+  const onCardAction = useCallback((t: Task, action: CardAction) => {
+    switch (action.kind) {
+      case "open":
+        openTask(t);
+        return;
+      case "run":
+        void start(t);
+        return;
+      case "inspect":
+        setInspectedId(t.id);
+        return;
+      case "view-pr":
+        viewPullRequest({ projectPath: t.workdir, prUrl: action.url });
+        return;
+      case "open-dependency":
+        openTaskById(action.taskId);
+        return;
+      case "retry":
+      case "fix-ci": {
+        const busy = cardActionBusyRef.current;
+        if (busy.has(t.id)) return;
+        busy.add(t.id);
+        void (async () => {
+          try {
+            setError(null);
+            if (action.kind === "retry") {
+              await api.retryPipeline(t.id, action.stepTaskId ? { taskId: action.stepTaskId } : undefined);
+            } else {
+              // The PR watcher's own follow-up (src/bun/pr-watch.ts
+              // `PR_FIX_CI_ACTION`), as the run view's Next box starts it.
+              await api.runFollowUp(t.id, { presetId: PR_FIX_CI_PRESET });
+              toast.success("Fixing CI", { description: "A follow-up step is working on the failing checks." });
+            }
+          } catch (e) {
+            surfaceError(e);
+          } finally {
+            busy.delete(t.id);
+          }
+          await refresh();
+        })();
+        return;
+      }
+    }
+  }, [openTask, start, viewPullRequest, openTaskById, surfaceError, refresh]);
+  /** Restart a pipeline from its first step — the inspector's button. Asks
+   *  first, in the words the run view's own Restart uses. */
+  const restartPipelineRun = useCallback(async (t: Task) => {
+    const ok = await confirm({
+      title: "Restart this pipeline?",
+      description: "This starts a fresh run from the start step. Previous run history will be cleared.",
+      confirmLabel: "Restart",
+      variant: "destructive",
+    });
+    if (!ok) return;
+    try {
+      setError(null);
+      await api.restartPipeline(t.id);
+    } catch (e) {
+      surfaceError(e);
+    }
+    await refresh();
+  }, [confirm, surfaceError, refresh]);
+
   // Issue-flavored sibling of `viewPullRequest` above — same fallback
   // rationale (an unparseable URL can't drive the in-app detail subpage) and
   // the same generalized `GitHubItemDetailPrefill` mechanism, just with
@@ -2219,6 +2286,58 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
           </div>
         </div>
         <div className="electrobun-webkit-app-region-no-drag flex items-center gap-2">
+          {/* The board's search box and its View menu — all that is left of
+              the filter row. Shown with the board only: they filter nothing
+              else, and Cmd/Ctrl+F (above) finds the box through its ref. */}
+          {view.kind === "board" && (
+            <>
+              <div className="relative w-44">
+                <Search className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" aria-hidden />
+                <Input
+                  {...IDENTIFIER_INPUT_PROPS}
+                  ref={boardSearchRef}
+                  value={textQuery}
+                  onChange={(e) => setTextQuery(e.target.value)}
+                  placeholder="Find a task…"
+                  title="Search title, prompt, workdir, branch or PR number"
+                  aria-label="Search tasks"
+                  className="h-7 pl-7 text-xs"
+                  onKeyDown={(e) => {
+                    // Owner decision: Escape leaves the field but keeps the query
+                    // (no clear) — just blur so focus returns to the board.
+                    // `preventDefault` only, no `stopPropagation`: document-level
+                    // Escape listeners in this app coordinate through DOM markers
+                    // (see the comment block in RunPanel.tsx ~line 381-392), and
+                    // `ui/dialog.tsx` already honors `defaultPrevented`.
+                    if (e.key !== "Escape") return;
+                    // A dismissable layer above the board — any dialog (modal or
+                    // not, e.g. the usage popover, which carries no marker at all),
+                    // an open popover, or the floating quote pill — owns this
+                    // Escape first: the box yields WITHOUT `preventDefault` so that
+                    // layer's own listener closes it, and the NEXT Escape blurs the
+                    // box. Without this bail, a chord that focused the box while
+                    // such a layer was open would blur the box AND close the layer
+                    // on one keypress.
+                    if (document.querySelector('[role="dialog"], [data-popover-open], [data-quote-open]')) return;
+                    e.preventDefault();
+                    e.currentTarget.blur();
+                  }}
+                />
+              </div>
+              <Select
+                value={archivedView}
+                onChange={(e) => setArchivedView(e.target.value as "active" | "all" | "archived")}
+                className="h-7 w-[6.5rem] text-xs"
+                data-testid="board-view"
+                aria-label="View"
+                title="View: active cards, all cards, or archived cards"
+              >
+                <option value="active">Active</option>
+                <option value="all">All</option>
+                <option value="archived">Archived</option>
+              </Select>
+            </>
+          )}
           <span className="text-xs text-muted-foreground">
             {/* m4: counted over `nonStepTasks`, not raw `tasks` — a hidden
                 pipeline step must not inflate the total. */}
@@ -2352,37 +2471,37 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                     horizontally can't carry the card off-screen with it (an
                     abs-positioned descendant of a scrolling containing block
                     scrolls along with it — the previous bug). */}
+                <LeaseContext.Provider value={leases}>
+                <PrContext.Provider value={prs}>
                 <div className="relative flex-1">
                   <div className="kanban-scroll absolute inset-0 overflow-x-scroll">
                     <DndContext sensors={sensors} onDragEnd={onDragEnd}>
-                      <LeaseContext.Provider value={leases}>
-                      <PrContext.Provider value={prs}>
-                      <div className="flex min-w-full gap-3 p-4">
-                        {visibleColumns.map((c) => (
+                      <div className="flex min-h-full min-w-full gap-[9px] px-3 pb-3.5 pt-3">
+                        {COLUMNS.map((c) => (
                           <Column
                             key={c.id}
                             id={c.id}
-                            label={c.label}
+                            label={columnLabel(c.id)}
                             tasks={visibleTasks.filter((t) => boardColumnOf(t.column) === c.id)}
                             homeDir={homeDir}
-                            onStart={start}
                             onCancel={cancel}
                             onDelete={del}
+                            onSelect={selectCard}
                             onOpen={openTask}
+                            onAction={onCardAction}
                             onDiff={setDiffTask}
                             onMarkDone={markDone}
                             onArchive={archive}
                             onUnarchive={unarchive}
                             emptyHint={onboardingVisibility.showChecklist ? EMPTY_COLUMN_HINT[c.id] : undefined}
                             selectedTaskId={selected?.id ?? null}
+                            inspectedTaskId={inspected?.id ?? null}
                             onContextMenu={openTaskMenu}
                             onMergeTogether={c.id === "merge" ? mergeTogether : undefined}
                             onRefresh={c.id === "merge" ? refreshMerge : undefined}
                           />
                         ))}
                       </div>
-                      </PrContext.Provider>
-                      </LeaseContext.Provider>
                     </DndContext>
                   </div>
                   {/* Hovering a card draws lines to what it waits on and what
@@ -2422,6 +2541,21 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                     </div>
                   )}
                 </div>
+                {/* The selected card, docked under the board. Only while a
+                    card is selected: the board keeps the whole area otherwise. */}
+                {inspected && (
+                  <CardInspector
+                    task={inspected}
+                    onClose={closeInspector}
+                    onOpen={openTask}
+                    onAction={onCardAction}
+                    onRestart={restartPipelineRun}
+                    onStop={cancel}
+                    escapeCloses={selected === null}
+                  />
+                )}
+                </PrContext.Provider>
+                </LeaseContext.Provider>
               </motion.div>
             )}
 
@@ -2573,7 +2707,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
       <GitHubDialog
         open={githubOpen}
         projects={projects}
-        initialProjectPath={githubItemDetailPrefill?.projectPath ?? githubPullPrefill?.projectPath ?? repoFilter[0] ?? selected?.workdir ?? tasks[0]?.workdir ?? null}
+        initialProjectPath={githubItemDetailPrefill?.projectPath ?? githubPullPrefill?.projectPath ?? selected?.workdir ?? tasks[0]?.workdir ?? null}
         pullPrefill={githubPullPrefill}
         itemDetailPrefill={githubItemDetailPrefill}
         onClose={closeGithubDialog}
