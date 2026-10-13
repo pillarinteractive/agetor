@@ -23,6 +23,7 @@ import { startProgressWatchLoop } from "./progress-watch.ts";
 import { startDependencyLoop } from "./dependencies.ts";
 import { startMergeQueueLoop } from "./merge-queue.ts";
 import { startAwaitLoop } from "./awaits.ts";
+import { startPublishLoop } from "./publish-step.ts";
 import { startBranchSweep } from "./branch-sweep.ts";
 import { startAutopilot } from "./autopilot.ts";
 import { startStallMonitor } from "./stall-monitor.ts";
@@ -87,6 +88,7 @@ export const coreDeps = {
   startProgressWatchLoop,
   startDependencyLoop,
   startMergeQueueLoop,
+  startPublishLoop,
   startSlotScheduler,
   startAwaitLoop,
   startBranchSweep,
@@ -244,6 +246,9 @@ async function boot(opts: StartCoreOptions, deps: CoreDeps): Promise<ApiServer> 
   deps.startDependencyLoop();
   // Ready to Merge (merge-queue.ts): work signed-off PRs to green and merge.
   deps.startMergeQueueLoop();
+  // Finish run by Agetor (publish-step.ts): verify, push once and wait for CI
+  // for the cards `pipeline_gates` names; nothing to do while that is unset.
+  deps.startPublishLoop();
   // Step slots (step-slots.ts): start queued pipeline steps as running ones
   // finish.
   deps.startSlotScheduler();

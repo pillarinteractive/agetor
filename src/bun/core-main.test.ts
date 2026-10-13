@@ -57,6 +57,7 @@ const LOOPS = [
   "startProgressWatchLoop",
   "startDependencyLoop",
   "startMergeQueueLoop",
+  "startPublishLoop",
   "startSlotScheduler",
   "startAwaitLoop",
   "startBranchSweep",

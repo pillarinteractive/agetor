@@ -256,6 +256,11 @@ const ROUND_RULES =
   "This arrives as a verification failure: fix it locally and commit, do not push and do not touch the pull request. " +
   "Review re-reviews your fix and Finish publishes the approved commit with one push.";
 
+const foundBy = (inRun: boolean | undefined) =>
+  inRun ? "Found by Agetor while it ran Finish (no agent published this)" : "Found by Agetor's merge queue, not by a step";
+const roundNote = (input: { inRun?: boolean; round: number; maxRounds: number }) =>
+  input.inRun ? "" : ` This is fix round ${input.round} of ${input.maxRounds} for this card; after the last one it is held for the owner.`;
+
 /** The handoff Build receives for a CI failure found after the run finished:
  *  what Finish's own "verification failed" carries. Pure. */
 export function ciFailureHandoff(input: {
@@ -266,6 +271,9 @@ export function ciFailureHandoff(input: {
   round: number;
   maxRounds: number;
   signedOff: boolean;
+  /** Found by Agetor while it ran Finish inside the run (src/bun/publish-step.ts),
+   *  not by the merge queue afterwards: no fix-round count applies. */
+  inRun?: boolean;
 }): Handoff {
   const { pr, details } = input;
   const base = pr.baseRef ?? "the base branch";
@@ -276,14 +284,14 @@ export function ciFailureHandoff(input: {
   return {
     schemaVersion: 1,
     status: "done",
-    purpose: `Verification failed: CI on PR #${pr.number} failed ${input.signedOff ? "after the card was signed off" : "after the pipeline finished"}`,
+    purpose: `Verification failed: CI on PR #${pr.number} failed${input.inRun ? "" : input.signedOff ? " after the card was signed off" : " after the pipeline finished"}`,
     summary:
-      `Found by Agetor's merge queue, not by a step: CI failed on pull request #${pr.number} (${pr.url}) at head ${pr.headSha ?? "unknown"}. ` +
+      `${foundBy(input.inRun)}: CI failed on pull request #${pr.number} (${pr.url}) at head ${pr.headSha ?? "unknown"}. ` +
       `Failing checks this change caused:\n${jobs}\n\n` +
       (input.inherited.length ? `These also fail on ${base} and are not this change's to fix — leave them alone: ${input.inherited.join(", ")}.\n\n` : "") +
       `Reproduce each failure with the narrowest local command, fix the root cause, add the regression test if one was missing, and say which commit answers which failing job. ` +
       `If you find the failure is ${base}'s or a runner's and not this change's, make no code change: merge origin/${base} if it moved, and say so with the evidence. ` +
-      `${ROUND_RULES} This is fix round ${input.round} of ${input.maxRounds} for this card; after the last one it is held for the owner.`,
+      `${ROUND_RULES}${roundNote(input)}`,
     reason: logs || "The failed runs' logs could not be read; read them with `gh run view <run id> --log-failed`.",
     next: routeName(input.shape),
     artifacts: [pr.url, ...runUrls],
@@ -299,6 +307,7 @@ export function conflictHandoff(input: {
   round: number;
   maxRounds: number;
   signedOff: boolean;
+  inRun?: boolean;
 }): Handoff {
   const { pr } = input;
   const base = pr.baseRef ?? "develop";
@@ -308,17 +317,17 @@ export function conflictHandoff(input: {
   return {
     schemaVersion: 1,
     status: "done",
-    purpose: `Verification failed: PR #${pr.number} conflicts with ${base}`,
+    purpose: `Verification failed: ${pr.number ? `PR #${pr.number}` : "the branch"} conflicts with ${base}`,
     summary:
-      `Found by Agetor's merge queue, not by a step: pull request #${pr.number} (${pr.url}) no longer merges into ${base}` +
+      `${foundBy(input.inRun)}: ${input.inRun && !pr.number ? "this branch" : `pull request #${pr.number} (${pr.url})`} no longer merges into ${base}` +
       `${input.signedOff ? " (the card was signed off)" : ""}. ${files}\n\n` +
       `\`git fetch origin ${base}\`, merge origin/${base} into this branch (a merge commit — never a rebase, never a push to ${base}), ` +
       `resolve each conflict keeping both sides' intent, rerun the local checks for what the resolution touched, and commit. ` +
       `Make no change beyond the merge and what the resolution needs. ` +
-      `${ROUND_RULES} This is fix round ${input.round} of ${input.maxRounds} for this card; after the last one it is held for the owner.`,
-    reason: `PR #${pr.number} conflicts with ${base}`,
+      `${ROUND_RULES}${roundNote(input)}`,
+    reason: pr.number ? `PR #${pr.number} conflicts with ${base}` : `the branch conflicts with ${base}`,
     next: routeName(input.shape),
-    artifacts: [pr.url],
+    artifacts: pr.url ? [pr.url] : [],
     openQuestions: [],
   };
 }

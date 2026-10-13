@@ -40,6 +40,7 @@ import { runnerUse, activeCardOwners } from './dispatch-claims.ts';
 import { beginQueueCycle, completeQueueCycle, restoredQueueDelay } from './queue-cycle.ts';
 import { currentSlots } from './step-slots.ts';
 import {reviewApprovalMatches} from '../shared/pipeline.ts';
+import {approvedHeadFor} from '../shared/publish.ts';
 import { freezeCardInputs, queueValidator } from './queue-validation.ts';
 import type { CanonicalQueue } from '../shared/canonical-roadmap.ts';
 import { holdsAutopilotSlot, neverStarted, PROGRESSING_COLUMNS, waitingOnQuota } from "../shared/autopilot.ts";
@@ -490,7 +491,9 @@ export function reviewedPillarPipeline(t:Task,cfg:AutopilotConfig,pr:TaskPrStatu
   if(!review||!finish||profile?.model!=='gpt-6.1-sol')return false;
   const lastReview=run.history.filter(h=>h.stepId===review.id).at(-1),last=run.history.at(-1);
   return lastReview?.outcome==='succeeded'&&lastReview.handoff?.status==='done'
-    &&reviewApprovalMatches(lastReview.handoff,t.issueUrl!,pr.headSha)
+    // An Agetor-run Finish may have merged the base into the approved head
+    // (the change's own diff unchanged): the approval is of the head it carried over.
+    &&reviewApprovalMatches(lastReview.handoff,t.issueUrl!,approvedHeadFor(run.publish,pr.headSha))
     &&lastReview.handoff.openQuestions.length===0&&lastReview===run.history.at(-2)
     &&lastReview.nextStepIds.includes(finish.id)&&last?.stepId===finish.id&&last.outcome==='succeeded'
     &&last.handoff?.status==='done'&&last.handoff.openQuestions.length===0&&last.handoff.artifacts.includes(t.prUrl!);
