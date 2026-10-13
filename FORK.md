@@ -444,8 +444,9 @@ suggestion rules are gone.
 ### An unattended run that reaches its step cap finishes once (`fix/step-cap-wrap-up`)
 
 A planner-recommendation run that reaches its step cap after the automatic extension is used no longer waits for a
-person. It launches the step the run ends through (`capWrapUpStep` in `src/shared/pipeline.ts`: the one step with no
-outgoing edge, or `canFinish`) in place of the requested step, with the same arrivals and an added prompt section
+person. It launches the step the run ends through (`capWrapUpStep` in `src/shared/pipeline.ts`: the step with no
+outgoing edge, or `canFinish`; when several can end the run — Change's Understand may, for a card that needs no
+change — the last of them, the one no other end is reachable from) in place of the requested step, with the same arrivals and an added prompt section
 (`capWrapUpSection`): publish as usual, do not hand back, file one GitHub issue per unresolved finding and list them
 in the PR, and say so when the head is published unapproved. `run.capWrapUp` records it; it happens once per run, and
 a second cap hit blocks with `step-cap` as before. Attended runs are unchanged. If the cap arrives on a launch of
@@ -499,6 +500,18 @@ stopped pipeline) but shows in Backlog (`boardColumnOf`).
   after `maxRounds` rounds (or a round that left the head unchanged) the card is held in In Review with a "Held for
   you" timeline entry, and Autopilot leaves it there until the owner drags it to Ready to Merge again. The PR
   watcher's automatic Fix CI follows the same rule for these cards.
+  **A conflict with the base is counted apart, per base commit** (`reworkConflict`, `entry.conflict`): merging the
+  base in is Build's work, never the owner's. A card that conflicts with a base tip it has not been sent to Build for
+  gets a round whatever its other rounds came to, and also when it is already held ("No longer held for you: develop
+  moved to …"); for one base tip it gets at most `maxRounds`, each for a head the last round changed, then waits for
+  the base to move (one `git ls-remote` a pass, nothing fetched). The one conflict that is held for the owner for good
+  is a round that left the head as it was — Build could not resolve it (`heldFor: "conflict-unresolved"`) — or a
+  Build that hands off `blocked` inside the round, which blocks the run as any step does.
+  **A hold does not outlive its run.** A sign-off the owner took back (`autopilot_hands_off`) and the merge queue's
+  hold are each about one run of the card at one PR head (`autopilot_hands_off_marks`; `heldRun` on the rework
+  entry). When another run of the card — a restart, or that run reopened by the owner — finishes at a different head,
+  the marks are forgotten and Autopilot judges the card like any other (`signOffMarkLapsed`). The same run, the same
+  head, or a head an automatic fix round pushed keep them.
   A pipeline edge may carry `maxTraversals` (set through `PATCH /pipelines/:id`; the editor keeps it but has no
   control for it): a step that chooses the edge once more is held for a person (`exhaustedEdge`), e.g. `2` on
   Finish → Build. A pipeline's fix-up run returns the card to Ready to
