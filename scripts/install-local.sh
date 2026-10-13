@@ -69,3 +69,22 @@ fi
 ditto "$STAGE/Agetor.app" "$TARGET"
 echo "installed $(git -C "$ROOT" rev-parse --short HEAD) → $TARGET"
 open "$TARGET"
+
+# Each install leaves one app bundle and one database copy in the backups
+# folder. Keep the newest few. An older bundle that a process still has as its
+# working directory stays (see the note above about tmux servers).
+KEEP_APPS=3
+KEEP_DBS=5
+before_kb="$(du -sk "$BACKUPS" | cut -f1)"
+in_use="$(lsof -a -d cwd 2>/dev/null || true)"
+ls -1d "$BACKUPS"/Agetor.app.* 2>/dev/null | sort -r | tail -n +"$((KEEP_APPS + 1))" | while IFS= read -r old; do
+  case "$in_use" in
+    *"$old"*) echo "kept $old (still in use)" ;;
+    *) rm -rf "$old" ;;
+  esac
+done
+ls -1 "$BACKUPS"/agetor.sqlite.* 2>/dev/null | sort -r | tail -n +"$((KEEP_DBS + 1))" | while IFS= read -r old; do
+  rm -f "$old"
+done
+after_kb="$(du -sk "$BACKUPS" | cut -f1)"
+echo "pruned backups: kept $KEEP_APPS apps and $KEEP_DBS databases, freed $(( (before_kb - after_kb) / 1024 )) MB"
