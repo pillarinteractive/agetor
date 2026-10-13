@@ -288,8 +288,8 @@ test.describe("task context menu", () => {
 
     await rightClickCard(page, title);
     await expect(menu(page)).toBeVisible();
-    // Top-left corner of `<main>` — behind `KanbanFilters`' `px-4 py-2`
-    // container padding, never a card or the menu panel itself.
+    // Top-left corner of `<main>` — inside the board's own padding, never
+    // a card or the menu panel itself.
     await page.locator("main").click({ position: { x: 5, y: 5 } });
     await expect(menu(page)).toBeHidden();
   });

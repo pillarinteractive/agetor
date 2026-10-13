@@ -233,7 +233,7 @@ function runPanel(page: Page): Locator {
  *  (composer textarea visible). Mirrors `e2e/fx-interactions.spec.ts`'s
  *  identical helper. */
 async function openTask(page: Page, title: string): Promise<Locator> {
-  await page.getByText(title, { exact: true }).first().click();
+  await page.getByText(title, { exact: true }).first().dblclick();
   const panel = runPanel(page);
   await expect(panel.locator("textarea")).toBeVisible();
   return panel;

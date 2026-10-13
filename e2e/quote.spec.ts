@@ -94,7 +94,7 @@ function runPanel(page: Page) {
  *  one bubbles the click up to the same `Card`'s `onClick`, so picking the
  *  first (the `CardTitle`, which renders first in DOM order) is enough. */
 async function openTask(page: Page, title: string) {
-  await page.getByText(title, { exact: true }).first().click();
+  await page.getByText(title, { exact: true }).first().dblclick();
   const panel = runPanel(page);
   await expect(panel.locator("textarea")).toBeVisible();
   return panel;

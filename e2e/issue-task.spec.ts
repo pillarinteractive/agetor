@@ -509,7 +509,7 @@ test.describe("task from a Git issue", () => {
     expect(existsSync(path.join(backend.dataDir, "issue-threads", taskId, `issue-${ISSUE_NUMBER}-thread.md`))).toBe(true);
 
     // Run panel shows the durable "View issue" affordance.
-    await taskCard(page, cardTitle).click();
+    await taskCard(page, cardTitle).dblclick();
     const panel = runPanel(page);
     await expect(panel.locator("textarea")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
     await expect(panel.getByTestId("view-issue")).toBeVisible();

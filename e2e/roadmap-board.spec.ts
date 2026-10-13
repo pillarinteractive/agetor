@@ -278,7 +278,7 @@ test.describe("blocker lines", () => {
     // Step 7's card, from the Backlog into In Review — a column fully in
     // view, so the drop isn't racing the board's edge auto-scroll.
     const start = (await card(page, 17).boundingBox())!;
-    const to = (await page.locator("h2", { hasText: /^In Review$/ }).boundingBox())!;
+    const to = (await page.locator("h2", { hasText: /^In review$/ }).boundingBox())!;
     await page.mouse.move(start.x + 40, start.y + 20);
     await page.mouse.down();
     await page.mouse.move(start.x + 80, start.y + 40, { steps: 4 });
