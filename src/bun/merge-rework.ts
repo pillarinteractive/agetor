@@ -29,6 +29,14 @@
  *   round left unchanged): after that the card is held in In Review for the
  *   owner. Signing it off by hand again starts a fresh allowance.
  *
+ *   a conflict with the base is counted apart, per base commit: merging the
+ *   base in is Build's work, never the owner's. A card conflicting with a
+ *   base tip it has not been sent to Build for gets a round whatever its
+ *   other rounds came to — also when it is already held. For one base tip
+ *   it gets at most `maxRounds`, each for a new head. Only a round that left
+ *   the head as it was — Build could not resolve it — holds the card for
+ *   the owner for good.
+ *
  * Config: `merge_queue_rework` = {"enabled": true, "maxRounds": 3}. With
  * `enabled: false`, or for a pipeline without that shape, follow-ups run as
  * before. The per-card ledger lives in `merge_queue_rework_state` — in
@@ -91,6 +99,12 @@ export interface ReworkEntry {
    *  (`signOffMarkLapsed`). Absent on a hold recorded by an older build. */
   heldRun?: number;
   reopened?: boolean;
+  /** Conflict rounds started against one tip of the base branch. */
+  conflict?: { baseTip: string; rounds: number };
+  /** Why the card is held, when that decides what lifts it: Build's round
+   *  left the conflict as it was, so a moved base does not send it to Build
+   *  again. */
+  heldFor?: "conflict-unresolved";
 }
 
 function readState(): Record<string, ReworkEntry> {
@@ -102,6 +116,7 @@ function readState(): Record<string, ReworkEntry> {
       if (!raw || typeof raw !== "object") continue;
       const e = raw as Record<string, unknown>;
       const rerun = e.rerun as { head?: unknown; at?: unknown } | undefined;
+      const conflict = e.conflict as { baseTip?: unknown; rounds?: unknown } | undefined;
       out[id] = {
         rounds: typeof e.rounds === "number" && Number.isSafeInteger(e.rounds) && e.rounds >= 0 ? e.rounds : 0,
         ...(typeof e.lastHead === "string" ? { lastHead: e.lastHead } : {}),
@@ -110,6 +125,9 @@ function readState(): Record<string, ReworkEntry> {
         ...(e.held === true ? { held: true } : {}),
         ...(typeof e.heldRun === "number" && Number.isFinite(e.heldRun) ? { heldRun: e.heldRun } : {}),
         ...(e.reopened === true ? { reopened: true } : {}),
+        ...(conflict && typeof conflict.baseTip === "string" && conflict.baseTip && typeof conflict.rounds === "number" && Number.isSafeInteger(conflict.rounds) && conflict.rounds >= 0
+          ? { conflict: { baseTip: conflict.baseTip, rounds: conflict.rounds } } : {}),
+        ...(e.heldFor === "conflict-unresolved" ? { heldFor: "conflict-unresolved" as const } : {}),
       };
     }
     return out;
@@ -282,8 +300,12 @@ const ROUND_RULES =
 
 const foundBy = (inRun: boolean | undefined) =>
   inRun ? "Found by Agetor while it ran Finish (no agent published this)" : "Found by Agetor's merge queue, not by a step";
-const roundNote = (input: { inRun?: boolean; round: number; maxRounds: number }) =>
-  input.inRun ? "" : ` This is fix round ${input.round} of ${input.maxRounds} for this card; after the last one it is held for the owner.`;
+const roundNote = (input: { inRun?: boolean; round: number; maxRounds: number; perBase?: string }) =>
+  input.inRun ? ""
+    : input.perBase
+      ? ` This is round ${input.round} of ${input.maxRounds} against this commit of ${input.perBase}. If a conflict cannot be resolved without a decision that is the owner's, ` +
+        'change nothing and hand off with status "blocked", naming the file and the decision: that, and only that, puts the card in front of the owner.'
+      : ` This is fix round ${input.round} of ${input.maxRounds} for this card; after the last one it is held for the owner.`;
 
 /** The handoff Build receives for a CI failure found after the run finished:
  *  what Finish's own "verification failed" carries. Pure. */
@@ -332,6 +354,8 @@ export function conflictHandoff(input: {
   maxRounds: number;
   signedOff: boolean;
   inRun?: boolean;
+  /** Counted against one base commit, not against the card (`reworkConflict`). */
+  perBaseTip?: boolean;
 }): Handoff {
   const { pr } = input;
   const base = pr.baseRef ?? "develop";
@@ -348,7 +372,7 @@ export function conflictHandoff(input: {
       `\`git fetch origin ${base}\`, merge origin/${base} into this branch (a merge commit — never a rebase, never a push to ${base}), ` +
       `resolve each conflict keeping both sides' intent, rerun the local checks for what the resolution touched, and commit. ` +
       `Make no change beyond the merge and what the resolution needs. ` +
-      `${ROUND_RULES}${roundNote(input)}`,
+      `${ROUND_RULES}${roundNote({ ...input, ...(input.perBaseTip ? { perBase: base } : {}) })}`,
     reason: pr.number ? `PR #${pr.number} conflicts with ${base}` : `the branch conflicts with ${base}`,
     next: routeName(input.shape),
     artifacts: pr.url ? [pr.url] : [],
@@ -377,7 +401,7 @@ export const reworkDeps = {
   },
   /** The files that conflict between the PR's branch and its base, and the
    *  branch's head on the remote. */
-  async conflictFiles(task: Task, pr: TaskPrStatus): Promise<{ headSha: string | null; files: string[] }> {
+  async conflictFiles(task: Task, pr: TaskPrStatus): Promise<{ headSha: string | null; files: string[]; baseTip?: string | null }> {
     const base = pr.baseRef ?? "develop";
     if (!task.branch) return { headSha: null, files: [] };
     const git = (args: string[]) => exec(["git", ...args], task.workdir, 120_000, process.env);
@@ -388,7 +412,18 @@ export const reworkDeps = {
     const files = merged.exitCode === 1
       ? (merged.stdout.split("\n\n")[0] ?? "").split("\n").slice(1).map((l) => l.trim()).filter(Boolean)
       : [];
-    return { headSha: head.ok && head.stdout.trim() ? head.stdout.trim() : null, files: [...new Set(files)] };
+    const tip = await git(["rev-parse", `origin/${base}`]);
+    return {
+      headSha: head.ok && head.stdout.trim() ? head.stdout.trim() : null, files: [...new Set(files)],
+      baseTip: tip.ok && tip.stdout.trim() ? tip.stdout.trim() : null,
+    };
+  },
+  /** The base branch's tip on the remote, without fetching it; null when it
+   *  could not be read. Asked for a held card, once a pass. */
+  async baseTip(task: Task, base: string): Promise<string | null> {
+    const r = await exec(["git", "ls-remote", "origin", `refs/heads/${base}`], task.workdir, 60_000, process.env);
+    const sha = r.ok ? (r.stdout.trim().split(/\s+/)[0] ?? "") : "";
+    return /^[0-9a-f]{40}$/i.test(sha) ? sha : null;
   },
   async rerunFailed(task: Task, runId: number): Promise<{ ok: boolean; error?: string }> {
     const r = await rerunGitHubWorkflowRun({ dir: task.workdir, runId, failedOnly: true });
@@ -415,11 +450,11 @@ function say(taskId: string, text: string, tone: "info" | "warning" | "danger" |
 
 /** Out of rounds, or a round changed nothing: back to In Review, sign-off
  *  withdrawn, for the owner. Says so once. */
-function hold(task: Task, pr: Pick<TaskPrStatus, "number">, entry: ReworkEntry, what: string, why: string): ReworkOutcome {
+function hold(task: Task, pr: Pick<TaskPrStatus, "number">, entry: ReworkEntry, what: string, why: string, heldFor?: ReworkEntry["heldFor"]): ReworkOutcome {
   if (entry.held) return { kind: "held" };
   const heldRun = tasks.get(task.id)?.pipelineRun?.startedAt ?? task.pipelineRun?.startedAt;
-  const { reopened: _reopened, ...rest } = entry;
-  writeEntry(task.id, { ...rest, held: true, ...(heldRun != null ? { heldRun } : {}) });
+  const { reopened: _reopened, heldFor: _heldFor, ...rest } = entry;
+  writeEntry(task.id, { ...rest, held: true, ...(heldRun != null ? { heldRun } : {}), ...(heldFor ? { heldFor } : {}) });
   setMergeQueued(task.id, false);
   if (tasks.get(task.id)?.column === "merge") pipelineUpdateColumn(task.id, null, "review");
   say(
@@ -522,21 +557,88 @@ export async function reworkCiFailure(task: Task, pr: TaskPrStatus): Promise<Rew
     ciFailureHandoff({ shape, pr, details, inherited, round, maxRounds: cfg.maxRounds, signedOff }));
 }
 
-/** The open PR of a card whose run has finished conflicts with its base. */
+/**
+ * The open PR of a card whose run has finished conflicts with its base.
+ * Merging the base in is Build's work, so this is counted per base commit
+ * and not against the card's fix rounds:
+ *
+ * - a base tip the card has not been sent to Build for: a round, whatever
+ *   its other rounds came to, and also when the card is already held
+ *   (rounds ran out on CI failures, or on an older base tip);
+ * - the same base tip again: only for a head the last round changed, and at
+ *   most `maxRounds` times — then it waits for the base to move;
+ * - the same base tip and the same head: Build's round resolved nothing.
+ *   That is the one conflict held for the owner, and a moved base does not
+ *   lift it (`heldFor`).
+ *
+ * When the base tip cannot be read the card's ordinary round limit applies.
+ */
 export async function reworkConflict(task: Task, pr: TaskPrStatus): Promise<ReworkOutcome> {
   const cfg = parseReworkConfig(preferences.get(MERGE_REWORK_PREF));
   const shape = reviewedReworkFor(task, cfg);
   if (!shape) return { kind: "skipped", why: "not a reviewed pipeline" };
   if (task.pipelineRun?.status !== "done") return { kind: "skipped", why: "the run is not finished" };
   if (pr.state !== "open") return { kind: "skipped", why: "the pull request is not open" };
-  if (reworkEntry(task.id).held) return { kind: "held" };
+  const base = pr.baseRef ?? "develop";
+  const before = reworkEntry(task.id);
+  if (before.held) {
+    if (before.heldFor === "conflict-unresolved") return { kind: "held" };
+    // Held, and the base has not moved since its last conflict round (or
+    // cannot be read): nothing new to hand Build. One `ls-remote`, no fetch.
+    const tip = await reworkDeps.baseTip(task, base).catch(() => null);
+    if (!tip || tip === before.conflict?.baseTip) return { kind: "held" };
+  }
   const seen = pr.headSha ?? "";
   if (failedStarts.has(`${task.id}:${seen}`)) return { kind: "skipped", why: "a round could not be started for this head" };
   const found = await reworkDeps.conflictFiles(task, pr);
   const head = found.headSha ?? seen;
-  const base = pr.baseRef ?? "develop";
-  return startRound(task, { ...pr, headSha: head || pr.headSha }, head, shape, cfg, `a conflict with ${base}`, (round, signedOff) =>
-    conflictHandoff({ shape, pr: { ...pr, headSha: head || pr.headSha }, files: found.files, round, maxRounds: cfg.maxRounds, signedOff }));
+  const at = { ...pr, headSha: head || pr.headSha };
+  const what = `a conflict with ${base}`;
+  const tip = found.baseTip ?? null;
+  if (!tip) {
+    if (before.held) return { kind: "held" };
+    return startRound(task, at, head, shape, cfg, what, (round, signedOff) =>
+      conflictHandoff({ shape, pr: at, files: found.files, round, maxRounds: cfg.maxRounds, signedOff }));
+  }
+
+  const sameTip = before.conflict?.baseTip === tip;
+  const tipRounds = sameTip ? before.conflict!.rounds : 0;
+  if (sameTip && tipRounds > 0 && before.lastHead === head) {
+    if (before.held) return { kind: "held" };
+    return hold(task, pr, before, what, `the round through ${shape.build.name} left the branch as it was — it could not resolve the conflict`, "conflict-unresolved");
+  }
+  if (tipRounds >= cfg.maxRounds) {
+    if (before.held) return { kind: "held" };
+    return hold(task, pr, before, what,
+      `${tipRounds} round${tipRounds === 1 ? "" : "s"} through ${shape.build.name} did not resolve it against ${base} at ${tip.slice(0, 8)}. It goes to ${shape.build.name} again by itself when ${base} moves`);
+  }
+  const key = `${task.id}:${head}`;
+  if (failedStarts.has(key)) return { kind: "skipped", why: "a round could not be started for this head" };
+  const signedOff = task.column === "merge";
+  const round = tipRounds + 1;
+  const r = await reworkDeps.rework(task.id, {
+    stepId: shape.build.id, fromStepId: shape.finish.id,
+    handoff: conflictHandoff({ shape, pr: at, files: found.files, round, maxRounds: cfg.maxRounds, signedOff, perBaseTip: true }),
+  });
+  if (tasks.get(task.id)?.pipelineRun?.status === "done") {
+    failedStarts.add(key);
+    const error = "error" in r ? r.error : "the run did not start";
+    say(task.id, `Couldn't send the card back to ${shape.build.name} (${what} on PR #${pr.number}): ${error}`, "warning");
+    return { kind: "error", error };
+  }
+  // A hold is lifted by the round: the finished run is signed off the
+  // ordinary way. The card's other rounds are not spent on a conflict.
+  const { held: wasHeld, heldRun: _heldRun, heldFor: _heldFor, reopened: _reopened, ...rest } = before;
+  writeEntry(task.id, { ...rest, lastHead: head, conflict: { baseTip: tip, rounds: round } });
+  const withdrawn = setMergeQueued(task.id, false);
+  say(
+    task.id,
+    `${wasHeld ? `No longer held for you: ${base} moved to ${tip.slice(0, 8)} and merging it in is ${shape.build.name}'s work. ` : ""}` +
+      `${withdrawn || signedOff ? "Merge queue" : "After the pipeline finished"}: ${what} on PR #${pr.number} — ${withdrawn || signedOff ? "sign-off withdrawn, " : ""}sent back through ${shape.build.name} → ${shape.review.name} → ${shape.finish.name} ` +
+      `(round ${round} of ${cfg.maxRounds} against ${base} at ${tip.slice(0, 8)}); nothing is pushed until ${shape.review.name} approves the merge`,
+    "warning",
+  );
+  return { kind: "round", round };
 }
 
 export function resetReworkForTests(): void {

@@ -390,6 +390,95 @@ test("the cap: after maxRounds rounds the card is held in In Review for the owne
   expect(rework.reworkEntry(id)).toEqual({ rounds: 0 });
 });
 
+// Card #974: "a conflict with develop … 3 fix rounds … nothing more runs on
+// it by itself". Merging the base in is Build's work: a held card goes back
+// to Build when the base has moved, once per base commit.
+test("a conflict is Build's per base commit: a held card goes back when the base moved, and is the owner's only when Build left it unresolved", async () => {
+  const { tasks, preferences } = await import("./db.ts");
+  const { isMergeQueued, setMergeQueued } = await import("./merge-intent.ts");
+  preferences.set(rework.MERGE_REWORK_PREF, JSON.stringify({ maxRounds: 2 }));
+  const { id } = await finishedCard();
+  const tips = ["b1", "b2", "b3"].map((c) => c.repeat(20));
+  const heads = ["1", "2", "3", "4", "5"].map((c) => c.repeat(40));
+  let tip = tips[0]!;
+  let fetches = 0;
+  rework.reworkDeps.baseTip = async () => tip;
+  rework.reworkDeps.conflictFiles = async (_t, pr) => {
+    fetches++;
+    return { headSha: pr.headSha, files: ["apps/web/src/cart.ts"], baseTip: tip };
+  };
+  const conflicting = (head: string) => failing({ checks: "success", failingChecks: [], headSha: head });
+  const again = async () => {
+    await waitFor(() => tasks.get(id)!.pipelineRun?.status === "done");
+    setMergeQueued(id, true);
+    tasks.update(id, { column: "merge" });
+  };
+
+  // The card's ordinary rounds are used up by CI failures: held, as before.
+  stubCi("AssertionError: nope");
+  for (const head of heads.slice(0, 2)) {
+    expect((await rework.reworkCiFailure(tasks.get(id)!, failing({ headSha: head }))).kind).toBe("round");
+    await again();
+  }
+  expect(await rework.reworkCiFailure(tasks.get(id)!, failing({ headSha: heads[2]! }))).toEqual({ kind: "held" });
+  expect(rework.reworkEntry(id)).toMatchObject({ rounds: 2, held: true });
+  expect(tasks.get(id)!.column).toBe("review");
+
+  // It conflicts with a base tip it was never sent to Build for: a round,
+  // held or not, and the hold is lifted.
+  const steps = tasks.get(id)!.pipelineRun!.stepCount;
+  expect(await rework.reworkConflict(tasks.get(id)!, conflicting(heads[2]!))).toEqual({ kind: "round", round: 1 });
+  expect(rework.reworkEntry(id)).toEqual({ rounds: 2, lastHead: heads[2]!, conflict: { baseTip: tips[0]!, rounds: 1 } });
+  expect(rework.reworkHeld()).toEqual([]);
+  const build = tasks.get(id)!.pipelineRun!.history.find((h) => h.seq === steps + 1)!;
+  expect(tasks.get(build.taskId)!.prompt).toContain("round 1 of 2 against this commit of develop");
+  expect(tasks.get(build.taskId)!.prompt).toContain("change nothing and hand off with status");
+  expect(activity(id).some((l) => l.startsWith("No longer held for you: develop moved to b1b1b1b1") && l.includes("round 1 of 2 against develop at b1b1b1b1"))).toBe(true);
+  await again();
+
+  // The same base tip, a head the round changed: once more, up to maxRounds.
+  expect(await rework.reworkConflict(tasks.get(id)!, conflicting(heads[3]!))).toEqual({ kind: "round", round: 2 });
+  await again();
+  expect(await rework.reworkConflict(tasks.get(id)!, conflicting(heads[4]!))).toEqual({ kind: "held" });
+  expect(activity(id).filter((l) => l.startsWith("Held for you:")).at(-1)).toContain("2 rounds through Build did not resolve it against develop at b1b1b1b1");
+  expect(isMergeQueued(id)).toBe(false);
+
+  // Held against that tip: looked at every pass, nothing fetched, nothing started.
+  const before = { fetches, steps: tasks.get(id)!.pipelineRun!.stepCount };
+  for (let i = 0; i < 3; i++) expect(await rework.reworkConflict(tasks.get(id)!, conflicting(heads[4]!))).toEqual({ kind: "held" });
+  expect({ fetches, steps: tasks.get(id)!.pipelineRun!.stepCount }).toEqual(before);
+
+  // The base moves: one more round by itself, with a fresh count.
+  tip = tips[1]!;
+  expect(await rework.reworkConflict(tasks.get(id)!, conflicting(heads[4]!))).toEqual({ kind: "round", round: 1 });
+  expect(rework.reworkEntry(id).conflict).toEqual({ baseTip: tips[1]!, rounds: 1 });
+  await again();
+
+  // That round left the head as it was: Build could not resolve it. This is
+  // the owner's, and a moved base does not send it to Build again.
+  expect(await rework.reworkConflict(tasks.get(id)!, conflicting(heads[4]!))).toEqual({ kind: "held" });
+  expect(rework.reworkEntry(id)).toMatchObject({ held: true, heldFor: "conflict-unresolved" });
+  expect(activity(id).filter((l) => l.startsWith("Held for you:")).at(-1)).toContain("it could not resolve the conflict");
+  tip = tips[2]!;
+  const stopped = tasks.get(id)!.pipelineRun!.stepCount;
+  expect(await rework.reworkConflict(tasks.get(id)!, conflicting(heads[4]!))).toEqual({ kind: "held" });
+  expect(tasks.get(id)!.pipelineRun!.stepCount).toBe(stopped);
+});
+
+test("a conflict whose base tip cannot be read keeps the card's ordinary round limit", async () => {
+  const { tasks, preferences } = await import("./db.ts");
+  preferences.set(rework.MERGE_REWORK_PREF, JSON.stringify({ maxRounds: 1 }));
+  const { id } = await finishedCard();
+  rework.reworkDeps.baseTip = async () => null;
+  rework.reworkDeps.conflictFiles = async (_t, pr) => ({ headSha: pr.headSha, files: [] });
+  const conflicting = (head: string) => failing({ checks: "success", failingChecks: [], headSha: head });
+  expect(await rework.reworkConflict(tasks.get(id)!, conflicting("1".repeat(40)))).toEqual({ kind: "round", round: 1 });
+  await waitFor(() => tasks.get(id)!.pipelineRun?.status === "done");
+  expect(await rework.reworkConflict(tasks.get(id)!, conflicting("2".repeat(40)))).toEqual({ kind: "held" });
+  expect(await rework.reworkConflict(tasks.get(id)!, conflicting("2".repeat(40)))).toEqual({ kind: "held" });
+  expect(rework.reworkEntry(id)).toMatchObject({ rounds: 1, held: true });
+});
+
 test("a round that left the head unchanged is not repeated: held", async () => {
   const { tasks } = await import("./db.ts");
   const { id } = await finishedCard();
