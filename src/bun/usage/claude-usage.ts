@@ -6,7 +6,7 @@
  * `fetchClaudeQuota` always resolves — it never throws into the poller.
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import type { AgentKind, Harness, HarnessQuota, QuotaMeter, QuotaSource } from "../../shared/types.ts";
 import { claudeDotJsonPath, readClaudeToken } from "./creds.ts";
 
@@ -322,11 +322,55 @@ async function tryReadCacheQuota(harness: Harness): Promise<HarnessQuota | null>
 }
 
 /**
+ * The host a claude-code harness sends its requests to when that is not
+ * Anthropic: `ANTHROPIC_BASE_URL` in the harness's own environment, or
+ * exported by its launcher when `bin` is a small wrapper script (the
+ * "Claude Code via DeepSeek" harness is one). Null when it talks to Anthropic
+ * or nothing says otherwise.
+ *
+ * Such a harness runs the Claude CLI against someone else's API and bills
+ * there. It shares the machine's Claude login, so asking for its quota
+ * returns the Claude subscription's — a limit it does not draw on.
+ */
+export function gatewayHost(harness: Pick<Harness, "bin" | "env">, readBin: (path: string) => string | null = readSmallScript): string | null {
+  const fromEnv = harness.env?.ANTHROPIC_BASE_URL;
+  const script = harness.bin ? readBin(harness.bin) : null;
+  const fromScript = script?.match(/^\s*(?:export\s+)?ANTHROPIC_BASE_URL=["']?(https?:\/\/[^"'\s]+)/m)?.[1];
+  for (const url of [fromEnv, fromScript]) {
+    if (!url) continue;
+    try {
+      const host = new URL(url).hostname.toLowerCase();
+      if (host !== "api.anthropic.com") return host;
+    } catch {
+      // not a URL — says nothing about where requests go
+    }
+  }
+  return null;
+}
+
+/** A launcher script's text, or null for a binary, a large file or one that
+ *  cannot be read. */
+function readSmallScript(path: string): string | null {
+  try {
+    if (statSync(path).size > 64 * 1024) return null;
+    const text = readFileSync(path, "utf8");
+    return text.startsWith("#!") ? text : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Orchestrates API-first → file-fallback quota resolution for a claude-code
  * harness (plan section 3, "Provider seam"). Always resolves — never
  * throws — so a single misbehaving harness can't take down the poller.
  */
 export async function fetchClaudeQuota(harness: Harness): Promise<HarnessQuota> {
+  const gateway = gatewayHost(harness);
+  if (gateway) {
+    return errorQuota(harness, "unavailable",
+      `This harness sends its requests to ${gateway}, not to a Claude subscription, so it has no Claude usage limit to show.`);
+  }
   try {
     const apiQuota = await tryFetchApiQuota(harness);
     if (apiQuota) return apiQuota;

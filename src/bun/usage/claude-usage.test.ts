@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { parseClaudeUsage } from "./claude-usage.ts";
+import { parseClaudeUsage, gatewayHost } from "./claude-usage.ts";
 
 // `parseClaudeUsage` is pure (no I/O, no network) — these tests are hermetic
 // and use only inline, synthetic (redacted) fixtures. The extra positional
@@ -214,5 +214,34 @@ describe("parseClaudeUsage — defensive handling", () => {
     expect(() => parse({ limits: [null, "oops", 42, { percent: 10, resets_at: "2026-08-15T00:00:00Z" }] })).not.toThrow();
     const meters = parse({ limits: [null, "oops", 42, { percent: 10, resets_at: "2026-08-15T00:00:00Z" }] });
     expect(meters).toHaveLength(1);
+  });
+});
+
+
+describe("gatewayHost", () => {
+  const wrapper = `#!/bin/sh
+. "$HOME/.agetor/bin/agent-path.sh"
+export ANTHROPIC_BASE_URL="https://api.deepseek.com/anthropic"
+exec /opt/homebrew/bin/claude "$@"
+`;
+  const read = (files: Record<string, string>) => (path: string) => files[path] ?? null;
+
+  test("a launcher that exports another base URL is a gateway harness", () => {
+    expect(gatewayHost({ bin: "/bin/claude-deepseek", env: {} }, read({ "/bin/claude-deepseek": wrapper }))).toBe("api.deepseek.com");
+  });
+
+  test("the harness's own environment counts too", () => {
+    expect(gatewayHost({ bin: null, env: { ANTHROPIC_BASE_URL: "https://gateway.example/v1" } } as never, read({}))).toBe("gateway.example");
+  });
+
+  test("a plain launcher, Anthropic's own URL, a binary and a commented-out line are not gateways", () => {
+    const plain = `#!/bin/sh\nexec /opt/homebrew/bin/claude "$@"\n`;
+    const anthropic = `#!/bin/sh\nexport ANTHROPIC_BASE_URL=https://api.anthropic.com\nexec claude "$@"\n`;
+    const commented = `#!/bin/sh\n# export ANTHROPIC_BASE_URL="https://api.deepseek.com/anthropic"\nexec claude "$@"\n`;
+    expect(gatewayHost({ bin: "/a", env: {} }, read({ "/a": plain }))).toBeNull();
+    expect(gatewayHost({ bin: "/a", env: {} }, read({ "/a": anthropic }))).toBeNull();
+    expect(gatewayHost({ bin: "/a", env: {} }, read({ "/a": commented }))).toBeNull();
+    expect(gatewayHost({ bin: "/usr/bin/claude", env: {} }, read({}))).toBeNull();
+    expect(gatewayHost({ bin: null, env: { ANTHROPIC_BASE_URL: "not a url" } } as never, read({}))).toBeNull();
   });
 });
