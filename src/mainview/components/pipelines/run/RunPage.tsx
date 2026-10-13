@@ -4,7 +4,7 @@ import { formatElapsed } from "@/lib/card-state";
 import { prNumberFromUrl } from "@/lib/card-names";
 import { checksEvidence, executionSummary, hasLiveExecution, recoveryControls, stepTiles, type BandAction } from "@/lib/run-view";
 import { LiveProgressPanel } from "../LiveProgressPanel";
-import type { Handoff, PipelineGraph, PipelineStepRecord, Task, TaskPrStatus } from "../../../../shared/types.ts";
+import type { CheckLedgerEntry, Handoff, PipelineGraph, PipelineStepRecord, Task, TaskPrStatus } from "../../../../shared/types.ts";
 import { HoldAside } from "./HoldAside";
 import { ExecutionHistory, RecentActivity, type ResponseKindInfo, type RunActivityEntry } from "./RunHistory";
 import { RunHeader } from "./RunHeader";
@@ -24,6 +24,8 @@ export interface RunPageProps {
   now: number;
   /** The card's activity timeline, newest first; null while unavailable. */
   activity: RunActivityEntry[] | null;
+  /** The run's check ledger, oldest first; null or absent while unavailable. */
+  ledger?: CheckLedgerEntry[] | null;
   /** A step's full final report by execution `seq`: absent = not read yet, null = none. */
   reports: ReadonlyMap<number, string | null>;
   onNeedReport?: (seq: number) => void;
@@ -67,7 +69,7 @@ export function RunPage(props: RunPageProps) {
   const summary = run ? executionSummary(run) : null;
   const tiles = stepTiles(run, graph, steps, task, state);
   const controls = recoveryControls(task, steps, state);
-  const checks = checksEvidence({ pr, run, activity: props.activity, task, now });
+  const checks = checksEvidence({ pr, run, activity: props.activity, task, now, ledger: props.ledger });
 
   const [picked, setPicked] = useState<string | null>(props.initialStepId ?? null);
   const [tab, setTab] = useState<StepTab>(props.initialTab ?? "summary");

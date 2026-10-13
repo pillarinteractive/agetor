@@ -5,7 +5,7 @@ import { useConfirm } from "@/components/ui/confirm";
 import { useTheme } from "@/components/theme-provider";
 import { useAgentProfiles } from "@/lib/agent-profiles";
 import { api, ApiError } from "@/lib/api";
-import { useTaskActivity } from "@/lib/activity";
+import { useCheckLedger, useTaskActivity } from "@/lib/activity";
 import type { CardAction } from "@/lib/card-state";
 import { useCardStateOf } from "@/lib/use-card-state";
 import { PrContext } from "@/lib/prs";
@@ -674,6 +674,8 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
   const stateOf = useCardStateOf();
   const prs = useContext(PrContext);
   const activity = useTaskActivity(taskId, run ? `${run.stepCount}:${run.status}:${run.endedAt ?? ""}:${run.blocked.length}` : "");
+  // The check ledger moves when a gated step's turn is judged: its gate does.
+  const ledger = useCheckLedger(taskId, run ? `${run.stepCount}:${run.status}:${run.history.map((h) => (h.gate ? `${h.gate.state}${h.gate.at}` : "")).join(",")}` : "");
 
   // A step's full final report, read on demand for the Transcript tab
   // (`GET /tasks/:id/pipeline/reports?seq=N`): the run state keeps only the
@@ -783,6 +785,7 @@ export function PipelineRunView({ taskId, onOpenTask, onBack, onOpenSettingsAgen
         pr={prs.get(task.id) ?? null}
         now={Date.now()}
         activity={activity}
+        ledger={ledger}
         reports={reports}
         onNeedReport={onNeedReport}
         delegates={delegates}

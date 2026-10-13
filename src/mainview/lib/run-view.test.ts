@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { cardState, type CardState } from "./card-state.ts";
 import { checksEvidence, executionSummary, recoveryControls, roundOf, stepTiles, type BandAction } from "./run-view.ts";
-import type { PipelineBlock, PipelineBlockWait, PipelineRunState, PipelineStepRecord, Task, TaskPrStatus } from "../../shared/types.ts";
+import type { CheckLedgerEntry, PipelineBlock, PipelineBlockWait, PipelineRunState, PipelineStepRecord, Task, TaskPrStatus } from "../../shared/types.ts";
 
 // A fixed clock: every age and retry time below is measured from it.
 const NOW = new Date(2031, 2, 4, 15, 0).getTime();
@@ -284,7 +284,52 @@ describe("checksEvidence", () => {
     expect(e.recorded).toMatchObject([{ source: "step-wait", status: "running", text: 'Waiting on "ci-wait 1476"', head: null, observedAt: null, currentHead: false, duringStepId: "build" }]);
   });
 
+  test("the check ledger: each check of each evaluation is a row for the step it judged, with the head it was computed for", () => {
+    const line = (o: Partial<CheckLedgerEntry>): CheckLedgerEntry => ({
+      at: NOW - 30 * MIN, stepId: "build", stepName: "Build", seq: 2, turn: 1, checkId: "tree-clean", description: "clean", required: true, outcome: "pass", satisfied: true,
+      key: { head: "abc1234def", tree: "t", baseTip: "b", def: "d" }, exitCode: null, detail: "no uncommitted change to a tracked file", outputTail: "", outputPath: null, ...o,
+    });
+    const ledger = [
+      line({ outcome: "fail", satisfied: false, detail: "1 tracked file has uncommitted changes", key: { head: "0ld5ha0000", tree: "t", baseTip: "b", def: "d" } }),
+      line({ turn: 2, at: NOW - 20 * MIN }),
+      line({ turn: 2, at: NOW - 20 * MIN, checkId: "unit", required: false, outcome: "skip", satisfied: true, detail: "unchanged since it passed — not run again" }),
+      line({ stepId: "review", stepName: "Review", seq: 3, at: NOW - 10 * MIN, checkId: "review-verdict", outcome: "halt", satisfied: false, detail: "HEAD could not be read", key: { head: null, tree: null, baseTip: null, def: "d" } }),
+      line({ stepId: "review", stepName: "Review", seq: 3, at: NOW - 5 * MIN, checkId: "review-verdict", outcome: "waived", satisfied: false, detail: "the owner advanced the run past this check" }),
+    ];
+    const e = checksEvidence({ pr: pr(), run: done, activity: [], task: t, now: NOW, ledger });
+    expect(e.recorded.map((r) => [r.source, r.duringStepId, r.status, r.text, r.qualifier, r.currentHead])).toEqual([
+      ["step-check", "review", "none", "review-verdict: waived by the owner — the owner advanced the run past this check", "Review #3, evaluation 1 · on abc1234 (the pull request's head)", false],
+      ["step-check", "review", "unavailable", "review-verdict: could not be evaluated — HEAD could not be read", "Review #3, evaluation 1 · head not read", false],
+      ["step-check", "build", "passing", "tree-clean: passed — no uncommitted change to a tracked file", "Build #2, evaluation 2 · on abc1234 (the pull request's head)", false],
+      ["step-check", "build", "passing", "unit: passed earlier, unchanged — unchanged since it passed — not run again", "Build #2, evaluation 2 · on abc1234 (the pull request's head) · optional", false],
+      ["step-check", "build", "failing", "tree-clean: failed — 1 tracked file has uncommitted changes", "Build #2, evaluation 1 · on 0ld5ha0 (not the pull request's head)", false],
+    ]);
+    expect(e.recorded[2]).toMatchObject({ head: "abc1234def", observedAt: NOW - 20 * MIN, url: null });
+    expect(e.note).toBe("Only the first row speaks for the pull request's current head. Step checks are the ones Agetor ran when a step's turn ended, each for the head it names; they are not CI.");
+    // Without a pull request a row says which commit and claims nothing about a PR.
+    const alone = checksEvidence({ pr: null, run: done, activity: [], task: t, now: NOW, ledger: ledger.slice(1, 2) });
+    expect(alone.recorded[0]!.qualifier).toBe("Build #2, evaluation 2 · on abc1234");
+    expect(alone.note).toContain("the current head's CI checks are unavailable");
+    // No ledger, or an empty one: exactly what it was.
+    const before = checksEvidence({ pr: pr(), run: done, activity, task: t, now: NOW });
+    expect(checksEvidence({ pr: pr(), run: done, activity, task: t, now: NOW, ledger: [] })).toEqual(before);
+    expect(checksEvidence({ pr: pr(), run: done, activity, task: t, now: NOW, ledger: null })).toEqual(before);
+  });
+
   test("a watcher that recorded no head says so", () => {
     expect(checksEvidence({ pr: pr({ headSha: null }), run: done, activity: [], task: t, now: NOW }).current!.qualifier).toBe("as of 2:57 PM on a head the watcher did not record");
+  });
+});
+
+describe("a step stopped on its checks", () => {
+  test("Retry runs the step again and Advance… is offered, named for what it does to the checks", () => {
+    const stopped = run({
+      status: "blocked", active: [{ stepId: "build", taskId: "s2", seq: 2 }],
+      blocked: [{ taskId: "s2", stepId: "build", kind: "check-failed", message: 'step "Build" still fails its required checks after 2 feedback turns and one fresh session: tree-clean (dirty)' }],
+      history: [rec(1, "understand", { nextStepIds: ["build"] }), rec(2, "build", { endedAt: null, outcome: null, gate: { state: "owner", turns: 2, max: 2, failed: ["tree-clean"], at: NOW } })],
+    });
+    const c = controls(task({ column: "blocked", pipelineRun: stopped }), [stepTask("s2", "review")]);
+    expect(retries(c).map((a) => [a.label, a.stepTaskId])).toEqual([["Retry Build", "s2"]]);
+    expect(c.advance).toEqual([{ key: "block:0:s2", fromTaskId: "s2", stepName: "Build", why: "did not pass its checks (advancing records them as waived)" }]);
   });
 });

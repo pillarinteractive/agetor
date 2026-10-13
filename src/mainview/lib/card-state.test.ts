@@ -97,6 +97,33 @@ describe("cardState — one case per state", () => {
     expect(state(task({ pipelineRun: slot }))).toMatchObject({ state: "queued", label: "Queued", reason: "Starts when a slot frees up", action: null, step: { name: "Build" } });
   });
 
+  test("a step judged by checks: Agetor checking, the agent back in the same step, and the owner's stop — each says which", () => {
+    const gated = (gate: Record<string, unknown>, o: Partial<PipelineRunState> = {}) => task({ pipelineRun: run({
+      active: [{ stepId: "build", taskId: "s2", seq: 2 }],
+      history: [rec(1, "understand"), rec(2, "build", { startedAt: NOW - 20 * MIN, endedAt: null, outcome: null, gate: { turns: 0, max: 2, failed: [], at: NOW - MIN, ...gate } as never })],
+      ...o,
+    }) });
+    expect(state(gated({ state: "checking" }))).toMatchObject({ state: "working", kind: "working", label: "Checking", reason: "Agetor is running this step's checks", step: { name: "Build" } });
+    expect(state(gated({ state: "feedback", turns: 1, failed: ["tree-clean", "diff-nonempty"] })))
+      .toMatchObject({ state: "working", label: "Fixing checks", reason: "Back in Build to fix failed checks: tree-clean, diff-nonempty · check-feedback turn 1 of 2", action: null });
+    // Passed, or never judged: an ordinary working card.
+    expect(state(gated({ state: "passed" }))).toMatchObject({ label: "Working", reason: "Agent is working" });
+    expect(state(task({ pipelineRun: run(building) }))).toMatchObject({ label: "Working", reason: "Agent is working" });
+    // A `checking` mark no check could still be running under is not believed.
+    expect(state(gated({ state: "checking", at: NOW - 16 * MIN }))).toMatchObject({ label: "Working", reason: "Agent is working" });
+    // Sent back in by the owner after a stop: its agent is working again.
+    expect(state(gated({ state: "owner", turns: 2, failed: ["tree-clean"] }))).toMatchObject({ label: "Working", reason: "Agent is working" });
+
+    const stopped = (message: string, handoff: unknown = null) => gated({ state: "owner", turns: 2, failed: ["tree-clean"] }, {
+      status: "blocked", blocked: [{ taskId: "s2", stepId: "build", kind: "check-failed", message }],
+      history: [rec(1, "understand"), rec(2, "build", { endedAt: null, outcome: null, handoff: handoff as never, gate: { state: "owner", turns: 2, max: 2, failed: ["tree-clean"], at: NOW } })],
+    });
+    // The block speaks, not the handoff the step wrote before its checks failed.
+    expect(state(stopped('step "Build" still fails its required checks after 2 feedback turns and one fresh session: tree-clean (1 tracked file has uncommitted changes)', handoff({ reason: "All done, handing to Review" }))))
+      .toMatchObject({ state: "needs", kind: "needs-you", label: "Needs you", reason: "Checks still failing: tree-clean", action: { kind: "retry", label: "Retry Build", stepTaskId: "s2" } });
+    expect(state(stopped('step "Build" finished, but a required check could not be evaluated: tree-clean (git status failed)')).reason).toBe("Checks could not be evaluated: tree-clean");
+  });
+
   test("Finish run by Agetor: waiting on CI, waiting on the base, and publishing, never Queued", () => {
     const held = (publish: Record<string, unknown>) => task({ pipelineRun: run({
       history: [rec(1, "understand"), rec(2, "build"), rec(3, "review")],

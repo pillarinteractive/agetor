@@ -330,16 +330,24 @@ export function cardState(task: Task, ctx: CardStateContext): CardState {
       const resumed = queuedWait(run);
       const wrapUp = run.capWrapUp && (run.capWrapUp.seq == null || run.active.some((a) => a.seq === run.capWrapUp!.seq));
       const others = run.active.slice(1).map((a) => stepName(run, a.stepId));
+      // A step judged by checks (src/shared/checks.ts): say when its agent is
+      // back in the same step because a check failed, and when no agent is
+      // working at all because Agetor is running the checks. A `checking`
+      // mark older than any check can run is not believed.
+      const gate = latestRecord(run, run.active[0]?.taskId)?.gate;
+      const failedChecks = gate?.failed.length ? `: ${gate.failed.join(", ")}` : "";
+      const checking = gate?.state === "checking" && now - gate.at < 15 * 60_000 ? "Agetor is running this step's checks" : null;
+      const fixing = gate?.state === "feedback" ? `Back in ${step?.name ?? "the step"} to fix failed checks${failedChecks} · check-feedback turn ${gate.turns} of ${gate.max}` : null;
       const doing = wrapUp
         ? "Wrapping up: the run reached its step cap"
-        : resumed?.state === "resuming"
+        : checking ?? fixing ?? (resumed?.state === "resuming"
           ? "Resumed to check whether its block has cleared"
           : started.length === 0
             ? "Step is starting"
             : others.length > 0
               ? `Agents are working (also ${others.join(", ")})`
-              : "Agent is working";
-      return make("working", "working", "Working", `${doing}${holds}`, null, elapsedMs);
+              : "Agent is working");
+      return make("working", "working", checking ? "Checking" : fixing ? "Fixing checks" : "Working", `${doing}${holds}`, null, elapsedMs);
     }
 
     if (run.status === "blocked") {
@@ -399,6 +407,14 @@ export function cardState(task: Task, ctx: CardStateContext): CardState {
       if (freed) return make("needs", "needs-you", "Needs you", `${freed.label} is free now`, retryStep());
       if (block?.kind === "step-cap") {
         return make("needs", "step-cap", "Step cap", `Reached the ${effectiveStepCap(run)}-step cap`, retryStep());
+      }
+      // Its required checks still fail after its turns and its fresh session,
+      // or could not be evaluated: the block says which, not the step's handoff.
+      if (block?.kind === "check-failed") {
+        const failed = latestRecord(run, block.taskId)?.gate?.failed ?? [];
+        const unevaluated = /could not be (?:evaluated|run)/.test(block.message);
+        const what = failed.length ? `${unevaluated ? "Checks could not be evaluated" : "Checks still failing"}: ${failed.join(", ")}` : blockReasonLine(null, block.message) || "Checks did not pass";
+        return make("needs", "needs-you", "Needs you", what, retryStep());
       }
       const handoff = latestRecord(run, block?.taskId)?.handoff;
       const why = blockReasonLine(handoff, block?.message) || "Blocked";

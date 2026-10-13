@@ -22,7 +22,8 @@ import type {
   Subagent,
   Task,
 } from "../../shared/types.ts";
-import { isFollowUpStepId } from "../../shared/pipeline.ts";
+import { isFollowUpStepId, stepGate } from "../../shared/pipeline.ts";
+import { CHECK_LIMITS } from "../../shared/checks.ts";
 
 // ---------------------------------------------------------------------------
 // usePipelines — module-cached list, modelled on useAgentProfiles.
@@ -846,4 +847,35 @@ export function latestRecordForTask(
     if (r.taskId === taskId && (!latest || r.seq > latest.seq)) latest = r;
   }
   return latest;
+}
+
+/** A step's gate as the pipeline editor shows it (read-only). */
+export interface StepGateDisplay {
+  /** declared — the step lists its own checks; defaults — it lists none and
+   *  gets the built-in ones for its place in a reviewed pipeline; none. */
+  source: "declared" | "defaults" | "none";
+  goal: string | null;
+  /** Check-feedback turns one visit may take, and whether the step says so itself. */
+  maxTurns: number;
+  maxTurnsDeclared: boolean;
+  checks: { id: string; description: string; how: string; required: boolean }[];
+}
+
+/**
+ * What a run that adopted the `steps` gate (`pipeline_gates`) would judge
+ * this step by: its own checks, or the defaults when it declares none.
+ * Whether any run has adopted the gate is not this function's business.
+ */
+export function stepGateDisplay(graph: PipelineGraph, step: PipelineStep): StepGateDisplay {
+  const gate = stepGate({ graph, gates: { steps: true } }, step);
+  return {
+    source: !gate ? "none" : step.checks ? "declared" : "defaults",
+    goal: step.goal?.trim() || null,
+    maxTurns: gate?.maxTurns ?? step.maxTurns ?? CHECK_LIMITS.maxTurnsDefault,
+    maxTurnsDeclared: step.maxTurns !== undefined,
+    checks: (gate?.checks ?? []).map((c) => ({
+      id: c.id, description: c.description, required: c.required,
+      how: c.run.kind === "builtin" ? "built-in" : `command, ${c.timeoutSec} s: ${c.run.command}`,
+    })),
+  };
 }
