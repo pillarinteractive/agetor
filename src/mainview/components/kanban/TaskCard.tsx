@@ -1,7 +1,7 @@
 import { memo } from "react";
 import { useDraggable } from "@dnd-kit/core";
 import { CSS } from "@dnd-kit/utilities";
-import { Activity, Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, CircleAlert, CircleDashed, CircleX, Clock3, GitCompare, GitMerge, ListTodo, Link2, Lock, LockOpen, Zap, PauseCircle, Square, Trash2, type LucideIcon } from "lucide-react";
+import { Archive, ArchiveRestore, ArrowRight, Bot, CheckCircle2, GitCompare, ListTodo, Link2, Lock, LockOpen, Zap, PauseCircle, Square, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { abbreviateHome, cn } from "@/lib/utils";
 import { taskTypeIcon } from "@/lib/task-type-icon";
@@ -11,28 +11,18 @@ import { isTaskFxPaused } from "../../../shared/fx-recovery.ts";
 import { shortPipelineName } from "@/components/pipelines/PipelineBadge";
 import { useTaskLeaseInfo } from "@/lib/leases";
 import { useTaskPr } from "@/lib/prs";
-import { formatElapsed, type CardAction, type CardStateIcon } from "@/lib/card-state";
+import { formatElapsed, type CardAction } from "@/lib/card-state";
 import { useCardState } from "@/lib/use-card-state";
 import { columnLabel } from "@/lib/column-labels";
 import { ordinal } from "../../../shared/block-reason.ts";
 import { progressFraction, progressLine, useTaskProgress } from "@/lib/progress";
 import { blockerColor, prNumberFromUrl, shortCardName, splitCardTitle } from "@/lib/card-names";
+import { STATE_ICONS } from "./StateBadge";
 
 // The theme's --destructive is a dark fill meant for buttons (30% lightness
 // in dark mode) — unreadable as text on a dark card. Text uses a lighter red.
 const DANGER_TEXT = "text-red-600 dark:text-red-400";
 
-
-/** The state band's icon. A state reads by its label and this icon; the
- *  colour only repeats it. */
-export const STATE_ICONS: Record<CardStateIcon, LucideIcon> = {
-  activity: Activity,
-  clock: Clock3,
-  alert: CircleAlert,
-  x: CircleX,
-  merge: GitMerge,
-  dashed: CircleDashed,
-};
 
 interface Props {
   task: Task;

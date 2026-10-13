@@ -87,7 +87,7 @@ test.describe("board fixtures", () => {
       [845, "waiting", "Auto retry"],
       [846, "waiting", "Auto retry"],
       [850, "waiting", "Auto retry"],
-      [851, "queued", "Dependency"],
+      [851, "waiting", "Dependency"],
       [860, "needs", "Needs you"],
       [861, "failed", "Failed"],
       [1031, "failed", "CI failed"],
@@ -153,7 +153,7 @@ test.describe("board fixtures", () => {
     await open(page);
     await expect(page.locator("h2")).toHaveText(["Backlog", "Running", "Blocked", "In review", "Merge queue", "Done"]);
     await expect(column(page, "blocked").getByTestId("column-count")).toHaveText("8");
-    await expect(column(page, "blocked").getByTestId("column-summary")).toHaveText("3 need you · 1 failed · 3 waiting · 1 queued");
+    await expect(column(page, "blocked").getByTestId("column-summary")).toHaveText("3 need you · 1 failed · 4 waiting");
     await expect(column(page, "running").getByTestId("column-summary")).toHaveText("1 needs you · 3 working · 2 waiting · 2 queued");
     await expect(column(page, "done").getByTestId("column-summary")).toHaveText("1 queued · 2 merged");
   });

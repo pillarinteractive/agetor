@@ -83,6 +83,7 @@ import type {
   Subagent,
   Task,
   TaskDiff,
+  PipelineStepReport,
   TaskEventsReplayMeta,
   TaskGitStatus,
   TaskReference,
@@ -645,6 +646,11 @@ export const api = {
    *  task isn't a pipeline task. */
   getPipelineRun: (taskId: string) =>
     j<{ task: Task; steps: Task[] }>(`/tasks/${encodeURIComponent(taskId)}/pipeline`),
+  /** One step execution's handoff and the full text of its final report
+   *  (`report` null when its turns hold no handoff). Read on demand: the
+   *  run state itself only keeps the handoff block. */
+  getPipelineReport: (taskId: string, seq: number) =>
+    j<{ reports: PipelineStepReport[] }>(`/tasks/${encodeURIComponent(taskId)}/pipeline/reports?seq=${seq}`),
   /** Manually advance a blocked (or just-settled) pipeline execution: start
    *  `nextStepIds`, or `null` to finish the run here. `handoff` seeds the
    *  synthetic handoff recorded for this manual transition (e.g. a

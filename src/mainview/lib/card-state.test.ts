@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { cardState, columnSummary, formatElapsed, stepStrip, type CardState, type CardStateContext } from "./card-state.ts";
+import { cardState, columnSummary, formatElapsed, stepOrder, stepStrip, type CardState, type CardStateContext } from "./card-state.ts";
 import { cardStatus } from "./card-status.ts";
 import type { PipelineBlockWait, PipelineRunState, PipelineStepRecord, Task, TaskPrStatus } from "../../shared/types.ts";
 import type { TaskLeaseInfo } from "./leases.ts";
@@ -74,10 +74,18 @@ describe("cardState — one case per state", () => {
     expect(s).toMatchObject({ state: "queued", label: "Dependency", icon: "dashed", reason: "Waiting on #1351 · running", action: { kind: "open-dependency", label: "Open dependency", taskId: "dep" } });
   });
 
-  test("Dependency: parked in the wait queue on an issue; opens the card only when the board knows which one", () => {
+  test("Dependency: a card that has run and waits on another is blue; one nothing has run yet stays grey", () => {
+    const blockedBy = [{ taskId: "dep", title: "Issue #1351: lease", satisfied: false, detail: "running", ref: "#1351" }];
+    const stopped = run({ status: "cancelled", history: [rec(1, "understand"), rec(2, "build", { outcome: "cancelled" })] });
+    expect(state(task({ column: "ready", pipelineRun: stopped, blockedBy }))).toMatchObject({ state: "waiting", label: "Dependency", icon: "clock", action: { kind: "open-dependency" } });
+    expect(state(task({ column: "blocked", pipelineRun: run({ status: "blocked", blocked: stepBlocked(), ...building }), blockedBy }))).toMatchObject({ state: "waiting", label: "Dependency" });
+    expect(state(task({ column: "ready", pipelineRun: run({ status: "idle" }), blockedBy }))).toMatchObject({ state: "queued", label: "Dependency", icon: "dashed" });
+  });
+
+  test("Dependency: parked in the wait queue on an issue is blue; opens the card only when the board knows which one", () => {
     const parked = run({ status: "blocked", blocked: stepBlocked(), ...building, wait: wait({ category: "dependency", what: "#41", ref: "#41" }) });
     const s = state(task({ column: "blocked", pipelineRun: parked }));
-    expect(s).toMatchObject({ state: "queued", label: "Dependency", reason: "Waiting on #41 — retrying when it lands or at 3:20 PM · attempt 2 of 3", action: { kind: "inspect", label: "Inspect retry" }, elapsedMs: 12 * MIN });
+    expect(s).toMatchObject({ state: "waiting", label: "Dependency", icon: "clock", reason: "Waiting on #41 — retrying when it lands or at 3:20 PM · attempt 2 of 3", action: { kind: "inspect", label: "Inspect retry" }, elapsedMs: 12 * MIN });
     const known = state(task({ column: "blocked", pipelineRun: parked, blockedBy: [{ taskId: "dep", title: "x", satisfied: true, detail: "done", ref: "#41" }] }));
     expect(known.action).toEqual({ kind: "open-dependency", label: "Open dependency", taskId: "dep" });
   });
@@ -254,6 +262,29 @@ describe("stepStrip", () => {
     const s = state(task({ pipelineRun: followUp }));
     expect(s.strip!.map((x) => x.status)).toEqual(["done", "done", "done", "done"]);
     expect(s).toMatchObject({ label: "Working", step: { name: "Fix CI" }, elapsedMs: 3 * MIN });
+  });
+
+  test("a step reached both directly and through others comes after the others; a loop back does not reorder", () => {
+    // Understand → Finish for a trivial change, beside Understand → Build → Review → Finish.
+    const edges = [
+      { id: "a", from: "understand", to: "build", label: "" },
+      { id: "b", from: "understand", to: "finish", label: "trivial" },
+      { id: "c", from: "build", to: "review", label: "" },
+      { id: "d", from: "review", to: "build", label: "changes" },
+      { id: "e", from: "review", to: "finish", label: "approved" },
+      { id: "f", from: "finish", to: "build", label: "verification failed" },
+    ];
+    expect(stepOrder(snapshot(STEPS, edges)!.graph)).toEqual(["understand", "build", "review", "finish"]);
+    // The steps as listed, when nothing says where the start is reached from.
+    expect(stepOrder(snapshot(STEPS, [])!.graph)).toEqual(["understand", "build", "review", "finish"]);
+    // A fan-out and its join: both branches before the step that joins them.
+    const fan = [
+      { id: "a", from: "understand", to: "build", label: "" },
+      { id: "b", from: "understand", to: "review", label: "" },
+      { id: "c", from: "build", to: "finish", label: "" },
+      { id: "d", from: "review", to: "finish", label: "" },
+    ];
+    expect(stepOrder(snapshot(STEPS, fan)!.graph)).toEqual(["understand", "build", "review", "finish"]);
   });
 
   test("no snapshot, no strip — and the step falls back to its id", () => {

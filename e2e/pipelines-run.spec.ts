@@ -222,10 +222,25 @@ function historyRowFor(page: Page, stepName: string): Locator {
     .filter({ hasText: new RegExp(`^#\\d+ ${stepName}`) });
 }
 
+/** The run view opens on the step tiles; the canvas (step nodes, edges,
+ *  satellites) is the other side of its switch, "Graph & routing". */
+async function showGraph(page: Page): Promise<void> {
+  await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
+  const graph = page.getByTestId("pipeline-run-presentation-graph");
+  if ((await graph.getAttribute("aria-pressed")) !== "true") await graph.click();
+  await expect(page.getByTestId("pipeline-run-graph")).toBeVisible();
+}
+
+/** Restart and Advance live under "Advanced run controls". */
+async function openAdvanced(page: Page): Promise<void> {
+  const advanced = page.getByTestId("pipeline-run-advanced");
+  if ((await advanced.getAttribute("open")) == null) await advanced.locator("summary").click();
+}
+
 async function openPipelineRunFromBoard(page: Page, backend: E2EBackend, title: string): Promise<void> {
   await gotoApp(page, backend.bootBase);
   await boardCard(page, title).dblclick();
-  await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
+  await showGraph(page);
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +382,7 @@ test.describe("pipelines run: executing a run", () => {
     await expect(boardCard(page, title).getByTestId("card-state")).toHaveText("No PR yet");
     await boardCard(page, title).dblclick();
     await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
+    await showGraph(page);
 
     // Click a done node -> RunPanel with the pipeline strip.
     await stepNode(page, A.id).click();
@@ -380,6 +396,7 @@ test.describe("pipelines run: executing a run", () => {
     // close afterward; go straight back to the board.
     await panel.getByTestId("run-panel-open-pipeline").click();
     await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
+    await showGraph(page);
 
     // Back to board -> card is visible (in Review).
     await page.getByTestId("pipeline-run-back").click();
@@ -475,6 +492,7 @@ test.describe("pipelines run: executing a run", () => {
     await expect(helperTab).toHaveAttribute("aria-selected", "true", { timeout: CONVERGE_TIMEOUT });
     await helperPanel.getByTestId("run-panel-open-pipeline").click();
     await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
+    await showGraph(page);
 
     // Helper Two never ran: its details say so and list no helpers.
     await helperTwoNode.click({ force: true });
@@ -494,6 +512,7 @@ test.describe("pipelines run: executing a run", () => {
     await expect(log).not.toContainText("Helper One");
     await panel.getByTestId("run-panel-open-pipeline").click();
     await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
+    await showGraph(page);
 
     // A: the cap line plus one row per allowed profile, with Helper One's
     // instructions and skill rendered so the step can brief its subagents.
@@ -585,7 +604,12 @@ test.describe("pipelines run: executing a run", () => {
     // here — only the one Advance form, inside the blocked entry itself.
     await expect(page.getByTestId("pipeline-run-review")).toHaveCount(0);
 
-    const advance = blocked.getByTestId("pipeline-run-advance");
+    // The one Advance form: under Advanced run controls, opened on request.
+    await expect(page.getByTestId("pipeline-run-advance")).toHaveCount(0);
+    await expect(page.getByTestId("pipeline-run-retry")).toHaveCount(0);
+    await openAdvanced(page);
+    await page.getByTestId("pipeline-run-advance-open").click();
+    const advance = page.getByTestId("pipeline-run-advance");
     await advance.getByRole("button", { name: "Pick next step(s)…" }).click();
     await advance.getByRole("button", { name: "B", exact: true }).click();
     // Close the popover before hitting Advance.
@@ -796,6 +820,7 @@ test.describe("pipelines run: executing a run", () => {
     // D only runs once both arrive, then the whole run finishes.
     await expect(stepNode(page, D.id)).toHaveAttribute("data-visual", "active", { timeout: CONVERGE_TIMEOUT });
     await expect(page.getByTestId("pipeline-run-status")).toHaveText("Done", { timeout: CONVERGE_TIMEOUT });
+    await page.getByTestId("pipeline-run-history-all").click();
     await expect(page.locator('[data-testid="pipeline-run-history-row"]')).toHaveCount(4);
 
     const finalTask = await getTask(backend, task.id);
@@ -913,6 +938,7 @@ test.describe("pipelines run: executing a run", () => {
     expect(firstRunStartedAt).not.toBeNull();
     expect(firstHistoryStartedAt).not.toBeNull();
 
+    await openAdvanced(page);
     await page.getByTestId("pipeline-run-restart").click();
     const confirmDialog = page.getByRole("dialog").filter({ hasText: "Restart this pipeline?" });
     await expect(confirmDialog).toBeVisible();
@@ -939,6 +965,7 @@ test.describe("pipelines run: executing a run", () => {
     expect(afterRestart.pipelineRun?.history[0]?.startedAt).not.toBe(firstHistoryStartedAt);
 
     // Restart is offered again once the new run has itself finished.
+    await openAdvanced(page);
     await expect(page.getByTestId("pipeline-run-restart")).toBeVisible();
   });
 });
@@ -1011,6 +1038,7 @@ test.describe("pipelines run: stopping one fan-out branch", () => {
     // Back to the run view (the panel sits on top of it).
     await panel.getByTestId("run-panel-open-pipeline").click();
     await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
+    await showGraph(page);
 
     // The stopped branch is blocked with the runner's "was stopped" copy;
     // the run reads Blocked — not Cancelled, since C is still live.

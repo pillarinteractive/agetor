@@ -1,209 +1,58 @@
-import { useEffect, useId, useState, type ReactNode } from "react";
-import { createPortal } from "react-dom";
-import { Gauge, X } from "lucide-react";
-import { Dialog } from "@/components/ui/dialog";
+import { useId, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { api } from "@/lib/api";
 import {
   DAY,
-  bottleneckLine,
   fmtDuration,
   fmtPct,
   fmtRange,
   fmtRate,
-  headlineRate,
   HOUR,
   MIN_OWNER_SAMPLE,
   targetRange,
   type Distribution,
   type ForecastTarget,
-  type VelocityAnswer,
-  type VelocityBottleneck,
+  type VelocityPhase,
   type VelocityReport,
 } from "../../../shared/velocity.ts";
 
-const TITLE_ID = "velocity-dialog-title";
-
-// Marks wear two of the app's tokens — the one it already uses for "running"
-// and the one for "waiting on something" — and every one of them is also
-// named in words. Text stays in the text tokens.
-const ACTIVE = "hsl(var(--info))";
-const WAITING = "hsl(var(--warning))";
+/**
+ * The Velocity view's detail: the charts and tables under "Phase timings,
+ * distributions and forecast method" (VelocityView.tsx). Inline SVG in the
+ * board's state colours, each also said in words: green for agents working
+ * and for completed steps, amber for what was held for the owner, blue for
+ * CI, the merge queue and slots with nothing able to start, grey for counts
+ * and for everything else. Each chart has its numbers as a table.
+ */
+const WORKING = "var(--state-working)";
+const HELD = "var(--state-needs)";
+const WAITING = "var(--state-waiting)";
+const NEUTRAL = "var(--state-queued)";
 const INK = "hsl(var(--foreground))";
-const MUTED = "hsl(var(--muted-foreground))";
-const RULE = "hsl(var(--border))";
-const SURFACE = "hsl(var(--background))";
+const MUTED = "var(--state-queued)";
+const RULE = "var(--board-line)";
+const SURFACE = "var(--board-card)";
 
-const STATE: Record<string, string> = {
-  building: "in flight",
-  merging: "in CI / the merge queue",
-  held: "held for your sign-off",
-  stuck: "finished, issue still open — needs you",
-  blocked: "blocked — needs you",
-  quota: "waiting for a usage limit",
-  retry: "retrying after a failure",
-  waiting: "waiting in the retry queue",
-  ready: "ready, waiting for a slot",
-  yours: "yours to do",
-  outside: "open in another milestone",
-};
+/** A phase's colour: what kind of time it was. */
+const phaseColour = (p: { phase: VelocityPhase; active: boolean }) => (p.active ? WORKING : p.phase === "owner" ? HELD : p.phase === "merge" ? WAITING : NEUTRAL);
+
 const WINDOW: Record<string, string> = { "24h": "Last 24 hours", "3d": "Last 3 days", "7d": "Last 7 days", all: "Since the run began" };
 const steps = (n: number, what = "step") => `${n} ${what}${n === 1 ? "" : "s"}`;
 const clock = (t: number) => new Date(t).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 const day = (t: number) => new Date(t).toLocaleDateString(undefined, { month: "short", day: "numeric" });
 const hourOf = (t: number) => new Date(t).toLocaleTimeString(undefined, { hour: "numeric" });
 
-/**
- * Velocity of the roadmap run (src/shared/velocity.ts; the numbers come from
- * `GET /autopilot/roadmap/velocity`): how fast steps complete, where a
- * step's time goes, how full the slots are, what holds the most work back,
- * and a forecast range. Opened from the board's summary beside the rocket
- * and from the Autopilot dialog.
- */
-export function VelocityDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
-  const [view, setView] = useState<"current" | "roadmap">("current");
-  const [delay, setDelay] = useState("");
-  const [applied, setApplied] = useState<number | null>(null);
-  const [answer, setAnswer] = useState<VelocityAnswer | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    let alive = true;
-    const load = () =>
-      void api
-        .getVelocity({ scope: view, ownerDelayHours: applied })
-        .then((a) => {
-          if (!alive) return;
-          setAnswer(a);
-          setError(null);
-        })
-        .catch((e) => alive && setError(e instanceof Error ? e.message : String(e)));
-    load();
-    const timer = setInterval(load, 60_000);
-    return () => {
-      alive = false;
-      clearInterval(timer);
-    };
-  }, [open, view, applied]);
-
-  if (!open) return null;
-  const r = answer?.available ? answer : null;
-
-  return createPortal(
-    <Dialog open onClose={onClose} labelledBy={TITLE_ID} className="flex max-h-[90vh] w-full max-w-4xl flex-col p-0">
-      <div data-testid="velocity-dialog" className="flex min-h-0 flex-col">
-        <header className="flex items-start justify-between gap-3 border-b border-border/60 p-3">
-          <div className="min-w-0">
-            <div id={TITLE_ID} className="flex items-center gap-2 text-sm font-semibold">
-              <Gauge className="size-4 shrink-0 text-muted-foreground" aria-hidden />
-              Velocity
-            </div>
-            {r && (
-              <p className="mt-0.5 text-xs text-muted-foreground" data-testid="velocity-subtitle">
-                Roadmap #{r.tracker} · {r.scopeLabel} · as of {clock(r.asOf)}
-                {r.runStartedAt != null && ` · the run began ${fmtDuration(r.generatedAt - r.runStartedAt)} ago`}
-              </p>
-            )}
-          </div>
-          <div className="flex shrink-0 items-center gap-2">
-            <div role="group" aria-label="What the progress chart covers" className="flex rounded-md border border-border p-0.5 text-xs">
-              {(["current", "roadmap"] as const).map((v) => (
-                <button
-                  key={v}
-                  type="button"
-                  data-testid={`velocity-view-${v}`}
-                  aria-pressed={view === v}
-                  onClick={() => setView(v)}
-                  className={`rounded px-2 py-1 ${view === v ? "bg-secondary font-medium text-secondary-foreground" : "text-muted-foreground hover:text-foreground"}`}
-                >
-                  {v === "current" ? "Milestones in scope" : "Whole roadmap"}
-                </button>
-              ))}
-            </div>
-            <Button variant="ghost" size="icon" onClick={onClose} aria-label="Close">
-              <X className="size-4" />
-            </Button>
-          </div>
-        </header>
-
-        <div className="flex min-h-0 flex-col gap-5 overflow-y-auto p-4 text-xs">
-          {error && <p className="text-red-600 dark:text-red-400">{error}</p>}
-          {!answer && !error && <p className="text-muted-foreground">Loading…</p>}
-          {answer && !answer.available && (
-            <p className="py-8 text-center text-sm text-muted-foreground" data-testid="velocity-empty">
-              {answer.reason}
-            </p>
-          )}
-          {r && (
-            <>
-              <Tiles r={r} />
-              <Section title="Progress" note={`Steps completed in ${r.scopeLabel}, against the ${r.burnup.total} it holds`}>
-                <BurnUp r={r} />
-              </Section>
-              <div className="grid gap-5 md:grid-cols-2">
-                <Section title="Where the time goes" note={r.time.n ? `${steps(r.time.n)} from card start to issue closed, summed` : undefined}>
-                  <TimeBreakdown r={r} />
-                </Section>
-                <div className="flex flex-col gap-5">
-                  <Section title="Cycle time" note="Card start → issue closed, agent steps">
-                    <CycleTime r={r} />
-                  </Section>
-                  <Section title="Rework">
-                    <Rework r={r} />
-                  </Section>
-                </div>
-              </div>
-              <Section title="Slots" note="How many of the in-flight slots were in use, by hour, over the last two days">
-                <Slots r={r} />
-              </Section>
-              <Section title="Throughput" note="Steps completed per day">
-                <Throughput r={r} />
-              </Section>
-              <Section title="Bottlenecks now" note="The open steps that could move, by how many steps wait behind them">
-                <Bottlenecks r={r} />
-              </Section>
-              <Section title="Forecast" note="An estimate — a range, not a date">
-                <Forecast
-                  r={r}
-                  delay={delay}
-                  onDelay={setDelay}
-                  onApply={() => {
-                    const n = Number(delay);
-                    setApplied(delay.trim() !== "" && Number.isFinite(n) && n >= 0 ? n : null);
-                  }}
-                />
-              </Section>
-              {r.dataQuality.length > 0 && (
-                <Section title="What couldn't be measured">
-                  <ul className="flex list-disc flex-col gap-0.5 pl-4 text-muted-foreground" data-testid="velocity-quality">
-                    {r.dataQuality.map((q) => (
-                      <li key={q}>{q}</li>
-                    ))}
-                  </ul>
-                </Section>
-              )}
-            </>
-          )}
-        </div>
-      </div>
-    </Dialog>,
-    document.body,
-  );
-}
-
-function Section({ title, note, children }: { title: string; note?: string; children: ReactNode }) {
+export function Section({ title, note, children }: { title: string; note?: string; children: ReactNode }) {
   return (
     <section className="min-w-0">
-      <h3 className="text-[13px] font-semibold text-foreground">{title}</h3>
+      <h4 className="text-[13px] font-semibold text-foreground">{title}</h4>
       {note && <p className="text-muted-foreground">{note}</p>}
       <div className="mt-2">{children}</div>
     </section>
   );
 }
 
-const Quiet = ({ children }: { children: ReactNode }) => <p className="text-muted-foreground">{children}</p>;
+export const Quiet = ({ children }: { children: ReactNode }) => <p className="text-muted-foreground">{children}</p>;
 
 /** A chart's numbers as a table, for whoever can't use the picture. */
 function AsTable({ head, rows, label }: { head: string[]; rows: (string | number)[][]; label: string }) {
@@ -214,7 +63,7 @@ function AsTable({ head, rows, label }: { head: string[]; rows: (string | number
         <thead>
           <tr>
             {head.map((h) => (
-              <th key={h} scope="col" className="border-b border-border/60 py-0.5 pr-3 font-medium text-muted-foreground">
+              <th key={h} scope="col" className="border-b border-board-line py-0.5 pr-3 font-medium text-muted-foreground">
                 {h}
               </th>
             ))}
@@ -224,7 +73,7 @@ function AsTable({ head, rows, label }: { head: string[]; rows: (string | number
           {rows.map((row, i) => (
             <tr key={i}>
               {row.map((c, j) => (
-                <td key={j} className="border-b border-border/30 py-0.5 pr-3">
+                <td key={j} className="border-b border-board-line py-0.5 pr-3">
                   {c}
                 </td>
               ))}
@@ -236,32 +85,9 @@ function AsTable({ head, rows, label }: { head: string[]; rows: (string | number
   );
 }
 
-function Tiles({ r }: { r: VelocityReport }) {
-  const rate = headlineRate(r);
-  const three = r.throughput.windows.find((w) => w.key === "3d");
-  const tiles: { label: string; value: string; note: string }[] = [
-    { label: "Completed", value: String(r.totals.runAgent + r.totals.runOwner), note: `steps, since the run began${r.totals.runOwner ? ` · ${r.totals.runOwner} yours` : ""}` },
-    { label: "Throughput", value: rate == null ? "—" : `${fmtRate(rate)}/day`, note: three && three.days < 3 ? "agent steps, since the run began" : "agent steps, last 3 days" },
-    { label: "Cycle time", value: r.cycle.all ? fmtDuration(r.cycle.all.median) : "—", note: r.cycle.all ? `median of ${steps(r.cycle.all.n)}` : "no step measured yet" },
-    { label: "Flow efficiency", value: fmtPct(r.time.flowEfficiency), note: "of a step's time is agents working" },
-    { label: "Slots in use", value: r.utilisation.avgUsed == null ? "—" : `${r.utilisation.avgUsed.toFixed(1)} of ${Math.round(r.utilisation.avgMax ?? r.maxInFlight)}`, note: r.utilisation.avgUsed == null ? "no samples yet" : `blocked ${fmtPct(r.utilisation.blockedShare)} of the time` },
-  ];
-  return (
-    <dl className="grid grid-cols-2 gap-x-6 gap-y-3 sm:grid-cols-5" data-testid="velocity-tiles">
-      {tiles.map((t) => (
-        <div key={t.label} className="min-w-0">
-          <dt className="text-muted-foreground">{t.label}</dt>
-          <dd className="text-xl font-semibold tabular-nums leading-tight text-foreground">{t.value}</dd>
-          <dd className="text-[11px] leading-snug text-muted-foreground">{t.note}</dd>
-        </div>
-      ))}
-    </dl>
-  );
-}
-
 // ── Progress ──────────────────────────────────────────────────────────────
 
-function BurnUp({ r }: { r: VelocityReport }) {
+export function BurnUp({ r }: { r: VelocityReport }) {
   const titleId = useId();
   const pts = r.burnup.points;
   const total = Math.max(1, r.burnup.total);
@@ -316,8 +142,8 @@ function BurnUp({ r }: { r: VelocityReport }) {
           </g>
         )}
         <line x1={x(now)} x2={x(now)} y1={m.t} y2={H - m.b} stroke={RULE} strokeWidth={1} />
-        <path d={line} fill="none" stroke={ACTIVE} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
-        <circle cx={x(now)} cy={y(done)} r={4.5} fill={ACTIVE} stroke={SURFACE} strokeWidth={2} />
+        <path d={line} fill="none" stroke={WORKING} strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
+        <circle cx={x(now)} cy={y(done)} r={4.5} fill={WORKING} stroke={SURFACE} strokeWidth={2} />
         <text x={x(now) - 8} y={Math.max(m.t + 10, y(done) - 9)} textAnchor="end" fontSize={11} fontWeight={600} fill={INK}>
           {done} done
         </text>
@@ -337,62 +163,60 @@ function BurnUp({ r }: { r: VelocityReport }) {
   );
 }
 
-// ── Where the time goes ───────────────────────────────────────────────────
+// ── Where the time goes, by phase ─────────────────────────────────────────
 
-function TimeBreakdown({ r }: { r: VelocityReport }) {
+/** Every phase behind the four buckets: its accumulated time, its share and
+ *  its median per step. */
+export function PhaseTable({ r }: { r: VelocityReport }) {
   if (r.time.n === 0) {
     const n = r.totals.runAgent;
     return <Quiet>{n === 0 ? "No agent step has completed yet — the breakdown appears with the first one." : `${steps(n)} completed, none with a card whose time could be split.`}</Quiet>;
   }
   const rows = r.time.phases.filter((p) => p.totalMs >= 60_000);
   const top = Math.max(...rows.map((p) => p.share), 0.01);
-  const eff = r.time.flowEfficiency ?? 0;
   return (
-    <div data-testid="velocity-time">
-      <div className="flex h-2.5 w-full gap-0.5 overflow-hidden rounded-sm" role="img" aria-label={`Agents working ${fmtPct(eff)} of the time, waiting ${fmtPct(1 - eff)}`}>
-        <div style={{ width: `${eff * 100}%`, background: ACTIVE }} />
-        <div style={{ width: `${(1 - eff) * 100}%`, background: WAITING }} />
-      </div>
-      <div className="mt-1 flex flex-wrap gap-x-4 text-muted-foreground">
-        <span className="inline-flex items-center gap-1.5">
-          <span className="inline-block size-2 rounded-[2px]" style={{ background: ACTIVE }} aria-hidden />
-          Agents working · {fmtDuration(r.time.activeMs)} · {fmtPct(eff)}
-        </span>
-        <span className="inline-flex items-center gap-1.5">
-          <span className="inline-block size-2 rounded-[2px]" style={{ background: WAITING }} aria-hidden />
-          Waiting · {fmtDuration(r.time.waitingMs)} · {fmtPct(1 - eff)}
-        </span>
-      </div>
-      <table className="mt-3 w-full border-collapse tabular-nums" aria-label="Time per phase">
-        <thead className="sr-only">
-          <tr>
-            <th scope="col">Phase</th>
-            <th scope="col">Share, drawn</th>
-            <th scope="col">Time</th>
-            <th scope="col">Share</th>
-            <th scope="col">Median per step</th>
+    <div data-testid="velocity-phases">
+      <table className="w-full border-collapse tabular-nums" aria-label="Time per phase">
+        <thead>
+          <tr className="text-left text-muted-foreground">
+            <th scope="col" className="border-b border-board-line py-1 pr-2 font-medium">
+              Phase / wait
+            </th>
+            <th scope="col" className="border-b border-board-line py-1 font-medium">
+              <span className="sr-only">Share, drawn</span>
+            </th>
+            <th scope="col" className="border-b border-board-line py-1 pl-2 text-right font-medium">
+              Accumulated
+            </th>
+            <th scope="col" className="border-b border-board-line py-1 pl-2 text-right font-medium">
+              Share
+            </th>
+            <th scope="col" className="border-b border-board-line py-1 pl-2 text-right font-medium">
+              Median / step
+            </th>
           </tr>
         </thead>
         <tbody>
           {rows.map((p) => (
-            <tr key={p.phase} data-testid={`velocity-phase-${p.phase}`} title={`${p.label}: ${fmtDuration(p.totalMs)} in all, ${fmtDuration(p.medianMs)} per step at the median`}>
-              <th scope="row" className="w-[42%] py-1 pr-2 text-left font-normal text-foreground">
+            <tr key={p.phase} data-testid={`velocity-phase-${p.phase}`}>
+              <th scope="row" className="w-[34%] py-1 pr-2 text-left font-normal text-foreground">
                 {p.label}
               </th>
               <td className="py-1">
-                <div className="h-2.5 rounded-r-[3px]" style={{ width: `${Math.max(1.5, (p.share / top) * 100)}%`, background: p.active ? ACTIVE : WAITING }} />
+                <div className="h-2.5 rounded-r-[3px]" style={{ width: `${Math.max(1.5, (p.share / top) * 100)}%`, background: phaseColour(p) }} />
               </td>
-              <td className="w-12 py-1 pl-2 text-right text-foreground">{fmtDuration(p.totalMs)}</td>
-              <td className="w-10 py-1 pl-2 text-right text-muted-foreground">{fmtPct(p.share)}</td>
+              <td className="w-16 py-1 pl-2 text-right text-foreground">{fmtDuration(p.totalMs)}</td>
+              <td className="w-12 py-1 pl-2 text-right text-muted-foreground">{fmtPct(p.share)}</td>
+              <td className="w-20 py-1 pl-2 text-right text-muted-foreground">{fmtDuration(p.medianMs)}</td>
             </tr>
           ))}
         </tbody>
       </table>
-      {(r.time.unsplit > 0 || r.time.stepsWithQuota > 0) && (
-        <p className="mt-1 text-muted-foreground">
-          {[r.time.stepsWithQuota > 0 ? `${steps(r.time.stepsWithQuota)} ran into a usage limit` : null, r.time.unsplit > 0 ? `${steps(r.time.unsplit)} more with a cycle time only` : null].filter(Boolean).join(" · ")}
-        </p>
-      )}
+      <p className="mt-1 text-muted-foreground">
+        Accumulated task time over {steps(r.time.n)}: tasks run side by side, so it is longer than the calendar time that passed.
+        {r.time.stepsWithQuota > 0 && ` ${steps(r.time.stepsWithQuota)} ran into a usage limit.`}
+        {r.time.unsplit > 0 && ` ${steps(r.time.unsplit)} more with a cycle time only.`}
+      </p>
     </div>
   );
 }
@@ -401,7 +225,7 @@ function TimeBreakdown({ r }: { r: VelocityReport }) {
 
 const spread = (d: Distribution) => `median ${fmtDuration(d.median)} · p75 ${fmtDuration(d.p75)} · p90 ${fmtDuration(d.p90)} · ${fmtDuration(d.min)}–${fmtDuration(d.max)}`;
 
-function CycleTime({ r }: { r: VelocityReport }) {
+export function CycleTime({ r }: { r: VelocityReport }) {
   const titleId = useId();
   const d = r.cycle.all;
   if (!d) return <Quiet>No agent step has completed with a card yet.</Quiet>;
@@ -428,7 +252,7 @@ function CycleTime({ r }: { r: VelocityReport }) {
             <g key={b.label}>
               {b.count > 0 && (
                 <>
-                  <path d={`M${cx - bar / 2},${H - m.b}V${top_ + 3}q0,-3 3,-3h${bar - 6}q3,0 3,3V${H - m.b}Z`} fill={ACTIVE}>
+                  <path d={`M${cx - bar / 2},${H - m.b}V${top_ + 3}q0,-3 3,-3h${bar - 6}q3,0 3,3V${H - m.b}Z`} fill={NEUTRAL}>
                     <title>{`${b.label}: ${steps(b.count)}`}</title>
                   </path>
                   <text x={cx} y={top_ - 4} textAnchor="middle" fontSize={10} fill={INK}>
@@ -456,7 +280,7 @@ function CycleTime({ r }: { r: VelocityReport }) {
   );
 }
 
-function Rework({ r }: { r: VelocityReport }) {
+export function Rework({ r }: { r: VelocityReport }) {
   const w = r.rework;
   if (w.n === 0) return <Quiet>No reviewed step yet.</Quiet>;
   const top = Math.max(...w.roundsDist.map((d) => d.steps));
@@ -473,7 +297,7 @@ function Rework({ r }: { r: VelocityReport }) {
                 {d.rounds} round{d.rounds === 1 ? "" : "s"}
               </th>
               <td className="py-0.5">
-                <div className="h-2.5 rounded-r-[3px]" style={{ width: `${(d.steps / top) * 100}%`, background: ACTIVE }} />
+                <div className="h-2.5 rounded-r-[3px]" style={{ width: `${(d.steps / top) * 100}%`, background: NEUTRAL }} />
               </td>
               <td className="w-16 py-0.5 pl-2 text-right text-muted-foreground">{steps(d.steps)}</td>
             </tr>
@@ -489,7 +313,7 @@ function Rework({ r }: { r: VelocityReport }) {
 
 // ── Slots ─────────────────────────────────────────────────────────────────
 
-function Slots({ r }: { r: VelocityReport }) {
+export function Slots({ r }: { r: VelocityReport }) {
   const titleId = useId();
   const u = r.utilisation;
   if (u.avgUsed == null) return <Quiet>No samples yet — every Autopilot pass adds one, starting with the first after this build was installed.</Quiet>;
@@ -502,13 +326,13 @@ function Slots({ r }: { r: VelocityReport }) {
   const bar = Math.min(10, band - 2);
   const y = (n: number) => H - m.b - (n / top) * (H - m.t - m.b);
   return (
-    <div data-testid="velocity-slots">
+    <div data-testid="velocity-slots-hourly">
       <p className="tabular-nums text-foreground">
-        {u.avgUsed.toFixed(1)} of {Math.round(u.avgMax ?? r.maxInFlight)} in use on average ({fmtPct(u.share)}) · blocked {fmtPct(u.blockedShare)} of the time
+        {u.avgUsed.toFixed(1)} of {Math.round(u.avgMax ?? r.maxInFlight)} occupied on average over all observed time ({fmtPct(u.share)}) · blocked {fmtPct(u.blockedShare)} of the time
         {(u.quotaShare ?? 0) > 0 && ` · holding for a usage limit ${fmtPct(u.quotaShare)}`}
       </p>
       <svg viewBox={`0 0 ${W} ${H}`} className="mt-1 h-auto w-full" role="img" aria-labelledby={titleId}>
-        <title id={titleId}>{`Slots in use by hour over the last 48 hours: ${u.avgUsed.toFixed(1)} of ${Math.round(u.avgMax ?? r.maxInFlight)} on average`}</title>
+        <title id={titleId}>{`Slots occupied by hour over the last 48 hours. Over all observed time: ${u.avgUsed.toFixed(1)} of ${Math.round(u.avgMax ?? r.maxInFlight)} on average`}</title>
         {[0, top].map((n) => (
           <g key={n}>
             <line x1={m.l} x2={W - m.r} y1={y(n)} y2={y(n)} stroke={RULE} strokeWidth={1} />
@@ -528,8 +352,8 @@ function Slots({ r }: { r: VelocityReport }) {
                 </rect>
               ) : (
                 <>
-                  <path d={`M${cx - bar / 2},${H - m.b}V${Math.min(H - m.b, y(p.used) + 2)}q0,-2 2,-2h${bar - 4}q2,0 2,2V${H - m.b}Z`} fill={ACTIVE}>
-                    <title>{`${when}: ${p.used.toFixed(1)} of ${Math.round(p.max ?? top)} slots in use${p.blocked ? `, blocked ${fmtPct(p.blocked)} of the hour` : ""}`}</title>
+                  <path d={`M${cx - bar / 2},${H - m.b}V${Math.min(H - m.b, y(p.used) + 2)}q0,-2 2,-2h${bar - 4}q2,0 2,2V${H - m.b}Z`} fill={NEUTRAL}>
+                    <title>{`${when}: ${p.used.toFixed(1)} of ${Math.round(p.max ?? top)} slots occupied${p.blocked ? `, blocked ${fmtPct(p.blocked)} of the hour` : ""}`}</title>
                   </path>
                   {(p.blocked ?? 0) > 0.02 && (
                     <rect x={cx - bar / 2} y={H - m.b + 4} width={bar} height={4} rx={1} fill={WAITING} opacity={0.35 + 0.65 * p.blocked!}>
@@ -549,8 +373,8 @@ function Slots({ r }: { r: VelocityReport }) {
       </svg>
       <div className="flex flex-wrap gap-x-4 text-muted-foreground">
         <span className="inline-flex items-center gap-1.5">
-          <span className="inline-block size-2 rounded-[2px]" style={{ background: ACTIVE }} aria-hidden />
-          Slots in use
+          <span className="inline-block size-2 rounded-[2px]" style={{ background: NEUTRAL }} aria-hidden />
+          Slots occupied (a slot may be waiting, not executing)
         </span>
         <span className="inline-flex items-center gap-1.5">
           <span className="inline-block h-1 w-2 rounded-[1px]" style={{ background: WAITING }} aria-hidden />
@@ -562,8 +386,8 @@ function Slots({ r }: { r: VelocityReport }) {
         </span>
       </div>
       <AsTable
-        label="Slots in use by hour"
-        head={["Hour", "In use", "Of", "Blocked"]}
+        label="Slots occupied by hour"
+        head={["Hour", "Occupied", "Of", "Blocked"]}
         rows={s.filter((p) => p.used != null).slice(-24).map((p) => [`${day(p.t)} ${hourOf(p.t)}`, p.used!.toFixed(1), Math.round(p.max ?? top), fmtPct(p.blocked)])}
       />
     </div>
@@ -572,7 +396,7 @@ function Slots({ r }: { r: VelocityReport }) {
 
 // ── Throughput ────────────────────────────────────────────────────────────
 
-function Throughput({ r }: { r: VelocityReport }) {
+export function Throughput({ r }: { r: VelocityReport }) {
   const all = r.throughput.windows;
   // A window longer than the run is the run: shown once.
   const windows = all.filter((w) => w.key === "all" || w.days < all[all.length - 1]!.days - 1e-9);
@@ -581,13 +405,13 @@ function Throughput({ r }: { r: VelocityReport }) {
       <table className="w-full border-collapse text-left tabular-nums" aria-label="Throughput by window">
         <thead>
           <tr className="text-muted-foreground">
-            <th scope="col" className="border-b border-border/60 py-0.5 pr-3 font-medium">
+            <th scope="col" className="border-b border-board-line py-0.5 pr-3 font-medium">
               Window
             </th>
-            <th scope="col" className="border-b border-border/60 py-0.5 pr-3 font-medium">
+            <th scope="col" className="border-b border-board-line py-0.5 pr-3 font-medium">
               Agent steps
             </th>
-            <th scope="col" className="border-b border-border/60 py-0.5 pr-3 font-medium">
+            <th scope="col" className="border-b border-board-line py-0.5 pr-3 font-medium">
               Your steps
             </th>
           </tr>
@@ -595,13 +419,13 @@ function Throughput({ r }: { r: VelocityReport }) {
         <tbody>
           {windows.map((w) => (
             <tr key={w.key}>
-              <th scope="row" className="border-b border-border/30 py-0.5 pr-3 font-normal">
+              <th scope="row" className="border-b border-board-line py-0.5 pr-3 font-normal">
                 {WINDOW[w.key]} <span className="text-muted-foreground">({w.days < 1 ? fmtDuration(w.days * DAY) : `${w.days.toFixed(1)} days`})</span>
               </th>
-              <td className="border-b border-border/30 py-0.5 pr-3">
+              <td className="border-b border-board-line py-0.5 pr-3">
                 {fmtRate(w.agentPerDay)}/day <span className="text-muted-foreground">({w.agent})</span>
               </td>
-              <td className="border-b border-border/30 py-0.5 pr-3">{w.owner ? `${fmtRate(w.ownerPerDay)}/day (${w.owner})` : "—"}</td>
+              <td className="border-b border-board-line py-0.5 pr-3">{w.owner ? `${fmtRate(w.ownerPerDay)}/day (${w.owner})` : "—"}</td>
             </tr>
           ))}
         </tbody>
@@ -614,53 +438,9 @@ function Throughput({ r }: { r: VelocityReport }) {
   );
 }
 
-// ── Bottlenecks ───────────────────────────────────────────────────────────
-
-function Bottlenecks({ r }: { r: VelocityReport }) {
-  const { critical, owner } = r.bottlenecks;
-  const also = owner.filter((o) => !critical.some((c) => c.issue === o.issue));
-  if (critical.length === 0 && also.length === 0) return <Quiet>Nothing is holding other steps back right now.</Quiet>;
-  const line = (b: VelocityBottleneck) => bottleneckLine(b, STATE[b.state] ?? b.state);
-  const top = Math.max(1, ...critical.map((b) => b.successors));
-  return (
-    <div data-testid="velocity-bottlenecks">
-      {critical.length > 0 && (
-        <ol className="flex flex-col gap-1.5">
-          {critical.map((b) => (
-            <li key={b.issue} className="grid grid-cols-[minmax(0,1fr)_9rem] items-center gap-3" data-testid="velocity-bottleneck">
-              <div className="min-w-0">
-                <div className="truncate text-foreground">
-                  <span className="tabular-nums text-muted-foreground">{b.step}</span> · #{b.issue} {b.title}
-                </div>
-                <div className={b.waitingOnYouMs != null ? "text-warning" : "text-muted-foreground"}>{line(b)}</div>
-              </div>
-              <div title={`${steps(b.successors)} can't complete before this one does`}>
-                <div className="h-2 rounded-r-[3px]" style={{ width: `${Math.max(3, (b.successors / top) * 100)}%`, background: MUTED }} />
-                <div className="tabular-nums text-muted-foreground">{steps(b.successors)} behind it</div>
-              </div>
-            </li>
-          ))}
-        </ol>
-      )}
-      {also.length > 0 && (
-        <div className="mt-2">
-          <div className="text-muted-foreground">Also waiting on you</div>
-          <ul className="mt-0.5 flex flex-col gap-0.5">
-            {also.map((b) => (
-              <li key={b.issue} className="truncate">
-                <span className="tabular-nums text-muted-foreground">{b.step}</span> · #{b.issue} {b.title} <span className="text-warning">— {line(b)}</span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-    </div>
-  );
-}
-
 // ── Forecast ──────────────────────────────────────────────────────────────
 
-function Forecast({ r, delay, onDelay, onApply }: { r: VelocityReport; delay: string; onDelay: (v: string) => void; onApply: () => void }) {
+export function Forecast({ r, delay, onDelay, onApply }: { r: VelocityReport; delay: string; onDelay: (v: string) => void; onApply: () => void }) {
   const f = r.forecast;
   const inputId = useId();
   if (!f.ok) {
@@ -677,21 +457,21 @@ function Forecast({ r, delay, onDelay, onApply }: { r: VelocityReport; delay: st
       <table className="w-full border-collapse text-left tabular-nums" aria-label="Forecast ranges">
         <thead>
           <tr className="align-bottom text-muted-foreground">
-            <th scope="col" className="border-b border-border/60 py-0.5 pr-3 font-medium">
+            <th scope="col" className="border-b border-board-line py-0.5 pr-3 font-medium">
               To finish
             </th>
-            <th scope="col" className="border-b border-border/60 py-0.5 pr-3 font-medium">
+            <th scope="col" className="border-b border-board-line py-0.5 pr-3 font-medium">
               Left
             </th>
-            <th scope="col" className="border-b border-border/60 py-0.5 pr-3 font-medium">
+            <th scope="col" className="border-b border-board-line py-0.5 pr-3 font-medium">
               {anyOwner ? "If your steps take no time" : "Simulated"}
             </th>
             {anyOwner && (
-              <th scope="col" className="border-b border-border/60 py-0.5 pr-3 font-medium">
+              <th scope="col" className="border-b border-board-line py-0.5 pr-3 font-medium">
                 {f.ownerDelayMs != null ? `With ${fmtDuration(f.ownerDelayMs)} per step of yours` : "With your steps"}
               </th>
             )}
-            <th scope="col" className="border-b border-border/60 py-0.5 font-medium">
+            <th scope="col" className="border-b border-board-line py-0.5 font-medium">
               Naive (left ÷ rate)
             </th>
           </tr>
@@ -699,17 +479,17 @@ function Forecast({ r, delay, onDelay, onApply }: { r: VelocityReport; delay: st
         <tbody>
           {f.targets.map((t) => (
             <tr key={t.key} className="align-top" data-testid={`velocity-forecast-${t.key}`}>
-              <th scope="row" className="border-b border-border/30 py-1 pr-3 font-normal text-foreground">
+              <th scope="row" className="border-b border-board-line py-1 pr-3 font-normal text-foreground">
                 {t.label}
               </th>
-              <td className="border-b border-border/30 py-1 pr-3">
+              <td className="border-b border-board-line py-1 pr-3">
                 {steps(t.remainingAgent, "agent step")}
-                {t.ownerSteps > 0 && <div className="text-warning">{t.ownerSteps} of yours on the path</div>}
+                {t.ownerSteps > 0 && <div className="text-[color:var(--state-needs)]">{t.ownerSteps} of yours on the path</div>}
                 {t.unreachable > 0 && <div className="text-muted-foreground">{t.unreachable} can never start</div>}
               </td>
-              <td className="border-b border-border/30 py-1 pr-3 font-medium text-foreground">{t.sim ? fmtRange(t.sim.low, t.sim.high) : "—"}</td>
-              {anyOwner && <td className="border-b border-border/30 py-1 pr-3 font-medium text-foreground">{withYours(t)}</td>}
-              <td className="border-b border-border/30 py-1 text-muted-foreground">{t.naive ? fmtRange(t.naive.low, t.naive.high) : "—"}</td>
+              <td className="border-b border-board-line py-1 pr-3 font-medium text-foreground">{t.sim ? fmtRange(t.sim.low, t.sim.high) : "—"}</td>
+              {anyOwner && <td className="border-b border-board-line py-1 pr-3 font-medium text-foreground">{withYours(t)}</td>}
+              <td className="border-b border-board-line py-1 text-muted-foreground">{t.naive ? fmtRange(t.naive.low, t.naive.high) : "—"}</td>
             </tr>
           ))}
         </tbody>

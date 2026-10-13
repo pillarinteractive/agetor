@@ -11,7 +11,7 @@ import { whyStopped } from "@/lib/board-health";
 import { columnLabel } from "@/lib/column-labels";
 import { useTaskPr } from "@/lib/prs";
 import { splitCardTitle } from "@/lib/card-names";
-import { STATE_ICONS } from "./TaskCard";
+import { STATE_ICONS } from "./StateBadge";
 
 interface Props {
   task: Task;
@@ -29,7 +29,7 @@ interface Props {
 
 /** What each recovery button does, in a sentence: resuming the step that
  *  stopped is not restarting the pipeline, and the two are easy to confuse. */
-function recoveryNote(task: Task, state: CardState): string | null {
+export function recoveryNote(task: Task, state: CardState): string | null {
   const step = state.step?.name ?? "the step";
   const status = task.pipelineRun?.status;
   if (state.kind === "step-cap") return `Retry resumes ${step} with another step allowance. It does not restart the pipeline.`;
@@ -43,7 +43,7 @@ function recoveryNote(task: Task, state: CardState): string | null {
 /** When the stopped step is tried again without anyone asking, from the
  *  wait queue (`run.wait`), a scheduled retry (`run.autoRetry`) or a held
  *  input (`inputRetry` on a block). */
-function retrySchedule(task: Task, now: number): [string, string][] {
+export function retrySchedule(task: Task, now: number): [string, string][] {
   const run = task.pipelineRun;
   if (!run || run.status !== "blocked") return [];
   const rows: [string, string][] = [];
