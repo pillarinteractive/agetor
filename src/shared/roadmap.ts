@@ -233,7 +233,15 @@ export interface RoadmapIssueState {
   /** The issue's GitHub milestone; null when it has none, undefined when the
    *  reader didn't ask. */
   milestone?: { number: number; title: string } | null;
+  /** The issue's label names; absent when the reader didn't ask. */
+  labels?: string[];
 }
+
+/** An open issue with this label is the owner's to do by hand: Autopilot never
+ *  starts it, exactly like a `[Human]` step, and its successors wait for it to
+ *  close. Add the label before starting an issue yourself; remove it to hand
+ *  the issue back. */
+export const MANUAL_LABEL = "manual";
 
 /**
  * complete — closed as completed: unlocks its successors.
@@ -264,7 +272,7 @@ export function roadmapStatus(parsed: ParsedRoadmap, states: ReadonlyMap<number,
   const done = new Set(parsed.steps.filter((s) => closedAs(s) === "complete").map((s) => s.step));
   return parsed.steps.map((s) => {
     const st = states.get(s.issue);
-    const base = { ...s, url: st?.url ?? null };
+    const base = { ...s, url: st?.url ?? null, human: s.human || (st?.labels ?? []).some((l) => l.toLowerCase() === MANUAL_LABEL) };
     const closed = closedAs(s);
     if (closed) return { ...base, status: closed, waitingOn: [], reason: null };
     const waitingOn = s.predecessors.filter((p) => !done.has(p));

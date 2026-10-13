@@ -26,7 +26,7 @@ export async function loadRoadmapTracker(project: string, issue: number): Promis
 
 /** One query for up to `BATCH` issues. Pure; exported for tests. */
 export function statesQuery(numbers: number[]): string {
-  const fields = numbers.map((n) => `i${n}: issue(number: ${n}) { number title body updatedAt state stateReason closedAt url milestone { number title } }`).join(" ");
+  const fields = numbers.map((n) => `i${n}: issue(number: ${n}) { number title body updatedAt state stateReason closedAt url milestone { number title } labels(first: 30) { nodes { name } } }`).join(" ");
   return `query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { ${fields} } }`;
 }
 
@@ -43,7 +43,7 @@ export function parseStatesResponse(stdout: string): Map<number, RoadmapIssueSta
   if (!repo || typeof repo !== "object") return null;
   const out = new Map<number, RoadmapIssueState>();
   for (const v of Object.values(repo as Record<string, unknown>)) {
-    const i = v as { number?: unknown; title?: unknown; body?: unknown; updatedAt?: unknown; state?: unknown; stateReason?: unknown; closedAt?: unknown; url?: unknown; milestone?: { number?: unknown; title?: unknown } | null } | null;
+    const i = v as { number?: unknown; title?: unknown; body?: unknown; updatedAt?: unknown; state?: unknown; stateReason?: unknown; closedAt?: unknown; url?: unknown; milestone?: { number?: unknown; title?: unknown } | null; labels?: { nodes?: unknown } | null } | null;
     if (!i || typeof i.number !== "number" || (i.state !== "OPEN" && i.state !== "CLOSED")) continue;
     // The issue's milestone decides whether its step is in a milestone's
     // scope (src/shared/roadmap.ts `roadmapScope`): null = it has none.
@@ -59,6 +59,8 @@ export function parseStatesResponse(stdout: string): Map<number, RoadmapIssueSta
       // When it closed: what velocity counts from (src/shared/velocity.ts).
       ...(typeof i.closedAt === "string" && Number.isFinite(Date.parse(i.closedAt)) ? { closedAt: Date.parse(i.closedAt) } : {}),
       ...(milestone !== undefined ? { milestone } : {}),
+      // Its labels: `manual` marks an issue the owner is doing by hand (src/shared/roadmap.ts).
+      ...(Array.isArray(i.labels?.nodes) ? { labels: (i.labels!.nodes as { name?: unknown }[]).map((l) => l?.name).filter((n): n is string => typeof n === "string") } : {}),
     });
   }
   return out;

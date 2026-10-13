@@ -3,7 +3,7 @@ import { parseStatesResponse, statesQuery } from "./roadmap-fetch.ts";
 
 test("statesQuery aliases one issue field per number", () => {
   const q = statesQuery([12, 345]);
-  expect(q).toContain("i12: issue(number: 12) { number title body updatedAt state stateReason closedAt url milestone { number title } }");
+  expect(q).toContain("i12: issue(number: 12) { number title body updatedAt state stateReason closedAt url milestone { number title } labels(first: 30) { nodes { name } } }");
   expect(q).toContain("i345: issue(number: 345)");
   expect(q).toContain("repository(owner: $owner, name: $name)");
 });
@@ -43,4 +43,13 @@ test("parseStatesResponse reads each issue's milestone: its number, none, or not
   expect(m.get(12)!.milestone).toEqual({ number: 7, title: "M01 — Widget foundations" });
   expect(m.get(13)!.milestone).toBeNull();
   expect("milestone" in m.get(14)!).toBe(false);
+});
+
+test("parseStatesResponse reads an issue's label names", () => {
+  const out = parseStatesResponse(JSON.stringify({ data: { repository: {
+    i7: { number: 7, state: "OPEN", stateReason: null, labels: { nodes: [{ name: "manual" }, { name: "area:web" }] } },
+    i8: { number: 8, state: "OPEN", stateReason: null },
+  } } }))!;
+  expect(out.get(7)!.labels).toEqual(["manual", "area:web"]);
+  expect(out.get(8)!.labels).toBeUndefined();
 });

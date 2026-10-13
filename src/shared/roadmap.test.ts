@@ -173,6 +173,22 @@ describe("pickRoadmap", () => {
     expect(p.human.map((v) => v.step)).toEqual(["1"]);
     expect(pickRoadmap(fresh, { busy: new Set(), free: 0 }).human.map((v) => v.step)).toEqual(["1"]);
   });
+
+  test("an issue labelled `manual` is the owner's: never picked, and its successors wait for it", () => {
+    const open = states({});
+    // Step 2 (#102) would start; the owner takes it by labelling the issue.
+    const taken = new Map(open);
+    taken.set(102, { ...open.get(102)!, labels: ["Manual", "area:web"] });
+    const views = roadmapStatus(parsed, taken);
+    expect(views.find((v) => v.issue === 102)!.human).toBe(true);
+    const p = pickRoadmap(views, { busy: new Set(), free: 5 });
+    expect(p.start.map((v) => v.issue)).not.toContain(102);
+    expect(p.human.map((v) => v.issue)).toContain(102);
+    // Other labels change nothing; removing the label hands it back.
+    const other = new Map(open);
+    other.set(102, { ...open.get(102)!, labels: ["area:web"] });
+    expect(pickRoadmap(roadmapStatus(parsed, other), { busy: new Set(), free: 5 }).start.map((v) => v.issue)).toContain(102);
+  });
 });
 
 test("the step prompt names the step, tracker, predecessors' issues and the Fixes line", () => {
