@@ -17,6 +17,8 @@ import { agentProfiles, preferences, tasks } from "./db.ts";
 import { run as run_, createGitHubPull, gitPushWithRetry, findGitHubPullForBranch, getGitHubCompare, getGitHubPullChecks, getGitHubPullReviewThreads, createGitHubComment, getGitHubIssueThread, getGitHubRefCheckRuns, updateGitHubIssue, updateGitHubPullBranch } from "./github.ts";
 import { runPipelineFollowUp } from "./pipeline-runner.ts";
 import { parseIssueUrl } from "../shared/issue-task.ts";
+import { ROLLUP_CHECKS, checksState, failedConclusion, newestPerName, type CheckRunLike } from "../shared/check-runs.ts";
+export { ROLLUP_CHECKS, newestPerName, type CheckRunLike };
 import { recordActivity, recordActivityOnce } from "./activity.ts";
 import { isTaskRunLive, moveMergedTaskToDone, publishGlobalEvent } from "./orchestrator.ts";
 
@@ -120,44 +122,6 @@ export function tasksToWatch(
   });
 }
 
-/** A check run as the roll-up reads it. `startedAt` and `id` order two runs
- *  of the same name; both are optional so a caller with neither still works. */
-export interface CheckRunLike {
-  name: string;
-  status: string;
-  conclusion: string | null;
-  htmlUrl: string | null;
-  startedAt?: string | null;
-  id?: number;
-}
-
-/**
- * The newest run of each check name, in first-seen order. GitHub lists every
- * check run of a commit: a second workflow run on the same commit (a
- * re-trigger, or `cancel-in-progress` cutting one short) leaves two runs of
- * one name, and only the newest says where that check stands. Newest is the
- * later `startedAt`; a run that has not started yet is newer than any that
- * has; ties go to the higher `id`, then to the later entry. Pure.
- */
-export function newestPerName<T extends CheckRunLike>(runs: readonly T[]): T[] {
-  const age = (r: T): number => {
-    const t = r.startedAt ? Date.parse(r.startedAt) : NaN;
-    if (Number.isFinite(t)) return t;
-    return r.status === "completed" ? -Infinity : Infinity;
-  };
-  const newest = new Map<string, T>();
-  for (const r of runs) {
-    const seen = newest.get(r.name);
-    if (!seen) {
-      newest.set(r.name, r);
-      continue;
-    }
-    const a = age(seen), b = age(r);
-    if (b > a || (b === a && (r.id ?? 0) >= (seen.id ?? 0))) newest.set(r.name, r);
-  }
-  return [...newest.values()];
-}
-
 /** Roll a PR's check runs up into one state, judging each check name by its
  *  newest run: a cancelled or failed older run beside a newer one counts for
  *  nothing. A name whose newest run is cancelled is still not a pass. */
@@ -165,16 +129,12 @@ export function rollUpChecks(all: readonly CheckRunLike[]): {
   checks: TaskPrStatus["checks"];
   failing: TaskPrStatus["failingChecks"];
 } {
-  const runs = newestPerName(all);
-  if (runs.length === 0) return { checks: "none", failing: [] };
   // A cancelled run isn't a code failure — it was superseded (a newer push,
   // or Agetor freeing runners for a merge train). It just isn't verified.
-  const failing = runs
-    .filter((r) => ["failure", "timed_out", "action_required", "startup_failure"].includes(r.conclusion ?? ""))
+  const failing = newestPerName(all)
+    .filter((r) => failedConclusion(r.conclusion))
     .map((r) => ({ name: r.name, url: r.htmlUrl, alsoOnBase: false }));
-  if (failing.length > 0) return { checks: "failure", failing };
-  if (runs.some((r) => r.status !== "completed" || r.conclusion === "cancelled")) return { checks: "pending", failing: [] };
-  return { checks: "success", failing: [] };
+  return { checks: checksState(all), failing };
 }
 
 /** Flag each PR failure that also fails on the base branch's tip. */
@@ -205,8 +165,6 @@ export function ownFailures(pr: TaskPrStatus | null): TaskPrStatus["failingCheck
   );
 }
 
-/** Aggregate checks that fail whenever any suite does — never a cause. */
-export const ROLLUP_CHECKS: ReadonlySet<string> = new Set(["required"]);
 
 function same(a: TaskPrStatus | undefined, b: TaskPrStatus): boolean {
   return (
@@ -262,7 +220,7 @@ async function maybeOpenMissingPr(task: Task): Promise<void> {
 
 /** The base a card's PR targets: the `pr_base_branch` preference, else
  *  `develop` when the remote has one, else the remote's default branch. */
-async function prBase(checkout: string): Promise<string> {
+export async function prBase(checkout: string): Promise<string> {
   const pref = preferences.get("pr_base_branch")?.trim();
   if (pref) return pref;
   if ((await run_(["git", "rev-parse", "--verify", "--quiet", "refs/remotes/origin/develop"], checkout)).ok) return "develop";
