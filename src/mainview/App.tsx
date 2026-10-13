@@ -2291,7 +2291,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
               else, and Cmd/Ctrl+F (above) finds the box through its ref. */}
           {view.kind === "board" && (
             <>
-              <div className="relative w-44">
+              <div className="relative w-28 lg:w-44">
                 <Search className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" aria-hidden />
                 <Input
                   {...IDENTIFIER_INPUT_PROPS}
@@ -2338,7 +2338,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
               </Select>
             </>
           )}
-          <span className="text-xs text-muted-foreground">
+          <span className="hidden whitespace-nowrap text-xs text-muted-foreground lg:inline">
             {/* m4: counted over `nonStepTasks`, not raw `tasks` — a hidden
                 pipeline step must not inflate the total. */}
             {/* `omittedArchivedCount`: archived cards the lean poll left out

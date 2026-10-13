@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { ArrowRight, ExternalLink, FolderOpen, RotateCcw, Square, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { Task } from "../../../shared/types.ts";
@@ -94,6 +94,25 @@ export function CardInspector({ task, onClose, onOpen, onAction, onRestart, onSt
     return () => document.removeEventListener("keydown", onKey);
   }, [onClose, escapeCloses]);
 
+  // Opening here can put the inspector under the pointer, over the card
+  // that was just clicked. The second click of a double click then lands on
+  // the inspector — possibly on one of its buttons — instead of the card. A
+  // second click (`detail` 2) that arrives before any first click of the
+  // inspector's own is that case: it opens the run, as the double click
+  // meant, and never reaches a button.
+  const untouchedRef = useRef(true);
+  useEffect(() => {
+    untouchedRef.current = true;
+  }, [task.id]);
+  const onClickCapture = (e: React.MouseEvent) => {
+    const strayDoubleClick = untouchedRef.current && e.detail >= 2;
+    untouchedRef.current = false;
+    if (!strayDoubleClick) return;
+    e.stopPropagation();
+    e.preventDefault();
+    onOpen(task);
+  };
+
   const run = task.pipelineRun ?? null;
   const title = splitCardTitle(task.title);
   const StateIcon = STATE_ICONS[state.icon];
@@ -126,6 +145,7 @@ export function CardInspector({ task, onClose, onOpen, onAction, onRestart, onSt
       data-testid="card-inspector"
       data-state={state.state}
       aria-label={`Selected card: ${task.title}`}
+      onClickCapture={onClickCapture}
       className="mx-4 mb-3 grid max-h-[42vh] shrink-0 grid-cols-1 gap-x-4 gap-y-3 overflow-y-auto rounded-lg border border-board-line bg-board-card p-3 text-[11px] text-muted-foreground md:grid-cols-[1.2fr_1fr]"
     >
       <div className="min-w-0">

@@ -197,6 +197,22 @@ test.describe("board fixtures", () => {
     await expectNoOverflow(page);
   });
 
+  test("a double click on a card the inspector then covers still opens the run, and presses nothing", async ({ page }) => {
+    await open(page, "", { width: 1440, height: 760 });
+    const title = card(page, 845).locator("h3");
+    const at = (await title.boundingBox())!;
+    await title.dblclick();
+    // The first click opened the inspector over the point that was clicked…
+    const inspector = (await page.getByTestId("card-inspector").boundingBox())!;
+    expect(inspector.y).toBeLessThan(at.y);
+    // …and the second one still meant "open": no inspector button took it.
+    await expect(page.getByTestId("fixture-notice")).toHaveText("Preview: open the run — Issue #845. Nothing was started.");
+    // After that, the inspector's buttons are ordinary buttons again.
+    await page.getByTestId("inspector-open").click();
+    await page.getByTestId("inspector-retry").dblclick();
+    await expect(page.getByTestId("fixture-notice")).toHaveText("Preview: Retry — Issue #845. Nothing was started.");
+  });
+
   test("keyboard: Tab to a card, Enter selects, Tab reaches its button, Escape closes the inspector", async ({ page }) => {
     await open(page);
     const first = card(page, 1455);

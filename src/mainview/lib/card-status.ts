@@ -2,8 +2,8 @@
  * One plain sentence per card — what it's doing, or what it's waiting on —
  * and, when it's the user's move, why and which button settles it. Derived
  * from the task, its pipeline run, its PR (src/bun/pr-watch.ts) and any lease
- * it holds or waits on (src/bun/lease-watch.ts). Feeds the card's status line
- * and the board's "Needs you" bar.
+ * it holds or waits on (src/bun/lease-watch.ts). The board's cards build on
+ * it (card-state.ts: state, step and button); the "Needs you" bar reads it too.
  */
 import type { PipelineRunState, Task, TaskPrStatus } from "../../shared/types.ts";
 import { currentRoadmapStatus, offerPending, type RoadmapCardInfo, type RoadmapNextMilestone, type RoadmapStatus, type RoadmapStepLinks } from "../../shared/roadmap.ts";
