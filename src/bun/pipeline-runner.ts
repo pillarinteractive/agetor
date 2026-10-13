@@ -41,7 +41,7 @@ import {HEAVY_INSTRUCTIONS,managedPillarRoot} from './heavy-jobs.ts';
 import { classifyFailure, formatRetryTime, harnessQuotaNotice, isQuotaPaused, nextRetryAt, TRANSIENT_RETRY_MAX, type FailureClass } from "./usage-limit.ts";
 import { fallbackHarnessFor, harnessDuringLimit, noteQuotaLimit } from "./quota-fallback.ts";
 import { listLeases } from "./lease-watch.ts";
-import { ownFailures, prStatusForTask } from "./pr-watch.ts";
+import { ownFailures, prBase, prStatusForTask } from "./pr-watch.ts";
 import { run as runCommand } from "./github.ts";
 import { waitingOnQuota } from "../shared/autopilot.ts";
 import { decisionPolicyForProject, PIPELINE_DECISIONS_PREF, plannerDecisionInstructions } from "../shared/pipeline-decisions.ts";
@@ -51,6 +51,11 @@ import {
 } from "../shared/publish.ts";
 import { composedHandoff, exhaustedHandoff, gateFailureLine, gateVerdict, type CheckResult } from "../shared/checks.ts";
 import { recordWaivedChecks, runStepChecks } from "./check-runner.ts";
+import { appendFeedback, readFeedback, readPosition, voidStepEvidence } from "./position.ts";
+import {
+  applicableFeedback, forwardPath, positionLine, renderOwnerFeedback, stepsFrom, validateFeedbackNote,
+  type PipelinePositionView, type PipelineReopenResult, type PipelineResume, type PipelineSteerResult, type Position,
+} from "../shared/position.ts";
 import {
   BLOCK_WAIT_PREF,
   classifyBlock,
@@ -2402,11 +2407,19 @@ async function launchStep(
     :step.name==='Finish'&&!publishBrief?`\n\nPublish only the exact independently approved head: do not merge, rebase or amend the branch in this step (GitHub CI already tests the pull request merged with its base). A change to reviewed code or a different head requires Build/Review again; passing verification alone is not independent approval.`:'';
   const withMachineCapacity=(prompt:string)=>managedRoot
     ? `${prompt}\n\n## Machine test capacity\n${HEAVY_INSTRUCTIONS}${approvalNote}`:prompt;
+  // The owner's notes for a run they reopened (`steerPipelineRun`): carried
+  // by this step and the steps after it until each has finished once since.
+  // Never by the writer of an Agetor-run Finish or the wrap-up, whose turn
+  // must not change the head. A run with no note has no such section.
+  const ownerNotes = publishBrief || wrapUp ? [] : applicableFeedback(
+    readFeedback(parent.id, run), forwardPath(snapshot.graph, run.history) ?? [], run.history, step.id);
+  const feedbackSection = renderOwnerFeedback(ownerNotes, { stepId: step.id, nameOf: (id) => stepNameById(snapshot.graph, id) });
+  const withFeedback = (prompt: string) => (feedbackSection ? `${prompt}\n\n${feedbackSection}` : prompt);
   // Last, so nothing after it reads as taking the wrap-up back.
   const withWrapUp = (prompt: string) => wrapUp
     ? `${prompt}\n\n${capWrapUpSection({ stepCap: effectiveStepCap(run), issueUrl: parent.issueUrl, prUrl: parent.prUrl })}`
     : prompt;
-  let composed = withWrapUp(withMachineCapacity(withSync(withRouting(withDecisions(composeStepPrompt({ ...composeArgs, inlineHandoff: true }))))));
+  let composed = withWrapUp(withMachineCapacity(withSync(withRouting(withDecisions(withFeedback(composeStepPrompt({ ...composeArgs, inlineHandoff: true })))))));
   if(inputReconciliation.note)composed+=`\n\n${inputReconciliation.note}`;
   // m12/D10: measure the SAME wrapping `startTaskInner` will actually launch
   // with — `composeLaunchPrompt` (the profile's instructions/skills
@@ -2416,7 +2429,7 @@ async function launchStep(
   if (profile.harnessKind === "gemini") {
     const fullPrompt = appendReferences(composeLaunchPrompt(profile, composed), references);
     if (promptByteOverage("gemini", fullPrompt)) {
-      composed = withWrapUp(withMachineCapacity(withSync(withRouting(withDecisions(composeStepPrompt({ ...composeArgs, inlineHandoff: false }))))));
+      composed = withWrapUp(withMachineCapacity(withSync(withRouting(withDecisions(withFeedback(composeStepPrompt({ ...composeArgs, inlineHandoff: false })))))));
     }
   }
 
@@ -2760,8 +2773,8 @@ async function performPipelineRetry(
  */
 export async function startPipelineRun(
   parent: Task,
-  opts?: { restart?: boolean; validate?:()=>Promise<string|null> },
-): Promise<{ runId: string; pending?: true } | { error: string }> {
+  opts?: { restart?: boolean; fromScratch?: boolean; validate?:()=>Promise<string|null> },
+): Promise<{ runId: string; pending?: true; resumed?: PipelineResume } | { error: string }> {
   return runExclusive(parent.id, async () => {
     // Minor 5: a delete cascade tombstones the parent (and removes its row)
     // before tearing down any step task — a start/restart racing in through
@@ -2848,8 +2861,24 @@ export async function startPipelineRun(
       return { error: "pipeline no longer exists, and this task has never run it" };
     }
 
-    const startStep = resolveStartStep(snapshot.graph);
-    if (!startStep) return { error: "pipeline has no resolvable start step" };
+    const firstStep = resolveStartStep(snapshot.graph);
+    if (!firstStep) return { error: "pipeline has no resolvable start step" };
+    // A restart of a gated run resumes at the first step whose gate is not
+    // satisfied now, instead of repeating Understand and Build over work
+    // that is still in the worktree (`readPosition`; Stage 3 of
+    // docs/plans/check-gated-pipeline.md). From the beginning stays one
+    // explicit flag away (`fromScratch`), and is what an ungated run, a run
+    // with no history, or a position on the start step gets — unchanged.
+    let resume: { step: PipelineStep; position: Extract<Position, { kind: "step" }> } | null = null;
+    if (opts?.restart && !opts.fromScratch && run.snapshot && run.history.length > 0 && gatedNow(fresh, snapshot, pipeline?.name ?? run.pipelineName)) {
+      const position = await readPosition({ parent: fresh, run, snapshot, publishOn: publishGatePref(fresh, { pipelineName: pipeline?.name ?? run.pipelineName }) });
+      if (position.kind === "complete") {
+        return { error: `${positionLine(position, (id) => stepNameById(snapshot.graph, id))} — rewind to a step to redo it, or restart from the beginning` };
+      }
+      const step = position.kind === "step" ? snapshot.graph.steps.find((s) => s.id === position.stepId) : undefined;
+      if (position.kind === "step" && step && step.id !== firstStep.id) resume = { step, position };
+    }
+    const startStep = resume?.step ?? firstStep;
     // Book global ownership before awaited preparation, for manual/API
     // starts as well as Autopilot. The first child atomically takes over.
     const booking=reserveRunner(fresh.id,startStep.name,isTaskRunLive,fresh.id);
@@ -2893,6 +2922,35 @@ export async function startPipelineRun(
     // survive (archive, not delete); a later delete cascade removes all of
     // it. The explicit `cancelRun` on `restartTargets` is folded into this
     // — `archiveTask({stopRun})` is exactly the Stop button's own path.
+    if (resume) {
+      // Resumed: the run, its history and its ledger are kept. Only what
+      // was still under way is stopped, and the run is reopened at the
+      // position with the handoff of the step before it.
+      const stopped = await retireActiveExecutions(fresh.id, run, "pipeline restarted");
+      reopenRunState(run, snapshot, forwardPath(snapshot.graph, run.history) ?? [], resume.step.id);
+      run.pipelineName = pipeline?.name ?? run.pipelineName;
+      const names = (ids: string[]) => ids.map((id) => stepNameById(snapshot.graph, id)).join(", ");
+      recordActivity(fresh.id, {
+        kind: "step", tone: "info",
+        text: `Restarted. ${positionLine(resume.position, (id) => stepNameById(snapshot.graph, id))}.` +
+          (stopped.length > 0 ? ` Stopped: ${names(stopped)}.` : "") + " History is kept; a restart from the beginning is a separate, explicit choice.",
+      });
+      persist(parentRow.id, run, { preserveStatus: true });
+      parentRow = tasks.get(parentRow.id) ?? parentRow;
+      const result = await launchTarget(parentRow, run, resume.step, resume.position.arrivals, { skipWorktreeRefresh: true });
+      checkJoinIncomplete(run);
+      persist(parentRow.id, run);
+      const resumed: PipelineResume = {
+        stepId: resume.step.id, stepName: resume.step.name, why: resume.position.why,
+        kept: resume.position.satisfied.map((k) => ({ stepId: k.stepId, stepName: stepNameById(snapshot.graph, k.stepId) })),
+      };
+      if (!result.ok) {
+        // Queued for a slot, or held for Agetor to run (Finish): under way.
+        if (run.blocked.some((b) => b.stepId === resume!.step.id && (b.kind === "slot-wait" || b.kind === "await"))) return { runId: "", pending: true as const, resumed };
+        return { error: `pipeline could not resume at ${resume.step.name} — see the run's blocked step for details` };
+      }
+      return { runId: result.runId, ...(result.pending ? { pending: true as const } : {}), resumed };
+    }
     if (opts?.restart) {
       for (const step of tasks.list()) {
         if (step.pipelineParentId !== fresh.id || step.archivedAt != null) continue;
@@ -3309,6 +3367,10 @@ export interface PipelineRunRefreshResult extends PipelineInstructionRefresh {
   error?: string;
   /** Only when the refresh asked for gates (`adoptPipelineGates`). */
   gates?: PipelineGateAdoption | { error: string };
+  /** Only when the refresh asked for gates and the run has them: where the
+   *  run stands now — the step a restart would resume at and what it would
+   *  keep (`positionLine`). The refresh itself launches nothing. */
+  position?: string;
 }
 
 /** Push a template's current instructions into every unarchived, unfinished
@@ -3335,11 +3397,16 @@ export async function refreshPipelineRuns(pipelineId: string, opts?: { gates?: b
       if (opts?.gates) {
         const adopted = await adoptPipelineGates(t.id);
         gates = "error" in adopted ? { error: adopted.error } : adopted;
-        if (t.pipelineRun?.status === "done") return { taskId: t.id, stepIds: [], unmatched: [], skippedPrompts: [], gates };
+        const at = await pipelinePosition(t.id).catch(() => null);
+        const position = at && !("error" in at) && at.line ? { position: at.line } : {};
+        if (t.pipelineRun?.status === "done") return { taskId: t.id, stepIds: [], unmatched: [], skippedPrompts: [], gates, ...position };
+        const result = await refreshPipelineInstructions(t.id);
+        if ("error" in result) return { ...failed(result.error), gates, ...position };
+        return { taskId: t.id, stepIds: result.stepIds, unmatched: result.unmatched, skippedPrompts: result.skippedPrompts, gates, ...position };
       }
       const result = await refreshPipelineInstructions(t.id);
-      if ("error" in result) return { ...failed(result.error), ...(gates ? { gates } : {}) };
-      return { taskId: t.id, stepIds: result.stepIds, unmatched: result.unmatched, skippedPrompts: result.skippedPrompts, ...(gates ? { gates } : {}) };
+      if ("error" in result) return failed(result.error);
+      return { taskId: t.id, stepIds: result.stepIds, unmatched: result.unmatched, skippedPrompts: result.skippedPrompts };
     } catch (e) {
       return failed(e instanceof Error ? e.message : String(e));
     }
@@ -3369,9 +3436,10 @@ export async function pipelineAdoptionsSettled(): Promise<void> {
  * duplicate of a live step; requires a blocked or cancelled run. */
 export async function retryPipelineStep(
   parentId: string,
-  opts?: { taskId?: string },
+  opts?: { taskId?: string; checksFirst?: boolean },
 ): Promise<{ task: Task } | { error: string; status: 400 | 404 | 409 }> {
-  return runExclusive(parentId, async () => {
+  let followUps: SettleFollowUp[] = [];
+  const result = await runExclusive(parentId, async () => {
     const parent = tasks.get(parentId);
     if (!parent || !parent.pipelineId) return { error: "not a pipeline task", status: 404 as const };
     if (!parent.pipelineRun) return { error: "pipeline has never run", status: 409 as const };
@@ -3379,10 +3447,57 @@ export async function retryPipelineStep(
     if (run.status !== "blocked" && run.status !== "cancelled") {
       return { error: "pipeline is not blocked or cancelled", status: 409 as const };
     }
+    // The owner's Retry of a step stopped on its checks: the checks are run
+    // first, and the step gets a turn only if one still fails.
+    if (opts?.checksFirst) {
+      const rechecked = await recheckStoppedGates(parent, run, opts.taskId);
+      if (rechecked) {
+        followUps = rechecked;
+        return { task: tasks.get(parentId)! };
+      }
+    }
     const result = await performPipelineRetry(parent, run, opts?.taskId);
     if ("error" in result) return { error: result.error, status: 409 as const };
     return { task: tasks.get(parentId)! };
   });
+  // The checks run with the lock released, as at any turn's end.
+  for (const f of followUps) await afterSettle(f);
+  return followUps.length > 0 && !("error" in result) ? { task: tasks.get(parentId) ?? result.task } : result;
+}
+
+/**
+ * The owner's Retry on a gated run (design §7): for every step that stopped
+ * with `check-failed`, judge the turn it ended on again by checks run NOW
+ * — the same settle that judged it the first time. They pass (the owner
+ * fixed the worktree, GitHub answers again): the run moves on with what the
+ * step handed off, and no turn is spent. One still fails: the step gets a
+ * check-feedback turn with the output, under a new allowance. Returns null
+ * — the ordinary retry applies — when the run is stopped on anything else,
+ * the stopped visit was not launched under the gate, or the card has since
+ * been taken out of `pipeline_gates`.
+ */
+async function recheckStoppedGates(parent: Task, run: PipelineRunState, onlyTaskId?: string): Promise<SettleFollowUp[] | null> {
+  if (tombstonedPipelineParents.has(parent.id) || parent.archivedAt != null || !run.snapshot) return null;
+  const stops = run.blocked.filter((b) => b.kind === "check-failed" && b.taskId && (!onlyTaskId || b.taskId === onlyTaskId));
+  if (stops.length === 0 || (!onlyTaskId && stops.length !== run.blocked.length)) return null;
+  const targets: { taskId: string; runId: string }[] = [];
+  for (const b of stops) {
+    const active = run.active.find((a) => a.taskId === b.taskId);
+    const record = active && run.history.find((h) => h.taskId === active.taskId && h.seq === active.seq);
+    const step = active && run.snapshot.graph.steps.find((s) => s.id === active.stepId);
+    const runId = active ? tasks.get(active.taskId)?.runId : null;
+    if (!active || !record?.gate || !step || !runId || isTaskRunLive(active.taskId) || !stepGateFor(parent, run, step)) return null;
+    targets.push({ taskId: active.taskId, runId });
+  }
+  run.blocked = run.blocked.filter((b) => !(b.kind === "check-failed" && targets.some((t) => t.taskId === b.taskId)));
+  recordActivity(parent.id, { kind: "step", tone: "info", text: "Retry: running the stopped step's checks again before giving it a turn" });
+  persist(parent.id, run);
+  const out: SettleFollowUp[] = [];
+  for (const t of targets) {
+    const follow = await settleStepRun(parent.id, t.taskId, t.runId, "succeeded");
+    if (follow) out.push(follow);
+  }
+  return out;
 }
 
 /**
@@ -3528,6 +3643,239 @@ export async function reworkPipelineRun(
       }
     }
     return { task: tasks.get(parentId)! };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Position, rewind and feedback (Stage 3 of docs/plans/check-gated-pipeline.md;
+// the walk is src/shared/position.ts, the reads are src/bun/position.ts)
+// ---------------------------------------------------------------------------
+
+/** Whether a run with this snapshot is gated for the card now: it adopted a
+ *  gate and `pipeline_gates` still names the card. Position, rewind and
+ *  feedback are for such runs only; every other run behaves as it did. */
+function gatedNow(parent: Pick<Task, "id" | "pipelineId">, snapshot: Pick<PipelineRunSnapshot, "gates">, pipelineName: string): boolean {
+  return (snapshot.gates?.steps === true && gatePref("steps", parent, { pipelineName })) ||
+    (snapshot.gates?.publish === true && publishGatePref(parent, { pipelineName }));
+}
+
+/**
+ * Stop and retire every execution still under way, for a run that is about
+ * to be reopened at another step: its pending questions are cancelled, its
+ * session is stopped and its step row archived (the path a restart takes for
+ * the rows it replaces), and its record ends as `cancelled`. The records
+ * stay in the history. Returns the step ids stopped. The caller persists.
+ */
+async function retireActiveExecutions(parentId: string, run: PipelineRunState, why: string): Promise<string[]> {
+  const stopped: string[] = [];
+  const retired = [...run.active];
+  // Out of `active` first: a settle that the stop sets off must find nothing
+  // of this execution left to decide.
+  run.active = [];
+  for (const a of retired) {
+    stopped.push(a.stepId);
+    const record = run.history.find((h) => h.taskId === a.taskId && h.seq === a.seq);
+    if (record && record.outcome === null) {
+      record.endedAt = Date.now();
+      freezeStepReport(record);
+      record.outcome = "cancelled";
+    }
+    checksInFlight.delete(a.taskId);
+    deferredSettles.delete(a.taskId);
+    cancelPendingForTask(a.taskId, why);
+    const archived = await archiveTask(a.taskId, { force: true, stopRun: true, fromPipeline: true });
+    if ("error" in archived) console.warn(`[agetor] pipeline ${parentId}: failed to retire step task ${a.taskId}:`, archived.error);
+  }
+  return [...new Set(stopped)];
+}
+
+/**
+ * Put a run back to "about to launch `stepId`": nothing active, blocked,
+ * waiting or scheduled; no held Agetor-run Finish (it verifies the head
+ * again from the start); the wrap-up mark cleared; and room under the step
+ * cap for the steps from `stepId` to the end of the path — raised just
+ * enough, as a fix round and a follow-up raise it, because the owner asked
+ * for these steps. History, step count and generation are untouched.
+ */
+function reopenRunState(run: PipelineRunState, snapshot: PipelineRunSnapshot, path: readonly PipelineStep[], stepId: string): void {
+  run.active = [];
+  run.blocked = [];
+  run.joins = {};
+  delete run.wait;
+  delete run.autoRetry;
+  delete run.launchRetries;
+  delete run.capWrapUp;
+  delete run.publish;
+  run.snapshot = snapshot;
+  run.status = "running";
+  run.endedAt = null;
+  const needed = Math.max(1, stepsFrom(path, stepId).length);
+  const ext = Math.max(0, Math.trunc(run.capExtensions ?? 0));
+  if (run.stepCount + needed > effectiveStepCap(run)) {
+    run.snapshot = { ...snapshot, maxSteps: Math.ceil((run.stepCount + needed) / (1 + ext)) };
+  }
+}
+
+/** Commits on the card's branch that the remote does not have, as this
+ *  machine last fetched it (nothing is fetched): a rewind leaves them where
+ *  they are, and says so. */
+async function unpushedCommits(parent: Task): Promise<{ count: number | null; head: string | null; remoteHead: string | null }> {
+  const checkout = parent.worktreePath ?? parent.workdir;
+  const git = async (args: string[]) => {
+    const r = await runCommand(["git", ...args], checkout, 30_000, process.env).catch(() => null);
+    return r && r.ok ? r.stdout.trim() : null;
+  };
+  const head = await git(["rev-parse", "--verify", "--quiet", "HEAD"]);
+  const remoteHead = parent.branch ? await git(["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${parent.branch}`]) : null;
+  // Never published: everything the base (as last fetched) does not have.
+  const base = remoteHead ? null : await prBase(checkout).catch(() => null);
+  const baseTip = base ? await git(["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${base}`]) : null;
+  const since = remoteHead ?? baseTip ?? parent.baseRef ?? null;
+  const n = head && since ? await git(["rev-list", "--count", `${since}..HEAD`]) : null;
+  return { count: n !== null && /^\d+$/.test(n) ? Number(n) : null, head, remoteHead };
+}
+
+/** Read where a gated run stands (`GET /tasks/:id/pipeline/position`).
+ *  Judged with the run's own snapshot; a restart judges with the template as
+ *  it then is. Starts nothing and writes nothing. */
+export async function pipelinePosition(parentId: string): Promise<PipelinePositionView | { error: string; status: 404 | 409 }> {
+  const parent = tasks.get(parentId);
+  if (!parent?.pipelineId || tombstonedPipelineParents.has(parentId)) return { error: "not a pipeline task", status: 404 as const };
+  const run = parent.pipelineRun;
+  if (!run?.snapshot) return { error: "pipeline has never run", status: 409 as const };
+  const snapshot = run.snapshot;
+  if (!gatedNow(parent, snapshot, run.pipelineName)) return { gated: false, position: null, line: null, steps: [] };
+  const position = await readPosition({ parent, run, snapshot, publishOn: publishGatePref(parent, run) });
+  const path = forwardPath(snapshot.graph, run.history) ?? [];
+  const done = (id: string) => run.history.some((h) => h.stepId === id && (h.outcome === "succeeded" || h.outcome === "advanced-manually") && h.handoff);
+  return {
+    gated: true, position, line: positionLine(position, (id) => stepNameById(snapshot.graph, id)),
+    // A step can be reopened when the step before it has finished once.
+    steps: path.map((s, i) => ({ id: s.id, name: s.name, reached: i === 0 || done(path[i - 1]!.id) })),
+  };
+}
+
+type ReopenTarget = { parent: Task; run: PipelineRunState; snapshot: PipelineRunSnapshot; step: PipelineStep; path: PipelineStep[]; arrivals: { stepId: string; seq: number; handoff: Handoff | null }[] };
+
+/** The checks every reopen makes, and what the reopened step is handed: the
+ *  newest finished visit of the step before it on the path. */
+function reopenTarget(parentId: string, stepId: unknown, what: string): ReopenTarget | { error: string; status: 400 | 404 | 409 } {
+  const parent = tasks.get(parentId);
+  if (!parent?.pipelineId || tombstonedPipelineParents.has(parentId)) return { error: "not a pipeline task", status: 404 as const };
+  if (parent.archivedAt != null) return { error: "pipeline task is archived — unarchive it first", status: 409 as const };
+  const run = parent.pipelineRun;
+  if (!run?.snapshot) return { error: "pipeline has never run", status: 409 as const };
+  const snapshot = run.snapshot;
+  if (!gatedNow(parent, snapshot, run.pipelineName)) {
+    return { error: `${what} is for a run with check gates (pipeline_gates), and this card's run has none — use Retry, Advance or Restart`, status: 409 as const };
+  }
+  if (typeof stepId !== "string" || !stepId.trim()) return { error: "stepId (a step of the run) is required", status: 400 as const };
+  const step = snapshot.graph.steps.find((s) => s.id === stepId);
+  if (!step) return { error: `unknown step id "${stepId}"`, status: 400 as const };
+  const path = forwardPath(snapshot.graph, run.history);
+  if (!path) return { error: "this pipeline is not one path with loops (a step fans out or joins): its position is not defined", status: 409 as const };
+  const at = path.findIndex((s) => s.id === step.id);
+  if (at === -1) return { error: `${step.name} is not on this run's path (${path.map((s) => s.name).join(" → ")})`, status: 400 as const };
+  const arrivals: ReopenTarget["arrivals"] = [];
+  if (at > 0) {
+    const before = path[at - 1]!;
+    const sender = run.history.filter((h) => h.stepId === before.id && (h.outcome === "succeeded" || h.outcome === "advanced-manually") && h.handoff).sort((a, b) => b.seq - a.seq)[0];
+    if (!sender) return { error: `${step.name} has not been reached in this run: ${before.name} has no finished visit to hand it`, status: 409 as const };
+    arrivals.push({ stepId: before.id, seq: sender.seq, handoff: sender.handoff });
+  }
+  return { parent, run, snapshot, step, path, arrivals };
+}
+
+/** Stop what is under way and launch `t.step`. The caller holds the lock.
+ *  `record` writes what the reopen is on record for (void lines, a note)
+ *  once the worktree is known to be usable and before anything is stopped:
+ *  when it throws, nothing has changed. */
+async function reopenRunAt(t: ReopenTarget, why: string, record: () => void): Promise<{ stopped: string[] } | { error: string; status: 409 }> {
+  const prepared = await refreshParentWorktree(t.parent, t.run);
+  if ("error" in prepared) return { error: `could not prepare the pipeline's worktree, so nothing was changed: ${prepared.error}`, status: 409 as const };
+  try {
+    record();
+  } catch (e) {
+    return { error: `it could not be recorded beside the run, so nothing was changed: ${e instanceof Error ? e.message : String(e)}`, status: 409 as const };
+  }
+  const stopped = await retireActiveExecutions(t.parent.id, t.run, why);
+  reopenRunState(t.run, t.snapshot, t.path, t.step.id);
+  persist(t.parent.id, t.run, { preserveStatus: true });
+  await launchTarget(tasks.get(t.parent.id) ?? prepared.parent, t.run, t.step, t.arrivals, { skipWorktreeRefresh: true });
+  checkJoinIncomplete(t.run);
+  persist(t.parent.id, t.run);
+  return { stopped: stopped.map((id) => stepNameById(t.snapshot.graph, id)) };
+}
+
+/**
+ * Rewind a gated run to `stepId` (`POST /tasks/:id/pipeline/rewind`): the
+ * gate evidence of that step and of every step after it is voided in the
+ * ledger (lines appended; nothing is deleted), a Finish that Agetor is
+ * holding is dropped, whatever is running is stopped, and the step is
+ * launched with the handoff of the step before it. The history is kept.
+ * Git is not touched: no reset, no branch change, nothing on the remote —
+ * the commits stay, and `unpushed` says how many the remote does not have.
+ */
+export async function rewindPipelineRun(parentId: string, input: { stepId: unknown }): Promise<PipelineReopenResult | { error: string; status: 400 | 404 | 409 }> {
+  return runExclusive(parentId, async () => {
+    const t = reopenTarget(parentId, input.stepId, "Rewind");
+    if ("error" in t) return t;
+    let voided: PipelineStep[] = [];
+    const reopened = await reopenRunAt(t, "pipeline rewound", () => {
+      voided = voidStepEvidence({ parent: t.parent, run: t.run, snapshot: t.snapshot, fromStepId: t.step.id, why: `rewound to ${t.step.name} by the owner` });
+    });
+    if ("error" in reopened) return reopened;
+    const unpushed = await unpushedCommits(t.parent);
+    recordActivity(parentId, {
+      kind: "step", tone: "warning",
+      text: `Rewound to ${t.step.name}: the results of ${voided.map((s) => s.name).join(", ")} are void and each runs again.` +
+        (reopened.stopped.length > 0 ? ` Stopped: ${reopened.stopped.join(", ")}.` : "") +
+        ` History is kept and git is untouched${unpushed.count ? ` (${unpushed.count} commit${unpushed.count === 1 ? "" : "s"} not on the remote stay where they are)` : ""}.`,
+    });
+    return { task: tasks.get(parentId)!, stepId: t.step.id, stepName: t.step.name, voided: voided.map((s) => s.name), stopped: reopened.stopped, unpushed };
+  });
+}
+
+/**
+ * Steer a gated run with the owner's feedback (`POST
+ * /tasks/:id/pipeline/feedback`): the note is recorded beside the run, the
+ * run is reopened from `fromStepId`, and that step's next prompt carries the
+ * note — as does each later step's, until it has finished once since
+ * (`applicableFeedback`). With `invalidate` the evidence of those steps is
+ * voided as a rewind voids it. Without it nothing is voided: the steps run
+ * once more as a refinement of work whose results stand. Git is not touched.
+ */
+export async function steerPipelineRun(
+  parentId: string,
+  input: { fromStepId: unknown; note: unknown; invalidate?: unknown },
+): Promise<PipelineSteerResult | { error: string; status: 400 | 404 | 409 }> {
+  return runExclusive(parentId, async () => {
+    const note = validateFeedbackNote(input.note);
+    if (!note.ok) return { error: note.error, status: 400 as const };
+    if (input.invalidate !== undefined && typeof input.invalidate !== "boolean") return { error: "invalidate must be true or false when given", status: 400 as const };
+    const invalidate = input.invalidate === true;
+    const t = reopenTarget(parentId, input.fromStepId, "Feedback to a step");
+    if ("error" in t) return t;
+    let voided: PipelineStep[] = [];
+    let feedbackId = "";
+    const reopened = await reopenRunAt(t, "pipeline reopened with feedback", () => {
+      // The void lines first: a note without them is still a valid refinement.
+      if (invalidate) voided = voidStepEvidence({ parent: t.parent, run: t.run, snapshot: t.snapshot, fromStepId: t.step.id, why: `voided with the owner's feedback to ${t.step.name}` });
+      feedbackId = appendFeedback(parentId, t.run, { fromStepId: t.step.id, note: note.note, invalidate }).id;
+    });
+    if ("error" in reopened) return reopened;
+    const unpushed = await unpushedCommits(t.parent);
+    const later = stepsFrom(t.path, t.step.id).slice(1).map((s) => s.name);
+    recordActivity(parentId, {
+      kind: "step", tone: "warning",
+      text: `Feedback sent to ${t.step.name}${later.length > 0 ? ` (and passed on to ${later.join(", ")})` : ""}: ${note.note.replace(/\s+/g, " ").slice(0, 200)}${note.note.length > 200 ? "…" : ""} — ` +
+        (invalidate ? `the results of ${voided.map((s) => s.name).join(", ")} are void and each runs again.` : "a refinement: earlier results stand, and each of those steps runs once more.") +
+        (reopened.stopped.length > 0 ? ` Stopped: ${reopened.stopped.join(", ")}.` : ""),
+    });
+    return {
+      task: tasks.get(parentId)!, stepId: t.step.id, stepName: t.step.name, voided: voided.map((s) => s.name), stopped: reopened.stopped, unpushed,
+      feedbackId, invalidated: invalidate,
+    };
   });
 }
 
@@ -4183,7 +4531,7 @@ async function settleStepRun(
           return { kind: "return", value: null };
         };
         if ("error" in judged) {
-          return forOwner(`step "${stepName}" finished, but its checks could not be run: ${judged.error} — Retry gives the step a turn and runs them again`, prior?.failed ?? []);
+          return forOwner(`step "${stepName}" finished, but its checks could not be run: ${judged.error} — Retry runs them again`, prior?.failed ?? []);
         }
         const verdict = gateVerdict(judged.results);
         if (verdict.state === "pass") {
@@ -4196,7 +4544,7 @@ async function settleStepRun(
         // GitHub did not answer, a required check is still running): not the
         // step's to fix, so no turn is spent on it.
         if (verdict.state === "halt") {
-          return forOwner(`step "${stepName}" finished, but a required check could not be evaluated: ${found} — nothing was sent back to the step; Retry gives it a turn and runs the checks again, Advance moves on without them`, failedIds);
+          return forOwner(`step "${stepName}" finished, but a required check could not be evaluated: ${found} — nothing was sent back to the step; Retry runs the checks again (and gives the step a turn only if one then fails), Advance moves on without them`, failedIds);
         }
         if (turns < max) {
           // The same refusals as the handoff reminder: never send into a run

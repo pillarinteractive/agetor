@@ -31,7 +31,7 @@ import {
 import { refreshOne } from "./usage/poller.ts";
 import { archiveTask, cancelFxAutoResume, createTask, deleteOrphanWorktree, deleteTask, isOrphanedPipelineStep, listWorktrees, minCliVersionError, publishGlobalEvent, startTask, cancelRun, reconcileTaskSession, resumeFxRecovery, sendInput, subscribe, subscribeGlobal, unarchiveTask, worktreeGitStatus } from "./orchestrator.ts";
 import { readCheckLedger } from "./check-runner.ts";
-import { advancePipeline, cancelPipelineRun, isPipelineStepTask, listBlockWaits, adoptPipelineGates, adoptPipelineInstructions, pipelineGatesUnmatched, pipelineStepReports, refreshPipelineInstructions, refreshPipelineRuns, releaseSlotWaits, retryPipelineStep, startPipelineRun } from "./pipeline-runner.ts";
+import { advancePipeline, cancelPipelineRun, isPipelineStepTask, listBlockWaits, adoptPipelineGates, adoptPipelineInstructions, pipelineGatesUnmatched, pipelinePosition, pipelineStepReports, refreshPipelineInstructions, refreshPipelineRuns, releaseSlotWaits, retryPipelineStep, rewindPipelineRun, startPipelineRun, steerPipelineRun } from "./pipeline-runner.ts";
 import { PIPELINE_GATES_PREF, gateUnmatchedLine } from "../shared/publish.ts";
 import { approvePlan, effectiveContent, planSlug, setEditedContent } from "./task-plans.ts";
 import { checkAllHarnesses } from "./agent-status.ts";
@@ -50,7 +50,7 @@ import { setMergeQueued } from "./merge-intent.ts";
 import { noteOwnerSignOff } from "./merge-rework.ts";
 import { recordPromptDismissal } from "./interaction-audit.ts";
 import { KEEP_AWAKE_PREF_KEY, KEEP_SCREEN_ON_PREF_KEY, recheckKeepAwake } from "./keep-awake.ts";
-import { applyAutopilotPatch, applyRoadmapContinue, applyRoadmapResolve, autopilotSnapshot, noteSignOffWithdrawn, requestAutopilotPass, setAutopilotNotifier } from "./autopilot.ts";
+import { applyAutopilotPatch, applyRoadmapContinue, applyRoadmapResolve, autopilotSnapshot, noteOwnerReopenedRun, noteSignOffWithdrawn, requestAutopilotPass, setAutopilotNotifier } from "./autopilot.ts";
 import { departTrainNow, refreshMergeColumn } from "./merge-queue.ts";
 import { readDragPasteboardPaths } from "./drag-pasteboard.ts";
 import { listGitHubTokens, setGitHubToken, deleteGitHubToken } from "./github-tokens.ts";
@@ -5121,9 +5121,11 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           const result = await refreshPipelineInstructions(req.params.id, {
             expectedCapturedAt: body.expectedCapturedAt, expectedTemplateUpdatedAt: body.expectedTemplateUpdatedAt,
           });
-          return "error" in result
-            ? json({ error: result.error }, { status: result.status, headers: corsHeaders(req) })
-            : json(gates ? { ...result, gates } : result, { headers: corsHeaders(req) });
+          if ("error" in result) return json({ error: result.error }, { status: result.status, headers: corsHeaders(req) });
+          if (!gates) return json(result, { headers: corsHeaders(req) });
+          // With gates adopted: where the run stands now (nothing is launched).
+          const at = await pipelinePosition(req.params.id).catch(() => null);
+          return json({ ...result, gates, ...(at && !("error" in at) && at.line ? { position: at.line } : {}) }, { headers: corsHeaders(req) });
         }),
       },
 
@@ -5144,7 +5146,9 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             taskId = body.taskId;
           }
 
-          const result = await retryPipelineStep(req.params.id, { taskId });
+          // The owner's Retry: a step stopped on its checks has them run
+          // again first (design §7). Internal retries never ask for this.
+          const result = await retryPipelineStep(req.params.id, { taskId, checksFirst: true });
           return "error" in result
             ? json({ error: result.error }, { status: result.status, headers: corsHeaders(req) })
             : json(withRunningSubagents(result.task), { headers: corsHeaders(req) });
@@ -5256,10 +5260,74 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
             return json({ error: "task is not a pipeline task" }, { status: 400, headers: corsHeaders(req) });
           }
           server.timeout(req, 0);
-          const result = await startPipelineRun(task, { restart: true });
+          // `{"fromScratch": true}`: discard the history and start at the
+          // first step, as every restart did. Without it a run with check
+          // gates resumes at the first step whose gate is not satisfied
+          // (`resumed` in the answer says where and what was kept); a run
+          // without gates restarts from the beginning either way.
+          const raw = await req.json().catch(() => null);
+          const body = raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+          if (body.fromScratch !== undefined && typeof body.fromScratch !== "boolean") {
+            return json({ error: "fromScratch must be true or false when given" }, { status: 400, headers: corsHeaders(req) });
+          }
+          const result = await startPipelineRun(task, { restart: true, fromScratch: body.fromScratch === true });
+          // The owner redid the run: a sign-off taken back before is about
+          // the run as it stood (src/bun/autopilot.ts).
+          if (!("error" in result) && result.resumed) noteOwnerReopenedRun(task.id);
           return "error" in result
             ? json({ error: result.error }, { status: 409, headers: corsHeaders(req) })
             : json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Where a run with check gates stands: the first step whose gate is
+      // not satisfied now, what is kept before it, and the steps it can be
+      // rewound or sent feedback to. Reads only. `{gated: false}` for a run
+      // without gates.
+      "/tasks/:id/pipeline/position": {
+        GET: authed(async (req) => {
+          const task = tasks.get(req.params.id);
+          if (!task) return json({ error: "not found" }, { status: 404, headers: corsHeaders(req) });
+          if (!task.pipelineId) return json({ error: "task is not a pipeline task" }, { status: 400, headers: corsHeaders(req) });
+          const result = await pipelinePosition(req.params.id);
+          return "error" in result
+            ? json({ error: result.error }, { status: result.status, headers: corsHeaders(req) })
+            : json(result, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Rewind a gated run to a step: `{"stepId": "<step id>"}`. Voids that
+      // step's and every later step's gate evidence in the ledger (appended,
+      // never deleted), drops a Finish Agetor is holding, stops what is
+      // running and launches the step. Git and the remote are not touched;
+      // the answer's `unpushed` counts the commits the remote does not have.
+      "/tasks/:id/pipeline/rewind": {
+        POST: authed(async (req) => {
+          server.timeout(req, 0);
+          const raw = await req.json().catch(() => null);
+          const body = raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+          const result = await rewindPipelineRun(req.params.id, { stepId: body.stepId });
+          if ("error" in result) return json({ error: result.error }, { status: result.status, headers: corsHeaders(req) });
+          noteOwnerReopenedRun(req.params.id);
+          return json({ ...result, task: withRunningSubagents(result.task) }, { headers: corsHeaders(req) });
+        }),
+      },
+
+      // Steer a gated run: `{"fromStepId": "<step id>", "note": "…",
+      // "invalidate": true|false}`. The note is recorded, the run reopens
+      // from that step, and its next prompt — and each later step's, until it
+      // has finished once since — carries the note. `invalidate` also voids
+      // the evidence as a rewind does; without it the steps run once more as
+      // a refinement and earlier results stand.
+      "/tasks/:id/pipeline/feedback": {
+        POST: authed(async (req) => {
+          server.timeout(req, 0);
+          const raw = await req.json().catch(() => null);
+          const body = raw && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
+          const result = await steerPipelineRun(req.params.id, { fromStepId: body.fromStepId, note: body.note, invalidate: body.invalidate });
+          if ("error" in result) return json({ error: result.error }, { status: result.status, headers: corsHeaders(req) });
+          noteOwnerReopenedRun(req.params.id);
+          return json({ ...result, task: withRunningSubagents(result.task) }, { headers: corsHeaders(req) });
         }),
       },
 
