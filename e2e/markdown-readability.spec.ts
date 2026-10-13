@@ -80,7 +80,7 @@ function runPanel(page: Page) {
 /** Click a task card by its exact title and wait for the composer textarea
  *  to mount as proof the run panel is open. */
 async function openTask(page: Page, title: string) {
-  await page.getByText(title, { exact: true }).first().click();
+  await page.getByText(title, { exact: true }).first().dblclick();
   const panel = runPanel(page);
   await expect(panel.locator("textarea")).toBeVisible();
   return panel;

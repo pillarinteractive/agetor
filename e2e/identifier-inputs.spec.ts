@@ -30,8 +30,8 @@ import { gotoApp, openSettingsGeneral } from "./helpers";
  *     `WorktreeOptions`).
  *  3. The branch-name input (`branch-name-input`, visible because Isolate
  *     defaults on).
- *  4. The Kanban filter bar's harness filter search box (`MultiSearchSelect`)
- *     — a sibling primitive to `SearchSelect`.
+ *  4. (The Kanban filter bar's harness filter is gone with the filter row;
+ *     the board's search box, now in the top bar, is covered at the end.)
  *  5. Negative check: the Title input (a prose field) must NOT carry
  *     `autocorrect="off"` — pins the deliberate prose-vs-identifier split so
  *     a future "apply everywhere" change trips this test.
@@ -142,23 +142,6 @@ test.describe("identifier inputs opt out of autocorrect", () => {
     await expect(titleInput).not.toHaveAttribute("autocorrect", "off");
   });
 
-  test("Kanban filter bar: harness filter search box carries the opt-out set", async ({ page, backend }) => {
-    await gotoApp(page, backend.bootBase);
-
-    // "All harnesses" is the MultiSearchSelect trigger's empty-state label
-    // (KanbanFilters.tsx) — a plain <button>, not inside the New Task panel,
-    // so no extra scoping is needed. The New Task panel's own placeholder
-    // "Search projects…" collides with the filter bar's repo filter, which
-    // is why this spec never asserts on that placeholder unscoped.
-    const harnessTrigger = page.getByRole("button", { name: "All harnesses", exact: true });
-    await harnessTrigger.click();
-    const harnessSearch = page.getByPlaceholder("Search harnesses…");
-    await expect(harnessSearch).toBeVisible({ timeout: CONVERGE_TIMEOUT });
-    await expectIdentifierInput(harnessSearch);
-    await page.keyboard.press("Escape");
-    await expect(harnessSearch).toBeHidden();
-  });
-
   test("New Task panel: Extensions picker search box carries the opt-out set", async ({ page, backend }) => {
     // The Extensions trigger is disabled until the New Task panel has a
     // non-empty workdir (PromptComposer: `disabled={disabled ||
@@ -259,11 +242,11 @@ test.describe("identifier inputs opt out of autocorrect", () => {
 
 // Wave 4 — the rule widened from "identifier inputs" to "identifier inputs
 // AND search/filter boxes" (a corrected query just finds nothing), so the
-// Kanban bar's free-text box opts out too. It's always mounted on the board,
-// so no popover to open.
+// board's free-text search box opts out too. It's in the top bar (App.tsx)
+// whenever the board is showing, so no popover to open.
 test.describe("search/filter boxes opt out of autocorrect", () => {
-  test("Kanban free-text filter box carries the opt-out set", async ({ page, backend }) => {
+  test("Board search box carries the opt-out set", async ({ page, backend }) => {
     await gotoApp(page, backend.bootBase);
-    await expectIdentifierInput(page.getByPlaceholder("Search title, prompt, workdir, branch…"));
+    await expectIdentifierInput(page.getByRole("textbox", { name: "Search tasks" }));
   });
 });

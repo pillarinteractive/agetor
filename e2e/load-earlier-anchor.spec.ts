@@ -185,7 +185,7 @@ function taskCard(page: Page, title: string): Locator {
  *  full-screen backdrop once a panel is showing — see
  *  `openTaskWhilePanelOpen` below). */
 async function openTask(page: Page, title: string): Promise<Locator> {
-  await page.getByText(title, { exact: true }).first().click();
+  await page.getByText(title, { exact: true }).first().dblclick();
   const panel = runPanel(page);
   await expect(panel.locator("textarea")).toBeVisible();
   return panel;

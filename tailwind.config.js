@@ -68,6 +68,18 @@ export default {
         "success-solid": "hsl(var(--success-solid))",
         "danger-solid": "hsl(var(--danger-solid))",
         "warning-solid": "hsl(var(--warning-solid))",
+        // Board card states and the columns' lane (index.css): `state` is
+        // whichever state the nearest `data-state` ancestor names.
+        state: {
+          DEFAULT: "var(--state)",
+          bg: "var(--state-bg)",
+          working: "var(--state-working)",
+          waiting: "var(--state-waiting)",
+          neutral: "var(--state-queued-bg)",
+        },
+        lane: "var(--lane)",
+        "board-card": "var(--board-card)",
+        "board-line": "var(--board-line)",
       },
       borderRadius: {
         lg: "var(--radius)",
@@ -78,16 +90,6 @@ export default {
         geist: ['"Geist Variable"', "ui-sans-serif", "system-ui", "sans-serif"],
       },
       keyframes: {
-        // Slower, calmer than tailwind's default `pulse` — used by TaskCard's
-        // awaiting-glow overlay to indicate "this card is waiting on you"
-        // without feeling anxious. Animates OPACITY only (compositor-friendly:
-        // no per-frame repaint) — the glow itself is a static box-shadow on a
-        // dedicated overlay element (see TaskCard), which is also what keeps
-        // it from clobbering Tailwind's `ring-*` box-shadow on the card.
-        "awaiting-pulse": {
-          "0%, 100%": { opacity: "0.45" },
-          "50%":      { opacity: "1" },
-        },
         // Pipelines canvas: a soft pulse around the node currently
         // running/awaiting attention, using the --info token (blue) so it
         // matches the rest of the app's "in progress" color language rather
@@ -109,7 +111,6 @@ export default {
         },
       },
       animation: {
-        "awaiting-pulse": "awaiting-pulse 2.4s ease-in-out infinite",
         "pipeline-pulse": "pipeline-pulse 1.6s ease-in-out infinite",
         "pipeline-dash": "pipeline-dash 1s linear infinite",
       },

@@ -91,7 +91,7 @@ function runPanel(page: Page) {
  *  `.first()` resolves the board `CardTitle` over any later text-match
  *  inside the (not-yet-open) panel. */
 async function openTask(page: Page, title: string) {
-  await page.getByText(title, { exact: true }).first().click();
+  await page.getByText(title, { exact: true }).first().dblclick();
   const panel = runPanel(page);
   await expect(panel.locator("textarea")).toBeVisible();
   return panel;

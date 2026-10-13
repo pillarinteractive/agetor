@@ -10,8 +10,7 @@ import type { HarnessQuota } from "../src/shared/types.ts";
  * chord — Meta+F on Mac, Ctrl+F elsewhere, `isFindShortcut` in
  * `src/mainview/lib/find-shortcut.ts` — while no task details panel is open
  * focuses the kanban board's free-text search box
- * (`src/mainview/components/kanban/KanbanFilters.tsx`, `aria-label="Search
- * tasks"`) and selects its contents; while a task's panel is open, the
+ * (in the top bar, `src/mainview/App.tsx`, `aria-label="Search tasks"`) and selects its contents; while a task's panel is open, the
  * panel's own Cmd/Ctrl+F (`src/mainview/components/kanban/RunPanel.tsx`
  * ~line 1637) owns the chord instead and opens its message-search bar
  * (`aria-label="Search messages"`); modal dialogs and non-escape-only
@@ -121,7 +120,7 @@ function runPanel(page: Page): Locator {
  *  composer textarea rendering is not sufficient proof (knowledge gotcha
  *  #1 above). */
 async function openTask(page: Page, title: string): Promise<Locator> {
-  await page.getByText(title, { exact: true }).first().click();
+  await page.getByText(title, { exact: true }).first().dblclick();
   const panel = runPanel(page);
   await expect(panel.locator("textarea")).toBeVisible();
   await expect(panel).toHaveClass(/translate-x-0/);
@@ -174,7 +173,7 @@ async function pressFindChord(page: Page, mod: "Meta" | "Control"): Promise<void
   await page.keyboard.press(`${mod}+KeyF`);
 }
 
-/** The board's free-text filter box (`KanbanFilters.tsx`) — located by its
+/** The board's free-text search box (top bar, `App.tsx`) — located by its
  *  accessible name, which also doubles as the stable e2e locator the plan
  *  calls for. */
 function boardSearchBox(page: Page): Locator {
@@ -291,7 +290,7 @@ test.describe("board search: Cmd/Ctrl+F focus", () => {
     // `UsagePopover` renders `role="dialog"` WITHOUT `aria-modal` and
     // WITHOUT `data-popover-open`, so it isn't in
     // `FIND_SHORTCUT_BLOCKING_LAYERS` — the chord still reaches the board
-    // box while it's open. It IS matched by `KanbanFilters`'s broader
+    // box while it's open. It IS matched by the search box's broader
     // `[role="dialog"], [data-popover-open], [data-quote-open]` Escape
     // guard, so the box must yield the first Escape to it and only blur on
     // the second.

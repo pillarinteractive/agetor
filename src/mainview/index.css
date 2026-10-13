@@ -96,6 +96,25 @@
     --success-solid: 160.1 84.1% 39.4%; /* emerald-500 */
     --danger-solid: 0 84.2% 60.2%; /* red-500 */
     --warning-solid: 37.7 92.1% 50.2%; /* amber-500 */
+    /* Board card states (src/mainview/lib/card-state.ts): one text colour and
+       one tint per state, plus the columns' lane. Plain hex rather than HSL
+       triplets: they are never used with an alpha, and the pairs were picked
+       together for contrast (text on its own tint, and on the card). */
+    --state-working: #11643b;
+    --state-working-bg: #ddf5e5;
+    --state-waiting: #16579b;
+    --state-waiting-bg: #e0efff;
+    --state-needs: #80500a;
+    --state-needs-bg: #ffefcf;
+    --state-failed: #a12635;
+    --state-failed-bg: #ffe4e7;
+    --state-merged: #6840a4;
+    --state-merged-bg: #eee4fc;
+    --state-queued: #526174;
+    --state-queued-bg: #edf0f5;
+    --lane: #e9edf1;
+    --board-card: #ffffff;
+    --board-line: #d5dfe8;
   }
 
   .dark {
@@ -139,11 +158,36 @@
     --success-solid: 160.1 84.1% 39.4%; /* emerald-500 */
     --danger-solid: 0 84.2% 60.2%; /* red-500 */
     --warning-solid: 37.7 92.1% 50.2%; /* amber-500 */
+    --state-working: #92e8b2;
+    --state-working-bg: #1e422e;
+    --state-waiting: #9ccaff;
+    --state-waiting-bg: #1e3758;
+    --state-needs: #ffce7d;
+    --state-needs-bg: #4e3617;
+    --state-failed: #ffb0b5;
+    --state-failed-bg: #50242e;
+    --state-merged: #d7b4ff;
+    --state-merged-bg: #392b53;
+    --state-queued: #b7c3d2;
+    --state-queued-bg: #2d3747;
+    --lane: #141d28;
+    --board-card: #1b232e;
+    --board-line: #354255;
   }
 
   * { @apply border-border; }
   body { @apply bg-background text-foreground; }
 }
+
+/* A board card, its inspector chip or a column summary names its state once
+   (`data-state`); everything inside reads the pair through `--state` /
+   `--state-bg` (Tailwind: `text-state`, `bg-state-bg`, `border-state`). */
+[data-state="working"] { --state: var(--state-working); --state-bg: var(--state-working-bg); }
+[data-state="waiting"] { --state: var(--state-waiting); --state-bg: var(--state-waiting-bg); }
+[data-state="needs"] { --state: var(--state-needs); --state-bg: var(--state-needs-bg); }
+[data-state="failed"] { --state: var(--state-failed); --state-bg: var(--state-failed-bg); }
+[data-state="merged"] { --state: var(--state-merged); --state-bg: var(--state-merged-bg); }
+[data-state="queued"] { --state: var(--state-queued); --state-bg: var(--state-queued-bg); }
 
 /* WKWebView hides overlay scrollbars when idle. Force a persistent horizontal
    scrollbar on the kanban so users always have a hit target to drag. */

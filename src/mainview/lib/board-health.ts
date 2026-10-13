@@ -52,13 +52,17 @@ const GROUPS: Record<WaitCause, Pick<WaitGroup, "title" | "clears" | "action">> 
   ci: { title: "Waiting on CI", clears: "Wakes when the checks finish", action: null },
   command: { title: "Waiting on a local command", clears: "Wakes when the command exits", action: null },
 };
-const ORDER = Object.keys(GROUPS) as WaitCause[];
+/** Causes, most actionable first. */
+export const WAIT_CAUSE_ORDER = Object.keys(GROUPS) as WaitCause[];
+const ORDER = WAIT_CAUSE_ORDER;
 
 const firstLine = (text: string) => text.split("\n")[0]!.replace(/\s+/g, " ").trim();
 /** `step "Review" reported it is blocked: - Waiting for …` → `Waiting for …`. */
 const said = (message: string) => firstLine(message.replace(/^step "[^"]*" reported it is blocked:\s*/i, "")).replace(/^[-–]\s*/, "");
 
-function causeOf(block: PipelineBlock, task: Task): WaitCause {
+/** Why one block holds its card. Reads the block's kind first and its text
+ *  only where the kind doesn't say (a step that reports itself blocked). */
+export function causeOf(block: PipelineBlock, task: Task): WaitCause {
   switch (block.kind) {
     case "slot-wait":
       return "slot";

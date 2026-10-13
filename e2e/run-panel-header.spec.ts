@@ -64,7 +64,7 @@ function runPanel(page: Page) {
  *  to mount as proof the panel is open — same idiom as `e2e/quote.spec.ts`'s
  *  `openTask`. */
 async function openTask(page: Page, title: string) {
-  await page.getByText(title, { exact: true }).first().click();
+  await page.getByText(title, { exact: true }).first().dblclick();
   const panel = runPanel(page);
   await expect(panel.locator("textarea")).toBeVisible();
   return panel;

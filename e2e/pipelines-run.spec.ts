@@ -224,7 +224,7 @@ function historyRowFor(page: Page, stepName: string): Locator {
 
 async function openPipelineRunFromBoard(page: Page, backend: E2EBackend, title: string): Promise<void> {
   await gotoApp(page, backend.bootBase);
-  await boardCard(page, title).click();
+  await boardCard(page, title).dblclick();
   await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
 }
 
@@ -358,12 +358,14 @@ test.describe("pipelines run: executing a run", () => {
 
     await waitForColumn(backend, task.id, "review");
 
-    // Board badge — checked once the run has settled, on a fresh load of
-    // the board (a badge doesn't depend on run status, so checking it here
-    // rather than mid-run avoids racing the fake driver's resolve delay).
+    // Back on the board, once the run has settled: the card says the run
+    // is over (its step reads "Complete") and what is left for the owner.
+    // A card with a next move shows that button in its footer in place of
+    // the pipeline's name, so the name isn't asserted here.
     await page.getByTestId("pipeline-run-back").click();
-    await expect(boardCard(page, title).getByTestId("task-card-pipeline")).toBeVisible();
-    await boardCard(page, title).click();
+    await expect(boardCard(page, title).getByTestId("card-step")).toHaveText("StepComplete");
+    await expect(boardCard(page, title).getByTestId("card-state")).toHaveText("No PR yet");
+    await boardCard(page, title).dblclick();
     await expect(page.getByTestId("pipeline-run-view")).toBeVisible();
 
     // Click a done node -> RunPanel with the pipeline strip.

@@ -2,8 +2,8 @@
  * One plain sentence per card — what it's doing, or what it's waiting on —
  * and, when it's the user's move, why and which button settles it. Derived
  * from the task, its pipeline run, its PR (src/bun/pr-watch.ts) and any lease
- * it holds or waits on (src/bun/lease-watch.ts). Feeds the card's status line
- * and the board's "Needs you" bar.
+ * it holds or waits on (src/bun/lease-watch.ts). The board's cards build on
+ * it (card-state.ts: state, step and button); the "Needs you" bar reads it too.
  */
 import type { PipelineRunState, Task, TaskPrStatus } from "../../shared/types.ts";
 import { currentRoadmapStatus, offerPending, type RoadmapCardInfo, type RoadmapNextMilestone, type RoadmapStatus, type RoadmapStepLinks } from "../../shared/roadmap.ts";
@@ -32,22 +32,27 @@ export function formatAge(ms: number): string {
   return min % 60 ? `${h}h ${min % 60}m` : `${h}h`;
 }
 
-const stepName = (run: PipelineRunState, stepId: string | null | undefined) =>
+export const stepName = (run: PipelineRunState, stepId: string | null | undefined) =>
   run.snapshot?.graph.steps.find((s) => s.id === stepId)?.name ?? stepId ?? "a step";
 
-function latestRecord(run: PipelineRunState, taskId: string | null | undefined) {
+export function latestRecord(run: PipelineRunState, taskId: string | null | undefined) {
   let best: PipelineRunState["history"][number] | null = null;
   for (const r of run.history) if (r.taskId === taskId && (!best || r.seq > best.seq)) best = r;
   return best;
 }
 
-function prPhrase(pr: TaskPrStatus): { text: string; tone: CardStatus["tone"]; needsYou: CardStatus["needsYou"] } {
+/** Which of an open PR's situations {@link prPhrase} described. */
+export type PrPhraseKind = "update-branch" | "ci-failed" | "base-failing" | "review-comments" | "checks-running" | "no-checks" | "review-pr";
+
+/** An open PR in one sentence, outside Ready to Merge. */
+export function prPhrase(pr: TaskPrStatus): { kind: PrPhraseKind; text: string; tone: CardStatus["tone"]; needsYou: CardStatus["needsYou"] } {
   const behind = (pr.behindBy ?? 0) > 0;
   // Same rule as pr-watch.ts ownFailures: inherited, rollup, and (when behind)
   // already-fixed-on-base failures aren't the PR's.
   const own = pr.failingChecks.filter((c) => !c.alsoOnBase && c.name !== "required" && !(behind && c.passesOnBase));
   if (pr.checks === "failure" && own.length === 0 && behind && pr.failingChecks.some((c) => c.passesOnBase)) {
     return {
+      kind: "update-branch",
       text: `PR #${pr.number}: behind ${pr.baseRef ?? "base"}, which fixed its failing checks — update the branch`,
       tone: "warning",
       needsYou: { reason: `PR #${pr.number} needs its branch updated`, action: "open", actionLabel: "Open" },
@@ -55,6 +60,7 @@ function prPhrase(pr: TaskPrStatus): { text: string; tone: CardStatus["tone"]; n
   }
   if (pr.checks === "failure" && own.length > 0) {
     return {
+      kind: "ci-failed",
       text: `PR #${pr.number}: CI failing (${own.map((c) => c.name).slice(0, 2).join(", ")})`,
       tone: "danger",
       needsYou: { reason: `PR #${pr.number} CI failing`, action: "open", actionLabel: "Fix CI" },
@@ -62,6 +68,7 @@ function prPhrase(pr: TaskPrStatus): { text: string; tone: CardStatus["tone"]; n
   }
   if (pr.checks === "failure") {
     return {
+      kind: "base-failing",
       text: `PR #${pr.number}: waiting on ${pr.baseRef ?? "base"} (same checks fail there)`,
       tone: "warning",
       needsYou: null,
@@ -69,13 +76,24 @@ function prPhrase(pr: TaskPrStatus): { text: string; tone: CardStatus["tone"]; n
   }
   if (pr.unresolvedThreads > 0) {
     return {
+      kind: "review-comments",
       text: `PR #${pr.number}: ${pr.unresolvedThreads} review comment${pr.unresolvedThreads === 1 ? "" : "s"} to address`,
       tone: "warning",
       needsYou: { reason: `PR #${pr.number} has review comments`, action: "open", actionLabel: "Address" },
     };
   }
-  if (pr.checks === "pending") return { text: `PR #${pr.number}: checks running`, tone: "info", needsYou: null };
+  if (pr.checks === "pending") return { kind: "checks-running", text: `PR #${pr.number}: checks running`, tone: "info", needsYou: null };
+  // No check has reported: that is not a pass, so it doesn't read as one.
+  if (pr.checks === "none") {
+    return {
+      kind: "no-checks",
+      text: `PR #${pr.number}: no checks reported — review it`,
+      tone: "warning",
+      needsYou: { reason: `PR #${pr.number} has no checks to go by`, action: "open-pr", actionLabel: "Review PR" },
+    };
+  }
   return {
+    kind: "review-pr",
     text: `PR #${pr.number}: checks pass — review and sign off`,
     tone: "success",
     needsYou: { reason: `PR #${pr.number} ready for your review`, action: "open-pr", actionLabel: "Review PR" },
@@ -86,29 +104,40 @@ function prPhrase(pr: TaskPrStatus): { text: string; tone: CardStatus["tone"]; n
  *  {@link QUIET_AFTER_MS} — or null. A live lab/E2E run reporting progress
  *  isn't quiet: a long test command legitimately produces no transcript. */
 export const QUIET_AFTER_MS = 20 * 60_000;
-function quietFor(task: Task, ctx: { now: number; progressActive?: boolean }): string | null {
+export function quietFor(task: Task, ctx: { now: number; progressActive?: boolean }): string | null {
   if (ctx.progressActive || task.lastActivityAt == null) return null;
   const ms = ctx.now - task.lastActivityAt;
   return ms >= QUIET_AFTER_MS ? formatAge(ms) : null;
 }
 
-function mergeStatus(pr: TaskPrStatus | null): CardStatus {
-  if (!pr) return { line: "Opening a PR so it can merge", tone: "info", needsYou: null };
+/** Which part of merging {@link mergePhrase} described. */
+export type MergePhraseKind = "opening-pr" | "pr-closed" | "draft" | "updating-branch" | "fixing-ci" | "base-failing" | "addressing-review" | "merging" | "waiting-ci";
+
+/** A Ready to Merge card in one sentence: the part of merging it is on. */
+export function mergePhrase(pr: TaskPrStatus | null): CardStatus & { kind: MergePhraseKind } {
+  if (!pr) return { kind: "opening-pr", line: "Opening a PR so it can merge", tone: "info", needsYou: null };
   const n = `PR #${pr.number}`;
   if (pr.state === "closed") {
-    return { line: `${n} was closed — can't merge`, tone: "danger", needsYou: { reason: `${n} was closed`, action: "open", actionLabel: "Open" } };
+    return { kind: "pr-closed", line: `${n} was closed — can't merge`, tone: "danger", needsYou: { reason: `${n} was closed`, action: "open", actionLabel: "Open" } };
   }
-  if (pr.draft) return { line: `${n} is a draft — can't merge`, tone: "warning", needsYou: { reason: `${n} is a draft`, action: "open-pr", actionLabel: "Open PR" } };
-  if ((pr.behindBy ?? 0) > 0) return { line: `${n}: updating from ${pr.baseRef ?? "base"}, then merging`, tone: "info", needsYou: null };
+  if (pr.draft) return { kind: "draft", line: `${n} is a draft — can't merge`, tone: "warning", needsYou: { reason: `${n} is a draft`, action: "open-pr", actionLabel: "Open PR" } };
+  if ((pr.behindBy ?? 0) > 0) return { kind: "updating-branch", line: `${n}: updating from ${pr.baseRef ?? "base"}, then merging`, tone: "info", needsYou: null };
   if (pr.checks === "failure") {
     const p = prPhrase(pr);
     return p.needsYou
-      ? { line: `${n}: CI failing — fixing before merge`, tone: "warning", needsYou: null }
-      : { line: `${n}: waiting on ${pr.baseRef ?? "base"} (same checks fail there)`, tone: "warning", needsYou: null };
+      ? { kind: "fixing-ci", line: `${n}: CI failing — fixing before merge`, tone: "warning", needsYou: null }
+      : { kind: "base-failing", line: `${n}: waiting on ${pr.baseRef ?? "base"} (same checks fail there)`, tone: "warning", needsYou: null };
   }
-  if (pr.unresolvedThreads > 0) return { line: `${n}: addressing review comments, then merging`, tone: "info", needsYou: null };
-  if (pr.checks === "success") return { line: `${n}: green — merging`, tone: "success", needsYou: null };
-  return { line: `${n}: merges when checks pass`, tone: "info", needsYou: null };
+  if (pr.unresolvedThreads > 0) return { kind: "addressing-review", line: `${n}: addressing review comments, then merging`, tone: "info", needsYou: null };
+  if (pr.checks === "success") return { kind: "merging", line: `${n}: green — merging`, tone: "success", needsYou: null };
+  return { kind: "waiting-ci", line: `${n}: merges when checks pass`, tone: "info", needsYou: null };
+}
+
+/** A PR closed without merging, on a card that is not in Ready to Merge or
+ *  Done: the card has no live PR, which is not the same as never having one. */
+export function closedPrStatus(pr: TaskPrStatus): CardStatus {
+  const n = `PR #${pr.number}`;
+  return { line: `${n} was closed without merging`, tone: "warning", needsYou: { reason: `${n} was closed without merging`, action: "open", actionLabel: "Open" } };
 }
 
 export function cardStatus(
@@ -152,7 +181,10 @@ export function cardStatus(
 
   // Ready to Merge: signed off — Agetor is working the PR to green and will
   // merge it (src/bun/merge-queue.ts). Say which part it's on.
-  if (task.column === "merge") return mergeStatus(pr);
+  if (task.column === "merge") {
+    const m = mergePhrase(pr);
+    return { line: m.line, tone: m.tone, needsYou: m.needsYou };
+  }
 
   // A roadmap step's card waiting in the backlog: its step and what it waits
   // on. The owner's ready steps are in the Needs you strip already (by
@@ -277,6 +309,7 @@ export function cardStatus(
       return { line: p.text, tone: p.tone, needsYou: task.column === "done" ? null : p.needsYou };
     }
     if (task.column === "done") return { line: headline || "Done", tone: "muted", needsYou: null };
+    if (pr?.state === "closed") return closedPrStatus(pr);
     // In Review is for a PR; a finished run without one needs one first.
     return {
       line: headline ? `No PR yet — ${headline}` : "Finished, but no PR yet",
@@ -305,6 +338,7 @@ export function cardStatus(
     const p = prPhrase(pr);
     return { line: p.text, tone: p.tone, needsYou: task.column === "done" ? null : p.needsYou };
   }
+  if (pr?.state === "closed" && task.column !== "done") return closedPrStatus(pr);
   if (task.column === "review") {
     return { line: "Finished — ready for review", tone: "success", needsYou: { reason: "finished", action: "open", actionLabel: "Review" } };
   }

@@ -469,7 +469,7 @@ test.describe("agent profile picker in the shared launch dialogs", () => {
 
     // Transcript: the injected "Agent instructions" block precedes the
     // issue-derived "Your task:" body.
-    await page.getByText(cardTitle, { exact: true }).first().click();
+    await page.getByText(cardTitle, { exact: true }).first().dblclick();
     const panel = runPanel(page);
     await expect(panel.locator("textarea")).toBeVisible({ timeout: CONVERGE_TIMEOUT });
     const instructionsBlock = panel.getByTestId("agent-instructions-block").first();

@@ -556,7 +556,7 @@ test.describe("@ file references", () => {
     }).toPass({ timeout: CONVERGE_TIMEOUT });
 
     await expect(taskCard(page, title)).toBeVisible({ timeout: CONVERGE_TIMEOUT });
-    await taskCard(page, title).click();
+    await taskCard(page, title).dblclick();
 
     const panel = runPanel(page);
     await expect(panel.locator("textarea").first()).toBeVisible({ timeout: CONVERGE_TIMEOUT });
@@ -573,7 +573,7 @@ test.describe("@ file references", () => {
     expect(startedTaskId, "the prior 'Start' scenario must have run first").toBeTruthy();
 
     await gotoApp(page, backend.bootBase);
-    await taskCard(page, startedTaskTitle).click();
+    await taskCard(page, startedTaskTitle).dblclick();
 
     const panel = runPanel(page);
     const textarea = panel.getByTestId("send-textarea");
@@ -618,7 +618,7 @@ test.describe("@ file references", () => {
     expect(startedTaskId, "the prior 'Start' scenario must have run first").toBeTruthy();
 
     await gotoApp(page, backend.bootBase);
-    await taskCard(page, startedTaskTitle).click();
+    await taskCard(page, startedTaskTitle).dblclick();
     const panel = runPanel(page);
     const textarea = panel.getByTestId("send-textarea");
     await expect(textarea).toBeVisible({ timeout: CONVERGE_TIMEOUT });
@@ -667,7 +667,7 @@ test.describe("@ file references", () => {
     expect(seeded.ok).toBe(true);
 
     await gotoApp(page, backend.bootBase);
-    await taskCard(page, startedTaskTitle).click();
+    await taskCard(page, startedTaskTitle).dblclick();
     const panel = runPanel(page);
     await panel.getByRole("button", { name: "Edit", exact: true }).first().click();
 
@@ -751,7 +751,7 @@ test.describe("@ file references", () => {
     createdTaskIds.push(task.id);
 
     await gotoApp(page, backend.bootBase);
-    await taskCard(page, title).click();
+    await taskCard(page, title).dblclick();
     const panel = runPanel(page);
     const textarea = panel.getByTestId("send-textarea");
     await expect(textarea).toBeVisible({ timeout: CONVERGE_TIMEOUT });

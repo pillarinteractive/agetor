@@ -249,21 +249,72 @@ The top bar's sun button (`keepScreenOn` preference, off by default) also keeps 
   description only if the PR fully resolves the issue, and `Refs #n` plus what's left otherwise. Merging a `Refs` PR
   leaves the issue open (see "Closing issues when their PR merges").
 
-## Knowing what each card is doing (`feat/board-clarity`)
+## Knowing what each card is doing (`feat/board-clarity`, `feat/pipeline-cards`)
 
-The status strip above the board (`SystemStrip`) and the filter row (`KanbanFilters`) are unmounted since 2026-10-13,
-ahead of a redesign of the cards and the card view. Both files remain. Search and the archived view were in the
-filter row, so the board has neither until the redesign.
+The board is still the main view: backlog and finished work stay on it, and nothing but a selected card opens beside
+it. Since `feat/pipeline-cards` every card keeps three things apart:
 
-- **Status line** under every card title (`src/mainview/lib/card-status.ts`): the step and how long it's been running,
-  what it waits on (lab, base-branch CI), the PR's state, or the result headline; ⓘ when it needs you.
-- **Needs you** (`src/mainview/components/kanban/NeedsYouBar.tsx`): a card that waits on the user says so on its own
-  status line. The strip at the top of the board is mounted with `roadmapOnly`, so it lists only Autopilot's roadmap
-  steps that wait on the user (they have no card) and is hidden when there are none. Its per-card entries and its
-  suggestion rows are still in the component but are not shown.
+| What | Where on the card | Comes from |
+| --- | --- | --- |
+| **Status**: where the card is in the workflow | the column | `task.column` |
+| **Step**: where its pipeline is | "Step **Build**", "· round 2" after a loop back, and a strip of segments | the run's active or stopped step, over the snapshot's graph |
+| **State**: what is happening now | the coloured band at the top: an icon and a label | the run, the PR, the leases, the wait queue |
+
+The state is never read from the column alone. A card in Running whose step is parked on CI says "Waiting on CI", not
+"Working"; a card in Blocked that the wait queue retries says "Auto retry", not "Needs you".
+
+- **`src/mainview/lib/card-state.ts`** (`cardState(task, { pr, lease, now, progressActive, roadmap })`) decides all of
+  it and is pure. Its precedence follows `cardStatus` (`card-status.ts`), whose sentences it reuses; the blocked
+  branches use the wait queue's helpers (`src/shared/block-wait.ts`) and `causeOf` (`board-health.ts`). It returns the
+  state, a label, an icon, one line of reason, the step, the strip, an elapsed time and the card's one action.
+- **Six colours, each with a label and an icon** so none depends on colour: green *Working*; blue for a wait that ends
+  by itself (*Waiting on CI*, *Waiting on command*, *Auto retry*, and Ready to Merge's *Opening PR*, *Updating
+  branch*, *Fixing CI*, *Merging*, *In merge train*); amber for the owner's move (*Needs input*, *Needs you*, *Step
+  cap*, *Quiet*, *Review PR*, *Review comments*, *Update branch*, *No PR yet*, *PR closed*, *Draft PR*); red *Failed*
+  and *CI failed*; purple *Merged*; grey *Queued*, *Dependency*, *Stopped*, *Done*. Amber and red cards carry the
+  colour on their border too. The values are the `--state-*` variables in `src/mainview/index.css`, for both themes.
+  Nothing on a card pulses or glows.
+- **The strip** has one segment per step of the run's snapshot, ordered from the start step along the edges; follow-up
+  steps have none. A segment is green only if it comes before the current step and has a succeeded execution, so after
+  a loop back the steps ahead read as to do again. No snapshot (a single-agent task, a run not started): no strip.
+- **Elapsed time** is shown only where the data has it: since the active step's latest start, or since a step was
+  parked in the wait queue. There is no "blocked for" time, no PR approval and no sign-off state: the board is not
+  told any of those, so the card does not show them.
+- **A task without a pipeline** is *Working* only while the server reports activity for it (`lastActivityAt`); in
+  Running without that it reads "No activity yet".
+- **The footer is one button or a name.** The button is the owner's next move: *Answer*, *Run*, *Retry <step>*,
+  *Resume <step>*, *Fix CI*, *Review PR*, *Inspect PR / CI / retry*, *Open dependency*, *Open*. With no move to make
+  the footer names the agent on the current step and the pipeline. *Retry* and *Resume* continue the step that
+  stopped (`POST /tasks/:id/pipeline/retry`, the same request as dropping a blocked card on Running); they never
+  restart the run. *Fix CI* starts the PR watcher's `pr:fix-ci` follow-up at once, without a confirmation, and is
+  offered only on a finished pipeline whose own checks fail (not ones the base branch fails too).
+- **A click selects a card** and opens the inspector under the board (`CardInspector.tsx`): Status, Step and State
+  as three chips, the step's own words in full, the retry schedule (`run.wait`, `run.autoRetry`, a held input), what
+  the PR watcher last saw and when, and the actions: the card's button, Retry or Resume step, **Restart pipeline…**
+  (asks first, in the run view's words), Stop, Inspect PR, Open run. Escape or its × closes it. A **double click**, or
+  Open run, opens the full view as a click used to. Keyboard: Tab to a card, Enter or Space selects it, Tab reaches
+  its button.
+- **Columns** are lanes with a count and a summary of their cards' states ("3 need you · 1 failed · 3 waiting"). The
+  board shows "In review" and "Merge queue" for the columns the rest of this file, the CLI and the server call In
+  Review and Ready to Merge (`src/mainview/lib/column-labels.ts`); the ids (`review`, `merge`) are unchanged. Columns
+  narrow to 11.5rem, then the board scrolls sideways.
+- **Search and View** are in the top bar: the search box (Cmd/Ctrl+F; title, prompt, workdir, branch, PR number) and
+  a View menu (Active / All / Archived). The status strip (`SystemStrip`) and the filter row (`KanbanFilters`), with
+  the repo, harness, type and status filters, are deleted; `board-health.ts` stays for `causeOf` and `whyStopped`.
+- **Two PR sentences changed** (`card-status.ts`): a PR with no check runs no longer reads "checks pass", and a card
+  whose PR was closed without merging says so instead of "no PR yet".
+- **Needs you** (`src/mainview/components/kanban/NeedsYouBar.tsx`) is untouched and still not mounted on the board:
+  a card that waits on the owner says so in its own state band.
 - **Activity** timeline in the run view (`src/bun/activity.ts`): steps derived from the run's history, plus PR, CI,
   review, merge, lease and auto-fix events appended to `<dataDir>/activity/<taskId>.jsonl` as they happen.
-- The run view header leads with the card's title; a step's panel strip names the card it belongs to.
+- The run view header leads with the card's title; a step's panel strip names the card it belongs to. The run view
+  and the run panel themselves are unchanged.
+
+**Trying the cards without a core.** `bun run hmr`, then open `http://localhost:5173/fixtures/board.html`
+(`?theme=dark`, `?case=long`, `?case=backlog`, `?select=t845`): every state through the real components from made-up
+data (`src/mainview/fixtures/`). The page imports no API client and its buttons only report what they stood for. It
+is not an entry of `vite build`, so it is not in the packaged app. `e2e/board-fixtures.spec.ts` runs against it with
+no backend; set `BOARD_SHOTS_DIR` to keep its screenshots.
 
 ## Orchestrator suggestions, layer 1 (`feat/suggestions`)
 
