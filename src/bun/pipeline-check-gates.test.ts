@@ -404,13 +404,24 @@ test("a started run adopts the gate only on an explicit refresh, and drops it th
   expect(await runner.adoptPipelineGates(card.id)).toEqual({ publish: true, steps: true, changed: true });
   expect(runOf(card.id).snapshot!.gates).toEqual({ publish: true, steps: true });
 
-  // Adopted, the stopped Build is retried: its next turn is judged by the checks, and its missing handoff is composed.
+  // Adopted — but the Build that is stopped was launched without the gate: retried, it is settled as before.
   gateOn(card.pipeline.name, [card.id]);
   await runner.adoptPipelineGates(card.id);
-  const retried = await runner.retryPipelineStep(card.id, { taskId: visits(runOf(card.id), card.build)[0]!.taskId });
+  const old = visits(runOf(card.id), card.build)[0]!;
+  const retried = await runner.retryPipelineStep(card.id, { taskId: old.taskId });
   expect("error" in retried).toBe(false);
+  await waitFor(() => (runs.listForTask(old.taskId).length >= 3 && runOf(card.id).status === "blocked" ? true : null), "the retried Build to stop again");
+  expect(runOf(card.id).blocked.map((b) => b.kind)).toEqual(["handoff-missing"]);
+  expect(visits(runOf(card.id), card.build)[0]!.gate).toBeUndefined();
+  expect(timesRun(counter)).toBe(0);
+
+  // The step's next launch is under the gate: its missing handoff is composed once its check passes.
+  const advanced = await runner.advancePipeline(card.id, { nextStepIds: [card.build.id] });
+  expect("error" in advanced).toBe(false);
   const done = await settled(card.id, "done");
-  expect(visits(done, card.build)[0]).toMatchObject({ outcome: "succeeded", gate: { state: "passed", composed: true } });
+  const launched = visits(done, card.build)[1]!;
+  expect(launched).toMatchObject({ outcome: "succeeded", gate: { state: "passed", composed: true } });
+  expect(tasks.get(launched.taskId)!.prompt).toContain("## Step goal\n\nWhat must be true when this step ends: Committed.");
   expect(timesRun(counter)).toBe(1);
 }, 90_000);
 

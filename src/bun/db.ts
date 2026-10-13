@@ -587,12 +587,12 @@ const sanitizeStepReminder = (raw: unknown): NonNullable<PipelineStepRecord["rem
   };
 };
 
-const STEP_GATE_STATES = new Set<string>(["checking", "feedback", "passed", "exhausted", "owner"]);
+const STEP_GATE_STATES = new Set<string>(["working", "checking", "feedback", "passed", "exhausted", "owner"]);
 
 /** {@link PipelineStepRecord.gate} — where a gated visit stands. A malformed
- *  one collapses to absent: the visit's feedback turns are then counted from
- *  zero again, which costs at most a few extra turns and never skips a check
- *  (the checks themselves are recomputed from the worktree every time). */
+ *  one collapses to absent, and the visit is then settled on its handoff as
+ *  a visit launched without the gate is; the step's next launch is judged
+ *  by its checks again. */
 const sanitizeStepGate = (raw: unknown): PipelineStepRecord["gate"] => {
   if (!isPlainObject(raw)) return undefined;
   const { state, turns, max, failed, at, composed } = raw as Record<string, unknown>;

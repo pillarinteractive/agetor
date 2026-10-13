@@ -546,13 +546,16 @@ export interface CheckLedgerEntry {
   outputPath: string | null;
 }
 
-/** Where one visit of a gated step stands (`PipelineStepRecord.gate`). */
+/** Where one visit of a gated step stands (`PipelineStepRecord.gate`). Set
+ *  when the visit is launched under the gate: a visit launched without it is
+ *  never judged by checks, whatever the run adopts afterwards. */
 export interface PipelineStepGateState {
-  /** checking — Agetor is running the checks; feedback — a failed check went
-   *  back to the step and its turn is running; passed; exhausted — still
-   *  failing after its turns, ended for one fresh session; owner — waiting
-   *  for the owner. */
-  state: "checking" | "feedback" | "passed" | "exhausted" | "owner";
+  /** working — launched under the gate, its first turn is running; checking
+   *  — Agetor is running the checks; feedback — a failed check went back to
+   *  the step and its turn is running; passed; exhausted — still failing
+   *  after its turns, ended for one fresh session; owner — waiting for the
+   *  owner. */
+  state: "working" | "checking" | "feedback" | "passed" | "exhausted" | "owner";
   /** Check-feedback turns delivered in this visit. */
   turns: number;
   /** Turns the visit may take (`PipelineStep.maxTurns` when it was judged). */

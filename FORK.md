@@ -672,6 +672,121 @@ woken when the wait finished (the run recorded `step-blocked`, and only `await` 
 now woken like any other when its own CI waits finish, while the wait queue — not the owner — holds it
 (`ciBlockedAwaits`, `src/bun/awaits.ts`). This one applies with the switch off.
 
+## Checks on working steps (`feat/check-gates-stage-2`)
+
+Stage 2 of `docs/plans/check-gated-pipeline.md`. **Off unless switched on.** For a card it covers, a step with a
+gate is finished when checks Agetor runs itself pass — not when its agent's handoff says so. When the step's turn
+ends its checks are run on the card's worktree; a required check that fails goes back to the **same step, in its own
+session**, as another turn that carries the failure. `src/shared/checks.ts` is the pure half (the model, the order,
+the verdict, the words), `src/bun/check-runner.ts` runs the checks and keeps the ledger, and `settleStepRun`
+(`src/bun/pipeline-runner.ts`) decides what a result does to the run.
+
+**What a gated step's turn end does**
+
+| The turn ended with | Required checks | Then |
+| --- | --- | --- |
+| a handoff | all pass | the run advances by the graph, as before |
+| a handoff | one fails | the handoff is void; the step gets a check-feedback turn (`sendInput` into its session): the step's goal, each failed check's id, description, exit code and the last 60 lines of its output, the log's path, and the handoff contract again |
+| no handoff, before its one reminder | not run yet | the reminder, as before |
+| no handoff, after the reminder | all pass | **the run advances** with a handoff Agetor composes (below). The card is never blocked for a missing handoff when its checks pass |
+| no handoff, after the reminder | one fails | a check-feedback turn, as above |
+| a `blocked` handoff, a question, an `agetor-await` | not run | as before: the wait queue, the owner, the await |
+
+- **A feedback turn is not a launch.** Same step task, same session, same history record: `run.stepCount` does not
+  move, so it costs nothing against the step cap, and the execution keeps the slot it had (it stays `active` with no
+  block, which is what `slotUse` counts). The record's `gate` says where the visit stands
+  (`working → checking → feedback → passed`, `turns`, `max`, `failed`), and the card reads "Fixing checks — back in Build to fix
+  failed checks: tree-clean · check-feedback turn 1 of 2".
+- **`maxTurns`** feedback turns per visit (step field, 0..5, default 2). Still failing after them: the visit ends
+  (`outcome: "failed"`, `gate.state: "exhausted"`) and the step is launched **once more in a fresh session**, with the
+  failures as its arrival — that is one real launch and counts as a step. If the fresh session's turns run out too,
+  the run blocks with kind `check-failed` for the owner. Retry gives the step a turn and a new allowance of
+  `maxTurns`; Advance moves on and writes one `waived` line per failing check in the ledger.
+- **A check that could not be evaluated** (git did not answer, GitHub unreadable, a required check still running, a
+  command that could not be started) is `halt`: no turn is spent on the step, the run blocks `check-failed` at once.
+- **The composed handoff** is marked in `purpose`, `summary` and `reason` with
+  `[Composed by Agetor — not written by the step's agent]`; the summary names the checks that passed and quotes the
+  step's last two messages (the end of them, 4,000 characters at most); `next` is the step's one way forward. It is
+  only composed where there is one way forward (Build). A Review is never advanced this way: with no handoff there is
+  no verdict, `review-verdict` fails, and it costs a same-step turn. `gate.composed` is set on the record.
+- **Not gated:** a follow-up step, the writer's turn of an Agetor-run Finish, and the wrap-up at the step cap.
+- **Review findings still route to Build.** `review-verdict` passes for "changes-requested" as long as the verdict
+  names HEAD: that is a judgement, and the run follows it. What stopped is going round Build → Review → Finish for a
+  dirty tree, a missing commit or an approval of another head.
+
+**The checks.** A step's `checks` is a list of
+
+```json
+{"id": "unit", "description": "The unit tests pass.", "run": {"kind": "command", "command": "make unit"},
+ "dependsOn": ["tree-clean"], "skipWhen": "unchanged-since-pass", "required": true, "timeoutSec": 120}
+```
+
+`run` is `{"kind":"builtin","name":…}` or `{"kind":"command","command":…}` (`sh -c` in the card's worktree, exit 0
+passes, killed at `timeoutSec`, 600 at most; its whole output is saved beside the ledger). `dependsOn`: runs only
+after those passed. `skipWhen: "unchanged-since-pass"`: a recorded pass for the same HEAD, tree, base tip and
+definition is not run again. `required: false`: reported, never gates. The built-ins:
+
+| Built-in | Passes when | Reads |
+| --- | --- | --- |
+| `tree-clean` | no uncommitted change to a tracked file | `git status --porcelain --untracked-files=no` |
+| `diff-nonempty` | HEAD has a commit the base does not | `git rev-list --count origin/<base>..HEAD` (the base as last fetched; nothing is fetched) |
+| `review-verdict` | the turn's handoff has `reviewApproval`, its `headSha` is HEAD, and "approved" has no findings and complete acceptance | the handoff and `git rev-parse HEAD`; the ledger records HEAD's tree |
+| `head-approved` | HEAD is the head the run's last finished Review approved | the run's history |
+| `merges-with-base` | `git merge-tree` of HEAD and the base has no conflict | local refs only |
+| `head-published` | `origin/<branch>` is at HEAD | `git ls-remote` |
+| `pr-required-check` | the PR's `required` check (the whole set without one) passed for HEAD; not applicable with no PR; still running → `halt` | GitHub, read-only |
+
+**Defaults.** A step that declares no `checks` gets, in a reviewed pipeline (Build → Review → Finish,
+`reviewedPipelineShape`): **Build** `tree-clean` + `diff-nonempty`; **Review** `tree-clean` + `review-verdict`. Every
+other step has no gate; `"checks": []` on a step says "no gate" on purpose. No test suite, linter, type checker or
+build is a default, and none runs on this Mac unless a pipeline declares a command check.
+
+**The prompt.** A gated step's prompt gets `## Step goal` (the step's `goal`, when it has one) before `## Your step`,
+and `## Checks this step must pass` after it: one line per check with its description. Writing `{{checks}}` in the
+step's instructions puts the list there instead. With the gate off the prompt is byte for byte what it was.
+
+**The ledger** is `<data dir>/pipeline-runs/<card>/checks-<generation>.jsonl`: one line per check per evaluation
+(step, visit `seq`, evaluation `turn`, outcome `pass`/`fail`/`skip`/`halt`/`waived`, the key — HEAD, tree, base tip,
+definition hash — exit code, detail, output tail, log path). Append-only and written only by the core. It is a file
+so a build that does not know checks cannot erase it; it is only ever *trusted* to skip a `skipWhen` check — every
+built-in is recomputed. `GET /tasks/:id/pipeline/checks` returns it, and the run view's Checks tab lists the
+selected step's rows under "Recorded while … was executing".
+
+**The switch** is the same `pipeline_gates` preference as Finish, under its own key:
+
+```json
+{"steps": {"pipelines": ["Change"], "cards": ["<task id>", "<task id>"]}}
+```
+
+Both gates at once: `{"publish": {"pipelines": ["Change"], "cards": […]}, "steps": {"pipelines": ["Change"], "cards": […]}}`.
+The semantics are those of `publish`: `pipelines` (names or ids) turns it on, `cards` is the trial list (remove it
+to cover every card of those pipelines), and a card is covered when its run *adopted* the gate
+(`run.snapshot.gates.steps`) **and** the preference still names it.
+- A run adopts when it starts. A started run adopts only on an explicit refresh — `POST /pipelines/:id/refresh-runs`
+  or `POST /tasks/:id/pipeline/refresh-instructions` with `{"gates": true}` (`adoptPipelineGates`, which now answers
+  `{publish, steps, changed}`). That refresh also copies each step's `goal`, `checks` and `maxTurns` from the template
+  onto the run (never its text). It takes effect at each step's next launch: a visit already launched — running,
+  or stopped on a block — keeps the loop it was launched with, also when it is retried (its record has no `gate`).
+- Taking a card or the pipeline out of the preference works at once, with no refresh.
+
+**Editing a step's gate.** The step panel of the pipeline editor shows a step's goal, checks and turns read-only
+(`pipeline-step-gate`). They are edited through the pipeline's JSON for now: `PATCH /pipelines/:id` with the whole
+`graph`, each step carrying `goal`, `checks`, `maxTurns` as wanted. `validatePipelineGraph` keeps them (and rejects a
+duplicate id, an unknown built-in, an empty command, a dependency cycle, a timeout over 600); the editor's own saves
+preserve them because it sends back the step objects it loaded.
+
+**To trial it:** set the preference with two or three card ids, call `refresh-runs` with `{"gates": true}`, and watch
+for "did not pass its checks … sent back to Build in its own session" and "moving on with a handoff composed by
+Agetor" on the cards' timelines. Compare `agetor blocks` for `handoff-missing` and launches per merged card. To back
+out: remove `steps` from the preference. After a rollback to a build without this, a `check-failed` block is
+dropped by that build's reader (the step then reads as running with nothing live until the unsettled-step sweep
+settles it the old way), a record's `gate` is dropped, and the ledger file is left alone.
+
+Not done here: `Retry` does not re-run the checks before giving the step a turn (it gives a turn, then they run);
+position resolution, rewind and steer are Stage 3; the card's strip still colours a segment by a succeeded
+execution; `Review → Build` has no default `maxTraversals`; a `blocked` handoff is honoured as before without its
+checks being run.
+
 ## Priority cards (`feat/priority-cards`)
 
 `src/bun/priority.ts`: "Make priority (run now)" in a card's right-click menu, or `PUT /tasks/:id/priority` with

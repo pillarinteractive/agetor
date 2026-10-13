@@ -2412,7 +2412,12 @@ async function launchStep(
   });
 
   run.active.push({ stepId: step.id, taskId: childId, seq });
-  run.history.push({ seq, stepId: step.id, taskId: childId, startedAt: now, endedAt: null, outcome: null, handoff: null, nextStepIds: [] });
+  run.history.push({
+    seq, stepId: step.id, taskId: childId, startedAt: now, endedAt: null, outcome: null, handoff: null, nextStepIds: [],
+    // Launched under the gate, with the roster in its prompt: only such a
+    // visit is judged by checks when its turn ends.
+    ...(stepChecks ? { gate: { state: "working" as const, turns: 0, max: stepChecks.maxTurns, failed: [], at: now } } : {}),
+  });
   // The agent execution an Agetor-run Finish visit ends in (`publishVisitOver`).
   if (run.publish && run.publish.stepId === step.id && (run.publish.state === "write" || run.publish.state === "agent") && run.publish.seq === undefined) {
     run.publish.seq = seq;
@@ -4076,8 +4081,10 @@ async function settleStepRun(
       // handoff says so. Never for the writer of an Agetor-run Finish (CI
       // already decided that visit) or the wrap-up at the step cap (it
       // publishes what there is).
+      // Only a visit that was launched under the gate (`gate` on its record):
+      // adopting gates never switches a step that is already under way.
       const stepObj = graph.steps.find((s) => s.id === activeEntry.stepId);
-      const gate = stepObj && run.publish?.seq !== activeEntry.seq && run.capWrapUp?.seq !== activeEntry.seq
+      const gate = stepObj && historyEntry?.gate && run.publish?.seq !== activeEntry.seq && run.capWrapUp?.seq !== activeEntry.seq
         ? stepGateFor(parent, run, stepObj) : null;
       /**
        * Judge the turn by the gate. `return`: the settle ends here — with the
