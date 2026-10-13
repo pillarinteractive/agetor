@@ -71,6 +71,10 @@ const {
   parseImportFlags,
   parseAdvanceFlags,
   parseRetryFlags,
+  parseRestartFlags,
+  parseRewindFlags,
+  parseFeedbackFlags,
+  pipelinePositionLines,
   resolveStepRef,
   resolveActiveStepRef,
   resolveImportProfiles,
@@ -1389,6 +1393,111 @@ test("cmdPipeline restart --json: prints the raw { runId, pending? } response", 
   currentClient = makeClient({ listTasks: async () => [task()], restartPipeline: async () => res });
   await cmdPipeline(["restart", "parent-1"], jsonFlags);
   expect(jsonOutputs).toEqual([res]);
+});
+
+// ── restart as resume, position, rewind, feedback (check gates, Stage 3) ──
+
+test("parseRestartFlags: --from-scratch, nothing, and a typo that must not pick the other restart", () => {
+  expect(parseRestartFlags([])).toEqual({ fromScratch: false });
+  expect(parseRestartFlags(["--from-scratch"])).toEqual({ fromScratch: true });
+  expect(() => parseRestartFlags(["--from-scrach"])).toThrow(/usage: agetor pipeline restart/);
+});
+
+test("cmdPipeline restart: sends fromScratch only when asked, and says where a gated run resumed", async () => {
+  const calls: unknown[] = [];
+  currentClient = makeClient({
+    listTasks: async () => [task()],
+    restartPipeline: async (id: string, opts?: { fromScratch?: boolean }) => {
+      calls.push([id, opts]);
+      return opts?.fromScratch
+        ? { runId: "run-2" }
+        : { runId: "run-1", resumed: { stepId: "s2", stepName: "Review", why: "Review has not finished in this run", kept: [{ stepId: "s0", stepName: "Understand" }, { stepId: "s1", stepName: "Build" }] } };
+    },
+  });
+  await cmdPipeline(["restart", "parent-1"], flags);
+  expect(outputs[0]).toContain("resumed pipeline");
+  expect(outputs[0]).toContain("Review");
+  expect(outputs[0]).toContain("Review has not finished in this run");
+  expect(outputs[1]).toContain("kept, not run again: Understand, Build");
+  expect(outputs[1]).toContain("agetor pipeline restart parent-1 --from-scratch");
+  await cmdPipeline(["restart", "parent-1", "--from-scratch"], flags);
+  expect(outputs[2]).toContain("restarted pipeline");
+  expect(calls).toEqual([["parent-1", { fromScratch: false }], ["parent-1", { fromScratch: true }]]);
+});
+
+test("parseRewindFlags: --to is required, given once, and nothing else is accepted", () => {
+  expect(parseRewindFlags(["--to", "Review"])).toEqual({ to: "Review" });
+  for (const bad of [[], ["--to"], ["Review"], ["--to", "Review", "--to", "Build"], ["--to", "Review", "--force"]]) {
+    expect(() => parseRewindFlags(bad)).toThrow(/usage: agetor pipeline rewind|needs a value/);
+  }
+});
+
+test("cmdPipeline rewind: resolves the step by name against the run's graph and reports what is void and what git still holds", async () => {
+  const sent: unknown[] = [];
+  currentClient = makeClient({
+    listTasks: async () => [task({ pipelineRun: pipelineRun() })],
+    rewindPipeline: async (id: string, body: { stepId: string }) => {
+      sent.push([id, body]);
+      return { task: task(), stepId: "s2", stepName: "Fix", voided: ["Fix"], stopped: ["Fix"], unpushed: { count: 2, head: "a".repeat(40), remoteHead: null } };
+    },
+  });
+  await cmdPipeline(["rewind", "parent-1", "--to", "fix"], flags);
+  expect(sent).toEqual([["parent-1", { stepId: "s2" }]]);
+  expect(outputs[0]).toContain("rewound pipeline");
+  expect(outputs[0]).toContain("void: Fix");
+  expect(outputs[1]).toContain("stopped: Fix");
+  expect(outputs[2]).toContain("git is untouched — 2 commits not on the remote stay where they are");
+  await expect(cmdPipeline(["rewind", "parent-1", "--to", "Nope"], flags)).rejects.toThrow(/unknown step "Nope"/);
+  await expect(cmdPipeline(["rewind", "parent-1"], flags)).rejects.toThrow(/usage: agetor pipeline rewind/);
+  expect(sent).toHaveLength(1);
+});
+
+test("parseFeedbackFlags: --from and exactly one of --note / --note-file", () => {
+  expect(parseFeedbackFlags(["--from", "Build", "--note", "use the helper"])).toEqual({ from: "Build", note: "use the helper", invalidate: false });
+  expect(parseFeedbackFlags(["--note-file", "-", "--invalidate", "--from", "Build"])).toEqual({ from: "Build", noteFile: "-", invalidate: true });
+  for (const bad of [[], ["--from", "Build"], ["--note", "x"], ["--from", "Build", "--note", "x", "--note-file", "f"], ["--from", "Build", "--note", "x", "--void"]]) {
+    expect(() => parseFeedbackFlags(bad)).toThrow(/usage: agetor pipeline feedback/);
+  }
+});
+
+test("cmdPipeline feedback: sends the note to the named step; invalidate only when asked; an empty note is refused before anything is sent", async () => {
+  const sent: unknown[] = [];
+  currentClient = makeClient({
+    listTasks: async () => [task({ pipelineRun: pipelineRun() })],
+    sendPipelineFeedback: async (id: string, body: { fromStepId: string; note: string; invalidate?: boolean }) => {
+      sent.push([id, body]);
+      return { task: task(), stepId: "s1", stepName: "Investigate", voided: body.invalidate ? ["Investigate", "Fix"] : [], stopped: [], unpushed: { count: 0, head: null, remoteHead: null }, feedbackId: "f1", invalidated: body.invalidate === true };
+    },
+  });
+  await cmdPipeline(["feedback", "parent-1", "--from", "Investigate", "--note", "  look at the retry path  "], flags);
+  await cmdPipeline(["feedback", "parent-1", "--from", "s1", "--note", "again", "--invalidate"], flags);
+  expect(sent).toEqual([
+    ["parent-1", { fromStepId: "s1", note: "look at the retry path" }],
+    ["parent-1", { fromStepId: "s1", note: "again", invalidate: true }],
+  ]);
+  expect(outputs[0]).toContain("a refinement: earlier results stand");
+  expect(outputs.some((o) => o.includes("void: Investigate, Fix"))).toBe(true);
+  await expect(cmdPipeline(["feedback", "parent-1", "--from", "s1", "--note", "   "], flags)).rejects.toThrow(/the note is empty/);
+  expect(sent).toHaveLength(2);
+});
+
+test("pipelinePositionLines / cmdPipeline position: what is kept, where it resumes, and what a run without gates says", async () => {
+  const view = {
+    gated: true, line: "Resumes at Fix — Fix has not finished in this run; Investigate is still satisfied and is not run again",
+    position: { kind: "step" as const, stepId: "s2", why: "Fix has not finished in this run", arrivals: [], satisfied: [{ stepId: "s1", seq: 1, why: "finished as step 1; its handoff is kept" }], path: ["s1", "s2"] },
+    steps: [{ id: "s1", name: "Investigate", reached: true }, { id: "s2", name: "Fix", reached: true }],
+  };
+  const text = pipelinePositionLines(view).join("\n");
+  expect(text).toContain("Resumes at Fix");
+  expect(text).toContain("Investigate");
+  expect(text).toContain("step 1 — finished as step 1; its handoff is kept");
+  expect(text).toContain("can be rewound or sent feedback to: Investigate, Fix");
+  expect(pipelinePositionLines({ gated: false, position: null, line: null, steps: [] }).join("\n")).toContain("no check gates");
+
+  currentClient = makeClient({ listTasks: async () => [task()], getPipelinePosition: async () => view });
+  await cmdPipeline(["position", "parent-1"], jsonFlags);
+  expect(jsonOutputs).toEqual([view]);
+  await expect(cmdPipeline(["position"], flags)).rejects.toThrow(/usage: agetor pipeline position/);
 });
 
 // ── cmdPipeline: status (task-scoped) ────────────────────────────────────

@@ -49,6 +49,8 @@ export interface RunPageProps {
   onStop: () => void;
   onRestart: () => void;
   onAdvance: (fromTaskId: string | null, nextStepIds: string[] | null, handoff?: Partial<Handoff>) => void;
+  /** For a run with check gates: its position and the owner's ways to reopen it. */
+  reopen?: Parameters<typeof HoldAside>[0]["reopen"];
   onViewChanges?: () => void;
   initialStepId?: string | null;
   initialTab?: StepTab;
@@ -178,6 +180,7 @@ export function RunPage(props: RunPageProps) {
               onOpenTask={props.onOpenTask}
               onRestart={props.onRestart}
               onAdvance={props.onAdvance}
+              reopen={props.reopen}
             />
           </div>
         </div>

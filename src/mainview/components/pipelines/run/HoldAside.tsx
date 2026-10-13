@@ -8,7 +8,9 @@ import { hasLiveExecution, type AdvanceTarget, type ExecutionSummary, type Recov
 import { StateBadge } from "@/components/kanban/StateBadge";
 import { recoveryNote, retrySchedule } from "@/components/kanban/CardInspector";
 import type { Handoff, PipelineGraph, PipelineRunState, Task, TaskPrStatus } from "../../../../shared/types.ts";
+import { reopenChoices, resumeOffer, type PipelinePositionView } from "../../../../shared/position.ts";
 import { AdvanceForm } from "./AdvanceForm";
+import { ReopenForms } from "./ReopenForms";
 import { InfoRow, PANEL, SUB } from "./parts";
 
 /** Who has to act for the run to move, in a word or two. */
@@ -48,6 +50,7 @@ export function HoldAside({
   onOpenTask,
   onRestart,
   onAdvance,
+  reopen,
 }: {
   task: Task;
   run: PipelineRunState | null;
@@ -65,6 +68,14 @@ export function HoldAside({
   onOpenTask: (t: Task) => void;
   onRestart: () => void;
   onAdvance: (fromTaskId: string | null, nextStepIds: string[] | null, handoff?: Partial<Handoff>) => void;
+  /** A run with check gates: where it stands, and the owner's ways to reopen
+   *  it from a step. Absent for every other run, which shows what it did. */
+  reopen?: {
+    view: PipelinePositionView;
+    onRewind: (stepId: string) => void;
+    onFeedback: (fromStepId: string, note: string, invalidate: boolean) => void;
+    onRestartFromScratch: () => void;
+  };
 }) {
   const [showGoal, setShowGoal] = useState(false);
   // Which Advance form is open. None is by default: advancing is never a default.
@@ -79,6 +90,9 @@ export function HoldAside({
   const executing = run ? run.active.filter((a) => steps.find((t) => t.id === a.taskId)?.column === "running").length : 0;
   const candidates = (graph?.steps ?? []).map((s) => ({ value: s.id, label: s.name }));
   const awaiting = controls.advance.filter((a) => a.key.startsWith("review:"));
+  // Only a run with check gates has a position to restart from or steps to reopen.
+  const choices = reopen?.view.gated ? reopenChoices(reopen.view) : [];
+  const offer = resumeOffer(reopen?.view);
   const target = (a: AdvanceTarget) => (
     <div key={a.key} data-testid="pipeline-run-advance-target">
       <Button
@@ -216,14 +230,40 @@ export function HoldAside({
         )}
       </div>
 
-      {(controls.restart || controls.advance.length > 0) && (
+      {(controls.restart || controls.advance.length > 0 || choices.length > 0) && (
         <details data-testid="pipeline-run-advanced" className="mt-4 border-t border-board-line pt-3">
           <summary className="cursor-pointer rounded text-xs font-semibold text-foreground focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring">Advanced run controls</summary>
           <p className={cn(SUB, "mt-2")}>
-            These are not retries. Advancing overrides the pipeline's routing: you choose what runs next. Restarting starts a fresh run from the first step and clears this run's history. Each asks before it does anything.
+            These are not retries. Advancing overrides the pipeline's routing: you choose what runs next.{" "}
+            {reopen?.view.gated
+              ? "This run has check gates: restarting resumes at the first step whose checks do not hold now and keeps the history; from the beginning is a separate choice that clears it. Rewinding and feedback reopen the run from a step you pick."
+              : "Restarting starts a fresh run from the first step and clears this run's history."}{" "}
+            Each asks before it does anything.
           </p>
+          {reopen?.view.gated && reopen.view.line && (
+            <p data-testid="pipeline-run-position" className={cn(SUB, "mt-1.5 [overflow-wrap:anywhere]")}>
+              {reopen.view.line}
+            </p>
+          )}
           <div className="mt-2.5 flex flex-col gap-2">
             {controls.advance.map(target)}
+            {controls.restart && offer && (
+              <div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  data-testid="pipeline-run-resume"
+                  disabled={busy}
+                  title={`Run ${offer.stepName} and what follows; ${offer.kept.join(", ")} ${offer.kept.length === 1 ? "is" : "are"} kept — asks first`}
+                  onClick={onRestart}
+                  className="h-7 gap-1 px-2.5 text-[11px]"
+                >
+                  <RotateCcw className="size-3" aria-hidden />
+                  Restart from {offer.stepName}…
+                </Button>
+              </div>
+            )}
             {controls.restart && (
               <div>
                 <Button
@@ -233,14 +273,15 @@ export function HoldAside({
                   data-testid="pipeline-run-restart"
                   disabled={busy}
                   title="Start the pipeline again from its first step — asks first"
-                  onClick={onRestart}
+                  onClick={reopen?.view.gated ? reopen.onRestartFromScratch : onRestart}
                   className="h-7 gap-1 px-2.5 text-[11px]"
                 >
                   <RotateCcw className="size-3" aria-hidden />
-                  Restart pipeline…
+                  {reopen?.view.gated ? "Restart from the beginning…" : "Restart pipeline…"}
                 </Button>
               </div>
             )}
+            {reopen && choices.length > 0 && <ReopenForms choices={choices} busy={busy} onRewind={reopen.onRewind} onFeedback={reopen.onFeedback} />}
           </div>
         </details>
       )}

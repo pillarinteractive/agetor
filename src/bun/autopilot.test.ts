@@ -1218,6 +1218,88 @@ test("sign-off: a card the user moved is left alone — signed off by hand, or t
   }
 });
 
+// Card #816: taken back from Ready to Merge (and held by the merge queue)
+// during one run, then restarted; the fresh run finished at a new approved
+// head and the card still sat in In Review, because the mark had no end.
+test("sign-off: a taken-back sign-off is about one run at one head — a new run finishing at a new head is signed off again", async () => {
+  const { signOffPass } = await import("./autopilot.ts");
+  const { signOffMarkLapsed } = await import("../shared/autopilot.ts");
+  const mark = { run: 1000, head: "aaa" };
+  const cases: [string, Parameters<typeof signOffMarkLapsed>[0], Parameters<typeof signOffMarkLapsed>[1], boolean][] = [
+    ["the same run, the same head", mark, { run: 1000, done: true, head: "aaa" }, false],
+    ["the same run, a head an automatic fix round pushed", mark, { run: 1000, done: true, head: "bbb" }, false],
+    ["a new run that changed nothing", mark, { run: 2000, done: true, head: "AAA" }, false],
+    ["a new run still going", mark, { run: 2000, done: false, head: "bbb" }, false],
+    ["a new run, finished at a new head", mark, { run: 2000, done: true, head: "bbb" }, true],
+    ["the same run, reopened by the owner, finished at a new head", { ...mark, reopened: true }, { run: 1000, done: true, head: "bbb" }, true],
+    ["the same run, reopened, the same head", { ...mark, reopened: true }, { run: 1000, done: true, head: "aaa" }, false],
+    ["a mark that recorded no run", { run: null, head: "aaa" }, { run: 2000, done: true, head: "bbb" }, false],
+    ["a mark that recorded no head", { run: 1000, head: null }, { run: 2000, done: true, head: "bbb" }, false],
+    ["no head to compare with now", mark, { run: 2000, done: true, head: null }, false],
+  ];
+  for (const [name, m, now, want] of cases) expect([name, signOffMarkLapsed(m, now)]).toEqual([name, want]);
+
+  const card = (startedAt: number) => reviewCard("c12", 12, { pipelineRun: { ...handoffRun(), startedAt } });
+  const released: string[] = [];
+  const deps = (head: string, marks: { run: number | null; head: string | null }[]) => signOffDeps({ c12: ["apps/web/src/lib/fleet/nodes.ts"] }, { c12: prOf(81, head) }, {
+    handsOff: () => new Set(released.includes("c12") ? [] : ["c12"]), handsOffMarks: () => marks, releaseHandsOff: (id) => void released.push(id),
+  });
+
+  // The run the sign-off was taken back in: left alone, as before.
+  const same = deps("aaa", [mark]);
+  await signOffPass(await roadmapState(), [card(1000)], same.deps);
+  expect(same.log).toMatchObject({ signedOff: [], activity: [], lookups: 0 });
+  expect(released).toEqual([]);
+
+  // Two marks (the user's and the merge queue's): one still standing keeps it.
+  const two = deps("bbb", [mark, { run: 2000, head: "bbb" }]);
+  await signOffPass(await roadmapState(), [card(2000)], two.deps);
+  expect(two.log.signedOff).toEqual([]);
+  expect(released).toEqual([]);
+
+  // A new run finished at a new head: the marks are forgotten and the card
+  // is signed off like any other.
+  const fresh = deps("bbb", [mark, { run: 1000, head: "aaa" }]);
+  await signOffPass(await roadmapState(), [card(2000)], fresh.deps);
+  expect(released).toEqual(["c12"]);
+  expect(fresh.log.signedOff).toEqual(["c12"]);
+  expect(fresh.log.activity[0]).toContain("taken back during an earlier run");
+});
+
+test("sign-off: taking a sign-off back records the run and head it is about; the merge queue's hold does too, and both are forgotten together", async () => {
+  const { noteSignOffWithdrawn, noteOwnerReopenedRun, readHandsOff, AUTOPILOT_STATE_PREF, HANDS_OFF_PREF, HANDS_OFF_MARKS_PREF } = await import("./autopilot.ts");
+  const { reworkHoldMark, noteRunReopened, resetReworkForTests } = await import("./merge-rework.ts");
+  const { preferences } = await import("./db.ts");
+  const before = { state: preferences.get(AUTOPILOT_STATE_PREF), off: preferences.get(HANDS_OFF_PREF), marks: preferences.get(HANDS_OFF_MARKS_PREF) };
+  try {
+    preferences.set(AUTOPILOT_STATE_PREF, JSON.stringify({ cards: ["mine-1"] }));
+    preferences.set(HANDS_OFF_PREF, "[]");
+    preferences.set(HANDS_OFF_MARKS_PREF, "{}");
+    noteSignOffWithdrawn("mine-1");
+    expect(readHandsOff()).toEqual(["mine-1"]);
+    // No such task row here: nothing to record, so the mark cannot lapse.
+    expect(JSON.parse(preferences.get(HANDS_OFF_MARKS_PREF)!)).toEqual({ "mine-1": { run: null, head: null } });
+    preferences.set(HANDS_OFF_MARKS_PREF, JSON.stringify({ "mine-1": { run: 1000, head: "aaa" } }));
+    noteOwnerReopenedRun("mine-1");
+    noteOwnerReopenedRun("someone-elses");
+    expect(JSON.parse(preferences.get(HANDS_OFF_MARKS_PREF)!)).toEqual({ "mine-1": { run: 1000, head: "aaa", reopened: true } });
+
+    // The merge queue's hold: a hold from before the run was recorded takes
+    // the run it is first asked about, and keeps it.
+    preferences.set("merge_queue_rework_state", JSON.stringify({ held: { rounds: 3, lastHead: "cb5", held: true }, loose: { rounds: 1, lastHead: "x" } }));
+    expect(reworkHoldMark("loose", 5)).toBeNull();
+    expect(reworkHoldMark("held", 1000)).toEqual({ run: 1000, head: "cb5" });
+    expect(reworkHoldMark("held", 2000)).toEqual({ run: 1000, head: "cb5" });
+    noteRunReopened("held");
+    expect(reworkHoldMark("held", 2000)).toEqual({ run: 1000, head: "cb5", reopened: true });
+  } finally {
+    resetReworkForTests();
+    preferences.set(AUTOPILOT_STATE_PREF, before.state ?? "{}");
+    preferences.set(HANDS_OFF_PREF, before.off ?? "[]");
+    preferences.set(HANDS_OFF_MARKS_PREF, before.marks ?? "{}");
+  }
+});
+
 // ── Roadmap: a blocked step in the wait queue is in flight, not the owner's ─
 
 test("roadmap: a card parked in the blocked-step wait queue is in flight — no second card, no slot, not under Needs you; a block that is the owner's is counted apart", async () => {

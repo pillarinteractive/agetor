@@ -3,7 +3,7 @@
 | Field | Value |
 | --- | --- |
 | Date | 2026-10-13 |
-| Status | Stages 0, 1 and 2 are built (Stage 2 on `feat/check-gates-stage-2`, 2026-10-13; see "Stage 2 as built" in section 5 and FORK.md "Checks on working steps"). Stage 3 is not. |
+| Status | Stages 0, 1, 2 and 3 are built (Stage 3 on `feat/check-gates-stage-3`, 2026-10-13; see "Stage 3 as built" in section 6 and FORK.md "Position, rewind and feedback"). |
 | Base | `release` at `56e9adb` |
 | Location | `docs/plans/`, where this repository already keeps designs (`pipelines.md`, `global-owner-and-test-caps.md`); no `docs/design/` was created. |
 | Evidence | Source on `release`; the live board's database, block log and await records, read-only, on 2026-10-13. |
@@ -208,6 +208,29 @@ What invalidates a result:
 
 Restart resolves the position and offers it ("Restart from Review"), with "from the beginning" as an explicit choice. Incident 5 then needs neither: the prompt refresh already updates the text, and a restart no longer repeats satisfied steps.
 
+### Stage 3 as built (2026-10-13)
+
+Built as described in this section and section 7, for runs with check gates only. Where the code differs from this
+document, and why:
+
+| This document says | Built as | Why |
+| --- | --- | --- |
+| Understand is satisfied when a succeeded record with a handoff exists (table above). | Also: its prompt carries the card's goal as it is now, and no change of the card's issue contract was recorded after it finished. | A handoff about another goal or another issue body is not this card's plan. The digests are the ones `reconcileCardInputs` already keeps for a dispatched card; a card without them is judged by the goal alone. |
+| Build: `tree-clean` and `diff-nonempty` pass now. Review: a `review-verdict` pass in the ledger keyed on HEAD. | Every required check of the step's gate: built-ins recomputed, `review-verdict` recomputed from the visit's own handoff against HEAD, command checks from a standing ledger pass (HEAD, tree, definition). Each step also needs a finished visit later than the previous step's. | The trust order of section 3: recompute where possible. Without the visit-order rule a Review that ran before the newest Build would still count. |
+| A moved base voids `merges-with-base` and CI freshness. | A ledger pass of a command check is matched on HEAD, tree and definition, not on the base tip; whatever is recomputed sees the base as it is. | The same rule, stated for command checks: a command tested the tree. |
+| Restart offers the position ("Restart from Review"), with "from the beginning" as an explicit choice. | Restart **is** the resume for a gated run (route, CLI, run view); from the beginning is `fromScratch` / `--from-scratch` / its own button. Everything satisfied → refused, with both alternatives named. The inspector's Restart stays "from the beginning". | The owner's request for this stage. The inspector keeps the one meaning its confirmation describes. |
+| A restart archives every step task and starts a new generation. | A resume keeps the generation: history, step numbers, ledger and handoff files continue; only executions still under way are stopped and archived. | Evidence and handoffs are keyed by generation; a new one would orphan exactly what the resume relies on. |
+| Steer, X active: the text goes to its session and does not count against `maxTurns`. X earlier: kept for X's next launch. | Feedback always reopens the run from X (stopping what runs) and X's next prompt carries the note, as do the later steps' until each has finished once since. | The owner's request for this stage. The step panel's message box still reaches a live step's session. |
+| Steer without "invalidate": not specified beyond the note. | A refinement: nothing voided, the prompt says the earlier work stands. The visit has the step's ordinary turn allowance, not one turn. | One turn would send a failed refinement straight to a fresh session. |
+| Rewind voids the results of X and later steps. | `void` lines appended: one per step (check id `(step)`, voiding its visits up to that step number) and one per check with a result (carrying that result's key). | A step without checks (Understand) must be voidable, and a `skipWhen` pass must not be reused. |
+| Retry / Resume, drag to Running: re-runs the current step's checks, then gives a turn only if one still fails. | The Retry route does, for a step stopped with `check-failed`: the stopped turn is settled again with checks run now. A drag to Running or a plain Run is still the ordinary retry. | `startTask` returns a run id, and a re-judged step may have none; left for a follow-up. |
+| Advance records `waived`. Refresh instructions: text and `goal`. | Unchanged from Stage 2. A `{"gates": true}` refresh also answers with the position line. | — |
+| `CardInspector.tsx` (section 11). | The run view's Advanced controls; the inspector is unchanged. | Agreed scope. |
+| The strip: a segment is green when the step's gate is satisfied (section 8). | Not built. | It needs the position on every card of the board; the read touches the worktree. |
+
+Also built: `GET /tasks/:id/pipeline/position`; `unpushed` in the rewind and feedback answers; the owner's notes in
+`feedback-<generation>.jsonl` beside the ledger.
+
 ## 7. Operator operations
 
 | Operation | Effect on the run | Today |
@@ -221,7 +244,7 @@ Restart resolves the position and offers it ("Restart from Review"), with "from 
 
 ## 8. Compatibility and rollout
 
-**Switch.** A `pipeline_gates` preference: per project, per pipeline and, for the trial, per card (`{"publish": {"cards": ["…"]}}`). It is captured in the run's snapshot as `pipeline_decisions` is.
+**Switch.** A `pipeline_gates` preference: per project, per pipeline and, for the trial, per card (`{"publish": {"cards": ["…"]}}`). A pipeline is named by its id or its exact name (case-insensitive), a card by its full id; an entry that matches nothing is reported by the gates refresh and on the card's timeline (added after the trial, where `"Change"` silently matched nothing). It is captured in the run's snapshot as `pipeline_decisions` is.
 
 **Running cards.** They adopt gates at their next step launch, and only when the owner asks through the refresh-runs route with an explicit flag. They do not adopt on save, because gates change behaviour and `refreshPipelineInstructions` promises to change text only. They are not held back until a restart either, because that is incident 5. A step in mid-turn is never switched.
 

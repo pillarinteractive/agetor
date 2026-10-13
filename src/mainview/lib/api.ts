@@ -133,6 +133,7 @@ export interface AutopilotStateDto {
 }
 import { TASK_EVENTS_REPLAY_META_EVENT } from "../../shared/types.ts";
 import type { RoadmapStatus } from "../../shared/roadmap.ts";
+import type { PipelinePositionView, PipelineReopenResult, PipelineResume, PipelineSteerResult } from "../../shared/position.ts";
 import type { VelocityAnswer } from "../../shared/velocity.ts";
 import { fetchWithRecovery } from "./net-retry.ts";
 
@@ -702,8 +703,27 @@ export const api = {
    *  (same as `/tasks/:id/start`'s bounded-spawn-await shape, item 16) —
    *  NOT a `Task`: the route hands back the server result verbatim.
    *  `retry: false` to match every other run-mutating pipeline route. */
-  restartPipeline: (taskId: string) =>
-    j<{ runId: string; pending?: true }>(`/tasks/${encodeURIComponent(taskId)}/pipeline/restart`, { method: "POST" }, { retry: false }),
+  restartPipeline: (taskId: string, opts?: { fromScratch?: boolean }) =>
+    j<{ runId: string; pending?: true; resumed?: PipelineResume }>(`/tasks/${encodeURIComponent(taskId)}/pipeline/restart`, {
+      method: "POST",
+      // `fromScratch`: discard the history and start at the first step.
+      // Without it a run with check gates resumes at the first step whose
+      // gate is not satisfied; a run without gates is unaffected.
+      ...(opts?.fromScratch ? { body: JSON.stringify({ fromScratch: true }) } : {}),
+    }, { retry: false }),
+  /** Where a run with check gates stands, and the steps it can be rewound
+   *  or sent feedback to (`gated: false` for a run without gates). */
+  getPipelinePosition: (taskId: string) =>
+    j<PipelinePositionView>(`/tasks/${encodeURIComponent(taskId)}/pipeline/position`),
+  /** Rewind a gated run to a step: its and every later step's gate evidence
+   *  is voided, what is running is stopped, the step is launched. Git is not
+   *  touched. `retry: false` — a replay would rewind twice. */
+  rewindPipeline: (taskId: string, body: { stepId: string }) =>
+    j<PipelineReopenResult>(`/tasks/${encodeURIComponent(taskId)}/pipeline/rewind`, { method: "POST", body: JSON.stringify(body) }, { retry: false }),
+  /** Send the owner's feedback to a step of a gated run and reopen the run
+   *  from it; `invalidate` also voids the evidence as a rewind does. */
+  sendPipelineFeedback: (taskId: string, body: { fromStepId: string; note: string; invalidate?: boolean }) =>
+    j<PipelineSteerResult>(`/tasks/${encodeURIComponent(taskId)}/pipeline/feedback`, { method: "POST", body: JSON.stringify(body) }, { retry: false }),
   listAgentModels: () => j<AgentModelMap>("/agent-models"),
   /** Per-harness model catalog (fx account-scoped, one entry per enabled
    *  harness) — see `HarnessModelMap`. */

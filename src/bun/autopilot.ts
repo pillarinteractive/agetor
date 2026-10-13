@@ -32,7 +32,7 @@ import { run } from "./github.ts";
 import { askThread, taggedJson, type ThreadAnswer } from "./codex-thread.ts";
 import { createTaskFromIssue } from "./issue-queue.ts";
 import { setMergeQueued } from "./merge-intent.ts";
-import { reworkHeld } from "./merge-rework.ts";
+import { noteOwnerSignOff, noteRunReopened, reworkHeld, reworkHoldMark } from "./merge-rework.ts";
 import { describeRiskyFiles, parseRiskyRules, riskyFiles, RISKY_PATHS_PREF, type RiskyRules } from "../shared/risky-paths.ts";
 import { hasConfirmedNoPr, prStatusForTask } from "./pr-watch.ts";
 import { onCardRemoved, startTask, subscribeGlobal, isTaskRunLive } from "./orchestrator.ts";
@@ -43,7 +43,7 @@ import {reviewApprovalMatches} from '../shared/pipeline.ts';
 import {approvedHeadFor} from '../shared/publish.ts';
 import { freezeCardInputs, queueValidator } from './queue-validation.ts';
 import type { CanonicalQueue } from '../shared/canonical-roadmap.ts';
-import { holdsAutopilotSlot, neverStarted, PROGRESSING_COLUMNS, waitingOnQuota } from "../shared/autopilot.ts";
+import { holdsAutopilotSlot, neverStarted, PROGRESSING_COLUMNS, signOffMarkLapsed, waitingOnQuota, type SignOffMark } from "../shared/autopilot.ts";
 import { formatRetryTime, isQuotaPaused } from "./usage-limit.ts";
 import { listLeases } from "./lease-watch.ts";
 import { blockedCardLine } from "../shared/block-reason.ts";
@@ -95,6 +95,11 @@ const CONFIG_VERSION_PREF = "autopilot_config_version";
  *  card off again. Its own preference, not part of the state, because it is
  *  written from the task PATCH while a pass may hold the state. */
 export const HANDS_OFF_PREF = "autopilot_hands_off";
+/** What each of those marks is about (`SignOffMark`, by card id): the run
+ *  and the head at the time. A mark does not outlive that run — a new run of
+ *  the card that finishes at a new head is signed off like any other. Beside
+ *  the list, not in it, so a build that only knows the list still reads it. */
+export const HANDS_OFF_MARKS_PREF = "autopilot_hands_off_marks";
 /** Safety net only — passes are driven by board events (startAutopilot). */
 const FALLBACK_MS = 15 * 60_000;
 /** Columns of a card still being built (Blocked included): such a card
@@ -438,16 +443,92 @@ export function readHandsOff(): string[] {
   }
 }
 
+function readHandsOffMarks(): Record<string, SignOffMark> {
+  try {
+    const v = JSON.parse(preferences.get(HANDS_OFF_MARKS_PREF) ?? "{}");
+    if (!v || typeof v !== "object" || Array.isArray(v)) return {};
+    const out: Record<string, SignOffMark> = {};
+    for (const [id, raw] of Object.entries(v as Record<string, unknown>)) {
+      if (!raw || typeof raw !== "object") continue;
+      const m = raw as Record<string, unknown>;
+      out[id] = {
+        run: typeof m.run === "number" && Number.isFinite(m.run) ? m.run : null,
+        head: typeof m.head === "string" && m.head ? m.head : null,
+        ...(m.reopened === true ? { reopened: true } : {}),
+      };
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function writeHandsOffMarks(marks: Record<string, SignOffMark>): void {
+  preferences.set(HANDS_OFF_MARKS_PREF, JSON.stringify(marks));
+}
+
+/** The card's run and its pull request's head as they are now. */
+function signOffMarkNow(taskId: string): SignOffMark {
+  return { run: tasks.get(taskId)?.pipelineRun?.startedAt ?? null, head: prStatusForTask(taskId)?.headSha ?? null };
+}
+
 /**
  * The user dragged a card out of Ready to Merge (the task PATCH withdrew its
  * sign-off). If it is one of Autopilot's, it is theirs from here on:
- * Autopilot doesn't sign it off again, whatever its PR looks like later.
+ * Autopilot doesn't sign it off again, whatever its PR looks like later —
+ * for as long as that is the same run of the card. The mark records the run
+ * and the head it is about (`HANDS_OFF_MARKS_PREF`).
  */
 export function noteSignOffWithdrawn(taskId: string): void {
   const cfg=parseConfig(preferences.get(AUTOPILOT_PREF)),task=tasks.get(taskId);
   if (!readState().cards.includes(taskId)&&!(cfg.autoMergePipelines&&task?.pipelineId&&sameDir(task.workdir,cfg.project))) return;
   const cur = readHandsOff();
   if (!cur.includes(taskId)) preferences.set(HANDS_OFF_PREF, JSON.stringify([...cur, taskId].slice(-500)));
+  writeHandsOffMarks({ ...readHandsOffMarks(), [taskId]: signOffMarkNow(taskId) });
+}
+
+/** The owner sent a card's run back through its steps (restart from a step,
+ *  rewind, feedback): a sign-off taken back before that was about the run as
+ *  it stood, and lapses once the redone run finishes at a new head. */
+export function noteOwnerReopenedRun(taskId: string): void {
+  const marks = readHandsOffMarks();
+  if (marks[taskId] && !marks[taskId]!.reopened) writeHandsOffMarks({ ...marks, [taskId]: { ...marks[taskId]!, reopened: true } });
+  noteRunReopened(taskId);
+}
+
+/** Every mark that keeps Autopilot off this card, with what each is about.
+ *  A mark from a build that did not record it is given the card's run and
+ *  head as they are now: it then lapses with the next run, not with this one. */
+function handsOffMarksFor(taskId: string): SignOffMark[] {
+  const out: SignOffMark[] = [];
+  if (readHandsOff().includes(taskId)) {
+    const marks = readHandsOffMarks();
+    if (!marks[taskId] || marks[taskId]!.run == null || !marks[taskId]!.head) {
+      const now = signOffMarkNow(taskId);
+      marks[taskId] = { ...marks[taskId], run: marks[taskId]?.run ?? now.run, head: marks[taskId]?.head ?? now.head };
+      writeHandsOffMarks(marks);
+      // Recorded only now: about this run, so it holds for this pass.
+      out.push({ run: null, head: null });
+    } else {
+      out.push(marks[taskId]!);
+    }
+  }
+  const held = reworkHoldMark(taskId, tasks.get(taskId)?.pipelineRun?.startedAt ?? null);
+  if (held) out.push(held);
+  return out;
+}
+
+/** Forget every mark on a card whose marks have all lapsed. */
+function releaseHandsOff(taskId: string): void {
+  const cur = readHandsOff();
+  if (cur.includes(taskId)) preferences.set(HANDS_OFF_PREF, JSON.stringify(cur.filter((id) => id !== taskId)));
+  const marks = readHandsOffMarks();
+  if (marks[taskId]) {
+    delete marks[taskId];
+    writeHandsOffMarks(marks);
+  }
+  // The merge queue's hold with its spent fix rounds: a new run starts afresh.
+  noteOwnerSignOff(taskId);
 }
 
 export interface SignOffDeps {
@@ -456,6 +537,12 @@ export interface SignOffDeps {
   prFiles(t: Task, pr: number): Promise<string[] | null>;
   rules(): RiskyRules;
   handsOff(): ReadonlySet<string>;
+  /** What each mark keeping Autopilot off this card is about (the user took
+   *  its sign-off back; the merge queue held it). Without this, or with no
+   *  mark to judge, a hands-off card is never signed off. */
+  handsOffMarks?(taskId: string): SignOffMark[];
+  /** Forget those marks: the run they were about has been replaced. */
+  releaseHandsOff?(taskId: string): void;
   /** Move the card to Ready to Merge. */
   signOff(t: Task): void;
   activity(taskId: string, text: string, tone: "info" | "warning" | "muted"): void;
@@ -472,8 +559,12 @@ export interface SignOffDeps {
  *   no longer applies is released and the card signed off.
  * - A file list that can't be read is not "risky": the card stays where it
  *   is for this pass, with one note, and is looked at again on the next.
- * - A card the user took back from Ready to Merge is never signed off again,
- *   and one they moved out of In Review is no longer held.
+ * - A card the user took back from Ready to Merge, or the merge queue held
+ *   for them, is not signed off again — for that run of the card. Such a
+ *   mark is about one run at one head (`signOffMarkLapsed`): when a new run
+ *   of the card, or that run reopened by the owner, finishes at another
+ *   head, the mark is forgotten and the card is judged like any other.
+ * - A card they moved out of In Review is no longer held.
  *
  * Mutates `state`. Exported for tests.
  */
@@ -513,8 +604,15 @@ export async function signOffPass(state: AutopilotState, mine: Task[], deps: Sig
     const wasHeld = state.held.includes(t.id);
     // Signed off or finished by the user: no longer waiting in In Review.
     if (wasHeld && (t.column === "merge" || t.column === "done")) release(t.id);
-    if (t.column !== "review" || t.pipelineRun?.status !== "done" || handsOff.has(t.id)) continue;
+    if (t.column !== "review" || t.pipelineRun?.status !== "done") continue;
     const pr = deps.prStatus(t.id);
+    if (handsOff.has(t.id)) {
+      const marks = deps.handsOffMarks?.(t.id) ?? [];
+      const now = { run: t.pipelineRun.startedAt ?? null, done: true, head: pr?.state === "open" ? (pr.headSha ?? null) : null };
+      if (marks.length === 0 || !marks.every((m) => signOffMarkLapsed(m, now))) continue;
+      deps.releaseHandsOff?.(t.id);
+      deps.activity(t.id, "Autopilot: this card's sign-off was taken back during an earlier run; a new run has finished at a new head, so it is judged again like any other card", "info");
+    }
     if (pr?.state !== "open") continue;
     const authorized=!!cfg&&reviewedPillarPipeline(t,cfg,pr);
     if(cfg?.autoMergePipelines&&cfg.roadmap?.issue===639&&sameDir(t.workdir,cfg.project)&&!authorized)continue;
@@ -562,6 +660,8 @@ const SIGN_OFF_DEPS: SignOffDeps = {
   rules: () => parseRiskyRules(preferences.get(RISKY_PATHS_PREF)),
   // …and cards the merge queue handed back after their fix rounds ran out.
   handsOff: () => new Set([...readHandsOff(), ...reworkHeld()]),
+  handsOffMarks: handsOffMarksFor,
+  releaseHandsOff,
   signOff(t) {
     setMergeQueued(t.id, true);
     tasks.update(t.id, { column: "merge" });
@@ -1673,6 +1773,9 @@ export async function autopilotTick(): Promise<void> {
     const withdrawn = readHandsOff();
     const stillThere = withdrawn.filter((id) => all.some((t) => t.id === id && t.archivedAt == null && t.column !== "done"));
     if (stillThere.length !== withdrawn.length) preferences.set(HANDS_OFF_PREF, JSON.stringify(stillThere));
+    const marks = readHandsOffMarks();
+    const keptMarks = Object.fromEntries(Object.entries(marks).filter(([id]) => stillThere.includes(id)));
+    if (Object.keys(keptMarks).length !== Object.keys(marks).length) writeHandsOffMarks(keptMarks);
     const reviewed=cfg.autoMergePipelines?all.filter(t=>reviewedPillarPipeline(t,cfg,SIGN_OFF_DEPS.prStatus(t.id))):[];
     await signOffPass(state,[...new Map([...mine,...reviewed].map(t=>[t.id,t])).values()],SIGN_OFF_DEPS,cfg);
     if(!cfg.enabled)return; // lifecycle sign-off never enables new admissions

@@ -279,6 +279,29 @@ export async function runStepChecks(input: {
   return results;
 }
 
+/**
+ * What a set of checks comes to on the worktree right now, without a visit
+ * and without a ledger line: every built-in recomputed (a command check is
+ * not run — a position is read, and reading must start nothing). Used to
+ * find a run's position (src/shared/position.ts). `review-verdict` is judged
+ * there, from the visit's own handoff; here it has none and is left out.
+ * Null key fields mean the worktree could not be read.
+ */
+export async function probeBuiltinChecks(input: { parent: Task; run: PipelineRunState; checks: readonly StepCheck[] }): Promise<{
+  key: CheckKey; now: Record<string, { satisfied: boolean; detail: string; outcome: Finding["outcome"] }>;
+}> {
+  const wt = await readWorktree(input.parent);
+  const now: Record<string, { satisfied: boolean; detail: string; outcome: Finding["outcome"] }> = {};
+  if (!wt) return { key: { head: null, tree: null, baseTip: null }, now };
+  for (const check of input.checks) {
+    if (check.run.kind !== "builtin" || check.run.name === "review-verdict") continue;
+    const found = await builtin(check as StepCheck & { run: { kind: "builtin" } }, { task: input.parent, run: input.run, wt, handoff: null })
+      .catch((e): Finding => finding("halt", `could not be evaluated: ${e instanceof Error ? e.message : String(e)}`));
+    now[check.id] = { satisfied: found.satisfied, detail: found.detail, outcome: found.outcome };
+  }
+  return { key: wt.key, now };
+}
+
 /** Record that the owner advanced past checks that had not passed: one
  *  `waived` line each. A waiver is never read as a pass. Best-effort. */
 export function recordWaivedChecks(input: { parent: Task; run: PipelineRunState; step: PipelineStep; seq: number; checks: readonly StepCheck[]; ids: readonly string[] }): void {

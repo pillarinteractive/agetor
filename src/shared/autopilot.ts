@@ -69,3 +69,30 @@ export function autopilotLabel(
           : "Autopilot — not set up";
   return mode === "none" ? what : `${what}${c.enabled ? "" : " (paused)"}`;
 }
+
+/**
+ * What a sign-off that was taken back was about: the run of the card then
+ * (`PipelineRunState.startedAt`) and the head its pull request had.
+ * `reopened` is set when the owner sent that same run back through its steps
+ * afterwards (restart from a step, rewind, feedback). Null fields were not
+ * recorded: such a mark is never judged to have lapsed.
+ */
+export interface SignOffMark {
+  run: number | null;
+  head: string | null;
+  reopened?: boolean;
+}
+
+/**
+ * Whether a taken-back sign-off no longer applies. It was about one run of
+ * the card at one head: it lapses when another run of the card — a restart,
+ * or that run reopened by the owner — has finished with a different head.
+ * Until then the card stays the owner's: the same run at the same head, the
+ * same head after a restart that changed nothing, or a new head pushed by an
+ * automatic fix round of the run the mark is about all keep it. Pure.
+ */
+export function signOffMarkLapsed(mark: SignOffMark, now: { run: number | null; done: boolean; head: string | null }): boolean {
+  if (mark.run == null || !mark.head || now.run == null || !now.head || !now.done) return false;
+  if (now.run === mark.run && !mark.reopened) return false;
+  return now.head.toLowerCase() !== mark.head.toLowerCase();
+}

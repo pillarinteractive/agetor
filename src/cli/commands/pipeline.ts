@@ -14,6 +14,7 @@ import {
   stepNameById,
   validatePipelineGraph,
 } from "../../shared/pipeline.ts";
+import type { PipelinePositionView, PipelineReopenResult } from "../../shared/position.ts";
 import type {
   AgentProfile,
   Handoff,
@@ -221,13 +222,21 @@ export async function cmdPipeline(args: string[], flags: Flags): Promise<void> {
 
     case "restart": {
       const ref = args[1];
-      if (!ref) throw usageError("pipeline restart");
+      if (!ref || ref.startsWith("-")) throw usageError("pipeline restart");
+      const f = parseRestartFlags(args.slice(2));
       const task = await resolvePipelineTask(client, ref);
       // Mirrors `startTask`'s own response shape (this launches the start
       // step's agent synchronously, same as a plain Run) rather than
       // returning the task — see `POST /tasks/:id/pipeline/restart`.
-      const res = await client.restartPipeline(task.id);
+      const res = await client.restartPipeline(task.id, { fromScratch: f.fromScratch });
       if (flags.json) return printJson(res);
+      if (res.resumed) {
+        // A run with check gates: resumed where its gate is not satisfied.
+        const kept = res.resumed.kept.map((k) => k.stepName).join(", ");
+        out(`${c.cyan("↻")} resumed pipeline for ${c.dim(task.id.slice(0, 8))} at ${c.bold(res.resumed.stepName)} — ${res.resumed.why}`);
+        out(c.dim(`  kept, not run again: ${kept || "(nothing)"} · from the beginning instead: agetor pipeline restart ${task.id.slice(0, 8)} --from-scratch`));
+        return;
+      }
       if (res.pending) {
         out(
           `${c.yellow("▸")} restarting pipeline for ${c.dim(task.id.slice(0, 8))} — run ${res.runId.slice(0, 8)} ` +
@@ -236,6 +245,49 @@ export async function cmdPipeline(args: string[], flags: Flags): Promise<void> {
       } else {
         out(`${c.cyan("↻")} restarted pipeline for ${c.dim(task.id.slice(0, 8))} — run ${res.runId.slice(0, 8)}`);
       }
+      return;
+    }
+
+    case "position": {
+      const ref = args[1];
+      if (!ref || ref.startsWith("-") || args.length !== 2) throw usageError("pipeline position");
+      const task = await resolvePipelineTask(client, ref);
+      const view = await client.getPipelinePosition(task.id);
+      if (flags.json) return printJson(view);
+      for (const line of pipelinePositionLines(view)) out(line);
+      return;
+    }
+
+    case "rewind": {
+      const ref = args[1];
+      if (!ref || ref.startsWith("-")) throw usageError("pipeline rewind");
+      const f = parseRewindFlags(args.slice(2));
+      const task = await resolvePipelineTask(client, ref);
+      const graph = task.pipelineRun?.snapshot?.graph;
+      if (!graph) throw new Error("pipeline has no run snapshot yet — nothing to rewind");
+      const res = await client.rewindPipeline(task.id, { stepId: resolveStepRef(graph, f.to) });
+      if (flags.json) return printJson(res);
+      out(`${c.yellow("⟲")} rewound pipeline for ${c.dim(task.id.slice(0, 8))} to ${c.bold(res.stepName)} — void: ${res.voided.join(", ")}`);
+      for (const line of reopenNoteLines(res)) out(line);
+      return;
+    }
+
+    case "feedback": {
+      const ref = args[1];
+      if (!ref || ref.startsWith("-")) throw usageError("pipeline feedback");
+      const f = parseFeedbackFlags(args.slice(2));
+      const note = (f.noteFile !== undefined ? (f.noteFile === "-" ? await Bun.stdin.text() : readFileSync(f.noteFile, "utf8")) : f.note!).trim();
+      if (!note) throw new Error("pipeline feedback: the note is empty");
+      const task = await resolvePipelineTask(client, ref);
+      const graph = task.pipelineRun?.snapshot?.graph;
+      if (!graph) throw new Error("pipeline has no run snapshot yet — nothing to send feedback to");
+      const res = await client.sendPipelineFeedback(task.id, { fromStepId: resolveStepRef(graph, f.from), note, ...(f.invalidate ? { invalidate: true } : {}) });
+      if (flags.json) return printJson(res);
+      out(
+        `${c.yellow("✎")} feedback sent to ${c.bold(res.stepName)} for ${c.dim(task.id.slice(0, 8))} — ` +
+          (res.invalidated ? `void: ${res.voided.join(", ")}` : "a refinement: earlier results stand"),
+      );
+      for (const line of reopenNoteLines(res)) out(line);
       return;
     }
 
@@ -268,7 +320,7 @@ export async function cmdPipeline(args: string[], flags: Flags): Promise<void> {
       throw new Error(
         "unknown pipeline subcommand: " +
           sub +
-          " (use ls | show | rm | export | import | retry | advance | refresh-instructions | restart | status | handoff | decision | decisions)",
+          " (use ls | show | rm | export | import | retry | advance | refresh-instructions | restart | position | rewind | feedback | status | handoff | decision | decisions)",
       );
   }
 }
@@ -399,6 +451,93 @@ export function parseRetryFlags(args: string[]): RetryFlags {
     else throw usageError("pipeline retry");
   }
   return f;
+}
+
+interface RestartFlags {
+  /** `--from-scratch` — discard the history and start at the first step,
+   *  where a run with check gates would otherwise resume at its position. */
+  fromScratch: boolean;
+}
+
+/** Pure flag parser for `agetor pipeline restart` — just `--from-scratch`.
+ *  An unknown flag throws: a typo must not silently pick the other kind of
+ *  restart. */
+export function parseRestartFlags(args: string[]): RestartFlags {
+  const f: RestartFlags = { fromScratch: false };
+  for (const a of args) {
+    if (a === "--from-scratch") f.fromScratch = true;
+    else throw usageError("pipeline restart");
+  }
+  return f;
+}
+
+interface RewindFlags {
+  /** `--to <step>` — the step to rewind to (name, id or edge label,
+   *  resolved by `resolveStepRef`). Required. */
+  to: string;
+}
+
+/** Pure flag parser for `agetor pipeline rewind` — `--to <step>`, required.
+ *  A rewind stops what is running and voids results: it never guesses. */
+export function parseRewindFlags(args: string[]): RewindFlags {
+  let to: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--to" && to === undefined) to = flagValue(args, ++i, a);
+    else throw usageError("pipeline rewind");
+  }
+  if (to === undefined) throw usageError("pipeline rewind");
+  return { to };
+}
+
+interface FeedbackFlags {
+  /** `--from <step>` — the step the run is reopened from. Required. */
+  from: string;
+  /** `--note <text>` or `--note-file <file|->`: exactly one. */
+  note?: string;
+  noteFile?: string;
+  /** `--invalidate` — also void the evidence of that step and the later ones. */
+  invalidate: boolean;
+}
+
+/** Pure flag parser for `agetor pipeline feedback` — `--from <step>`, one of
+ *  `--note <text>` / `--note-file <file|->`, and `--invalidate`. */
+export function parseFeedbackFlags(args: string[]): FeedbackFlags {
+  const f: Partial<FeedbackFlags> & { invalidate: boolean } = { invalidate: false };
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!;
+    if (a === "--from" && f.from === undefined) f.from = flagValue(args, ++i, a);
+    else if (a === "--note" && f.note === undefined) f.note = flagValue(args, ++i, a);
+    else if (a === "--note-file" && f.noteFile === undefined) f.noteFile = flagValue(args, ++i, a, /* allowDash */ true);
+    else if (a === "--invalidate") f.invalidate = true;
+    else throw usageError("pipeline feedback");
+  }
+  if (f.from === undefined || (f.note === undefined) === (f.noteFile === undefined)) throw usageError("pipeline feedback");
+  return f as FeedbackFlags;
+}
+
+/** Pure renderer for `agetor pipeline position`. */
+export function pipelinePositionLines(view: PipelinePositionView): string[] {
+  if (!view.gated || !view.position) return [c.dim("this run has no check gates (pipeline_gates) — a restart begins at the first step")];
+  const lines = [view.line ?? ""];
+  const p = view.position;
+  if (p.kind !== "unsupported") {
+    const name = (id: string) => view.steps.find((s) => s.id === id)?.name ?? id;
+    for (const s of p.satisfied) lines.push(`  ${c.green("✓")} ${name(s.stepId)}  ${c.dim(`step ${s.seq} — ${s.why}`)}`);
+    if (p.kind === "step") lines.push(`  ${c.yellow("▸")} ${c.bold(name(p.stepId))}  ${c.dim(p.why)}`);
+  }
+  const open = view.steps.filter((s) => s.reached).map((s) => s.name);
+  if (open.length > 0) lines.push(c.dim(`  can be rewound or sent feedback to: ${open.join(", ")}`));
+  return lines;
+}
+
+/** What a rewind or feedback left as it was, and what it stopped. */
+function reopenNoteLines(res: PipelineReopenResult): string[] {
+  const lines: string[] = [];
+  if (res.stopped.length > 0) lines.push(c.dim(`  stopped: ${res.stopped.join(", ")}`));
+  const n = res.unpushed.count;
+  lines.push(c.dim(`  git is untouched${n ? ` — ${n} commit${n === 1 ? "" : "s"} not on the remote stay where they are` : n === null ? " (unpushed commits could not be counted)" : ""}`));
+  return lines;
 }
 
 /**

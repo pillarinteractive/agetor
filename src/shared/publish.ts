@@ -39,8 +39,10 @@ import { ROLLUP_CHECKS, checksState, failedConclusion, newestPerName, type Check
 // The switch
 // ---------------------------------------------------------------------------
 
-/** `{"publish": {"pipelines": ["Change"], "cards": ["<task id>", …]}}`.
- *  `pipelines` (names or ids) is the switch, off when absent or empty.
+/** `{"publish": {"pipelines": ["<pipeline id>"], "cards": ["<task id>", …]}}`.
+ *  `pipelines` is the switch, off when absent or empty: each entry is a
+ *  pipeline's id or its exact name (case-insensitive; never a prefix — see
+ *  {@link unmatchedGateRefs} for what an entry that matches nothing does).
  *  `cards` is the trial list: when present, only those cards of those
  *  pipelines; leave it out to cover every card of them. Each gate has its own
  *  entry of the same shape: `publish` (Finish run by Agetor) and `steps`
@@ -83,6 +85,47 @@ export function publishGateOn(gate: PublishGate, card: { id: string; pipelineId:
   const name = card.pipelineName?.trim().toLowerCase();
   const pipeline = gate.pipelines.some((p) => p === card.pipelineId || (!!name && p.toLowerCase() === name));
   return pipeline && (gate.cards === null || gate.cards.includes(card.id));
+}
+
+/** What the preference names that is not there, so it gates nothing. */
+export interface GateUnmatched {
+  /** Entries of `pipelines` that are no pipeline's id and no pipeline's
+   *  exact name (case-insensitive), as `<gate>: <entry>`. */
+  pipelines: string[];
+  /** Entries of `cards` that are no task's id, as `<gate>: <entry>`. */
+  cards: string[];
+}
+
+/**
+ * The entries of `pipeline_gates` that match nothing. A pipeline is named by
+ * its id or by its exact name, compared without regard to case — never by a
+ * prefix: "Change" does not name "Change: Understand, Build, Review, Finish",
+ * and used to switch nothing on without a word. A card is named by its full
+ * task id. Pure.
+ */
+export function unmatchedGateRefs(
+  raw: string | null | undefined,
+  known: { pipelines: readonly { id: string; name: string }[]; hasCard: (id: string) => boolean },
+): GateUnmatched {
+  const out: GateUnmatched = { pipelines: [], cards: [] };
+  const names = new Set(known.pipelines.map((p) => p.name.trim().toLowerCase()));
+  const ids = new Set(known.pipelines.map((p) => p.id));
+  for (const name of ["publish", "steps"] as const) {
+    const gate = parsePipelineGate(raw, name);
+    for (const p of gate.pipelines) if (!ids.has(p) && !names.has(p.toLowerCase())) out.pipelines.push(`${name}: ${p}`);
+    for (const c of gate.cards ?? []) if (!known.hasCard(c)) out.cards.push(`${name}: ${c}`);
+  }
+  return out;
+}
+
+/** One line saying what `unmatched` names, or null when everything matched. */
+export function gateUnmatchedLine(unmatched: GateUnmatched): string | null {
+  const parts: string[] = [];
+  if (unmatched.pipelines.length > 0) {
+    parts.push(`no pipeline has the id or the exact name ${unmatched.pipelines.map((p) => JSON.stringify(p.replace(/^\w+: /, ""))).join(", ")}`);
+  }
+  if (unmatched.cards.length > 0) parts.push(`no card has the id ${unmatched.cards.map((c) => JSON.stringify(c.replace(/^\w+: /, ""))).join(", ")}`);
+  return parts.length > 0 ? `pipeline_gates names what is not there, so it gates nothing: ${parts.join("; ")}. Use a pipeline's id or its whole name, and a card's full id` : null;
 }
 
 /** The step Agetor runs for a run that adopted the gate: Finish of the

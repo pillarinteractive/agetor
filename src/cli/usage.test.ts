@@ -69,11 +69,12 @@ test("pipeline: 'pipelines' aliases to 'pipeline', with export/import subcommand
   expect(canonical("pipelines")).toBe("pipeline");
   expect(USAGE["pipeline"]).toBeDefined();
   expect(USAGE["pipeline"]!.split("\n", 1)[0]).toBe(
-    "usage: agetor pipeline <ls | show <ref> | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> [--name <n>] | retry <task> [--from <task>] | advance <task> [--next <step>… | --finish] [--from <task>] | restart <task> | status <task> [--handoffs] | handoff <task> [<step>|--all]>",
+    "usage: agetor pipeline <ls | show <ref> | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> [--name <n>] | retry <task> [--from <task>] | advance <task> [--next <step>… | --finish] [--from <task>] | refresh-instructions <task> | restart <task> [--from-scratch] | position <task> | rewind <task> --to <step> | feedback <task> --from <step> (--note <text> | --note-file <file|->) [--invalidate] | status <task> [--handoffs] | handoff <task> [<step>|--all]>",
   );
   expect(helpFor("pipelines", "export")).toBe(USAGE["pipeline export"]);
   expect(helpFor("pipeline", "import")).toBe(USAGE["pipeline import"]);
   expect(helpFor("pipeline", "rm")).toBe(USAGE["pipeline"]); // unknown sub → command block
+  for (const sub of ["position", "rewind", "feedback"]) expect(helpFor("pipeline", sub)).toBe(USAGE[`pipeline ${sub}`]);
   expect(usageError("pipeline").message).toBe(USAGE["pipeline"]!.split("\n", 1)[0]!);
 });
 

@@ -2060,7 +2060,10 @@ function AppInner() {
     if (!ok) return;
     try {
       setError(null);
-      await api.restartPipeline(t.id);
+      // The inspector's Restart is the one its confirmation describes: from
+      // the first step, history cleared. Resuming a run with check gates at
+      // its position is offered on the run view, under Advanced.
+      await api.restartPipeline(t.id, { fromScratch: true });
     } catch (e) {
       surfaceError(e);
     }

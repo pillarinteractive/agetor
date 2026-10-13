@@ -1292,16 +1292,38 @@ export function effectiveStepCap(run: PipelineRunState): number {
 
 /**
  * The step an unattended run is finished through when it reaches its step
- * cap (`run.capWrapUp`): the one step {@link resolveNextSteps} can end the
- * run from — no outgoing edge, or a "choose" step with `canFinish`
- * (follow-up steps, appended edgeless, are not counted). Null when the graph
- * has none or more than one, which keeps the `step-cap` block.
+ * cap (`run.capWrapUp`): the step {@link resolveNextSteps} ends the run from
+ * — no outgoing edge, or a "choose" step with `canFinish` (follow-up steps,
+ * appended edgeless, are not counted). When several steps can end the run,
+ * it is the last of them: the one no other end can be reached from. Change
+ * has two — Understand may finish a card that needs no change, and Finish —
+ * and every path from Understand leads to Finish, never back. Null when the
+ * graph has no end, or ends that do not lead to one another (two branches
+ * that each finish), which keeps the `step-cap` block.
  */
 export function capWrapUpStep(g: PipelineGraph): PipelineStep | null {
   const hasOutgoing = new Set(g.edges.map((e) => e.from));
   const ends = g.steps.filter((s) =>
     !isFollowUpStepId(s.id) && (!hasOutgoing.has(s.id) || (s.canFinish === true && s.transition !== "all")));
-  return ends.length === 1 ? (ends[0] ?? null) : null;
+  if (ends.length <= 1) return ends[0] ?? null;
+  const reachableFrom = (id: string): Set<string> => {
+    const seen = new Set<string>();
+    const queue = [id];
+    while (queue.length > 0) {
+      const at = queue.pop()!;
+      for (const e of g.edges) {
+        if (e.from !== at || seen.has(e.to)) continue;
+        seen.add(e.to);
+        queue.push(e.to);
+      }
+    }
+    return seen;
+  };
+  const last = ends.filter((s) => {
+    const reach = reachableFrom(s.id);
+    return !ends.some((o) => o.id !== s.id && reach.has(o.id));
+  });
+  return last.length === 1 ? (last[0] ?? null) : null;
 }
 
 /** The section a cap wrap-up launch appends to the step's prompt, after
