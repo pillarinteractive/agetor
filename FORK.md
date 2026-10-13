@@ -559,6 +559,80 @@ behaviour without a rebuild: stale green PRs merge as they are and disbanded mem
 then id), so a duplicate run cancelled by `cancel-in-progress` beside one that passed no longer reads as pending; a
 name whose newest run is cancelled is still not a pass.
 
+## Finish run by Agetor (`feat/check-gates-stage-0-1`)
+
+Stage 1 of `docs/plans/check-gated-pipeline.md`. **Off unless switched on.** For a card it covers, a reviewed
+pipeline's Finish step (the `Finish` of Build → Review → Finish, `reviewedPipelineShape`) is carried out by the core,
+not by an agent: `src/shared/publish.ts` is the pure state machine (`decidePublish`, `applyPublish`),
+`src/bun/publish-step.ts` observes git and GitHub and acts, once a minute per held card and at once when a card is
+put on hold. The visit's state is `run.publish`, so a core restart loses nothing.
+
+| State | Agetor checks | Then |
+| --- | --- | --- |
+| `verify-head` | no tracked changes; HEAD is the last Review's `reviewApproval.headSha` (`reviewApprovalMatches`) | `check-merge`. Dirty, another head, or not approved → Build. No `reviewApproval` at all → the agent runs Finish as before (`agent`). |
+| `check-merge` | `git merge-tree` of HEAD and `origin/<base>` | contains the base tip → `hold-base`. Clean and the change's own diff unchanged → Agetor merges the base in, then `hold-base`. Conflicts → Build. Clean but the diff would change → `hold-base` with the approved head as it is. |
+| `hold-base` | the base tip's checks (`required` when it has one, else any failure) | red → stay (a push would spend a run that must fail). Otherwise `push`. |
+| `push` | `git ls-remote` | already there → `pr`. Otherwise one push of that sha. Remote diverged, or the branch is a base branch → the owner. |
+| `pr` | the branch's pull request | none → a draft is opened (`Refs #n`). → `wait-ci` |
+| `wait-ci` | the head's check runs, newest per name | green → `finalize`. Failed and finished → `classify`. Newest cancelled, nothing running → one re-run. |
+| `classify` | each failing job on the base: tip first, then up to ten commits back for one that ran it (`baseVerdicts`) | a runner fault (`infraReason`) → one re-run per head. Passes on the base or never ran there → Build, with `ciFailureHandoff`. Fails there too → `base-red`. |
+| `base-red` | the base's runs of the inherited jobs, every 3 min | failing → stay. Passing → `refresh`. |
+| `refresh` | as `check-merge` | base unmoved → re-run the failed jobs once. Clean merge, same diff → Agetor merges the base in → `push`. Conflict or a changed diff → Build ("merge origin/<base>"). |
+| `finalize` | still green for the published head | PR marked ready, a facts comment posted, then `write`. |
+| `write` | — | one turn of Finish's own agent rewrites the PR description; its handoff ends the run whatever `next` it names. |
+
+- **No agent, no slot, no attempt while it waits.** A held Finish has no step task: the run carries a run-level
+  `await` block for the step (it reads as running), `slotUse` and the card-owner count see nothing, `stepCount` does
+  not move. The wait on a red base is a state Agetor entered from what it read on GitHub; no handoff, no `waitingRef`
+  and no `classifyBlock` take part, and it leaves the state by itself when the base's jobs pass. A visit costs one
+  step in total, as before: the writer's turn, or the record written when it is sent back to Build (that record also
+  counts against `maxTraversals` on Finish → Build).
+- **Whose failure** is decided by check name and job against the base, never by log text. Log text is read only for
+  the runner-fault decision (one re-run when wrong) and quoted to Build.
+- **What it pushes.** One commit, by sha, to the card's own branch: the approved head, or that head with the base
+  merged in by Agetor when the merge is clean and `git patch-id` of `git diff <base>...HEAD` (plus the list of changed
+  files) is the same before and after (`mergeProbe`: `merge-tree` + `commit-tree`, the worktree is untouched until the
+  fast-forward). `run.publish.approvedHead` stays the head Review saw and `carried` counts the merges; Autopilot's
+  sign-off check accepts the carried head (`approvedHeadFor`). It never force-pushes, never pushes to `main`,
+  `master`, `develop`, `release` or the card's base, never rebases or amends, never merges the PR.
+- **What the agent still does.** It writes the PR description (and at most one comment mapping acceptance criteria
+  to evidence) and decides `Fixes #n` or `Refs #n`. It does not push, wait, classify or choose an edge.
+- **Stops for the owner** (a `step-blocked` block on the card; Retry resumes the visit where it stopped): the remote
+  branch diverged, the PR was closed or merged or moved to another head, no check started in 20 minutes, CI cancelled
+  again after its one re-run, an action failed five times, or Finish → Build reached its `maxTraversals`. Manual
+  Advance and Stop do not act on a held Finish (there is no step task to act on): take the card out of the
+  preference and it is its agent's again.
+
+**The switch** is the `pipeline_gates` preference:
+
+```json
+{"publish": {"pipelines": ["Change"], "cards": ["<task id>", "<task id>"]}}
+```
+
+`pipelines` (names or ids) turns it on; `cards` is the trial list, and while it is present only those cards are
+covered. Remove `cards` to cover every card of those pipelines. A card is covered when its run *adopted* the gate
+(`run.snapshot.gates.publish`) **and** the preference still names it:
+- A run adopts when it starts. A run that has started adopts only on an explicit refresh:
+  `POST /pipelines/:id/refresh-runs` with `{"gates": true}`, or `POST /tasks/:id/pipeline/refresh-instructions` with
+  `{"gates": true}` (`adoptPipelineGates`). It takes effect at Finish's next launch; a step in mid-turn is not
+  switched. Saving the preference or the pipeline alone changes no running card.
+- Taking a card or the pipeline out of the preference works at once, with no refresh: the next launch of Finish is
+  the agent's, and a Finish Agetor is holding is handed to its agent on the next pass.
+
+**To trial it:** set the preference with two or three card ids, call `refresh-runs` with `{"gates": true}`, and watch
+the cards' timelines ("Finish (run by Agetor): …"). Compare `agetor blocks` for Finish `step-blocked` and launches per
+merged card. To back out: `{}` in the preference. After a rollback to a build without this, a card that was being
+held shows an `await` block nothing wakes — press Retry on it and its agent runs Finish.
+
+Not done here: the board's card states (`src/mainview` is unchanged, so a held Finish reads "Queued — No step is
+running yet" with the real line on the run view); the `ci` cap in `step_slots` does not count cards waiting in
+`wait-ci`; the writer's turn still takes a verification slot because slots are keyed by step name.
+
+Also in this change: a step that started a CI wait and then ended the same turn with a `blocked` handoff was never
+woken when the wait finished (the run recorded `step-blocked`, and only `await` blocks were woken). Such a step is
+now woken like any other when its own CI waits finish, while the wait queue — not the owner — holds it
+(`ciBlockedAwaits`, `src/bun/awaits.ts`). This one applies with the switch off.
+
 ## Priority cards (`feat/priority-cards`)
 
 `src/bun/priority.ts`: "Make priority (run now)" in a card's right-click menu, or `PUT /tasks/:id/priority` with
