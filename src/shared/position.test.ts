@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { builtinCheck, checkDefHash } from "./checks.ts";
+import { defaultChecksOf } from "./pipeline.ts";
 import {
   applicableFeedback, forwardPath, parseFeedbackLog, positionLine, renderOwnerFeedback, reopenChoices, resolvePosition, resumeOffer, stepsFrom,
   validateFeedbackNote, voidEntries, voidedThrough, POSITION_LIMITS, STEP_VOID_CHECK_ID,
@@ -33,6 +34,14 @@ const CHANGE: PipelineGraph = {
   startStepId: "understand",
 };
 
+/** The same pipeline with the trivial change routed through Review
+ *  (Understand → Review, "trivial change made"): Finish is only ever reached
+ *  from Review. `CHANGE` is the graph the board runs today. */
+const CHANGE_VIA_REVIEW: PipelineGraph = {
+  ...CHANGE,
+  edges: CHANGE.edges.map((e) => (e.id === "understand-finish" ? { ...e, id: "understand-review", to: "review" } : e)),
+};
+
 const handoff = (o: Partial<Handoff> = {}): Handoff => ({ schemaVersion: 1, purpose: "p", summary: "s", reason: "r", next: null, artifacts: [], openQuestions: [], status: "done", ...o });
 const verdict = (headSha: string, v: "approved" | "changes-requested" = "approved"): Handoff => handoff({
   reviewApproval: { verdict: v, headSha, issueUrl: "https://github.com/o/r/issues/1", acceptanceComplete: v === "approved", findings: v === "approved" ? [] : ["fix the test"] },
@@ -43,9 +52,9 @@ const rec = (seq: number, stepId: string, next: string[], o: Partial<Rec> = {}):
 const BUILD_CHECKS = [builtinCheck("tree-clean"), builtinCheck("diff-nonempty")];
 const REVIEW_CHECKS = [builtinCheck("tree-clean"), builtinCheck("review-verdict")];
 const ok = { satisfied: true, detail: "ok" };
-const evidence = (o: { dirty?: boolean; empty?: boolean; buildChecks?: StepCheck[] } = {}): Record<string, StepEvidence> => ({
+const evidence = (o: { dirty?: boolean; empty?: boolean; buildChecks?: StepCheck[]; reviewChecks?: StepCheck[] } = {}): Record<string, StepEvidence> => ({
   build: { checks: o.buildChecks ?? BUILD_CHECKS, now: { "tree-clean": o.dirty ? { satisfied: false, detail: "2 tracked files have uncommitted changes" } : ok, "diff-nonempty": o.empty ? { satisfied: false, detail: "no commit ahead of develop" } : ok } },
-  review: { checks: REVIEW_CHECKS, now: { "tree-clean": o.dirty ? { satisfied: false, detail: "2 tracked files have uncommitted changes" } : ok } },
+  review: { checks: o.reviewChecks ?? REVIEW_CHECKS, now: { "tree-clean": o.dirty ? { satisfied: false, detail: "2 tracked files have uncommitted changes" } : ok } },
 });
 /** Understand, Build, Review (approved HEAD), Finish — a run that finished. */
 const FINISHED: Rec[] = [
@@ -75,6 +84,30 @@ describe("forwardPath", () => {
     expect(forwardPath(CHANGE, [rec(1, "understand", ["finish"]), rec(2, "finish", ["build"])])!.map((s) => s.id)).toEqual(["understand", "finish", "build", "review"]);
     // On the ordinary path Finish → Build leads back, so the path ends at Finish.
     expect(forwardPath(CHANGE, [...FINISHED.slice(0, 3), rec(4, "finish", ["build"])])!.map((s) => s.id)).toEqual(["understand", "build", "review", "finish"]);
+  });
+
+  test("trivial change → Review: the path Understand's visit took, then the one Review's did", () => {
+    const ids = (history: Rec[]) => forwardPath(CHANGE_VIA_REVIEW, history)!.map((s) => s.id);
+    expect(ids(FINISHED)).toEqual(["understand", "build", "review", "finish"]);
+    // Review has two steps ahead of it here (Build was skipped): its visit says which.
+    expect(ids([rec(1, "understand", ["review"])])).toEqual(["understand", "review"]);
+    expect(ids([rec(1, "understand", ["review"]), rec(2, "review", ["finish"])])).toEqual(["understand", "review", "finish"]);
+    expect(ids([rec(1, "understand", ["review"]), rec(2, "review", ["build"])])).toEqual(["understand", "review", "build"]);
+    expect(ids([rec(1, "understand", ["review"]), rec(2, "review", ["finish"]), rec(3, "finish", ["build"])])).toEqual(["understand", "review", "finish", "build"]);
+  });
+
+  test("a shortcut ends once the step it skipped has finished: the path goes through that step again", () => {
+    const full = ["understand", "build", "review", "finish"];
+    // Trivial → Review, changes requested, Build answered.
+    expect(forwardPath(CHANGE_VIA_REVIEW, [rec(1, "understand", ["review"]), rec(2, "review", ["build"]), rec(3, "build", ["review"])])!.map((s) => s.id)).toEqual(full);
+    // Trivial → Review → Finish, a CI failure, Build answered.
+    expect(forwardPath(CHANGE_VIA_REVIEW, [rec(1, "understand", ["review"]), rec(2, "review", ["finish"]), rec(3, "finish", ["build"]), rec(4, "build", ["review"])])!.map((s) => s.id)).toEqual(full);
+    // Trivial → Finish (today's graph), a CI failure, Build answered.
+    expect(forwardPath(CHANGE, [rec(1, "understand", ["finish"]), rec(2, "finish", ["build"]), rec(3, "build", ["review"])])!.map((s) => s.id)).toEqual(full);
+    // A Build that has not finished does not end it: the visits' own order still holds.
+    expect(forwardPath(CHANGE, [rec(1, "understand", ["finish"]), rec(2, "finish", ["build"]), rec(3, "build", ["review"], { outcome: "failed" })])!.map((s) => s.id)).toEqual(["understand", "finish", "build", "review"]);
+    // Understand ran again afterwards and took the shortcut again: Build's older visit is not after it.
+    expect(forwardPath(CHANGE, [rec(1, "understand", ["finish"]), rec(2, "finish", ["build"]), rec(3, "build", ["review"]), rec(4, "understand", ["finish"])])!.map((s) => s.id).slice(0, 2)).toEqual(["understand", "finish"]);
   });
 
   test("a step with two ways forward and no finished visit ends the path: what follows is not known", () => {
@@ -162,6 +195,55 @@ describe("resolvePosition", () => {
       }), ["complete"]],
     // The trivial path.
     ["Understand made the trivial change and Finish published it", input({ history: [rec(1, "understand", ["finish"]), rec(2, "finish", [])] }), ["complete"]],
+    ["…Finish sent a CI failure to Build, which has not finished: Build, with Finish's handoff",
+      input({ history: [rec(1, "understand", ["finish"]), rec(2, "finish", ["build"])] }), ["build", ["understand", "finish"], [["finish", 2]]]],
+    ["…the same under Agetor's Finish: what it failed to publish does not hold the run at Finish",
+      input({ history: [rec(1, "understand", ["finish"]), rec(2, "finish", ["build"])], publish: { stepId: "finish", head: OLD, approvedHead: null, carried: 0, requiredPassed: false } }),
+      ["build", ["understand", "finish"], [["finish", 2]]]],
+    ["…Build answered: Review, with Build's handoff, as on any card",
+      input({ history: [rec(1, "understand", ["finish"]), rec(2, "finish", ["build"]), rec(3, "build", ["review"])] }), ["review", ["understand", "build"], [["build", 3]]]],
+    ["…Review approved: Finish, with Review's handoff",
+      input({ history: [rec(1, "understand", ["finish"]), rec(2, "finish", ["build"]), rec(3, "build", ["review"]), rec(4, "review", ["finish"], { handoff: verdict(HEAD) })] }),
+      ["finish", ["understand", "build", "review"], [["review", 4]]]],
+    ["…and Finish published it", input({ history: [rec(1, "understand", ["finish"]), rec(2, "finish", ["build"]), rec(3, "build", ["review"]), rec(4, "review", ["finish"], { handoff: verdict(HEAD) }), rec(5, "finish", [])] }), ["complete"]],
+    // The trivial path through Review (Understand → Review → Finish).
+    ["trivial → Review: the ordinary path is unchanged", input({ graph: CHANGE_VIA_REVIEW }), ["complete"]],
+    ["trivial → Review: Understand made the change, Review has not run", input({ graph: CHANGE_VIA_REVIEW, history: [rec(1, "understand", ["review"])] }), ["review", ["understand"], [["understand", 1]]]],
+    ["trivial → Review: approved and published", input({ graph: CHANGE_VIA_REVIEW, history: [rec(1, "understand", ["review"]), rec(2, "review", ["finish"], { handoff: verdict(HEAD) }), rec(3, "finish", [])] }), ["complete"]],
+    ["trivial → Review: approved, Finish has not run", input({ graph: CHANGE_VIA_REVIEW, history: [rec(1, "understand", ["review"]), rec(2, "review", ["finish"], { handoff: verdict(HEAD) })] }),
+      ["finish", ["understand", "review"], [["review", 2]]]],
+    ["trivial → Review: the approval names another head — Review again; Build's checks are not asked of a run that skipped Build",
+      input({ graph: CHANGE_VIA_REVIEW, evidence: evidence({ empty: true }), history: [rec(1, "understand", ["review"]), rec(2, "review", ["finish"], { handoff: verdict(OLD) }), rec(3, "finish", [])] }),
+      ["review", ["understand"], [["understand", 1]]]],
+    // A visit Understand handed the work to has `tree-clean` reported, not required (`defaultChecksOf`).
+    ["trivial → Review: Understand left the change uncommitted — not Review's to hold; its verdict for HEAD stands",
+      input({ graph: CHANGE_VIA_REVIEW, evidence: evidence({ dirty: true, reviewChecks: defaultChecksOf(CHANGE_VIA_REVIEW, CHANGE_VIA_REVIEW.steps[2]!, [rec(1, "understand", ["review"])]) }),
+        history: [rec(1, "understand", ["review"]), rec(2, "review", ["finish"], { handoff: verdict(HEAD) }), rec(3, "finish", [])] }),
+      ["complete"]],
+    ["trivial → Review: …a Review that declares `tree-clean` itself is held by it",
+      input({ graph: CHANGE_VIA_REVIEW, evidence: evidence({ dirty: true }), history: [rec(1, "understand", ["review"]), rec(2, "review", ["finish"], { handoff: verdict(HEAD) }), rec(3, "finish", [])] }),
+      ["review", ["understand"], [["understand", 1]]]],
+    ["trivial → Review: changes requested — Build, with Review's findings",
+      input({ graph: CHANGE_VIA_REVIEW, history: [rec(1, "understand", ["review"]), rec(2, "review", ["build"], { handoff: verdict(HEAD, "changes-requested") })] }),
+      ["build", ["understand", "review"], [["review", 2]]]],
+    ["trivial → Review: …Build answered — Review, with Build's handoff",
+      input({ graph: CHANGE_VIA_REVIEW, history: [rec(1, "understand", ["review"]), rec(2, "review", ["build"], { handoff: verdict(OLD, "changes-requested") }), rec(3, "build", ["review"])] }),
+      ["review", ["understand", "build"], [["build", 3]]]],
+    ["trivial → Review: …and asked for changes again at this head — Build, with those findings",
+      input({ graph: CHANGE_VIA_REVIEW, history: [rec(1, "understand", ["review"]), rec(2, "review", ["build"], { handoff: verdict(OLD, "changes-requested") }), rec(3, "build", ["review"]), rec(4, "review", ["build"], { handoff: verdict(HEAD, "changes-requested") })] }),
+      ["build", ["understand"], [["review", 4]]]],
+    ["trivial → Review: Agetor's Finish published HEAD and the required check passed",
+      input({ graph: CHANGE_VIA_REVIEW, history: [rec(1, "understand", ["review"]), rec(2, "review", ["finish"], { handoff: verdict(HEAD) }), rec(3, "finish", [])], publish: { stepId: "finish", head: HEAD, approvedHead: HEAD, carried: 0, requiredPassed: true } }),
+      ["complete"]],
+    ["trivial → Review: …the required check has not passed: Finish again, with Review's handoff",
+      input({ graph: CHANGE_VIA_REVIEW, history: [rec(1, "understand", ["review"]), rec(2, "review", ["finish"], { handoff: verdict(HEAD) }), rec(3, "finish", [])], publish: { stepId: "finish", head: HEAD, approvedHead: HEAD, carried: 0, requiredPassed: false } }),
+      ["finish", ["understand", "review"], [["review", 2]]]],
+    ["trivial → Review: Agetor merged the base in (the diff unchanged) — the carried approval stands here too",
+      input({ graph: CHANGE_VIA_REVIEW, history: [rec(1, "understand", ["review"]), rec(2, "review", ["finish"], { handoff: verdict(OLD) }), rec(3, "finish", [])], publish: { stepId: "finish", head: HEAD, approvedHead: OLD, carried: 1, requiredPassed: true } }),
+      ["complete"]],
+    ["trivial → Review: Finish sent a CI failure to Build — Build, with Finish's handoff",
+      input({ graph: CHANGE_VIA_REVIEW, history: [rec(1, "understand", ["review"]), rec(2, "review", ["finish"], { handoff: verdict(HEAD) }), rec(3, "finish", ["build"])], publish: { stepId: "finish", head: HEAD, approvedHead: HEAD, carried: 0, requiredPassed: false } }),
+      ["build", ["understand", "review", "finish"], [["finish", 3]]]],
     ["a graph that fans out", input({ graph: { ...CHANGE, steps: CHANGE.steps.map((s) => (s.id === "understand" ? { ...s, transition: "all" as const } : s)) } }), ["unsupported"]],
   ];
   for (const [name, given, want] of cases) test(name, () => expect(at(resolvePosition(given))).toEqual(want as never));

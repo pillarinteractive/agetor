@@ -1050,6 +1050,44 @@ test('explicit Pillar lifecycle sign-off includes fresh manually created reviewe
  }
 });
 
+// The Change graph with the trivial change handed to Finish (the board's
+// graph today) and to Review (Pillar's instruction policy): what is signed
+// off is a head an independent Review approved, whichever way it got there.
+test("lifecycle sign-off needs Review's approval on both routes of a trivial change", async () => {
+  const { reviewedPillarPipeline } = await import("./autopilot.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const url = "https://github.com/pillar-interactive/pillar/pull/1342", issue = "https://github.com/pillar-interactive/pillar/issues/1314";
+  const head = "a".repeat(40);
+  const pr = { ...prOf(1342, head), url };
+  const policy = { ...cfg, enabled: false, project: "/pillar", roadmap: { issue: 639 }, autoMergePipelines: true, autoMergeSince: 150 };
+  const done = { schemaVersion: 1, purpose: "p", summary: "s", reason: "r", next: null, artifacts: [], openQuestions: [], status: "done" };
+  const approved = { ...done, next: "Finish", reviewApproval: { verdict: "approved", headSha: head, issueUrl: issue, acceptanceComplete: true, findings: [] } };
+  const changes = { ...done, next: "Build", reviewApproval: { verdict: "changes-requested", headSha: "b".repeat(40), issueUrl: issue, acceptanceComplete: false, findings: ["R1"] } };
+  const published = { ...done, artifacts: [url] };
+  const verdict = (trivialTo: "finish" | "review", visits: [string, string[], Record<string, unknown>][]) => {
+    const step = (id: string, name: string) => newStep({ id, name, agentProfileId: id === "review" ? "reviewer" : "other" });
+    const graph = {
+      steps: [step("understand", "Understand"), step("build", "Build"), step("review", "Review"), step("finish", "Finish")], startStepId: "understand",
+      edges: [["understand", "build"], ["understand", trivialTo], ["build", "review"], ["review", "build"], ["review", "finish"], ["finish", "build"]].map(([from, to]) => ({ id: `${from}-${to}`, from, to, label: "" })),
+    };
+    const history = visits.map(([stepId, nextStepIds, handoff], i) => ({ seq: i + 1, stepId, taskId: `t${i}`, outcome: "succeeded", handoff, nextStepIds }));
+    const run = { status: "done", endedAt: 200, active: [], blocked: [], joins: {}, snapshot: { graph, profiles: { reviewer: { model: "gpt-6.1-sol" }, other: { model: "opus" } }, capturedAt: 100 }, history };
+    return reviewedPillarPipeline(reviewCard("card", 1314, { workdir: "/pillar", pipelineId: "p", issueUrl: issue, prUrl: url, pipelineRun: run }), policy, pr);
+  };
+  const ordinary: [string, string[], Record<string, unknown>][] = [["understand", ["build"], done], ["build", ["review"], done], ["review", ["finish"], approved], ["finish", [], published]];
+  for (const to of ["finish", "review"] as const) expect(verdict(to, ordinary)).toBe(true);
+  // → Finish: no Review saw the change, so the card waits for a person.
+  expect(verdict("finish", [["understand", ["finish"], done], ["finish", [], published]])).toBe(false);
+  // …until a CI failure took it round through Build and Review.
+  expect(verdict("finish", [["understand", ["finish"], done], ["finish", ["build"], done], ["build", ["review"], done], ["review", ["finish"], approved], ["finish", [], published]])).toBe(true);
+  // → Review: approved there, published by Finish.
+  expect(verdict("review", [["understand", ["review"], done], ["review", ["finish"], approved], ["finish", [], published]])).toBe(true);
+  expect(verdict("review", [["understand", ["review"], done], ["review", ["build"], changes], ["build", ["review"], done], ["review", ["finish"], approved], ["finish", [], published]])).toBe(true);
+  // A verdict for another head, or one that asked for changes, is not approval on either route.
+  expect(verdict("review", [["understand", ["review"], done], ["review", ["finish"], { ...approved, reviewApproval: { ...approved.reviewApproval, headSha: "b".repeat(40) } }], ["finish", [], published]])).toBe(false);
+  expect(verdict("review", [["understand", ["review"], done], ["review", ["finish"], { ...changes, next: "Finish" }], ["finish", [], published]])).toBe(false);
+});
+
 test('merge policy opt-in is independent from new admissions and fixes its activation boundary once',async()=>{
  const {applyAutopilotPatch,AUTOPILOT_PREF}=await import('./autopilot.ts');const {preferences}=await import('./db.ts');
  const before=preferences.get(AUTOPILOT_PREF);

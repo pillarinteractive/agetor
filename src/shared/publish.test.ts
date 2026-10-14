@@ -62,6 +62,26 @@ describe("the switch (pipeline_gates)", () => {
     expect(publishStepOf(null)).toBeNull();
     expect(publishStepOf(snap({ gates: { publish: true }, graph: { ...graph, steps: [step("Build"), step("Finish")] } }))).toBeNull();
   });
+
+  test("…and it is Finish whichever step Understand hands a trivial change to", () => {
+    const step = (name: string, canFinish = false): PipelineStep => ({
+      id: name.toLowerCase(), name, instructions: "", agentProfileId: "a", position: { x: 0, y: 0 }, subagents: { profileIds: [], cap: null }, transition: "choose", join: "any",
+      ...(canFinish ? { canFinish: true } : {}),
+    });
+    for (const trivialTo of ["finish", "review"]) {
+      const graph = {
+        steps: [step("Understand", true), step("Build"), step("Review"), step("Finish", true)], startStepId: "understand",
+        edges: [
+          { id: "1", from: "understand", to: "build", label: "build" }, { id: "2", from: "understand", to: trivialTo, label: "trivial change made" },
+          { id: "3", from: "build", to: "review", label: "" }, { id: "4", from: "review", to: "build", label: "changes requested" },
+          { id: "5", from: "review", to: "finish", label: "approved" }, { id: "6", from: "finish", to: "build", label: "verification failed" },
+        ],
+      };
+      const snapshot: PipelineRunSnapshot = { graph, maxSteps: 14, profiles: {}, capturedAt: 0, gates: { publish: true } };
+      expect(publishStepOf(snapshot)?.id).toBe("finish");
+      expect(publishStepOf({ ...snapshot, gates: { steps: true } })).toBeNull();
+    }
+  });
 });
 
 describe("whose failure: the control arm reads the base by job name", () => {

@@ -201,12 +201,13 @@ export const USAGE: Record<string, string> = {
   Update a profile. --skill appends to the existing skill list unless
   --clear-skills is also given (then the list is replaced).`,
 
-  pipeline: `usage: agetor pipeline <ls | show <ref> | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> [--name <n>] | retry <task> [--from <task>] | advance <task> [--next <step>… | --finish] [--from <task>] | refresh-instructions <task> | restart <task> [--from-scratch] | position <task> | rewind <task> --to <step> | feedback <task> --from <step> (--note <text> | --note-file <file|->) [--invalidate] | status <task> [--handoffs] | handoff <task> [<step>|--all]>
+  pipeline: `usage: agetor pipeline <ls | show <ref> | edit <ref> --file <pipeline.json|-> | rm <ref> | export <ref> [--out <file|->] [--force] | import <file|-> [--name <n>] | retry <task> [--from <task>] | advance <task> [--next <step>… | --finish] [--from <task>] | refresh-instructions <task> | restart <task> [--from-scratch] | position <task> | rewind <task> --to <step> | feedback <task> --from <step> (--note <text> | --note-file <file|->) [--invalidate] | status <task> [--handoffs] | handoff <task> [<step>|--all]>
 
   Manage pipelines — named graphs of agent-profile-bound steps launched as
   one board task (built in the app's Pipelines editor; the CLI moves them
   around) — and control a pipeline TASK's run.
-    ls / show / rm / export / import   take a pipeline <ref> (id, or its
+    ls / show / edit / rm / export / import
+                                        take a pipeline <ref> (id, or its
                                         unique case-insensitive name)
     retry / advance / refresh-instructions / restart / position / rewind /
     feedback / status / handoff         take a pipeline TASK <ref> (id or
@@ -214,7 +215,20 @@ export const USAGE: Record<string, string> = {
                                         task-targeting command; a hidden
                                         step task's id is refused — target
                                         its pipeline task instead)
-  Launch a pipeline with 'agetor add --pipeline <id|name>'.`,
+  Launch a pipeline with 'agetor add --pipeline <id|name>'. Update one in
+  place from a file with 'agetor pipeline edit <ref> --file <file|->'.`,
+
+  "pipeline edit": `usage: agetor pipeline edit <ref> --file <pipeline.json|->
+
+  Replace an existing pipeline's name, description, graph and step cap with
+  the PipelineInput JSON in the file ('-' reads stdin) — the format 'pipeline
+  export' writes — keeping its id, so nothing is duplicated. The file is
+  validated like an import; 'profileName' hints are ignored (profile ids are
+  taken as written: this is for a pipeline that already lives on this
+  machine). Unfinished runs started from the pipeline take the edited step
+  instructions by themselves; a step that is executing takes them at its
+  next launch. Their routing, agent assignments and step cap stay as they
+  started — a new edge applies to runs started after the edit.`,
 
   "pipeline export": `usage: agetor pipeline export <ref> [--out <file|->] [--force]
 

@@ -5,9 +5,10 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { rmTestDataDir } from "./test-data-dir.ts";
 
-// What an unattended board (the planner-recommendation policy) does with the
-// two stops that need no person: a step that ended without a handoff, and a
-// run that reached its step cap. Same bootstrap as pipeline-auto-retry.test.ts.
+// What an unattended board (a project with a decision policy:
+// planner-recommendation or agent-followups) does with the two stops that
+// need no person: a step that ended without a handoff, and a run that
+// reached its step cap. Same bootstrap as pipeline-auto-retry.test.ts.
 const DATA_DIR = mkdtempSync(path.join(tmpdir(), "agetor-unattended-"));
 process.env.AGETOR_DATA_DIR = DATA_DIR;
 process.env.AGETOR_CLAUDE_DRIVER = "fake";
@@ -55,14 +56,14 @@ const activity = (id: string): string[] => {
 };
 
 /** Start a pipeline of `names` steps in a cycle (one step: no edge), each handing off with `suffix`. */
-async function start(names: string[], suffix: string, maxSteps: number, unattended: boolean) {
+async function start(names: string[], suffix: string, maxSteps: number, unattended: boolean, mode = "planner-recommendation") {
   const { createTask, startTask } = await import("./orchestrator.ts");
   const { agentProfiles, pipelines, preferences } = await import("./db.ts");
   const { newStep } = await import("../shared/pipeline.ts");
   const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
   const { PIPELINE_DECISIONS_PREF } = await import("../shared/pipeline-decisions.ts");
   const workdir = mkdtempSync(path.join(tmpdir(), "agetor-unattended-wd-"));
-  preferences.set(PIPELINE_DECISIONS_PREF, JSON.stringify({ mode: "planner-recommendation", projects: unattended ? [workdir] : [] }));
+  preferences.set(PIPELINE_DECISIONS_PREF, JSON.stringify({ mode, projects: unattended ? [workdir] : [] }));
   const profile = agentProfiles.insert({
     name: `unattended-${randomUUID()}`, harness: "claude-code", model: "fake-model", effort: null, mode: null, fast: false, maxMode: false, instructions: "", skills: [],
   });
@@ -114,6 +115,25 @@ test("unattended: a step that never hands off is scheduled to start again", asyn
   expect(activity(parentId).some((l) => l.includes("ended without a handoff") && l.includes("retrying automatically at"))).toBe(true);
 });
 
+// Pillar's instruction policy selects agent-followups: who files the
+// follow-up issue changes, what the board does unattended does not.
+test("agent-followups is unattended in the same way: the cap extends itself once, and a missing handoff is retried", async () => {
+  const { tasks } = await import("./db.ts");
+  const capped = await start(["A", "B"], "done", 2, true, "agent-followups");
+  const run = await blockedRun(capped.parentId);
+  expect(run.snapshot!.decisionPolicy).toBe("agent-followups");
+  expect(run.capExtensions).toBe(1);
+  expect(run.stepCount).toBe(4);
+  expect(run.blocked.some((b) => b.kind === "step-cap")).toBe(true);
+  const prompt = tasks.get(run.history[0]!.taskId)!.prompt;
+  expect(prompt).toContain("You own one follow-up issue per decision");
+  expect(prompt).not.toContain("attempts one GitHub follow-up issue per run");
+
+  const silent = await start(["Build"], "missing", 25, true, "agent-followups");
+  const waiting = await blockedRun(silent.parentId);
+  expect(waiting.autoRetry).toMatchObject({ stepId: silent.stepIds[0], kind: "transient", attempt: 1 });
+});
+
 test("attended: a step that never hands off waits for a person", async () => {
   const { parentId } = await start(["Build"], "missing", 25, false);
   const run = await blockedRun(parentId);
@@ -122,28 +142,30 @@ test("attended: a step that never hands off waits for a person", async () => {
 });
 
 /** Build → Review → Finish (may end the run, or go back to Build); Review and Finish each choose `reviewNext`/`finishNext`. */
-async function startTemplate(reviewNext: string, finishNext: string, maxSteps: number, unattended: boolean, opts?: { understand?: boolean }) {
+async function startTemplate(reviewNext: string, finishNext: string, maxSteps: number, unattended: boolean, opts?: { understand?: boolean; trivialTo?: "review"; mode?: string }) {
   const { createTask, startTask } = await import("./orchestrator.ts");
   const { agentProfiles, pipelines, preferences } = await import("./db.ts");
   const { newStep } = await import("../shared/pipeline.ts");
   const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
   const { PIPELINE_DECISIONS_PREF } = await import("../shared/pipeline-decisions.ts");
   const workdir = mkdtempSync(path.join(tmpdir(), "agetor-unattended-wd-"));
-  preferences.set(PIPELINE_DECISIONS_PREF, JSON.stringify({ mode: "planner-recommendation", projects: unattended ? [workdir] : [] }));
+  preferences.set(PIPELINE_DECISIONS_PREF, JSON.stringify({ mode: opts?.mode ?? "planner-recommendation", projects: unattended ? [workdir] : [] }));
   const profile = agentProfiles.insert({
     name: `unattended-${randomUUID()}`, harness: "claude-code", model: "fake-model", effort: null, mode: null, fast: false, maxMode: false, instructions: "", skills: [],
   });
   const step = (name: string, next: string) => newStep({ name, agentProfileId: profile.id, instructions: `${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:${next}` });
   const build = step("Build", "Review"), review = step("Review", reviewNext), finish = { ...step("Finish", finishNext), canFinish: true };
   // With `understand`: the shape of the board's "Change" pipeline, whose
-  // first step may also end the run ("trivial change made").
-  const understand = { ...step("Understand", "Build"), canFinish: true };
+  // first step may also end the run ("trivial change made"). `trivialTo`:
+  // that edge leads to Review (Pillar's instruction policy) and Understand
+  // takes it.
+  const understand = { ...step("Understand", opts?.trivialTo === "review" ? "Review" : "Build"), canFinish: true };
   const graph = {
     steps: [...(opts?.understand ? [understand] : []), build, review, finish],
     edges: [
       ...(opts?.understand ? [
         { id: "understand-build", from: understand.id, to: build.id, label: "build" },
-        { id: "understand-finish", from: understand.id, to: finish.id, label: "trivial change made" },
+        { id: "understand-trivial", from: understand.id, to: opts?.trivialTo === "review" ? review.id : finish.id, label: "trivial change made" },
       ] : []),
       { id: "build-review", from: build.id, to: review.id, label: "" },
       { id: "review-build", from: review.id, to: build.id, label: "changes requested" },
@@ -237,6 +259,22 @@ test("unattended: Change's graph (Understand may finish too) is wrapped up throu
   const run = done.pipelineRun!;
   expect(run.history.map((h) => h.stepId)).toEqual([understand.id, build.id, review.id, build.id, finish.id]);
   expect(run.capWrapUp).toMatchObject({ fromStepId: review.id, seq: 5 });
+  expect(run.blocked).toEqual([]);
+  expect(tasks.get(run.history[4]!.taskId)!.prompt).toContain(WRAP_UP_HEADING);
+  expect(wrapUpLines(parentId)).toEqual(["Reached the 4-step cap — finishing through Finish and filing issues for what is unresolved"]);
+});
+
+test("unattended, trivial change → Review under agent-followups: the same one extension and one wrap-up through Finish", async () => {
+  const { tasks } = await import("./db.ts");
+  // Understand, Review (cap 2 → 4), Build, Review; the Build that Review
+  // asks for again meets the cap and Finish runs in its place.
+  const { parentId, understand, build, review, finish } = await startTemplate("Build", "done", 2, true, { understand: true, trivialTo: "review", mode: "agent-followups" });
+  const done = await waitFor(() => (tasks.get(parentId)?.pipelineRun?.status === "done" ? tasks.get(parentId)! : null));
+  const run = done.pipelineRun!;
+  expect(run.snapshot!.decisionPolicy).toBe("agent-followups");
+  expect(run.history.map((h) => h.stepId)).toEqual([understand.id, review.id, build.id, review.id, finish.id]);
+  expect(run.capExtensions).toBe(1);
+  expect(run.capWrapUp).toMatchObject({ fromStepId: build.id, seq: 5 });
   expect(run.blocked).toEqual([]);
   expect(tasks.get(run.history[4]!.taskId)!.prompt).toContain(WRAP_UP_HEADING);
   expect(wrapUpLines(parentId)).toEqual(["Reached the 4-step cap — finishing through Finish and filing issues for what is unresolved"]);

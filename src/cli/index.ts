@@ -61,7 +61,7 @@ Commands:
   keepalive <sub>     on | off | status: reopen the app if it dies (never after you quit it)
   harness <sub>       list | add | edit | enable | disable | rm | shell agent harnesses
   profile <sub>       list | show | add | edit | rm reusable agent profiles
-  pipeline <sub>      list | show | rm | export | import pipelines; retry [--from] |
+  pipeline <sub>      list | show | edit | rm | export | import pipelines; retry [--from] |
                       advance | restart | status [--handoffs] | handoff control and
                       inspect a pipeline task's run
   clone <url>         clone a repository as a new project (--provider, --dest, --no-eli5)

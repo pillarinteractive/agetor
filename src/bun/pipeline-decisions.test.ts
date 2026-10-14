@@ -21,13 +21,13 @@ afterEach(async () => {
   (await import("./pipeline-runner.ts")).stopPipelineAutoRetryTimers();
 });
 afterAll(async () => { await Bun.sleep(150); rmTestDataDir(dir); });
-async function fixture(enabled = true, blocked = false) {
+async function fixture(enabled = true, blocked = false, mode = "planner-recommendation") {
   const { tasks, preferences, agentProfiles, pipelines } = await import("./db.ts");
   const { createTask, startTask } = await import("./orchestrator.ts");
   const { newStep } = await import("../shared/pipeline.ts");
   const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER: marker } = await import("./agents.ts");
   const wd = mkdtempSync(join(tmpdir(), "agetor-decision-project-"));
-  preferences.set(PIPELINE_DECISIONS_PREF, JSON.stringify({ mode: "planner-recommendation", projects: enabled ? [wd] : [] }));
+  preferences.set(PIPELINE_DECISIONS_PREF, JSON.stringify({ mode, projects: enabled ? [wd] : [] }));
   const profile = agentProfiles.insert({ name: randomUUID(), harness: "claude-code", model: "fake-model", effort: null, mode: null, fast: false, maxMode: false, instructions: "Preserve permissions", skills: [] });
   const step = newStep({ name: "Build", agentProfileId: profile.id, instructions: `${marker}:${blocked ? "blocked" : "done"}` });
   const pipeline = pipelines.insert({ name: randomUUID(), graph: { steps: [step], edges: [], startStepId: step.id }, maxSteps: 14 });
@@ -405,4 +405,24 @@ test("concurrent records cannot race a pending update; a concurrent scope change
   const ledger = JSON.parse(readFileSync(result.path as string, "utf8"));
   expect(ledger.records).toHaveLength(2); expect(ledger.issueNumber).toBe(91); expect(ledger.issueUrl).toBe("https://github.com/acme/widget/issues/91");
   expect(ledger.sourceIssue).toBe("https://github.com/acme/widget/issues/12");
+});
+
+test("agent-managed decisions freeze the mode and never call remote issue adapters", async () => {
+  const { id, parent } = await fixture(true, false, "agent-followups");
+  const api = await adapters();
+  const before = JSON.stringify(parent.pipelineRun);
+  const input = record(parent.pipelineRun!.snapshot!.capturedAt);
+  const first = await api.call(id, input);
+  const repeat = await api.call(id, input);
+  const revised = await api.call(id, { ...input, rationale: "Updated checked evidence" });
+  expect(first.publication).toBe("agent-managed");
+  expect(first.followupMarker).toContain("https://github.com/acme/widget/issues/12");
+  expect(repeat.followupMarker).toBe(first.followupMarker);
+  expect(repeat.deduplicated).toBe(true);
+  expect(revised.followupMarker).toBe(first.followupMarker);
+  expect(api.counts()).toEqual({ created: 0, updated: 0 });
+  expect((await import("./db.ts")).tasks.get(id)!.pipelineRun!.snapshot!.decisionPolicy).toBe("agent-followups");
+  expect(JSON.stringify((await import("./db.ts")).tasks.get(id)!.pipelineRun)).toBe(before);
+  expect(plannerDecisionInstructions(id, input.capturedAt, "agent-followups")).toContain("You own one follow-up issue per decision");
+  expect(plannerDecisionInstructions(id, input.capturedAt, "agent-followups")).not.toContain("attempts one GitHub follow-up issue per run");
 });

@@ -1077,18 +1077,41 @@ export interface StepGate {
   maxTurns: number;
 }
 
+type Visit = Pick<PipelineStepRecord, "seq" | "stepId" | "outcome" | "nextStepIds">;
+
+/**
+ * The checks `step` gets when it declares none, by its place in a reviewed
+ * pipeline (`defaultStepChecks`): Build's, Review's, or none.
+ *
+ * Review's `tree-clean` stands on Build's gate, which made the tree clean
+ * before Review was handed it. Where another step hands Review the work
+ * (Understand's trivial change, on a graph that routes it through Review),
+ * nothing did: for a run whose last finished visit to send the work to
+ * Review was not Build's, the check is reported and not required. Review
+ * does not commit and must not discard what it was handed; an uncommitted
+ * change goes to Build on its verdict, or from Finish. Pure.
+ */
+export function defaultChecksOf(graph: PipelineGraph | null | undefined, step: PipelineStep, history: readonly Visit[] = []): StepCheck[] {
+  const shape = reviewedPipelineShape(graph);
+  if (shape?.build.id === step.id) return defaultStepChecks("build");
+  if (!shape || shape.review.id !== step.id) return defaultStepChecks(null);
+  const sent = history
+    .filter((h) => h.stepId !== step.id && (h.outcome === "succeeded" || h.outcome === "advanced-manually") && h.nextStepIds.includes(step.id))
+    .sort((x, y) => y.seq - x.seq)[0];
+  const checks = defaultStepChecks("review");
+  return !sent || sent.stepId === shape.build.id ? checks : checks.map((c) => (c.id === "tree-clean" ? { ...c, required: false } : c));
+}
+
 /**
  * The gate `step` has in a run with this snapshot, or null: the run adopted
  * the `steps` gate (`snapshot.gates`), and the step has checks — its own, or
  * the defaults for Build and Review of a reviewed pipeline when it declares
- * none (`checks: []` declares none on purpose). A follow-up step never has
- * one. Pure.
+ * none (`checks: []` declares none on purpose; `history` is the run's, for
+ * {@link defaultChecksOf}). A follow-up step never has one. Pure.
  */
-export function stepGate(snapshot: Pick<PipelineRunSnapshot, "graph" | "gates"> | null | undefined, step: PipelineStep): StepGate | null {
+export function stepGate(snapshot: Pick<PipelineRunSnapshot, "graph" | "gates"> | null | undefined, step: PipelineStep, history: readonly Visit[] = []): StepGate | null {
   if (!snapshot?.gates?.steps || isFollowUpStepId(step.id)) return null;
-  const shape = reviewedPipelineShape(snapshot.graph);
-  const role = shape?.build.id === step.id ? "build" : shape?.review.id === step.id ? "review" : null;
-  const checks = step.checks ?? defaultStepChecks(role);
+  const checks = step.checks ?? defaultChecksOf(snapshot.graph, step, history);
   if (checks.length === 0) return null;
   const maxTurns = Number.isInteger(step.maxTurns) ? Math.max(0, Math.min(CHECK_LIMITS.maxTurnsMax, step.maxTurns!)) : CHECK_LIMITS.maxTurnsDefault;
   return { checks, goal: step.goal?.trim() || null, maxTurns };
@@ -1703,7 +1726,9 @@ export function composeStepPrompt(input: {
 
   parts.push("## Delegation");
   // Codex has no subagent tool; a persona list there would only invite the
-  // agent to emulate one on its own (expensive) model.
+  // agent to emulate one on its own (expensive) model. Step text shared by
+  // several harnesses may still ask for a Scout: the line below says what
+  // that means for a step that cannot delegate.
   const canDelegate = !input.parentHarnessKind || input.parentHarnessKind === "claude-code";
   if (input.subagentProfiles.length > 0 && canDelegate) {
     parts.push(
@@ -1739,7 +1764,7 @@ export function composeStepPrompt(input: {
       );
     }
   } else {
-    parts.push("Do not spawn subagents for this step.");
+    parts.push("Do not spawn subagents for this step. Any Scout delegation requested elsewhere is conditional on supported tools and this step's permission; investigate directly with narrow reads instead.");
   }
 
   parts.push("## Working economically");

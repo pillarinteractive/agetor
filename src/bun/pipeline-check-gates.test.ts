@@ -297,7 +297,9 @@ test("a missing handoff with the checks failing costs a same-step turn, not the 
   expect(run.stepCount).toBe(3);
 }, 90_000);
 
-test("the Change shape's defaults on a real worktree: Build passes on its commit; a Review without a verdict is never advanced or composed", async () => {
+/** A card's worktree: a clone on `claude/x` with one commit ahead of
+ *  `origin/develop`. Nothing in the tests pushes to the bare origin. */
+async function makeRepo() {
   const root = mkdtempSync(path.join(tmpdir(), "agetor-check-gates-repo-"));
   const sh = async (cwd: string, ...args: string[]) => {
     const p = Bun.spawn(args, { cwd, stdout: "pipe", stderr: "pipe", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" } });
@@ -317,6 +319,11 @@ test("the Change shape's defaults on a real worktree: Build passes on its commit
   writeFileSync(path.join(repo, "feature.txt"), "feature\n");
   await sh(repo, "git", "add", ".");
   await sh(repo, "git", "commit", "-qm", "feat: the change");
+  return { repo, sh };
+}
+
+test("the Change shape's defaults on a real worktree: Build passes on its commit; a Review without a verdict is never advanced or composed", async () => {
+  const { repo, sh } = await makeRepo();
 
   // No `checks` declared anywhere: the defaults. Review's turns are 0 so the chain is short.
   const card = await makeCard({ workdir: repo, build: { checks: undefined }, review: { checks: undefined, maxTurns: 0 } });
@@ -345,6 +352,53 @@ test("the Change shape's defaults on a real worktree: Build passes on its commit
   // Finish has no gate by default, and nothing was pushed or changed.
   expect(await sh(repo, "git", "status", "--porcelain")).toBe("");
   expect(await sh(repo, "git", "ls-remote", "origin", "refs/heads/claude/x")).toBe("");
+}, 90_000);
+
+// The Change graph as Pillar's instruction policy routes a trivial change:
+// Understand → Review. No Build visit made the tree clean first, and Review
+// neither commits nor may discard what it was handed.
+test("trivial change → Review: an uncommitted change is reported on Review's visit, which is held by its verdict alone", async () => {
+  const { repo, sh } = await makeRepo();
+  writeFileSync(path.join(repo, "a.txt"), "the trivial change, left uncommitted\n");
+  const profile = agentProfiles.insert({
+    name: `check-gates-${randomUUID()}`, harness: "claude-code", model: "fake-model", effort: null, mode: null, fast: false, maxMode: false, instructions: "", skills: [],
+  });
+  const step = (name: string, next: string, extra: Partial<PipelineStep> = {}) =>
+    newStep({ name, agentProfileId: profile.id, instructions: `Do the ${name} work. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:${next}`, ...extra });
+  const understand = step("Understand", "Review", { canFinish: true }), build = step("Build", "Review"), review = step("Review", "Finish", { maxTurns: 0 });
+  const finish = step("Finish", "done", { canFinish: true });
+  const edge = (from: PipelineStep, to: PipelineStep, label = "") => ({ id: `${from.name}-${to.name}`, from: from.id, to: to.id, label });
+  const pipeline = pipelines.insert({
+    name: `check-gates-${randomUUID()}`, maxSteps: 9,
+    graph: {
+      steps: [understand, build, review, finish], startStepId: understand.id,
+      edges: [edge(understand, build, "build"), edge(understand, review, "trivial change made"), edge(build, review), edge(review, build, "changes requested"), edge(review, finish, "approved"), edge(finish, build, "verification failed")],
+    },
+  });
+  const created = await createTask({ title: "check gates", prompt: "goal", workdir: repo, isolation: "none", pipelineId: pipeline.id });
+  if ("error" in created) throw new Error(created.error);
+  parents.push(created.task.id);
+  const id = created.task.id;
+  gateOn(pipeline.name);
+  await start(id);
+  const run = await settled(id, "blocked");
+
+  // Understand has no gate and Build never ran.
+  expect(visits(run, understand).map((h) => [h.outcome, h.gate, h.nextStepIds])).toEqual([["succeeded", undefined, [review.id]]]);
+  expect(visits(run, build)).toEqual([]);
+  const prompt = tasks.get(visits(run, review)[0]!.taskId)!.prompt;
+  expect(prompt).toContain("- `tree-clean` (reported, does not hold the step) — ");
+  expect(prompt).toContain("- `review-verdict` — ");
+  // The scripted Review writes no verdict, which is all that holds it: the dirty tree is on record and held nothing.
+  expect(visits(run, review).map((h) => [h.outcome, h.gate?.state, h.gate?.failed])).toEqual([["failed", "exhausted", ["review-verdict"]], [null, "owner", ["review-verdict"]]]);
+  expect(run.blocked.map((b) => b.kind)).toEqual(["check-failed"]);
+  expect(run.blocked[0]!.message).not.toContain("tree-clean");
+  expect(readCheckLedger(id, run).filter((e) => e.stepName === "Review").map((e) => [e.seq, e.checkId, e.required, e.outcome])).toEqual([
+    [2, "tree-clean", false, "fail"], [2, "review-verdict", true, "fail"], [3, "tree-clean", false, "fail"], [3, "review-verdict", true, "fail"],
+  ]);
+  // Nobody was sent in to clean the tree: the change is still there.
+  expect(await sh(repo, "git", "status", "--porcelain")).toBe("M a.txt");
+  expect(sentTo(visits(run, review)[0]!.taskId).some((m) => m.includes(CHECK_FEEDBACK_MARKER))).toBe(false);
 }, 90_000);
 
 test("a check that cannot be evaluated spends no turn of the step and waits for the owner", async () => {

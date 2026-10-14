@@ -6,7 +6,7 @@ import {
   renderCheckFailures, reusablePass, reviewVerdictFinding, unrunResult, validateStepChecks, type CheckKey, type CheckResult,
 } from "./checks.ts";
 import {
-  CHECK_FEEDBACK_MARKER, composeCheckFeedback, composeStepPrompt, newStep, normalizeHandoff, stepGate, updatedPipelineGates, validatePipelineGraph,
+  CHECK_FEEDBACK_MARKER, composeCheckFeedback, composeStepPrompt, defaultChecksOf, newStep, normalizeHandoff, stepGate, updatedPipelineGates, validatePipelineGraph,
 } from "./pipeline.ts";
 import { parsePipelineGate, publishGateOn } from "./publish.ts";
 
@@ -135,6 +135,40 @@ describe("stepGate", () => {
     expect(stepGate(on, finish)).toBeNull();
     for (const role of ["build", "review"] as const) expect(defaultStepChecks(role).every((c) => c.run.kind === "builtin" && c.required)).toBe(true);
     expect(defaultStepChecks(null)).toEqual([]);
+  });
+  // The trivial change, as the board's graph routes it today (→ Finish) and
+  // as Pillar's instruction policy routes it (→ Review).
+  const trivial = (to: "f" | "r") => ({ graph: { steps: [understand, build, review, finish], edges: [...edges, { id: "e4", from: "u", to, label: "trivial change made" }, { id: "e5", from: "f", to: "b", label: "verification failed" }], startStepId: "u" }, gates: { steps: true as const } });
+  const visit = (seq: number, stepId: string, next: string[], outcome: "succeeded" | "advanced-manually" | "failed" | null = "succeeded") => ({ seq, stepId, outcome, nextStepIds: next });
+  const required = (gate: ReturnType<typeof stepGate>) => gate!.checks.map((c) => [c.id, c.required]);
+  test("trivial change → Finish: Review is only ever handed the work by Build, and both its defaults are required", () => {
+    const snap = trivial("f");
+    for (const history of [[], [visit(1, "u", ["b"]), visit(2, "b", ["r"])], [visit(1, "u", ["f"]), visit(2, "f", ["b"]), visit(3, "b", ["r"])]]) {
+      expect(required(stepGate(snap, review, history))).toEqual([["tree-clean", true], ["review-verdict", true]]);
+    }
+    expect(required(stepGate(snap, build, [visit(1, "u", ["f"]), visit(2, "f", ["b"])]))).toEqual([["tree-clean", true], ["diff-nonempty", true]]);
+    expect(stepGate(snap, understand)).toBeNull();
+    expect(stepGate(snap, finish)).toBeNull();
+  });
+  test("trivial change → Review: a visit Understand handed the work to reports `tree-clean` and is held by its verdict alone", () => {
+    const snap = trivial("r");
+    expect(required(stepGate(snap, review, [visit(1, "u", ["r"])]))).toEqual([["tree-clean", false], ["review-verdict", true]]);
+    expect(required(stepGate(snap, review, [visit(1, "u", ["r"], "advanced-manually")]))).toEqual([["tree-clean", false], ["review-verdict", true]]);
+    // Review's own visits do not change who handed it the work.
+    expect(required(stepGate(snap, review, [visit(1, "u", ["r"]), visit(2, "r", ["f"]), visit(3, "f", [])]))).toEqual([["tree-clean", false], ["review-verdict", true]]);
+    // Build's gate has passed since: the check is Review's to hold again.
+    expect(required(stepGate(snap, review, [visit(1, "u", ["r"]), visit(2, "r", ["b"]), visit(3, "b", ["r"])]))).toEqual([["tree-clean", true], ["review-verdict", true]]);
+    expect(required(stepGate(snap, review, [visit(1, "u", ["r"]), visit(2, "r", ["f"]), visit(3, "f", ["b"]), visit(4, "b", ["r"])]))).toEqual([["tree-clean", true], ["review-verdict", true]]);
+    // The ordinary card on the same graph, a visit that did not finish, and no history at all.
+    expect(required(stepGate(snap, review, [visit(1, "u", ["b"]), visit(2, "b", ["r"])]))).toEqual([["tree-clean", true], ["review-verdict", true]]);
+    expect(required(stepGate(snap, review, [visit(1, "u", ["b"]), visit(2, "b", ["r"]), visit(3, "u", ["r"], "failed")]))).toEqual([["tree-clean", true], ["review-verdict", true]]);
+    expect(required(stepGate(snap, review))).toEqual([["tree-clean", true], ["review-verdict", true]]);
+    // Build is gated as on any card; a Review that declares its checks keeps them as written.
+    expect(required(stepGate(snap, build, [visit(1, "u", ["r"]), visit(2, "r", ["b"])]))).toEqual([["tree-clean", true], ["diff-nonempty", true]]);
+    const own = { ...review, checks: [builtinCheck("tree-clean"), builtinCheck("review-verdict")] };
+    expect(required(stepGate({ ...snap, graph: { ...snap.graph, steps: [understand, build, own, finish] } }, own, [visit(1, "u", ["r"])]))).toEqual([["tree-clean", true], ["review-verdict", true]]);
+    expect(defaultChecksOf(snap.graph, review, [visit(1, "u", ["r"])]).map((c) => [c.id, c.required])).toEqual([["tree-clean", false], ["review-verdict", true]]);
+    expect(defaultChecksOf(snap.graph, understand, [visit(1, "u", ["r"])])).toEqual([]);
   });
   test("a step's own checks, goal and turns win; an empty list is no gate; a follow-up never has one", () => {
     const own = { ...build, checks: [cmd("unit")], goal: " Committed. ", maxTurns: 4 };

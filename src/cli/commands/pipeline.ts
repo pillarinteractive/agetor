@@ -115,6 +115,17 @@ export async function cmdPipeline(args: string[], flags: Flags): Promise<void> {
       }
       return;
     }
+    case "edit": {
+      const ref = args[1], file = args[3];
+      if (!ref || args[2] !== "--file" || !file || args.length !== 4) throw usageError("pipeline edit");
+      const parsed = parsePipelineFile(file === "-" ? await Bun.stdin.text() : readFileSync(file, "utf8"));
+      if (!parsed.ok) throw new Error(`invalid pipeline file: ${parsed.error}`);
+      const pipeline = await resolvePipeline(client, ref);
+      const updated = await client.updatePipeline(pipeline.id, parsed.input);
+      if (flags.json) return printJson(updated);
+      out(`${c.green("✓")} updated pipeline ${c.bold(updated.name)} — unfinished runs take edited step instructions; their routing, agents and caps stay as started`);
+      return;
+    }
     case "import": {
       const file = args[1];
       if (!file) throw usageError("pipeline import");
@@ -320,7 +331,7 @@ export async function cmdPipeline(args: string[], flags: Flags): Promise<void> {
       throw new Error(
         "unknown pipeline subcommand: " +
           sub +
-          " (use ls | show | rm | export | import | retry | advance | refresh-instructions | restart | position | rewind | feedback | status | handoff | decision | decisions)",
+          " (use ls | show | edit | rm | export | import | retry | advance | refresh-instructions | restart | position | rewind | feedback | status | handoff | decision | decisions)",
       );
   }
 }
