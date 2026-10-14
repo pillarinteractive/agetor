@@ -216,6 +216,22 @@ async function boot(opts: StartCoreOptions, deps: CoreDeps): Promise<ApiServer> 
     }
   }, 5 * 60_000).unref();
 
+  // Transcript retention (src/bun/event-retention.ts): archived cards'
+  // run events are pruned, and the space returned, two minutes after boot and
+  // hourly. The one-off switch to incremental auto-vacuum follows the first
+  // prune, when there is free space to return.
+  const retention = async (when: string) => {
+    try {
+      const r = await import("./event-retention.ts");
+      await r.retentionSweep(log);
+      if (when === "post-boot") r.enableIncrementalVacuum(log);
+    } catch (err) {
+      log(`transcript retention (${when}) failed: ${errMessage(err)}`);
+    }
+  };
+  setTimeout(() => void retention("post-boot"), 120_000).unref();
+  setInterval(() => void retention("hourly"), 60 * 60_000).unref();
+
   // Idle-session reaper (docs/plans/reduce-cpu-and-memory.md §3.1, T4): kills
   // claude REPL tmux sessions that have sat idle. The 30s delay lets
   // reconcileOrphans' reattaches settle so a task mid-reattach isn't
