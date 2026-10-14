@@ -1027,6 +1027,12 @@ export interface PipelineRunState {
    *  persisted so a core restart resumes at the same rung and no rung
    *  repeats for the same step execution. */
   ladder?: PipelineLadderState;
+  /** The ladder's one restart from the base branch (`restart-from-base`,
+   *  docs/plans/no-owner-holds.md): an unattended run that hit its step cap
+   *  again after its wrap-up had its attempt archived and started over from
+   *  the current base, once. Carried onto the restarted run, so a second cap
+   *  hit there closes out on an issue instead. */
+  capRestart?: PipelineCapRestart;
   /** An automatic retry of a step that failed for a reason a person can't
    *  fix — a usage limit (`quota`: waits for the reset, never gives up) or a
    *  transient failure (crash, overload, launch flake; a few attempts with
@@ -1061,6 +1067,25 @@ export interface PipelineStepReport {
   endedAt: number | null;
   handoff: Handoff | null;
   report: string | null;
+}
+
+export interface PipelineCapRestart {
+  at: number;
+  /** pending: decided, git not done yet (a core restart then closes out
+   *  instead of trying again); reset: the attempt is archived and the
+   *  worktree is on the base, the run not restarted yet; started: the run
+   *  restarted from scratch; failed: refused or failed, closed out instead. */
+  state: "pending" | "reset" | "started" | "failed";
+  /** The base branch the worktree was reset to. */
+  base?: string;
+  /** `archive/<slug>-attempt-<n>` (the worktree's HEAD) and, when the remote
+   *  branch differed, `…-pr` (the remote branch), with their commits. */
+  archive?: { ref: string; sha: string }[];
+  /** The pull request closed with a comment, if one was open. */
+  closedPr?: number;
+  /** Why it was refused or failed (state "failed"), or what went wrong on
+   *  the way that did not stop it. */
+  note?: string;
 }
 
 export interface PipelineLadderState {

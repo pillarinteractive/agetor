@@ -793,6 +793,10 @@ export const parsePipelineRunState = (raw: string | null): PipelineRunState | nu
       ? Math.min(rec.capExtensions as number, PIPELINE_LIMITS.capExtensionsMax)
       : undefined,
     capWrapUp: sanitizeCapWrapUp(rec.capWrapUp),
+    ...(() => {
+      const capRestart = sanitizeCapRestart(rec.capRestart);
+      return capRestart ? { capRestart } : {};
+    })(),
     autoRetry: sanitizeAutoRetry(rec.autoRetry),
     launchRetries: isPlainObject(rec.launchRetries)
       ? Object.fromEntries(Object.entries(rec.launchRetries).flatMap(([taskId, value]) => {
@@ -943,6 +947,27 @@ const sanitizeCapWrapUp = (raw: unknown): PipelineRunState["capWrapUp"] => {
         },
       }
       : {}),
+  };
+};
+
+const CAP_RESTART_STATES = new Set(["pending", "reset", "started", "failed"]);
+/** `run.capRestart`. An unreadable one is kept as used ("failed"), never
+ *  dropped: dropping it would let a run restart from the base twice. */
+const sanitizeCapRestart = (raw: unknown): PipelineRunState["capRestart"] => {
+  if (raw === undefined || raw === null) return undefined;
+  if (!isPlainObject(raw)) return { at: 0, state: "failed", note: "unreadable record" };
+  const r = raw as Record<string, unknown>;
+  const state = typeof r.state === "string" && CAP_RESTART_STATES.has(r.state) ? (r.state as NonNullable<PipelineRunState["capRestart"]>["state"]) : "failed";
+  const archive = Array.isArray(r.archive)
+    ? r.archive.flatMap((a) => (isPlainObject(a) && typeof a.ref === "string" && typeof a.sha === "string" ? [{ ref: a.ref.slice(0, 300), sha: a.sha.slice(0, 64) }] : [])).slice(0, 4)
+    : [];
+  return {
+    at: isFiniteNumber(r.at) ? r.at : 0,
+    state,
+    ...(typeof r.base === "string" && r.base ? { base: r.base.slice(0, 200) } : {}),
+    ...(archive.length ? { archive } : {}),
+    ...(Number.isSafeInteger(r.closedPr) && (r.closedPr as number) > 0 ? { closedPr: r.closedPr as number } : {}),
+    ...(typeof r.note === "string" && r.note ? { note: r.note.slice(0, 500) } : {}),
   };
 };
 

@@ -13,6 +13,9 @@
  *                 or PR, the base branch's CI, a lease, a usage limit, the
  *                 environment) stays in the wait queue, re-checked for ever
  *                 at a capped interval, never escalated;
+ *      restart-from-base — the step cap hit again after its wrap-up: the
+ *                 attempt is archived and the run starts over from the
+ *                 current base branch, once per card run;
  *   3. close    — one follow-up issue per unresolved item, then the existing
  *                 step-cap wrap-up through Finish when there is committed
  *                 work (`close-publish`), else a dependency wait on the
@@ -198,6 +201,12 @@ export interface OwnerHoldInput {
   wrapUpAvailable: boolean;
   /** The branch has commits of its own (or a pull request already). */
   hasCommits: boolean;
+  /** The run's step-cap wrap-up has been used (`run.capWrapUp`). */
+  wrapUpUsed?: boolean;
+  /** The one restart from the base branch is still available: not used by
+   *  this run (or the run it was restarted from), and the card has its own
+   *  branch and worktree to restart. */
+  capRestartAvailable?: boolean;
 }
 
 export type OwnerHoldDecision =
@@ -206,6 +215,7 @@ export type OwnerHoldDecision =
   | { action: "reroute"; to: string; why: string }
   | { action: "fresh"; why: string }
   | { action: "wait"; category: BlockWaitCategory; why: string }
+  | { action: "restart-from-base"; why: string }
   | { action: "close-publish"; why: string }
   | { action: "close-depend"; why: string };
 
@@ -249,6 +259,13 @@ export function resolveOwnerHold(input: OwnerHoldInput): OwnerHoldDecision {
 
   if (ANSWERABLE.has(input.kind) && input.hasSession && c.answers === 0) {
     return { action: "answer", why: "nobody will answer; it takes the recommended option and continues" };
+  }
+
+  // The step cap hit again after the wrap-up: the run is going round in
+  // circles. Start it over from the current base, once; the second time it
+  // closes out on an issue (owner decision 2026-10-14).
+  if (input.kind === "step-cap" && input.wrapUpUsed === true && input.capRestartAvailable === true) {
+    return { action: "restart-from-base", why: "the step cap is spent after its wrap-up; the attempt is archived and the run starts over from the current base, once" };
   }
 
   // Once closed, only the close-out's own steps run: nothing goes back.
@@ -296,6 +313,7 @@ export const RESOLUTION: Record<Exclude<OwnerHoldAction, "park">, string> = {
   reroute: "rerouted",
   fresh: "fresh-session",
   wait: "waiting",
+  "restart-from-base": "restarted-from-base",
   "close-publish": "closed-published",
   "close-depend": "closed-dependency",
 };

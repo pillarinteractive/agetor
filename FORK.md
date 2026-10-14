@@ -1819,10 +1819,23 @@ sees instead is GitHub issues labelled `agetor-owner-decision`, not parked cards
   question asked in an unattended run, and the merge-queue rework hold (`merge-rework.ts`: the hold files a follow-up
   issue; closing it lifts the hold with a fresh allowance, as a sign-off by hand does). The sites still record their
   block; the block log keeps logging it and gains a `resolution` (`answered`, `rerouted`, `fresh-session`,
-  `waiting`, `closed-published`, `closed-dependency`) folded in from a line of its own.
+  `waiting`, `restarted-from-base`, `closed-published`, `closed-dependency`) folded in from a line of its own.
+- **Restart once from the base** (`restart-from-base`; owner decision 2026-10-14, "Restart once from develop"): a
+  `step-cap` stop after the run's wrap-up (`run.capWrapUp`) no longer files an issue straight away. The card restarts
+  once from scratch on its current base branch (`owner-hold-io.ts` `restartFromBase`): refuse on uncommitted changes
+  or a worktree off the card's branch; push the worktree's HEAD to `archive/<issue-N|branch-slug>-attempt-<n>` and,
+  when the remote branch differs, that commit to `…-attempt-<n>-pr` (`--no-verify`, never forced); close the open PR
+  with a comment naming the archive; delete the remote branch; `git reset --hard origin/<base>` and unset the
+  upstream; then the existing from-scratch restart (`startPipelineRun({restart, fromScratch})`), with the card's
+  `baseRef` moved to the new base and its `prUrl` cleared. The base is the open PR's base, else the card's recorded
+  base branch, else `pr_base_branch` / `develop` / origin's default. `run.capRestart` (state, base, archive refs, the
+  closed PR) is written before git is touched and carried onto the restarted run, so a core restart never repeats it
+  and a second cap hit closes out on an issue as before. A refusal or a failed archive push (nothing deleted or
+  reset) closes out on an issue with the reason. Not for a card pinned to an existing branch, nor with
+  `owner_holds: "park"`, a person-run card or a user Stop.
 - **State**: `run.ladder` (rungs spent per step execution, reroutes, `closed`, `userStop`, `resolving`), written
   before each action, so a restart resumes at the same rung and nothing repeats. `run.wait.endless` / `closeout`,
-  `run.capWrapUp.closeout`.
+  `run.capWrapUp.closeout`, `run.capRestart`.
 - **The preference** `owner_holds`: `"resolve"` (default) or `"park"` (today's behaviour back), read at every
   decision. A card a person runs (no decision policy) behaves as before. A Stop the user pressed is never resumed:
   Stop marks the run (`ladder.userStop`), and only a step that runs again (a person's Retry, Advance, a message)

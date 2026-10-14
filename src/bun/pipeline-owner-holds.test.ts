@@ -362,3 +362,96 @@ test("follow-up issues are deduplicated across stops by the local ledger: the sa
   const r = await fileOwnerHoldIssue({ dir: mkdtempSync(path.join(tmpdir(), "agetor-owner-holds-nogit-")), key: "k1", title: "t", body: "b" });
   expect(r).toEqual({ number: 1502, url: "https://github.com/o/r/issues/1502", reused: true });
 });
+
+test("the step cap hit again after the wrap-up restarts the card once from its base, persisted on the restarted run; the second hit closes out on an issue", async () => {
+  const { resolveOwnerHolds, ownerHoldDeps } = await import("./pipeline-runner.ts");
+  const { tasks } = await import("./db.ts");
+  const { spawnSync } = await import("node:child_process");
+  await stubs();
+  process.env.AGETOR_FAKE_CLAUDE_BLOCKED_REASON = "stuck";
+  const { parentId, build, workdir } = await start({ build: "blocked" }, { single: true });
+  await settled(parentId, (r) => r.blocked.some((b) => b.kind === "step-blocked"));
+  // A card with its own branch in a worktree of its own (the fake agent ran
+  // in an isolation-none checkout; the restart's git side is stubbed here and
+  // tested in owner-hold-io-restart.test.ts). Not a git repo yet: the first
+  // start of the restart fails after the reset, and the next pass starts it.
+  const wt = path.join(mkdtempSync(path.join(tmpdir(), "agetor-owner-holds-wt-")), "wt");
+  const env = { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@e", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@e", GIT_CONFIG_GLOBAL: "/dev/null" };
+  tasks.update(parentId, { isolation: "worktree", worktreePath: wt, branch: "agetor/cap", branchSource: "created", prUrl: "https://github.com/o/r/pull/9" });
+  const calls: unknown[] = [];
+  ownerHoldDeps.restartFromBase = async (input) => {
+    calls.push(input);
+    return { ok: true, base: "develop", baseSha: "b".repeat(40), archive: [{ ref: "archive/card-attempt-1", sha: "a".repeat(40) }], closedPr: 9, note: null };
+  };
+  // The cap hit after the wrap-up: a run-level step-cap stop, nothing active.
+  const capped = (run: PipelineRunState): PipelineRunState => ({
+    ...run,
+    status: "blocked",
+    active: [],
+    blocked: [{ taskId: null, stepId: build.id, kind: "step-cap", message: "reached the 50-step cap for this run — retry to keep going, or stop here", pending: { stepId: build.id, arrivals: [] } }],
+    capWrapUp: { at: 1, fromStepId: build.id, seq: 2 },
+    wait: undefined,
+    autoRetry: undefined,
+    launchRetries: undefined,
+  });
+  tasks.setPipelineRun(parentId, capped(await runOf(parentId)));
+
+  expect(await resolveOwnerHolds()).toBe(1);
+  expect(calls).toEqual([expect.objectContaining({ branch: "agetor/cap", worktree: wt, slug: "agetor-cap" })]);
+  let run = await runOf(parentId);
+  expect(run.capRestart).toMatchObject({ state: "reset", base: "develop" });
+  expect(activity(parentId).at(-1)).toContain("the attempt is archived and the worktree is on develop, but the run could not start yet");
+  for (const args of [["init", "-q", "-b", "main"], ["commit", "-q", "--allow-empty", "-m", "x"], ["worktree", "add", "-q", "-b", "agetor/cap", wt]]) {
+    expect(spawnSync("git", args, { cwd: workdir, env }).status).toBe(0);
+  }
+  // The next pass starts the run; git is not touched again.
+  expect(await resolveOwnerHolds()).toBe(1);
+  expect(calls.length).toBe(1);
+  run = await runOf(parentId);
+  // A fresh run: history gone, the restart recorded on it (read back from the store).
+  expect(run.capRestart).toMatchObject({ state: "started", base: "develop", closedPr: 9, archive: [{ ref: "archive/card-attempt-1" }] });
+  expect(run.capWrapUp).toBeUndefined();
+  expect(tasks.get(parentId)!.baseRef).toBe("b".repeat(40));
+  expect(tasks.get(parentId)!.prUrl).toBeNull();
+  expect(activity(parentId).some((l) => l.startsWith("Resolving without you: the step cap was hit again after the wrap-up, so the card restarted once from the current develop") && l.includes("archive/card-attempt-1") && l.includes("PR #9 was closed"))).toBe(true);
+
+  // The restarted run hits the cap again after its own wrap-up: today's close-out.
+  run = await settled(parentId, (r) => r.blocked.some((b) => b.kind === "step-blocked"));
+  tasks.setPipelineRun(parentId, capped(run));
+  expect(await resolveOwnerHolds()).toBe(1);
+  expect(calls.length).toBe(1);
+  run = await runOf(parentId);
+  expect(run.ladder?.closed).toMatchObject({ mode: "depend" });
+  expect(run.wait).toMatchObject({ category: "dependency", closeout: true });
+  expect(run.capRestart?.state).toBe("started");
+  ownerHoldDeps.restartFromBase = async (input) => (await import("./owner-hold-io.ts")).restartFromBase(input);
+});
+
+test("a refused restart from the base (a dirty worktree, a failed archive push) closes out on an issue and is not tried again", async () => {
+  const { resolveOwnerHolds, ownerHoldDeps } = await import("./pipeline-runner.ts");
+  const { tasks } = await import("./db.ts");
+  await stubs();
+  process.env.AGETOR_FAKE_CLAUDE_BLOCKED_REASON = "stuck";
+  const { parentId, build } = await start({ build: "blocked" }, { single: true });
+  const run0 = await settled(parentId, (r) => r.blocked.some((b) => b.kind === "step-blocked"));
+  tasks.update(parentId, { isolation: "worktree", worktreePath: mkdtempSync(path.join(tmpdir(), "agetor-owner-holds-wt-")), branch: "agetor/cap2", branchSource: "created" });
+  let tried = 0;
+  ownerHoldDeps.restartFromBase = async () => {
+    tried++;
+    return { ok: false, why: "could not push the attempt to archive/x-attempt-1: remote rejected", archive: [], closedPr: null };
+  };
+  tasks.setPipelineRun(parentId, {
+    ...run0, status: "blocked", active: [], wait: undefined, capWrapUp: { at: 1, fromStepId: build.id, seq: 2 },
+    blocked: [{ taskId: null, stepId: build.id, kind: "step-cap", message: "reached the 50-step cap for this run — retry to keep going, or stop here", pending: { stepId: build.id, arrivals: [] } }],
+  });
+  expect(await resolveOwnerHolds()).toBe(1);
+  const run = await runOf(parentId);
+  expect(tried).toBe(1);
+  expect(run.capRestart).toMatchObject({ state: "failed", note: expect.stringContaining("remote rejected") });
+  expect(run.ladder?.closed).toMatchObject({ mode: "depend" });
+  expect(filed.at(-1)!.title).toContain("Owner decision");
+  expect(activity(parentId).some((l) => l.includes("could not be restarted from its base") && l.includes("remote rejected"))).toBe(true);
+  expect(await resolveOwnerHolds()).toBe(0);
+  expect(tried).toBe(1);
+  ownerHoldDeps.restartFromBase = async (input) => (await import("./owner-hold-io.ts")).restartFromBase(input);
+});

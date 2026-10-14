@@ -15,8 +15,8 @@ merged.
 
 ## The ladder
 
-`resolveOwnerHold(input) → {action: "park" | "answer" | "reroute" | "fresh" | "wait" | "close-publish" |
-"close-depend", why, …}` in `src/shared/owner-holds.ts`, pure and unit-tested. The runner
+`resolveOwnerHold(input) → {action: "park" | "answer" | "reroute" | "fresh" | "wait" | "restart-from-base" |
+"close-publish" | "close-depend", why, …}` in `src/shared/owner-holds.ts`, pure and unit-tested. The runner
 (`src/bun/pipeline-runner.ts`, `resolveOwnerHolds`) finds the stop that would wait for the owner (`ownerHoldOf`:
 blocked, nothing live, no retry pending, not the wait queue's), persists the rung counters on the run, and carries
 the decision out.
@@ -44,12 +44,49 @@ the decision out.
    - nothing to publish → a dependency wait on the first issue (`run.wait`, `closeout`, ref `#N`): blue, re-checked
      at the long interval, never resumed on a timer, resumed with a fresh allowance when the issue is closed.
 
+   Before this rung, the step cap hit again after the run's wrap-up restarts the card once (below).
+
    A hard stop takes this rung directly once rung 1 confirmed it. If GitHub refuses the issue, the close-out is
    tried again in 15 minutes (a blue wait on GitHub); it never falls back to the owner.
 
 Bounds: each rung at most once per step execution (`run.ladder.steps["<taskId>#<seq>"]`, or `"<kind>@<stepId>"` for
 a run-level stop), reroutes at most two a run, the close-out once a run (`ladder.closed`); every new execution is
 counted by the step cap. Counters are written before the action, so a restart resumes at the same rung.
+
+## Restart once from the base
+
+Owner decision 2026-10-14 ("Restart once from develop"): a card that hits its step cap again after its one
+wrap-up is going round in circles, and an issue with no options does not help the owner. It restarts once from
+scratch on the current base branch; only a second cap hit after that restart files the issue and waits.
+
+`resolveOwnerHold` returns `restart-from-base` for kind `step-cap` when the wrap-up has been used (`wrapUpUsed`) and
+the restart has not (`capRestartAvailable`: no `run.capRestart`, the card has its own branch — not one it was pinned
+to — in a worktree). The runner (`ladderRestartFromBase`) waits for a slot for the start step, writes
+`run.capRestart = {state: "pending"}`, then `restartFromBase` in `src/bun/owner-hold-io.ts` runs, in order:
+
+1. refusals, nothing changed: the worktree is not on the card's branch; `git status --porcelain` is not empty; no
+   base can be determined, or `git fetch origin +refs/heads/<base>:refs/remotes/origin/<base>` fails;
+2. `git ls-remote --heads origin` for the card's branch and for `archive/<slug>-attempt-*` (`<slug>` is
+   `issue-<N>`, else the branch; `<n>` is one past the highest on origin);
+   `git push --quiet --no-verify origin <HEAD>:refs/heads/archive/<slug>-attempt-<n>`; when the remote branch
+   exists and differs, fetch it and push it to `…-attempt-<n>-pr`. Never forced. A failed push stops here: nothing
+   is closed, deleted or reset;
+3. the open PR is closed with a comment: the card looped to its step cap, it restarts from the current base on the
+   same branch name, and where the archived attempt is (a failed close is noted; deleting the branch closes it);
+4. `git push --quiet --no-verify origin --delete <branch>`, only now;
+5. `git reset --hard refs/remotes/origin/<base>`, `git branch --unset-upstream`.
+
+The base is the open PR's base, else the card's recorded base branch (`card_base_branches`), else the project's
+(`pr_base_branch`, `develop`, origin's default). Then the card's `baseRef` becomes the new base commit, its `prUrl`
+is cleared, `run.capRestart` becomes `reset`, and the run restarts from scratch (`startPipelineRun({restart: true,
+fromScratch: true})` — the decision policy and check gates are captured as for any new run) with the record carried
+over as `started`. One activity line names the base, the archive refs and the closed PR. If the start itself fails
+(no slot, a Stop meanwhile), the record stays `reset` and the next pass only starts the run.
+
+A refusal or failure records `state: "failed"` with the reason and closes out on an issue (`close-depend`). A core
+restart while `pending` does the same: it is never tried twice. On the restarted run `capRestart` is set, so its own
+wrap-up runs again and a further cap hit closes out on an issue, as before this change. `park`, a person-run card
+and a user Stop are unchanged.
 
 ## The hard-stop field
 
@@ -100,6 +137,6 @@ block rate stays measurable. Velocity counts none of it as "Held for you"; that 
 
 ## Not changed
 
-The step cap extends once then wraps up through Finish and files issues; Agetor merges a moved base when clean with
+The step cap extends once then wraps up through Finish and files issues (and then restarts once from the base, above); Agetor merges a moved base when clean with
 unchanged patch-id and carries approval over; edited instructions reach unfinished runs; publication is verified in
 GitHub CI only; usage-limit handling; the merge queue's fresh rule. Nothing here merges or approves anything.

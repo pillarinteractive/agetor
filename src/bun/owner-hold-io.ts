@@ -135,3 +135,158 @@ export async function hasCommittedWork(parent: Task): Promise<boolean> {
   const n = r?.ok ? Number(r.stdout.trim()) : 0;
   return Number.isFinite(n) && n > 0;
 }
+
+// ── Restart once from the base branch ─────────────────────────────────────
+
+/** The git and GitHub calls {@link restartFromBase} makes — replaceable in
+ *  tests (a temporary origin and worktree, no GitHub). */
+export interface CapRestartDeps {
+  git: (args: string[], cwd: string) => Promise<{ ok: boolean; stdout: string; stderr?: string }>;
+  /** The card's open pull request for `branch`, if there is one. */
+  findOpenPull: (dir: string, branch: string) => Promise<{ number: number; url: string; base: string | null } | null>;
+  closePull: (dir: string, number: number, comment: string) => Promise<{ ok: boolean; error?: string }>;
+  /** The project's configured base when the card names none (`prBase`). */
+  defaultBase: (checkout: string) => Promise<string>;
+}
+
+export const capRestartDeps: CapRestartDeps = {
+  git: (args, cwd) => exec(["git", ...args], cwd, 120_000, process.env),
+  findOpenPull: async (dir, branch) => {
+    const { findGitHubPullForBranch } = await import("./github.ts");
+    const r = await findGitHubPullForBranch({ dir, branch }).catch(() => null);
+    return r?.ok && r.pull && r.pull.state === "open" ? { number: r.pull.number, url: r.pull.htmlUrl, base: r.pull.baseRef } : null;
+  },
+  closePull: async (dir, number, comment) => {
+    const { closeGitHubPull } = await import("./github.ts");
+    const r = await closeGitHubPull({ dir, number, comment }).catch((e: unknown) => ({ ok: false as const, error: String(e) }));
+    return r.ok ? { ok: true } : { ok: false, error: r.error };
+  },
+  defaultBase: async (checkout) => (await import("./pr-watch.ts")).prBase(checkout),
+};
+
+export interface CapRestartInput {
+  /** The card's worktree, on its branch. */
+  worktree: string;
+  /** The project checkout (for GitHub calls). */
+  dir: string;
+  branch: string;
+  /** `archive/<slug>-attempt-<n>`: the issue (`issue-1481`) or the branch. */
+  slug: string;
+  /** The card's own base branch name, when it recorded one. */
+  base: string | null;
+}
+
+export type CapRestartResult =
+  | { ok: true; base: string; baseSha: string; archive: { ref: string; sha: string }[]; closedPr: number | null; note: string | null }
+  /** Nothing was deleted or reset (`archive` lists any ref already pushed). */
+  | { ok: false; why: string; archive: { ref: string; sha: string }[]; closedPr: number | null };
+
+/** The archive name of a card: its issue number, else its branch. */
+export function capRestartSlug(issueNumber: number | null, branch: string): string {
+  if (issueNumber) return `issue-${issueNumber}`;
+  return branch.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "card";
+}
+
+const NO_VERIFY_PUSH = ["push", "--quiet", "--no-verify", "origin"];
+
+/**
+ * Restart a card once from its base branch (the `restart-from-base` rung,
+ * docs/plans/no-owner-holds.md). In order:
+ *
+ *   1. refuse on uncommitted changes, a worktree off the card's branch, or a
+ *      base that cannot be fetched — nothing done;
+ *   2. push the worktree's HEAD to `archive/<slug>-attempt-<n>` and, when the
+ *      card's remote branch exists and differs, that commit to `…-pr` (never
+ *      a force push; `n` is one past the highest attempt on origin). Either
+ *      failing stops here: nothing deleted, nothing reset;
+ *   3. close the open pull request with a comment saying where the attempt is;
+ *   4. delete the card's remote branch, so the restarted run's Finish can
+ *      publish the same name without a force push;
+ *   5. `git reset --hard origin/<base>` on the card's branch and unset its
+ *      upstream.
+ *
+ * Pushes skip the repository's pre-push hook (`--no-verify`), as Agetor's own
+ * pushes do: they publish commits that already exist. Never throws.
+ */
+export async function restartFromBase(input: CapRestartInput, deps: CapRestartDeps = capRestartDeps): Promise<CapRestartResult> {
+  const archive: { ref: string; sha: string }[] = [];
+  let closedPr: number | null = null;
+  const fail = (why: string): CapRestartResult => ({ ok: false, why, archive, closedPr });
+  const git = (args: string[]) => deps.git(args, input.worktree).catch((e: unknown) => ({ ok: false, stdout: "", stderr: String(e) }));
+  const err = (r: { stdout: string; stderr?: string }) => (r.stderr || r.stdout || "no output").split("\n")[0]!.slice(0, 200);
+  try {
+    // 1. Refusals before anything changes.
+    const on = await git(["symbolic-ref", "--quiet", "--short", "HEAD"]);
+    if (!on.ok || on.stdout.trim() !== input.branch) return fail(`the worktree is not on ${input.branch} (${on.ok ? on.stdout.trim() : "detached HEAD"})`);
+    const dirty = await git(["status", "--porcelain"]);
+    if (!dirty.ok) return fail(`git status failed: ${err(dirty)}`);
+    if (dirty.stdout.trim()) return fail(`the worktree has uncommitted changes that are not in its HEAD (${dirty.stdout.trim().split("\n").length} path(s)) — nothing archived or reset`);
+    const head = await git(["rev-parse", "HEAD"]);
+    if (!head.ok || !/^[0-9a-f]{40,64}$/.test(head.stdout.trim())) return fail(`cannot read HEAD: ${err(head)}`);
+    const headSha = head.stdout.trim();
+
+    const pull = await deps.findOpenPull(input.dir, input.branch).catch(() => null);
+    const base = (pull?.base || input.base || (await deps.defaultBase(input.worktree).catch(() => "")) || "").replace(/^origin\//, "");
+    if (!base) return fail("no base branch could be determined");
+    if (base === input.branch) return fail(`the base branch is the card's own branch (${base})`);
+    const fetched = await git(["fetch", "--quiet", "origin", `+refs/heads/${base}:refs/remotes/origin/${base}`]);
+    if (!fetched.ok) return fail(`cannot fetch origin/${base}: ${err(fetched)}`);
+    const baseTip = await git(["rev-parse", "--verify", "--quiet", `refs/remotes/origin/${base}^{commit}`]);
+    if (!baseTip.ok) return fail(`origin/${base} does not exist`);
+
+    // The card's remote branch, as origin has it now.
+    const remote = await git(["ls-remote", "--heads", "origin", `refs/heads/${input.branch}`]);
+    if (!remote.ok) return fail(`cannot read origin: ${err(remote)}`);
+    const remoteSha = remote.stdout.split("\n").map((l) => l.trim().split(/\s+/)).find((p) => p[1] === `refs/heads/${input.branch}`)?.[0] ?? null;
+
+    // 2. Archive: the next attempt number on origin.
+    const prefix = `archive/${input.slug}-attempt-`;
+    const listed = await git(["ls-remote", "--heads", "origin", `refs/heads/${prefix}*`]);
+    if (!listed.ok) return fail(`cannot list archive refs on origin: ${err(listed)}`);
+    const taken = [...listed.stdout.matchAll(new RegExp(`refs/heads/${prefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(\\d+)(?:-pr)?$`, "gm"))].map((m) => Number(m[1]));
+    const n = (taken.length ? Math.max(...taken) : 0) + 1;
+    const ref = `${prefix}${n}`;
+    const pushed = await git([...NO_VERIFY_PUSH, `${headSha}:refs/heads/${ref}`]);
+    if (!pushed.ok) return fail(`could not push the attempt to ${ref}: ${err(pushed)}`);
+    archive.push({ ref, sha: headSha });
+    if (remoteSha && remoteSha !== headSha) {
+      const have = await git(["cat-file", "-e", `${remoteSha}^{commit}`]);
+      if (!have.ok) {
+        const got = await git(["fetch", "--quiet", "origin", `refs/heads/${input.branch}`]);
+        if (!got.ok) return fail(`could not fetch origin/${input.branch} to archive it: ${err(got)}`);
+      }
+      const prRef = `${ref}-pr`;
+      const pushedPr = await git([...NO_VERIFY_PUSH, `${remoteSha}:refs/heads/${prRef}`]);
+      if (!pushedPr.ok) return fail(`could not push the remote branch to ${prRef}: ${err(pushedPr)}`);
+      archive.push({ ref: prRef, sha: remoteSha });
+    }
+
+    // 3. Close the open pull request, saying where the attempt is.
+    const notes: string[] = [];
+    if (pull) {
+      const comment = [
+        "Agetor runs this card unattended. Its pipeline looped to its step cap again after the wrap-up, so the card restarts once from the current base " +
+          `(\`${base}\`) on the same branch name, \`${input.branch}\`. A new pull request will be opened when the restarted run publishes.`,
+        `The archived attempt: ${archive.map((a) => `\`${a.ref}\` (${a.sha.slice(0, 12)})`).join(", ")}.`,
+        "If the restarted run hits its step cap again, Agetor files an owner-decision issue and the card waits on it.",
+      ].join("\n\n");
+      const closed = await deps.closePull(input.dir, pull.number, comment).catch((e: unknown) => ({ ok: false, error: String(e) }));
+      if (closed.ok) closedPr = pull.number;
+      else notes.push(`could not close PR #${pull.number} (${(closed.error ?? "").slice(0, 120)}); deleting its branch closes it`);
+    }
+
+    // 4. Delete the remote branch — only now that the archive is on origin.
+    if (remoteSha) {
+      const deleted = await git([...NO_VERIFY_PUSH, "--delete", input.branch]);
+      if (!deleted.ok) return fail(`archived, but could not delete origin/${input.branch}: ${err(deleted)} — the worktree was not reset`);
+    }
+
+    // 5. The worktree on the current base, with no upstream.
+    const reset = await git(["reset", "--hard", `refs/remotes/origin/${base}`]);
+    if (!reset.ok) return fail(`archived${remoteSha ? " and the remote branch deleted" : ""}, but the reset to origin/${base} failed: ${err(reset)}`);
+    await git(["branch", "--unset-upstream"]); // none set is fine
+    return { ok: true, base, baseSha: baseTip.stdout.trim(), archive, closedPr, note: notes.length ? notes.join("; ") : null };
+  } catch (e) {
+    return fail(`unexpected error: ${String(e).slice(0, 200)}`);
+  }
+}

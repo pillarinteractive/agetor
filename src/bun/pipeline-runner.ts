@@ -41,7 +41,8 @@ import {HEAVY_INSTRUCTIONS,managedPillarRoot} from './heavy-jobs.ts';
 import { classifyFailure, formatRetryTime, harnessQuotaNotice, isQuotaPaused, nextRetryAt, TRANSIENT_RETRY_MAX, type FailureClass } from "./usage-limit.ts";
 import { fallbackHarnessFor, harnessDuringLimit, noteQuotaLimit } from "./quota-fallback.ts";
 import { listLeases } from "./lease-watch.ts";
-import { ownFailures, prBase, prStatusForTask } from "./pr-watch.ts";
+import { invalidatePrStatus, issueNumberForTask, ownFailures, prBase, prStatusForTask } from "./pr-watch.ts";
+import { baseBranchFor } from "./base-branch.ts";
 import { run as runCommand } from "./github.ts";
 import { waitingOnQuota } from "../shared/autopilot.ts";
 import {
@@ -1117,11 +1118,15 @@ export const ownerHoldDeps: {
   answerInteraction: (req: ReturnType<typeof listPendingForTask>[number], note: string) => Promise<boolean>;
   hasCommits: (parent: Task) => Promise<boolean>;
   pending: (taskId: string) => ReturnType<typeof listPendingForTask>;
+  /** Archive the attempt and reset the worktree to the base
+   *  (owner-hold-io.ts `restartFromBase`). */
+  restartFromBase: (input: import("./owner-hold-io.ts").CapRestartInput) => Promise<import("./owner-hold-io.ts").CapRestartResult>;
 } = {
   fileIssue: async (input) => (await import("./owner-hold-io.ts")).fileOwnerHoldIssue(input),
   answerInteraction: async (req, note) => (await import("./owner-hold-io.ts")).answerPendingInteraction(req, note),
   hasCommits: async (parent) => (await import("./owner-hold-io.ts")).hasCommittedWork(parent),
   pending: (taskId) => listPendingForTask(taskId),
+  restartFromBase: async (input) => (await import("./owner-hold-io.ts")).restartFromBase(input),
 };
 
 /** The questions the ladder answers by itself: AskUserQuestion (dismissed,
@@ -1543,6 +1548,116 @@ async function ladderClose(parentId: string, hold: OwnerHold, mode: "publish" | 
   return true;
 }
 
+/** The one restart from the base is still there for this card: not used by
+ *  this run (nor carried over from the run it restarted), or used only as
+ *  far as the reset (the restart itself still to start); and the card has
+ *  a branch of its own in a worktree of its own. A branch the card was
+ *  pinned to (a PR's head, `branchSource: "existing"`) is never deleted. */
+function capRestartAvailable(parent: Task, run: PipelineRunState): boolean {
+  if (run.capRestart && run.capRestart.state !== "reset") return false;
+  return parent.isolation === "worktree" && !!parent.worktreePath && !!parent.branch && parent.branchSource !== "existing";
+}
+
+/**
+ * The step cap hit again after the wrap-up (`restart-from-base`): archive
+ * the attempt on origin, close its PR, delete its remote branch, reset the
+ * worktree to the current base (owner-hold-io.ts `restartFromBase`), and
+ * start the run again from scratch — once. `run.capRestart` is written
+ * before git is touched and carried onto the restarted run, so neither a
+ * core restart nor a second cap hit does it again: a refusal or failure,
+ * and the second cap hit, close out on an issue (`close-depend`).
+ */
+async function ladderRestartFromBase(parentId: string, hold: OwnerHold, why: string, now: number): Promise<boolean> {
+  const go = await runExclusive(parentId, async () => {
+    const parent = tasks.get(parentId);
+    const run = parent?.pipelineRun;
+    if (!parent || !run?.snapshot || parent.archivedAt != null || !ladderApplies(run) || !sameHold(run, hold)) return null;
+    if (!capRestartAvailable(parent, run)) return null;
+    delete ladderOf(run).resolving;
+    const resumed = run.capRestart?.state === "reset";
+    if (!resumed) run.capRestart = { at: now, state: "pending" };
+    persist(parentId, run, { preserveStatus: true });
+    return { parent, resumed };
+  }).catch(() => null);
+  if (!go) return false;
+  const { parent } = go;
+  const failed = async (note: string): Promise<boolean> => {
+    await runExclusive(parentId, async () => {
+      const run = tasks.get(parentId)?.pipelineRun;
+      if (!run) return;
+      run.capRestart = { ...(run.capRestart ?? { at: now }), state: "failed", note: note.slice(0, 500) };
+      persist(parentId, run, { preserveStatus: true });
+    }).catch(() => undefined);
+    say(parentId, `the step cap was hit again after the wrap-up, but the card could not be restarted from its base: ${note.slice(0, 240)}`, "warning");
+    return ladderClose(parentId, hold, "depend", `${why.split(";")[0]}; the restart from the base was refused: ${note.slice(0, 200)}`, now);
+  };
+
+  if (!go.resumed) {
+    const r = await ownerHoldDeps.restartFromBase({
+      worktree: parent.worktreePath!,
+      dir: parent.workdir,
+      branch: parent.branch!,
+      slug: (await import("./owner-hold-io.ts")).capRestartSlug(issueNumberForTask(parent), parent.branch!),
+      base: baseBranchFor(parent.id),
+    }).catch((e: unknown) => ({ ok: false as const, why: String(e), archive: [], closedPr: null }));
+    if (!r.ok) {
+      await runExclusive(parentId, async () => {
+        const run = tasks.get(parentId)?.pipelineRun;
+        if (!run) return;
+        run.capRestart = { at: now, state: "failed", ...(r.archive.length ? { archive: r.archive } : {}), ...(r.closedPr ? { closedPr: r.closedPr } : {}) };
+        persist(parentId, run, { preserveStatus: true });
+      }).catch(() => undefined);
+      return failed(r.why);
+    }
+    await runExclusive(parentId, async () => {
+      const p = tasks.get(parentId);
+      const run = p?.pipelineRun;
+      if (!p || !run) return;
+      // Steps copy the parent's base: the new attempt is measured from the
+      // base it starts on, and its PR is a new one.
+      tasks.update(parentId, { baseRef: r.baseSha, prUrl: null });
+      invalidatePrStatus(parentId);
+      run.capRestart = {
+        at: now, state: "reset", base: r.base, archive: r.archive,
+        ...(r.closedPr ? { closedPr: r.closedPr } : {}), ...(r.note ? { note: r.note } : {}),
+      };
+      persist(parentId, run, { preserveStatus: true });
+    }).catch(() => undefined);
+  }
+
+  const record = tasks.get(parentId)?.pipelineRun?.capRestart;
+  if (!record || record.state !== "reset") return false;
+  const carried = { ...record, state: "started" as const };
+  const started = await startPipelineRun(tasks.get(parentId) ?? parent, {
+    restart: true,
+    fromScratch: true,
+    carry: { capRestart: carried },
+    // A Stop pressed meanwhile is never undone.
+    validate: async () => {
+      const run = tasks.get(parentId)?.pipelineRun;
+      return run && ladderApplies(run) ? null : "the run was stopped";
+    },
+  }).catch((e: unknown) => ({ error: String(e) }));
+  if ("error" in started) {
+    // The attempt is archived and the worktree is on the base: the next pass
+    // starts the run (`state: "reset"`), unless it was stopped.
+    say(parentId, `the attempt is archived and the worktree is on ${record.base ?? "the base"}, but the run could not start yet (${started.error.slice(0, 160)}); it starts on the next pass`, "warning");
+    return true;
+  }
+  logResolution(parentId, hold, "restart-from-base");
+  const refs = (record.archive ?? []).map((a) => `${a.ref} (${a.sha.slice(0, 12)})`).join(" and ");
+  say(
+    parentId,
+    `the step cap was hit again after the wrap-up, so the card restarted once from the current ${record.base ?? "base"}: ` +
+      `the old attempt is archived on origin at ${refs || "(no ref)"}` +
+      (record.closedPr ? `, PR #${record.closedPr} was closed with a comment saying so` : "") +
+      `, the remote branch was deleted and the worktree reset to origin/${record.base ?? "base"}. A second cap hit files an issue and waits` +
+      (record.note ? ` (${record.note})` : ""),
+    "warning",
+  );
+  return true;
+}
+
 /** A closed-out card's follow-up issue was closed: a new allowance, and the
  *  stopped step resumes (or the run-level stop is retried). */
 async function resumeClosedOut(parentId: string, cleared: string, now: number): Promise<boolean> {
@@ -1656,14 +1771,20 @@ async function resolveOwnerHoldOf(parentId: string, now: number, busy: (stepName
         rerouteTo: build && !exhaustedEdge(graph, run.history, hold.stepId, [build.id]) ? build.id : null,
         closed: run.ladder?.closed != null,
         wrapUpAvailable: capWrapUpStep(graph) != null && run.capWrapUp == null,
+        wrapUpUsed: run.capWrapUp != null,
+        capRestartAvailable: capRestartAvailable(parent, run),
       },
+      startStepName: resolveStartStep(graph)?.name ?? hold.stepName,
     };
   }).catch(() => null);
   if (!seen) return false;
   const hasCommits = await ownerHoldDeps.hasCommits(seen.parent).catch(() => false);
   const decision = resolveOwnerHold({ ...seen.input, hasCommits });
-  // Resuming or restarting a step takes a slot like any other start.
+  // Resuming or restarting a step takes a slot like any other start. A
+  // restart from the base waits for its start step's slot before touching
+  // git (a restart cannot queue for one).
   if ((decision.action === "answer" || decision.action === "fresh") && !isPriority(parentId) && busy(seen.hold.stepName)) return false;
+  if (decision.action === "restart-from-base" && busy(seen.startStepName)) return false;
   switch (decision.action) {
     case "park":
       return false;
@@ -1675,6 +1796,8 @@ async function resolveOwnerHoldOf(parentId: string, now: number, busy: (stepName
       return ladderReroute(parentId, seen.hold, decision.to, decision.why);
     case "wait":
       return ladderWait(parentId, seen.hold, decision.category, now);
+    case "restart-from-base":
+      return ladderRestartFromBase(parentId, seen.hold, decision.why, now);
     case "close-publish":
       return ladderClose(parentId, seen.hold, "publish", decision.why, now);
     case "close-depend":
@@ -3508,7 +3631,7 @@ async function performPipelineRetry(
  */
 export async function startPipelineRun(
   parent: Task,
-  opts?: { restart?: boolean; fromScratch?: boolean; validate?:()=>Promise<string|null> },
+  opts?: { restart?: boolean; fromScratch?: boolean; validate?:()=>Promise<string|null>; carry?: Pick<PipelineRunState, "capRestart"> },
 ): Promise<{ runId: string; pending?: true; resumed?: PipelineResume } | { error: string }> {
   return runExclusive(parent.id, async () => {
     // Minor 5: a delete cascade tombstones the parent (and removes its row)
@@ -3709,6 +3832,9 @@ export async function startPipelineRun(
       stepCount: 0,
       startedAt: Date.now(),
       endedAt: null,
+      // The ladder's restart from the base (`restart-from-base`) is once per
+      // card run: the restarted run carries the record.
+      ...(opts?.carry?.capRestart ? { capRestart: opts.carry.capRestart } : {}),
     };
 
     // M-R4: persist the fresh run BEFORE launching anything — `persist`'s

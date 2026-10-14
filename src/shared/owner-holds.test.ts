@@ -128,6 +128,26 @@ test("once the run is closed out nothing goes back: a stop of the wrap-up is ans
   expect(walk({ kind: "step-cap", role: "finish", wrapUpAvailable: false, hasCommits: true })).toEqual(["close-depend"]);
 });
 
+test("the step cap hit again after the wrap-up restarts the card once from its base; the second time it closes out on an issue", () => {
+  const capAfterWrapUp = { kind: "step-cap" as const, role: "finish" as const, rerouteTo: null, hasSession: false, wrapUpAvailable: false, wrapUpUsed: true, hasCommits: true };
+  expect(resolveOwnerHold(base({ ...capAfterWrapUp, capRestartAvailable: true }))).toMatchObject({ action: "restart-from-base" });
+  // Also when another stop closed the run out before (the loop is the thing).
+  expect(resolveOwnerHold(base({ ...capAfterWrapUp, capRestartAvailable: true, closed: true })).action).toBe("restart-from-base");
+  // Restart used (by this run or the run it restarted from): today's close-out.
+  expect(resolveOwnerHold(base({ ...capAfterWrapUp, capRestartAvailable: false })).action).toBe("close-depend");
+  expect(resolveOwnerHold(base({ ...capAfterWrapUp }))).toMatchObject({ action: "close-depend", why: "the step cap is spent" });
+  // Wrap-up not used yet: never a restart.
+  expect(resolveOwnerHold(base({ ...capAfterWrapUp, wrapUpUsed: false, capRestartAvailable: true })).action).toBe("close-depend");
+  // Only the step cap restarts: any other kind after the wrap-up goes its usual way.
+  for (const kind of ["blocked", "no-handoff", "failed", "checks", "edge-limit", "profile-missing", "join-incomplete", "publish"] as OwnerHoldKind[]) {
+    expect(resolveOwnerHold(base({ kind, role: "finish", wrapUpUsed: true, capRestartAvailable: true })).action).not.toBe("restart-from-base");
+  }
+  // Park mode, a person-run card and a user Stop: nothing changes.
+  expect(resolveOwnerHold(base({ ...capAfterWrapUp, capRestartAvailable: true, mode: "park" })).action).toBe("park");
+  expect(resolveOwnerHold(base({ ...capAfterWrapUp, capRestartAvailable: true, unattended: false })).action).toBe("park");
+  expect(resolveOwnerHold(base({ ...capAfterWrapUp, capRestartAvailable: true, userStopped: true })).action).toBe("park");
+});
+
 test("a hard stop goes straight to the close-out once its answer confirmed it", () => {
   const hardStop = { kind: "credentials" as const, detail: "no npm token" };
   expect(walk({ kind: "blocked", role: "review", hardStop })).toEqual(["answer", "close-depend"]);
