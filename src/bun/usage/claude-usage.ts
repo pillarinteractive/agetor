@@ -8,7 +8,7 @@
 
 import { existsSync, readFileSync, statSync } from "node:fs";
 import type { AgentKind, Harness, HarnessQuota, QuotaMeter, QuotaSource } from "../../shared/types.ts";
-import { claudeDotJsonPath, readClaudeToken } from "./creds.ts";
+import { claudeDotJsonPath, lastKeychainFailure, readClaudeToken } from "./creds.ts";
 
 const OAUTH_USAGE_URL = "https://api.anthropic.com/api/oauth/usage";
 const FETCH_TIMEOUT_MS = 5000;
@@ -385,10 +385,13 @@ export async function fetchClaudeQuota(harness: Harness): Promise<HarnessQuota> 
     // fall through to the terminal "no data" result below
   }
 
+  const keychain = harness.home === null ? lastKeychainFailure() : null;
   return errorQuota(
     harness,
     "unavailable",
-    "No usage data for this account yet — run a task on this harness once " +
-      "and the claude CLI will populate its usage cache.",
+    keychain
+      ? `No usage data: ${keychain}.`
+      : "No usage data for this account yet — run a task on this harness once " +
+          "and the claude CLI will populate its usage cache.",
   );
 }

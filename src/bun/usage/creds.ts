@@ -51,9 +51,20 @@ export function claudeCredentialsPath(harness: Harness): string | null {
  *  Avoids prompting the user (or hammering `security`) on every poll cycle —
  *  mirrors CodexBar's consent model (plan section 3). */
 const KEYCHAIN_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+/** After a read that merely timed out (a busy machine, or a dialog nobody
+ *  answered yet) try again soon: a 6-hour cooldown there left the Claude
+ *  meters empty, and the usage-limit fallback blind, for hours after each
+ *  Agetor restart (2026-10-14). */
+const KEYCHAIN_TIMEOUT_COOLDOWN_MS = 10 * 60 * 1000;
 
 /** Module-level cooldown state. `null` = no recent failure. */
 let keychainCooldownUntilMs: number | null = null;
+/** Why the last Keychain read failed, in a few words, or null after a
+ *  success; shown in the Claude chip's reason so "no usage" says why. */
+let keychainFailure: string | null = null;
+export function lastKeychainFailure(): string | null {
+  return keychainFailure;
+}
 
 const CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials";
 
@@ -73,7 +84,7 @@ const CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials";
  * would never run). On timeout we kill the process, arm the cooldown, and
  * return null so the caller falls through to the `.claude.json` cache.
  */
-const KEYCHAIN_SPAWN_TIMEOUT_MS = 3000;
+const KEYCHAIN_SPAWN_TIMEOUT_MS = 10_000;
 
 export async function readKeychainClaudeToken(): Promise<string | null> {
   const now = Date.now();
@@ -104,16 +115,24 @@ export async function readKeychainClaudeToken(): Promise<string | null> {
     } finally {
       clearTimeout(timer);
     }
-    if (timedOut || exitCode !== 0) {
+    if (timedOut) {
+      keychainCooldownUntilMs = now + KEYCHAIN_TIMEOUT_COOLDOWN_MS;
+      keychainFailure = `the Keychain read did not answer within ${KEYCHAIN_SPAWN_TIMEOUT_MS / 1000}s (a macOS access prompt may be waiting); retrying in 10 minutes`;
+      return null;
+    }
+    if (exitCode !== 0) {
       keychainCooldownUntilMs = now + KEYCHAIN_COOLDOWN_MS;
+      keychainFailure = `the Keychain read failed (security exited ${exitCode}); retrying in 6 hours or after an Agetor restart`;
       return null;
     }
     const parsed = JSON.parse(stdout.trim());
     const token = parsed?.claudeAiOauth?.accessToken;
     if (typeof token !== "string" || !token) {
       keychainCooldownUntilMs = now + KEYCHAIN_COOLDOWN_MS;
+      keychainFailure = "the Keychain item holds no Claude login token";
       return null;
     }
+    keychainFailure = null;
     return token;
   } catch {
     keychainCooldownUntilMs = now + KEYCHAIN_COOLDOWN_MS;
