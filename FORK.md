@@ -1560,3 +1560,52 @@ card beside it) and `/fixtures/velocity.html?case=<name>` (roadmap, no-forecast,
 `computeVelocity`), import no API client, and are not entries of `vite build`. The run fixture has no canvas, which
 needs the core. `e2e/views-fixtures.spec.ts` runs against them with no backend; set `VIEWS_SHOTS_DIR` to keep its
 screenshots. `e2e/board-context.spec.ts` checks, against the real app, that the board comes back as it was.
+
+## Token savers (`feat/token-savers`)
+
+Five changes the owner approved on 2026-10-13 to cut what a card costs in tokens, one commit each so they can be
+merged apart. The measure for all of them is the first one.
+
+### Tokens per step visit: `scripts/step-tokens.ts`
+
+```bash
+bun scripts/step-tokens.ts --project pillar --pipeline Change --last 10            # a table
+bun scripts/step-tokens.ts --project pillar --pipeline Change --last 10 --json     # the same, for a diff
+```
+
+For the last N finished (`done`) pipeline cards of a project: one row per step visit — step, visit number, harness,
+model, input, output, cache-read and cache-write tokens, model calls and turns — then the median per visit and the
+total per step, for all visits and split into the first visit and the repeats. `weighted` is the one number of the
+cost section above (output×5 + cache write×1.25 + input + cache read×0.1). `--pipeline` is a name prefix.
+
+- **Read-only, and meant for the live board.** The database is opened read-only with `bun:sqlite` (never through
+  `src/bun/db.ts`, which migrates); session files are only read. It is a script, not a CLI command: a command needs a
+  route in the core, so an installed build, before the first number.
+- **How a visit maps to tokens.** A visit is a step task (`tasks.pipeline_parent_id`); its sessions are the ids on its
+  runs (`runs.claude_session_id`, `runs.codex_session_id`). Claude: `<config dir>/projects/<worktree path with every
+  non-alphanumeric as ->/<session>.jsonl`, each response counted once by `message.id` (it is written once per content
+  block), plus the session's `subagents/*.jsonl` (Scouts; their part is `subagents` in the JSON). Codex: the rollout
+  named after the session id under `<codex home>/sessions`, the last cumulative `total_token_usage`. `input` is the
+  uncached part for both. The parsing is `src/shared/step-usage.ts`.
+- **Visit numbers count every run of the card**: a restart's earlier visits are included and marked `*`
+  (`inCurrentRun: false`), as are follow-up steps (grouped as "Follow-up").
+- **What it cannot attribute**, listed under the table with the reason and never estimated: a step task with no
+  session id (never started, or a Finish visit Agetor ran itself — which cost no tokens), a session id whose file is
+  gone (Claude Code deletes old transcripts) and harnesses other than Claude Code and Codex. A visit with some of its
+  session files missing is counted and flagged as a lower bound. A DeepSeek-backed step is counted from its Claude
+  transcript under the model name Claude Code recorded.
+
+Baseline, 2026-10-13, the last 10 finished Change cards of Pillar (349 visits; median per visit, total in brackets):
+
+| Step | Visits | Input | Output | Cache read | Cache write | Calls | Weighted |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Understand | 14 | 124 (1.8k) | 49.6k (0.70M) | 2.72M (40.6M) | 264k (3.56M) | 59 (849) | 0.86M (12.0M) |
+| Build, first | 10 | 110 (1.6k) | 68.9k (0.89M) | 5.56M (106.7M) | 158k (2.47M) | 55 (792) | 1.11M (18.2M) |
+| Build, repeat | 112 | 28 (0.65M) | 4.8k (1.55M) | 0.58M (162.9M) | 33k (6.05M) | 13 (2,463) | 0.13M (32.2M) |
+| Review, first | 10 | 124k (1.50M) | 20.8k (0.21M) | 2.08M (23.9M) | 0 | 24 (263) | 0.50M (4.9M) |
+| Review, repeat | 112 | 66k (8.19M) | 5.5k (0.80M) | 0.52M (85.1M) | 0 | 10 (1,389) | 0.14M (20.7M) |
+| Finish | 79 | 35k (3.22M) | 2.9k (0.27M) | 0.33M (29.0M) | 0 | 11 (888) | 0.08M (7.4M) |
+| Follow-up | 12 | 47k (0.71M) | 3.1k (0.05M) | 0.53M (9.5M) | 0 | 13 (202) | 0.12M (1.9M) |
+
+All ten cards: 97.4M weighted tokens, 6,846 calls, 669 turns. One visit of 349 was a lower bound (one of its three
+session files was gone). Build ran on Claude (Sonnet, with a DeepSeek backup), Review and Finish on Codex.
