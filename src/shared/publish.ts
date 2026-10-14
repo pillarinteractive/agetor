@@ -45,12 +45,16 @@ import { ROLLUP_CHECKS, checksState, failedConclusion, newestPerName, type Check
  *  {@link unmatchedGateRefs} for what an entry that matches nothing does).
  *  `cards` is the trial list: when present, only those cards of those
  *  pipelines; leave it out to cover every card of them. Each gate has its own
- *  entry of the same shape: `publish` (Finish run by Agetor) and `steps`
- *  (checks on working steps, src/shared/checks.ts). */
+ *  entry of the same shape: `publish` (Finish run by Agetor), `steps`
+ *  (checks on working steps, src/shared/checks.ts) and `preload` (Build and
+ *  Review start with their reading done, src/shared/preload.ts). */
 export const PIPELINE_GATES_PREF = "pipeline_gates";
 
-/** The gates the preference can switch on. */
-export type PipelineGateName = "publish" | "steps";
+/** What the preference can switch on: the two gates, and `preload`
+ *  (src/shared/preload.ts) — not a gate, but switched the same way: reads
+ *  Agetor does at launch and puts in a Build or Review prompt. */
+export type PipelineGateName = "publish" | "steps" | "preload";
+export const PIPELINE_GATE_NAMES: readonly PipelineGateName[] = ["publish", "steps", "preload"];
 
 export interface PublishGate {
   pipelines: string[];
@@ -110,7 +114,7 @@ export function unmatchedGateRefs(
   const out: GateUnmatched = { pipelines: [], cards: [] };
   const names = new Set(known.pipelines.map((p) => p.name.trim().toLowerCase()));
   const ids = new Set(known.pipelines.map((p) => p.id));
-  for (const name of ["publish", "steps"] as const) {
+  for (const name of PIPELINE_GATE_NAMES) {
     const gate = parsePipelineGate(raw, name);
     for (const p of gate.pipelines) if (!ids.has(p) && !names.has(p.toLowerCase())) out.pipelines.push(`${name}: ${p}`);
     for (const c of gate.cards ?? []) if (!known.hasCard(c)) out.cards.push(`${name}: ${c}`);

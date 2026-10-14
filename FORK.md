@@ -1650,3 +1650,59 @@ above them the run's URL and the path of the whole failed log, which is saved.
 Not done: the excerpt is quoted inside the handoff's JSON, so its newlines arrive escaped, as the tail's did; the
 workflow name is not read for a run whose log could not be read; the Finish step's own instructions still say "log
 tail" (they are Pillar's, in `docs/engineering/agetor/`).
+
+### Build starts with its reading done (`pipeline_gates` → `preload`)
+
+**Off unless switched on.** Build's instructions begin "read the file map, then the line ranges it lists"; each of
+those reads is a model call that re-sends the session. For a card the switch covers, Agetor does them when it
+launches Build and puts the result in the prompt. `src/shared/preload.ts` is the pure half (the map parser, the
+budgets, the text), `src/bun/preload.ts` reads the worktree and git, `launchStep` adds the sections.
+
+| Visit | Decided by | What the prompt gets |
+| --- | --- | --- |
+| Build, first | the run's history holds no visit of Build, Review or Finish (`preloadKind`) — whatever came of such a visit | `## File map` (the map itself) and `## Code at the file map's ranges`: the map's Touch points, then Read for context, each headed `path:L<start>-L<end>` and read from the worktree as it is at launch |
+| Build, after anything else ran (Review's findings, Finish's CI failure, a merge-queue fix round, the fresh session after exhausted check turns) | the same test, the other way | `## File map` with a warning that its numbers may have moved, and `## What this branch changes so far`: `git diff -U10 <base>...HEAD`. No slice by line number. What already arrives (the handoff, the report, the CI excerpt) is unchanged |
+
+- **Line numbers are only used when they are true.** Slices are taken only when the commit the map's header names
+  is the worktree's HEAD (`mapHeadMatches`: the full sha or a prefix of at least 7). Another commit, or none named:
+  nothing is sliced, the prompt says which commit the map is for, and only the map is inlined. No map: nothing is
+  added. Each range is checked against the file as read: a range past its end is named as "the map is out of date
+  for it", never cut to fit.
+- **Never inlined, always named**: a path listed under Ruled out (wherever else the map lists it), a file that is
+  not there, a link out of the worktree, a binary, and by name (`excludedPath`, the same test for a slice and a file
+  of a diff) lockfiles, `*.snap`, JSON under `fixtures`/`testdata`/`golden`/`__snapshots__`, generated or vendored
+  code (`*.generated.*`, `*.pb.go`, `*.min.js`, `dist/`, `node_modules/` …). An excluded file of a diff is not even
+  asked of git: `--numstat` first, then the diff for the rest.
+- **Budgets** (`PRELOAD_LIMITS`, tokens at 4 characters): slices 12,000 in all and 400 lines each; a diff 20,000 in
+  all and 6,000 a file; the map 4,000. Over a budget the **largest items go first**, each with a
+  `- trimmed: read <path> yourself (<why>)` line; context ranges only get what touch points leave. Nothing is
+  dropped without a line. They are sized to what Build reads at its start anyway (the cost section above: a 50–57k
+  starting context, ~55 calls a first Build): what is saved is the calls, not the carrying.
+- **Today's loose maps** are read as they are: sections by their first words ("Touch points (done)", "Additional
+  touch points confirmed by Review"), the header's commit as `HEAD: <sha>`, `commit: <sha>` or `Header: commit
+  <sha>`, quoted or not; entries as `path:L12-L40`, `path:12-40`, `path:375–380,463–471`, `` `path` :277–279 ``,
+  `(new, 1–496)`, with or without quotes. A single line (`:88`, `L12`) gets a window (5 before, 40 after). An entry
+  with no range is named, not sliced. On the nine maps on the board on 2026-10-13 this finds every header commit
+  and 0–8 sliceable ranges a map; the exact `path:L<start>-L<end>` format Pillar's prompts are moving to is what
+  makes it worth switching on.
+- **Other prompt-size rules are untouched and separate**: the handoff's 16 KB and the report's 24 KB stay as they
+  are, and the budgets above are on top. A harness with a short prompt (gemini's argv cap) gets no inlined content,
+  only the map's path, in the same recomposition that already drops the inlined handoff. A Claude step prompt was
+  already over the 4 KB argv limit and pasted; it is pasted the same way, larger, with control characters removed
+  from everything inlined.
+
+**The switch** is `pipeline_gates`, under its own key, with the entries the gates have:
+
+```json
+{"preload": {"pipelines": ["<pipeline id>"], "cards": ["<task id>", "<task id>"]}}
+```
+
+`pipelines` (ids or exact names) turns it on; `cards` is the trial list, and leaving it out covers every card of
+those pipelines; an entry that matches nothing is reported like a gate's (`unmatchedGateRefs`). Unlike a gate it is
+**not adopted by a run**: nothing is stored on the card, it is read at each launch, and it takes effect at the next
+launch of Build with no refresh. With it off — or the card not named — prompts are byte for byte what they were, and
+no file or git command is read for them. It can be combined with `publish` and `steps` in the same preference.
+
+Not done: a Retry re-sends the visit's stored prompt, so what was inlined is as old as the launch (the sections say
+so and tell the step the worktree is newer); the base is the one last fetched, nothing is fetched; a pasted prompt
+of this size (up to ~100 KB more) has been exercised with the scripted agent only, not in a real Claude session.

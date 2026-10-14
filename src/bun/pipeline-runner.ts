@@ -51,6 +51,7 @@ import {
 } from "../shared/publish.ts";
 import { composedHandoff, exhaustedHandoff, gateFailureLine, gateVerdict, type CheckResult } from "../shared/checks.ts";
 import { recordWaivedChecks, runStepChecks } from "./check-runner.ts";
+import { stepPreload } from "./preload.ts";
 import { appendFeedback, readFeedback, readPosition, voidStepEvidence } from "./position.ts";
 import {
   applicableFeedback, forwardPath, positionLine, renderOwnerFeedback, stepsFrom, validateFeedbackNote,
@@ -2365,6 +2366,12 @@ async function launchStep(
     .filter((p): p is AgentProfileSnapshot => p !== undefined);
 
   const stepChecks = publishBrief || wrapUp ? null : stepGateFor(parent, run, step);
+  // What Agetor reads for the step at launch (`pipeline_gates`' `preload`):
+  // the file map and the code it points at, the branch's diff. Never for
+  // the writer of an Agetor-run Finish or the wrap-up, and
+  // never a reason for a launch to fail: unreadable means none.
+  const preload = publishBrief || wrapUp || !gatePref("preload", parent, run) ? null
+    : await stepPreload({ parent, graph: snapshot.graph, step, history: run.history }).catch(() => null);
   const composeArgs = {
     pipelineName: run.pipelineName,
     // The writer's turn of an Agetor-run Finish: the brief is its whole job.
@@ -2419,7 +2426,7 @@ async function launchStep(
   const withWrapUp = (prompt: string) => wrapUp
     ? `${prompt}\n\n${capWrapUpSection({ stepCap: effectiveStepCap(run), issueUrl: parent.issueUrl, prUrl: parent.prUrl })}`
     : prompt;
-  let composed = withWrapUp(withMachineCapacity(withSync(withRouting(withDecisions(withFeedback(composeStepPrompt({ ...composeArgs, inlineHandoff: true })))))));
+  let composed = withWrapUp(withMachineCapacity(withSync(withRouting(withDecisions(withFeedback(composeStepPrompt({ ...composeArgs, inlineHandoff: true, preload: preload?.inline })))))));
   if(inputReconciliation.note)composed+=`\n\n${inputReconciliation.note}`;
   // m12/D10: measure the SAME wrapping `startTaskInner` will actually launch
   // with — `composeLaunchPrompt` (the profile's instructions/skills
@@ -2429,7 +2436,9 @@ async function launchStep(
   if (profile.harnessKind === "gemini") {
     const fullPrompt = appendReferences(composeLaunchPrompt(profile, composed), references);
     if (promptByteOverage("gemini", fullPrompt)) {
-      composed = withWrapUp(withMachineCapacity(withSync(withRouting(withDecisions(withFeedback(composeStepPrompt({ ...composeArgs, inlineHandoff: false })))))));
+      // Nothing is inlined for a harness with a short prompt: not the
+      // handoffs, and not what was pre-loaded — only where the files are.
+      composed = withWrapUp(withMachineCapacity(withSync(withRouting(withDecisions(withFeedback(composeStepPrompt({ ...composeArgs, inlineHandoff: false, preload: preload?.reference })))))));
     }
   }
 

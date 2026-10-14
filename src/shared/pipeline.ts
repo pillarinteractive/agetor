@@ -1606,6 +1606,12 @@ export function composeStepPrompt(input: {
    *  the instructions say `{{checks}}`, else in a section after them. Absent:
    *  the prompt is exactly what it was before gates existed. */
   gate?: { goal: string | null; checks: StepCheck[]; issueUrl?: string | null } | null;
+  /** What Agetor read for the step at launch (src/shared/preload.ts), for a
+   *  card the `preload` switch covers: `card` — the file map — follows the
+   *  goal, `visit` — code slices, the branch's diff, the review bundle —
+   *  follows the context from the previous step(s). Absent or empty: the
+   *  prompt is exactly what it is without the switch. */
+  preload?: { card: string | null; visit: string | null } | null;
   /** Per-call token fencing the untrusted-handoff markers (review finding
    *  #4) — 8 hex chars from {@link randomHandoffNonce} when omitted.
    *  Production callers omit this; tests pass a fixed value for
@@ -1624,6 +1630,7 @@ export function composeStepPrompt(input: {
 
   parts.push("## Overall goal");
   parts.push(input.goal);
+  if (input.preload?.card) parts.push(input.preload.card);
 
   parts.push("## Context from previous step(s)");
   if (input.previous.length === 0) {
@@ -1698,6 +1705,8 @@ export function composeStepPrompt(input: {
       }
     }
   }
+
+  if (input.preload?.visit) parts.push(input.preload.visit);
 
   const gate = input.gate ?? null;
   if (gate?.goal) {
