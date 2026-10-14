@@ -12,6 +12,7 @@ import { migrate } from "./migrate.ts";
 import { migrations } from "./migrations/index.ts";
 import { coreCredsPath } from "./core-creds.ts";
 import { sanitizeNoChangeLoop } from "../shared/no-change-loop.ts";
+import { sanitizeFindingLedger } from "../shared/finding-ledger.ts";
 // Interactions live in-memory in `interactions.ts`. The import creates a
 // cycle: db.ts → interactions.ts → db.ts (for `tasks`). It is safe ONLY
 // because both modules access each other's exports exclusively from
@@ -814,6 +815,14 @@ export const parsePipelineRunState = (raw: string | null): PipelineRunState | nu
       const noChangeLoop = sanitizeNoChangeLoop(rec.noChangeLoop);
       return noChangeLoop ? { noChangeLoop } : {};
     })(),
+    ...(() => {
+      const findings = sanitizeFindingLedger(rec.findings);
+      return findings ? { findings } : {};
+    })(),
+    ...(isPlainObject(rec.findingCloseOut) && typeof (rec.findingCloseOut as { at?: unknown }).at === "number"
+      ? { findingCloseOut: { at: (rec.findingCloseOut as { at: number }).at, wrapped: (rec.findingCloseOut as { wrapped?: unknown }).wrapped === true } }
+      : {}),
+    ...(Number.isSafeInteger(rec.classSearchReturned) ? { classSearchReturned: rec.classSearchReturned as number } : {}),
     ...(() => {
       const publish = sanitizePublish(rec.publish);
       return publish ? { publish } : {};

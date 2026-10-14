@@ -1038,6 +1038,16 @@ export interface PipelineRunState {
    *  whether Review was told and the run sent to the wrap-up. Unattended runs
    *  with owner holds resolved only. */
   noChangeLoop?: import("./no-change-loop.ts").NoChangeLoopState;
+  /** Review findings by stable ID and how often each came back
+   *  (src/shared/finding-ledger.ts): drives the Class search gate, the
+   *  escalated Build and the close-out. */
+  findings?: import("./finding-ledger.ts").FindingLedger;
+  /** A close-out left Review only closed findings: when Review was told to
+   *  decide the verdict, and whether the run then went to the wrap-up. */
+  findingCloseOut?: { at: number; wrapped: boolean };
+  /** The Build execution (run seq) already sent back once for a missing
+   *  Class search; a second miss goes on to Review. */
+  classSearchReturned?: number;
   /** An automatic retry of a step that failed for a reason a person can't
    *  fix — a usage limit (`quota`: waits for the reset, never gives up) or a
    *  transient failure (crash, overload, launch flake; a few attempts with

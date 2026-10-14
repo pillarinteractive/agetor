@@ -45,6 +45,7 @@
  */
 import type { Handoff, Task, TaskPrStatus } from "../shared/types.ts";
 import { reviewedPipelineShape } from "../shared/pipeline.ts";
+import { MERGE_REGENERATE_PREF, parseRegenerateRules, regenerateCovering } from "../shared/publish.ts";
 import { preferences, tasks } from "./db.ts";
 import { recordActivity } from "./activity.ts";
 import { getGitHubPullChecks, rerunGitHubWorkflowRun, run as exec } from "./github.ts";
@@ -692,8 +693,11 @@ export async function reworkConflict(task: Task, pr: TaskPrStatus): Promise<Rewo
   if (failedStarts.has(key)) return { kind: "skipped", why: "a round could not be started for this head" };
   const signedOff = task.column === "merge";
   const round = tipRounds + 1;
+  // Only generated files conflict (`merge_regenerate`): Finish's merge
+  // rebuilds them and Review's approval carries over — no Build, no Review.
+  const regenerable = regenerateCovering(found.files, parseRegenerateRules(preferences.get(MERGE_REGENERATE_PREF), task.workdir)) !== null;
   const r = await reworkDeps.rework(task.id, {
-    stepId: shape.build.id, fromStepId: shape.finish.id,
+    stepId: regenerable ? shape.finish.id : shape.build.id, fromStepId: shape.finish.id,
     handoff: conflictHandoff({ shape, pr: at, files: found.files, round, maxRounds: cfg.maxRounds, signedOff, perBaseTip: true }),
   });
   if (tasks.get(task.id)?.pipelineRun?.status === "done") {
@@ -710,7 +714,8 @@ export async function reworkConflict(task: Task, pr: TaskPrStatus): Promise<Rewo
   say(
     task.id,
     `${wasHeld ? `No longer held for you: ${base} moved to ${tip.slice(0, 8)} and merging it in is ${shape.build.name}'s work. ` : ""}` +
-      `${withdrawn || signedOff ? "Merge queue" : "After the pipeline finished"}: ${what} on PR #${pr.number} — ${withdrawn || signedOff ? "sign-off withdrawn, " : ""}sent back through ${shape.build.name} → ${shape.review.name} → ${shape.finish.name} ` +
+      `${withdrawn || signedOff ? "Merge queue" : "After the pipeline finished"}: ${what} on PR #${pr.number} — ${withdrawn || signedOff ? "sign-off withdrawn, " : ""}` +
+      (regenerable ? `only generated files conflict (${found.files.join(", ")}), so ${shape.finish.name} merges ${base} in and regenerates them, keeping Review's approval ` : `sent back through ${shape.build.name} → ${shape.review.name} → ${shape.finish.name} `) +
       `(round ${round} of ${cfg.maxRounds} against ${base} at ${tip.slice(0, 8)}); nothing is pushed until ${shape.review.name} approves the merge`,
     "warning",
   );

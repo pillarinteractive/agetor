@@ -72,7 +72,7 @@ async function findByMarker(dir: string, key: string): Promise<{ number: number;
  * when the label cannot be set the marker still identifies it. Text is
  * redacted before it leaves the machine.
  */
-export async function fileOwnerHoldIssue(input: { dir: string; key: string; title: string; body: string }): Promise<{ number: number; url: string; reused: boolean } | { error: string }> {
+export async function fileOwnerHoldIssue(input: { dir: string; key: string; title: string; body: string; labels?: string[] }): Promise<{ number: number; url: string; reused: boolean } | { error: string }> {
   const ledger = readLedger();
   const known = ledger[input.key];
   if (known?.state === "filed" && known.number) return { number: known.number, url: known.url ?? "", reused: true };
@@ -86,7 +86,7 @@ export async function fileOwnerHoldIssue(input: { dir: string; key: string; titl
   writeLedger({ ...readLedger(), [input.key]: { state: "pending", at: Date.now() } });
   const title = redactDecisionText(input.title);
   const body = redactDecisionText(input.body);
-  let created = await createGitHubIssue({ dir: input.dir, title, body, labels: [OWNER_HOLD_LABEL] }).catch((e: unknown) => ({ ok: false as const, error: String(e) }));
+  let created = await createGitHubIssue({ dir: input.dir, title, body, labels: input.labels ?? [OWNER_HOLD_LABEL] }).catch((e: unknown) => ({ ok: false as const, error: String(e) }));
   if (!created.ok) created = await createGitHubIssue({ dir: input.dir, title, body }).catch((e: unknown) => ({ ok: false as const, error: String(e) }));
   if (!created.ok) return { error: created.error };
   const out = { number: created.item.number, url: created.item.htmlUrl };

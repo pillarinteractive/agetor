@@ -52,6 +52,7 @@ import {
 } from "../shared/owner-holds.ts";
 import { decisionPolicyForProject, PIPELINE_DECISIONS_PREF, plannerDecisionInstructions } from "../shared/pipeline-decisions.ts";
 import { buildSettled, noChangeReviewNote, reviewSettled, type HeadAt } from "../shared/no-change-loop.ts";
+import { buildFindingsNote, closeOutReviewNote, dueForCloseOut, markClosed, missingClassSearch, openFindings, recordReview, repeatedOpen, reviewFindingsNote } from "../shared/finding-ledger.ts";
 import {
   PIPELINE_GATES_PREF, gateUnmatchedLine, initialPublishState, parsePipelineGate, publishBlockMessage, publishGateOn, publishStepOf, publishVisitOver,
   unmatchedGateRefs, type GateUnmatched, type PipelineGateName,
@@ -1213,6 +1214,231 @@ async function guardNoChangeLoop(
   });
 }
 
+export const ROUNDS_PREF = "pipeline_rounds";
+
+/** `pipeline_rounds`: the profile (name or id) a Build escalates to when a
+ *  finding comes back, and the effort of a re-review. Defaults: "Builder",
+ *  "medium"; {"enabled": false} turns both off (the ledger, the Class
+ *  search gate and the close-out stay). */
+export function parseRoundsPolicy(raw: string | null | undefined): { escalateProfile: string | null; reviewEffort: string | null } {
+  const fallback = { escalateProfile: "Builder", reviewEffort: "medium" };
+  try {
+    const v = raw ? JSON.parse(raw) : null;
+    if (!v || typeof v !== "object" || Array.isArray(v)) return fallback;
+    if (v.enabled === false) return { escalateProfile: null, reviewEffort: null };
+    return {
+      escalateProfile: typeof v.escalateProfile === "string" ? v.escalateProfile.trim() || null : fallback.escalateProfile,
+      reviewEffort: typeof v.reviewEffort === "string" ? v.reviewEffort.trim() || null : fallback.reviewEffort,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+/** The escalation profile as a snapshot, kept on the run once taken so every
+ *  later escalated Build of the run uses the same one. */
+function escalationProfile(run: PipelineRunState, nameOrId: string | null): AgentProfileSnapshot | null {
+  if (!nameOrId || !run.snapshot) return null;
+  const kept = Object.values(run.snapshot.profiles).find((p) => p.id === nameOrId || p.name === nameOrId);
+  if (kept) return kept;
+  const live = agentProfiles.get(nameOrId) ?? agentProfiles.list().find((p) => p.name === nameOrId) ?? null;
+  const harness = live ? harnesses.getByIdOrKind(live.harness) : null;
+  if (!live || !harness || !harness.enabled) return null;
+  const snap = snapshotFromProfile(live, { kind: harness.kind, label: harness.label }, Date.now());
+  run.snapshot.profiles[snap.id] = snap;
+  return snap;
+}
+
+/** Git reads for the re-review packet — replaceable in tests. */
+export const packetDeps = {
+  git: async (args: string[], cwd: string): Promise<string | null> => {
+    const r = await runCommand(["git", ...args], cwd, 60_000, process.env).catch(() => null);
+    return r && r.ok ? r.stdout : null;
+  },
+};
+
+const PACKET_INLINE = 30_000;
+
+/** The change since `lastSha` without what a merge of the base brought in:
+ *  the reviewed head is merged (in a scratch tree, nothing written to the
+ *  branch) with the base commit HEAD now contains, and HEAD is diffed against
+ *  that, so develop's own hunks cancel out. */
+export async function cleanDelta(checkout: string, lastSha: string, base: string): Promise<{ diff: string; stat: string; note: string } | null> {
+  const git = packetDeps.git;
+  const head = (await git(["rev-parse", "HEAD"], checkout))?.trim();
+  if (!head) return null;
+  if (head === lastSha) return { diff: "", stat: "", note: "HEAD is the head last reviewed: no change since." };
+  const newBase = (await git(["merge-base", "HEAD", base], checkout))?.trim();
+  const oldBase = (await git(["merge-base", lastSha, base], checkout))?.trim();
+  let from = lastSha;
+  let note = `Changes from the last reviewed head ${lastSha.slice(0, 8)} to ${head.slice(0, 8)}.`;
+  if (newBase && oldBase && newBase !== oldBase) {
+    const tree = (await git(["merge-tree", "--write-tree", lastSha, newBase], checkout))?.split("\n")[0]?.trim();
+    if (tree && /^[0-9a-f]{40,64}$/.test(tree)) {
+      from = tree;
+      note += ` ${base} was merged in since; its own changes are left out (the reviewed head merged with ${newBase.slice(0, 8)} is the starting point), so what remains is Build's work and its conflict resolutions.`;
+    } else {
+      note += ` ${base} was merged in since (${oldBase.slice(0, 8)} → ${newBase.slice(0, 8)}) and that merge conflicted, so some lines below came from ${base}: check \`git log --merges ${lastSha.slice(0, 8)}..HEAD\`.`;
+    }
+  }
+  const stat = (await git(["diff", "--stat", from, "HEAD"], checkout)) ?? "";
+  let diff = (await git(["diff", "--function-context", from, "HEAD"], checkout)) ?? "";
+  if (diff.length > PACKET_INLINE) diff = (await git(["diff", "-U5", from, "HEAD"], checkout)) ?? diff;
+  return { diff, stat, note };
+}
+
+/** The runner's rounds section for a Build or Review launch. */
+async function roundsSection(
+  parent: Task,
+  run: PipelineRunState,
+  role: string,
+  escalated: boolean,
+  lastReview: PipelineStepRecord | null,
+  runDir: string,
+  seq: number,
+): Promise<string | null> {
+  const parts: string[] = [];
+  const checkout = parent.worktreePath ?? parent.workdir;
+  const base = `origin/${baseBranchFor(parent.id) ?? "develop"}`;
+  if (role === "build") {
+    const note = buildFindingsNote(run.findings, escalated);
+    if (note) parts.push(note);
+    const lastBuild = run.history.findLast((h) => stepRole(stepNameById(run.snapshot!.graph, h.stepId), h.stepId) === "build" && h.handoff);
+    if (run.classSearchReturned != null && lastBuild?.seq === run.classSearchReturned) {
+      parts.push("Agetor returned your previous handoff because its `Class search:` section was missing or incomplete for the open findings above. Add it, with a command and a hit count per ID.");
+    }
+    if (escalated && lastBuild?.handoff) {
+      parts.push(`## What the last Build did (execution ${lastBuild.seq})\n${lastBuild.handoff.summary}`);
+      const reviewed = run.history.findLast((h) => h.handoff?.reviewApproval?.headSha && h.seq < lastBuild.seq)?.handoff?.reviewApproval?.headSha;
+      if (reviewed && checkout) {
+        const d = await cleanDelta(checkout, reviewed, base);
+        if (d?.diff) parts.push(packetDiff("Its change", d, runDir, seq));
+      }
+    }
+  } else if (role === "review") {
+    const closing = run.findingCloseOut && !run.findingCloseOut.wrapped
+      ? Object.entries(run.findings ?? {}).filter(([, f]) => f.state === "closed").map(([id, f]) => ({ id, text: f.text, issue: f.issue ?? null }))
+      : [];
+    if (closing.length > 0 && openFindings(run.findings).length === 0) parts.push(closeOutReviewNote(closing));
+    const note = reviewFindingsNote(run.findings);
+    if (note) parts.push(note);
+    const lastSha = lastReview?.handoff?.reviewApproval?.headSha;
+    if (lastSha && checkout) {
+      const d = await cleanDelta(checkout, lastSha, base);
+      if (d) parts.push(packetDiff("## Re-review packet: the delta since your last review", d, runDir, seq,
+        "Review this delta, the open findings and Build's Class search lines. New findings on code you already reviewed are follow-ups unless the delta, a conflict resolution or a merged upstream change introduced them (cite which), or they are an unmet mandatory requirement or a security, privacy or data-loss defect."));
+    }
+  }
+  return parts.length ? parts.join("\n\n") : null;
+}
+
+function packetDiff(title: string, d: { diff: string; stat: string; note: string }, runDir: string, seq: number, lead = ""): string {
+  const head = [title, lead, d.note, d.stat ? "```\n" + d.stat.trim() + "\n```" : ""].filter(Boolean).join("\n\n");
+  if (!d.diff) return head;
+  if (d.diff.length <= PACKET_INLINE) return `${head}\n\n\`\`\`diff\n${d.diff.trim()}\n\`\`\``;
+  const file = join(runDir, `delta-${(Date.now()).toString(36)}-${seq}.diff`);
+  try {
+    writeFileSync(file, d.diff);
+    return `${head}\n\nThe diff is ${Math.round(d.diff.length / 1000)} KB: read it from \`${file}\`.`;
+  } catch {
+    return `${head}\n\n\`\`\`diff\n${d.diff.slice(0, PACKET_INLINE)}\n\`\`\`\n(cut at ${PACKET_INLINE} characters)`;
+  }
+}
+
+/** What the run does with Review's findings as it settles (an unattended
+ *  run only; src/shared/finding-ledger.ts): record them, close out the ones
+ *  that came back twice, and decide where the work goes. Returns the route,
+ *  changed or not. */
+export async function settleReviewFindings(
+  parent: Task,
+  run: PipelineRunState,
+  stepName: string,
+  entry: { stepId: string; seq: number },
+  handoff: Handoff,
+  resolved: { kind: "steps"; stepIds: string[] } | { kind: "terminal" },
+): Promise<{ kind: "steps"; stepIds: string[] } | { kind: "terminal" }> {
+  if (!run.snapshot || stepRole(stepName, entry.stepId) !== "review" || !ladderApplies(run)) return resolved;
+  const graph = run.snapshot.graph;
+  const approval = handoff.reviewApproval;
+  const findings = approval?.verdict === "approved" ? [] : approval?.findings ?? [];
+  if (!approval) return resolved;
+  run.findings = recordReview(run.findings, entry.seq, findings);
+  const due = dueForCloseOut(run.findings);
+  for (const [id, f] of due) {
+    const filed = await findingDeps.fileFollowup(parent, id, f).catch(() => null);
+    run.findings = markClosed(run.findings, id, filed);
+    recordActivity(parent.id, { kind: "step", tone: "warning",
+      text: `${RESOLVING_PREFIX}Finding ${id} came back after ${f.repeat} fixes — closed out of this card${filed ? ` as #${filed.number}` : ""} instead of another Build` });
+  }
+  if (resolved.kind !== "steps") return resolved;
+  const toBuild = resolved.stepIds.some((id) => stepRole(stepNameById(graph, id), id) === "build");
+  if (!toBuild || openFindings(run.findings).length > 0) return resolved;
+  // Only closed findings stand between this work and approval.
+  const closed = Object.values(run.findings ?? {}).some((f) => f.state === "closed");
+  if (!closed) return resolved;
+  if (!run.findingCloseOut) {
+    run.findingCloseOut = { at: Date.now(), wrapped: false };
+    recordActivity(parent.id, { kind: "step", tone: "info",
+      text: `${RESOLVING_PREFIX}Only closed-out findings remain — Review decides the verdict once more instead of another Build` });
+    return { kind: "steps", stepIds: [entry.stepId] };
+  }
+  if (run.findingCloseOut.wrapped || run.capWrapUp || !capWrapUpStep(graph)) return resolved;
+  run.findingCloseOut = { ...run.findingCloseOut, wrapped: true };
+  const why = "Review returned work whose only open findings were closed out after two fixes each";
+  run.capWrapUp = { at: Date.now(), fromStepId: resolved.stepIds[0]!, closeout: { issues: [], why } };
+  recordActivity(parent.id, { kind: "step", tone: "warning",
+    text: `${RESOLVING_PREFIX}Review kept closed-out findings as blockers — finishing through ${capWrapUpStep(graph)!.name}: published as not approved, nothing merged` });
+  return resolved;
+}
+
+/** A Build that addresses findings must list a Class search line for each
+ *  open one. One miss is sent back to the same Build; a second goes on to
+ *  Review, which checks it. */
+export async function classSearchReturn(
+  run: PipelineRunState,
+  stepName: string,
+  entry: { stepId: string; seq: number; taskId: string; startedAt: number; turnStartedAt?: number | null; endedAt?: number | null },
+  handoff: Handoff,
+): Promise<string[] | null> {
+  if (stepRole(stepName, entry.stepId) !== "build" || !ladderApplies(run)) return null;
+  const required = openFindings(run.findings).map(([id]) => id);
+  if (required.length === 0 || run.classSearchReturned === entry.seq) return null;
+  const report = findingDeps.report(entry);
+  const missing = missingClassSearch([handoff.summary, handoff.reason, report].join("\n"), required);
+  return missing.length > 0 ? missing : null;
+}
+
+/** GitHub and transcript reads for the findings rules — replaceable in tests. */
+export const findingDeps: {
+  fileFollowup: (parent: Task, id: string, f: import("../shared/finding-ledger.ts").LedgerFinding) => Promise<{ number: number; url: string } | null>;
+  report: (entry: { taskId: string; startedAt: number; turnStartedAt?: number | null; endedAt?: number | null }) => string;
+} = {
+  async fileFollowup(parent, id, f) {
+    const dir = parent.worktreePath ?? parent.workdir;
+    if (!dir) return null;
+    const issue = parent.issueUrl ? `#${/\/issues\/(\d+)/.exec(parent.issueUrl)?.[1] ?? ""}` : "this card";
+    const r = await ownerHoldDeps.fileIssue({
+      dir,
+      key: `finding-closeout:${parent.id}:${id}`,
+      title: `Bug (from ${issue}): ${f.text.replace(/\s+/g, " ").slice(0, 110)}`,
+      body: [
+        `Review finding **${id}** on ${issue} came back after ${f.repeat} fix attempts (the last on the escalation profile), so Agetor took it off that card instead of a further Build (finding close-out, owner decision 2026-10-14).`,
+        "",
+        "Finding as Review last wrote it:",
+        "",
+        f.text,
+        "",
+        `Raised by Review executions ${f.raised.join(", ")} of the card's run. The card's handoffs and Build's Class search lines are in its run folder.`,
+        "",
+        "Reproduce it with a failing test first, fix the root cause, and close with `Fixes`.",
+      ].join("\n"),
+      labels: ["bug", "follow-up"],
+    });
+    return "error" in r ? null : { number: r.number, url: r.url };
+  },
+  report: (entry) => stepFinalReport(entry.taskId, entry.startedAt, entry.turnStartedAt ?? null, { endedAt: entry.endedAt ?? undefined })?.body ?? "",
+};
+
 /**
  * A Build that Finish sent back (CI failed on the published head, typically a
  * runner or network fault) and that ended without changing anything goes
@@ -1252,7 +1478,7 @@ export async function skipReviewOfApprovedHead(
 /** What the ladder reads from and does to the rest of the core — replaceable
  *  in tests (no GitHub, no tmux). */
 export const ownerHoldDeps: {
-  fileIssue: (input: { dir: string; key: string; title: string; body: string }) => Promise<{ number: number; url: string; reused: boolean } | { error: string }>;
+  fileIssue: (input: { dir: string; key: string; title: string; body: string; labels?: string[] }) => Promise<{ number: number; url: string; reused: boolean } | { error: string }>;
   answerInteraction: (req: ReturnType<typeof listPendingForTask>[number], note: string) => Promise<boolean>;
   hasCommits: (parent: Task) => Promise<boolean>;
   pending: (taskId: string) => ReturnType<typeof listPendingForTask>;
@@ -3206,8 +3432,8 @@ async function launchStep(
     persist(parent.id, run);
     return { ok: false };
   }
-  const profile = step.agentProfileId ? snapshot.profiles[step.agentProfileId] : undefined;
-  if (!profile) {
+  const stepProfile = step.agentProfileId ? snapshot.profiles[step.agentProfileId] : undefined;
+  if (!stepProfile) {
     upsertBlocked(run, {
       taskId: null,
       stepId: step.id,
@@ -3218,6 +3444,19 @@ async function launchStep(
     persist(parent.id, run);
     return { ok: false };
   }
+  // Review rounds (src/shared/finding-ledger.ts, `pipeline_rounds`): a Build
+  // whose findings came back runs on the escalation profile; a re-review
+  // runs at the lighter effort.
+  const rounds = parseRoundsPolicy(preferences.get(ROUNDS_PREF));
+  const roundRole = publishBrief || wrapUp || !ladderApplies(run) ? null : stepRole(step.name, step.id);
+  const escalated = roundRole === "build" && repeatedOpen(run.findings).length > 0 ? escalationProfile(run, rounds.escalateProfile) : null;
+  const profile = escalated ?? stepProfile;
+  if (escalated) {
+    recordActivity(parent.id, { kind: "step", tone: "info",
+      text: `${step.name} runs on ${escalated.name} (${escalated.model ?? "default model"}) — ${repeatedOpen(run.findings).map(([id]) => id).join(", ")} came back after a fix` });
+  }
+  const lastReview = roundRole === "review" ? run.history.findLast((h) => h.stepId === step.id && h.handoff?.reviewApproval) : undefined;
+  const reReview = !!lastReview && !!rounds.reviewEffort;
 
   // Step slots (src/bun/step-slots.ts): too many agents at once starve the
   // machine. Over the limit, the step queues — a `slot-wait` block that the
@@ -3382,6 +3621,7 @@ async function launchStep(
   const references: TaskReference[] = [...(parent.references ?? []), ...handoffRefs];
 
   const syncNote = publishBrief ? null : await syncBaseNote(parent, step.name).catch(() => null);
+  const roundsNote = roundRole ? await roundsSection(parent, run, roundRole, !!escalated, lastReview ?? null, runDir, seq).catch(() => null) : null;
   const manuallyRouted = previous.some((p) => run.history.some((h) => h.seq === p.seq && h.stepId === p.stepId && h.outcome === "advanced-manually"));
   const managedRoot=managedPillarRoot(parent.worktreePath??parent.workdir);
   const approvalNote=step.name==='Review'
@@ -3412,6 +3652,7 @@ async function launchStep(
       !wrapUp && run.noChangeLoop?.instructedAt != null && run.noChangeLoop.wrappedAt == null && stepRole(step.name, step.id) === "review" && ladderApplies(run)
         ? noChangeReviewNote(run.noChangeLoop.rounds)
         : null,
+      roundsNote,
     ].filter(Boolean).join("\n\n") || null,
     machineCapacity: managedRoot ? `## Machine test capacity\n${HEAVY_INSTRUCTIONS}` : null,
     approvalNote: managedRoot ? approvalNote : null,
@@ -3436,7 +3677,7 @@ async function launchStep(
   }
 
   const now = Date.now();
-  const effort = profile.effort ?? defaultEffortFor(profile.harnessKind, profile.model, profile.harness);
+  const effort = (reReview ? rounds.reviewEffort : null) ?? profile.effort ?? defaultEffortFor(profile.harnessKind, profile.model, profile.harness);
   // While the profile's harness is at a known usage limit, start on its
   // configured backup (quota-fallback.ts); otherwise this is the profile's.
   const fallback = fallbackDuringLimit(profile.harness);
@@ -5837,6 +6078,23 @@ async function settleStepRun(
           if(historyEntry)historyEntry.handoff=parsedHandoff;
           upsertBlocked(run,{taskId,stepId:activeEntry.stepId,kind:'step-blocked',message:'Review requires repair; no permitted corrective route can be followed'});
           checkJoinIncomplete(run);persist(parentId,run);return null;
+        }
+      }
+      // Review's findings, by stable ID (src/shared/finding-ledger.ts): one
+      // that came back twice leaves the card; a Build that skipped its Class
+      // search goes back to itself once before any Review runs.
+      if (!freshSession && (resolved.kind === "steps" || resolved.kind === "terminal")) {
+        resolved = await settleReviewFindings(parentForGuard(parentId, parent), run, stepName, activeEntry, parsedHandoff, resolved);
+      }
+      if (!freshSession && resolved.kind === "steps" && historyEntry) {
+        const missing = await classSearchReturn(run, stepName,
+          { stepId: activeEntry.stepId, seq: activeEntry.seq, taskId, startedAt: historyEntry.startedAt, turnStartedAt: historyEntry.turnStartedAt ?? null, endedAt: Date.now() },
+          parsedHandoff);
+        if (missing) {
+          run.classSearchReturned = activeEntry.seq;
+          resolved = { kind: "steps", stepIds: [activeEntry.stepId] };
+          recordActivity(parentId, { kind: "step", tone: "warning",
+            text: `${stepName} handed off without a Class search line for ${missing.join(", ")} — back to ${stepName} once before Review` });
         }
       }
       // A Build sent back by a failed publication that changed nothing: the

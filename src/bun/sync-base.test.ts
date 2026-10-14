@@ -19,7 +19,8 @@ test("the prompt section says how far behind, merges (never rebases), and what t
   const s = syncBaseSection("develop", 3);
   expect(s).toContain("`origin/develop` is 3 commits ahead");
   expect(s).toContain("git merge --no-edit origin/develop");
-  expect(s).toContain("don't rebase");
+  expect(s).toContain("never rebase");
+  expect(s).toContain("GIT_EDITOR=true git merge");
   expect(s).toContain("git merge --abort");
   expect(syncBaseSection("develop", 1)).toContain("1 commit ahead");
 });

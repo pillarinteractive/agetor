@@ -277,6 +277,44 @@ export interface MergeProbe {
   conflicts: string[] | null;
   samePatch: boolean;
   commit: string | null;
+  /** Conflicted generated files Agetor rebuilt with their regenerate command
+   *  (`merge_regenerate`): the merge carries Review's approval like a clean
+   *  one, because only generator output changed. */
+  regenerated?: string[];
+}
+
+/** `merge_regenerate`: generated files whose merge conflicts Agetor resolves
+ *  by taking the base's copy and running the command that rebuilds them,
+ *  e.g. [{"project": "/repo", "path": "docs/README.md", "command": "python3 .github/scripts/validate_docs_index.py --write"}]. */
+export const MERGE_REGENERATE_PREF = "merge_regenerate";
+export interface RegenerateRule { project: string; path: string; command: string }
+
+export function parseRegenerateRules(raw: string | null | undefined, project: string): RegenerateRule[] {
+  let v: unknown;
+  try {
+    v = raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+  const trim = (x: string) => x.replace(/\/+$/, "");
+  return (Array.isArray(v) ? v : []).flatMap((r) => {
+    const o = r as Record<string, unknown> | null;
+    if (!o || typeof o.project !== "string" || typeof o.path !== "string" || typeof o.command !== "string") return [];
+    if (!o.path.trim() || !o.command.trim() || trim(o.project) !== trim(project)) return [];
+    return [{ project: o.project, path: o.path.trim(), command: o.command.trim() }];
+  });
+}
+
+/** The rules that cover every conflicted file, or null when one is not covered. */
+export function regenerateCovering(conflicts: readonly string[], rules: readonly RegenerateRule[]): RegenerateRule[] | null {
+  if (conflicts.length === 0) return null;
+  const used = new Map<string, RegenerateRule>();
+  for (const f of conflicts) {
+    const rule = rules.find((r) => r.path === f);
+    if (!rule) return null;
+    used.set(rule.command, rule);
+  }
+  return [...used.values()];
 }
 
 export interface PullSeen {

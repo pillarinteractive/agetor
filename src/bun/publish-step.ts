@@ -28,10 +28,14 @@ import { newestPerName, failedConclusion, ROLLUP_CHECKS, type CheckRunLike } fro
 import {
   PROTECTED_BRANCHES, applyPublish, baseVerdicts, decidePublish, failingCauses, publishBuildHandoff, publishEvidenceComment,
   publishWriterBrief, verdictsSettled,
+  MERGE_REGENERATE_PREF, parseRegenerateRules, regenerateCovering, type RegenerateRule,
   type BuildCause, type MergeProbe, type PublishAction, type PublishApproval, type PublishFacts, type PublishObservation,
   type PublishResult, type PullSeen,
 } from "../shared/publish.ts";
-import { tasks } from "./db.ts";
+import { preferences, tasks } from "./db.ts";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { recordActivity } from "./activity.ts";
 import {
   createGitHubComment, createGitHubPull, findGitHubPullForBranch, getGitHubRefCheckRuns, rerunGitHubWorkflowRun, setGitHubPullDraft,
@@ -74,6 +78,17 @@ async function gitCommand(args: string[], cwd: string, stdin?: string): Promise<
  *  the calls below. */
 export const publishDeps = {
   git: gitCommand,
+  /** A regenerate command, through the agents' PATH; true when it exited 0. */
+  async shell(command: string, cwd: string): Promise<boolean> {
+    try {
+      const p = Bun.spawn(["/bin/sh", "-c", `. "$HOME/.agetor/bin/agent-path.sh" 2>/dev/null; ${command}`], {
+        cwd, stdin: "ignore", stdout: "ignore", stderr: "ignore", timeout: 300_000, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      });
+      return (await p.exited) === 0;
+    } catch {
+      return false;
+    }
+  },
   base: (checkout: string): Promise<string> => prBase(checkout),
   async findPull(task: Task): Promise<{ ok: true; pull: PullSeen | null } | { ok: false }> {
     const found = await findGitHubPullForBranch({ dir: task.workdir, branch: task.branch! });
@@ -136,13 +151,16 @@ export function publishApproval(task: Pick<Task, "issueUrl">, run: PipelineRunSt
  * same for the merge commit, plus the list of files the change touches. Null
  * when git could not answer.
  */
-export async function mergeProbe(checkout: string, baseTip: string, base: string): Promise<MergeProbe | null> {
+export async function mergeProbe(checkout: string, baseTip: string, base: string, regenerate: readonly RegenerateRule[] = []): Promise<MergeProbe | null> {
   const git = publishDeps.git;
   const tried = await git(["merge-tree", "--write-tree", "--name-only", "HEAD", baseTip], checkout);
   if (tried.exitCode === 1) {
     // The tree id, then the conflicted paths, then a blank line and messages.
-    const files = (tried.stdout.split("\n\n")[0] ?? "").split("\n").slice(1).map((l) => l.trim()).filter(Boolean);
-    return { conflicts: [...new Set(files)], samePatch: false, commit: null };
+    const files = [...new Set((tried.stdout.split("\n\n")[0] ?? "").split("\n").slice(1).map((l) => l.trim()).filter(Boolean))];
+    const rules = regenerateCovering(files, regenerate);
+    const commit = rules ? await regeneratedMerge(checkout, baseTip, base, files, rules).catch(() => null) : null;
+    if (commit) return { conflicts: null, samePatch: true, commit, regenerated: files };
+    return { conflicts: files, samePatch: false, commit: null };
   }
   const tree = tried.stdout.split("\n")[0]?.trim();
   if (!tried.ok || !tree) return null;
@@ -157,6 +175,40 @@ export async function mergeProbe(checkout: string, baseTip: string, base: string
   };
   const [before, after] = [await fingerprint("HEAD"), await fingerprint(commit.stdout)];
   return { conflicts: null, samePatch: before !== null && before === after, commit: commit.stdout };
+}
+
+/**
+ * The merge of `baseTip` into HEAD with each conflicted generated file
+ * rebuilt: in a scratch worktree (the card's own is not touched), take the
+ * base's copy of each, run the rules' commands, and commit the merge when
+ * nothing else is left unmerged. The commit's id, or null — the conflict
+ * then goes to Build as before.
+ */
+async function regeneratedMerge(checkout: string, baseTip: string, base: string, files: string[], rules: RegenerateRule[]): Promise<string | null> {
+  const git = publishDeps.git;
+  const scratch = mkdtempSync(join(tmpdir(), "agetor-regenerate-"));
+  rmSync(scratch, { recursive: true, force: true });
+  const added = await git(["worktree", "add", "--detach", "--quiet", scratch, "HEAD"], checkout);
+  if (!added.ok) return null;
+  try {
+    await git(["merge", "--no-commit", "--no-ff", "--quiet", baseTip], scratch);
+    for (const f of files) {
+      if (!(await git(["checkout", "--theirs", "--", f], scratch)).ok) return null;
+    }
+    for (const rule of rules) {
+      if (!(await publishDeps.shell(rule.command, scratch))) return null;
+    }
+    if (!(await git(["add", "--", ...files], scratch)).ok) return null;
+    const unmerged = await git(["diff", "--name-only", "--diff-filter=U"], scratch);
+    if (!unmerged.ok || unmerged.stdout) return null;
+    const committed = await git(["commit", "--quiet", "--no-verify", "-m", `Merge remote-tracking branch 'origin/${base}'`,
+      "-m", `Merged by Agetor: ${files.join(", ")} conflicted and ${files.length === 1 ? "was" : "were"} regenerated (merge_regenerate); the change's own diff is otherwise unchanged.`], scratch);
+    if (!committed.ok) return null;
+    const sha = await git(["rev-parse", "HEAD"], scratch);
+    return sha.ok && sha.stdout ? sha.stdout : null;
+  } finally {
+    await git(["worktree", "remove", "--force", scratch], checkout);
+  }
 }
 
 /** Check runs of base commits other than the tip, which no longer change. */
@@ -216,7 +268,8 @@ async function observe(task: Task, run: PipelineRunState, p: PipelinePublishStat
       const tip = await baseTip();
       if (!tip) return { state: "unreadable", what: `origin/${base}` };
       const contains = (await git(["merge-base", "--is-ancestor", tip, "HEAD"], checkout)).ok;
-      return { state: p.state, baseTip: tip, contains, merge: contains ? null : await mergeProbe(checkout, tip, base) };
+      const regenerate = parseRegenerateRules(preferences.get(MERGE_REGENERATE_PREF), task.workdir);
+      return { state: p.state, baseTip: tip, contains, merge: contains ? null : await mergeProbe(checkout, tip, base, regenerate) };
     }
     case "hold-base": {
       const tip = await baseTip();

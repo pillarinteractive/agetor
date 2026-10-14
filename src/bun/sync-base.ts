@@ -52,7 +52,7 @@ export function syncBaseSection(branch: string, behind: number): string {
 \`origin/${branch}\` is ${behind} commit${behind === 1 ? "" : "s"} ahead of this branch. Bring it in before you verify, so your checks run against what the PR will merge into:
 
 1. Commit any outstanding work on this branch.
-2. \`git merge --no-edit origin/${branch}\` (a merge commit on this task branch — don't rebase, and never push to \`${branch}\`).
+2. \`GIT_EDITOR=true git merge --no-edit origin/${branch}\` (a merge commit on this task branch — never rebase, and never push to \`${branch}\`).
 3. If it conflicts, resolve it when the right resolution is clear from both sides' intent. If it isn't, \`git merge --abort\` and hand off to the step that fixes things (or as blocked if there's none), listing the conflicting files.
 
 Then carry on with your step as written below.`;
