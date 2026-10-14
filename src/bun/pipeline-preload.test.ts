@@ -21,6 +21,8 @@ process.env.AGETOR_TMUX_BIN = "/bin/echo";
 const { tasks, preferences, pipelines, agentProfiles } = await import("./db.ts");
 const { newStep } = await import("../shared/pipeline.ts");
 const { PIPELINE_GATES_PREF } = await import("../shared/publish.ts");
+const { PIPELINE_DECISIONS_PREF } = await import("../shared/pipeline-decisions.ts");
+const { STEP_PROMPT_ORDER_PREF } = await import("../shared/pipeline.ts");
 const { PRELOAD_LIMITS } = await import("../shared/preload.ts");
 const { STEP_SLOTS_PREF } = await import("./step-slots.ts");
 const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
@@ -54,6 +56,8 @@ beforeEach(() => {
     return realPreloadDeps.git(args, cwd);
   };
   preferences.set(PIPELINE_GATES_PREF, "{}");
+  preferences.set(PIPELINE_DECISIONS_PREF, "");
+  preferences.set(STEP_PROMPT_ORDER_PREF, "");
 });
 
 afterEach(async () => {
@@ -67,6 +71,8 @@ afterAll(async () => {
   Object.assign(preloadDeps, realPreloadDeps);
   preferences.set(STEP_SLOTS_PREF, slotsBefore ?? "");
   preferences.set(PIPELINE_GATES_PREF, "{}");
+  preferences.set(PIPELINE_DECISIONS_PREF, "");
+  preferences.set(STEP_PROMPT_ORDER_PREF, "");
   await new Promise((r) => setTimeout(r, 150));
   rmTestDataDir(DATA_DIR);
 });
@@ -477,7 +483,8 @@ describe("through the runner", () => {
 
     const buildTask = promptsOf(run, card.build)[0]!;
     const at = (prompt: string, heading: string) => prompt.indexOf(`\n\n${heading}`);
-    const order = ["## Overall goal", "## File map", "## Context from previous step(s)", "## Code at the file map's ranges", "## Your step"].map((h) => at(buildTask.prompt, h));
+    // The step's own text first, then the card's (the map, the goal), then this visit's (the context, the code).
+    const order = ["## Your step", "## File map", "## Overall goal", "## Context from previous step(s)", "## Code at the file map's ranges"].map((h) => at(buildTask.prompt, h));
     expect(order.every((i) => i > 0)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
     expect(buildTask.prompt).toContain("### src/total.ts:L10-L14\n\n```\ntotal 10\ntotal 11\ntotal 12\ntotal 13\ntotal 14\n```");
@@ -542,4 +549,50 @@ describe("through the runner", () => {
     expect(run.history).toHaveLength(4);
     for (const h of run.history) for (const heading of PRELOAD_HEADINGS) expect(tasks.get(h.taskId)!.prompt).not.toContain(heading);
   }, 60_000);
+});
+
+// Prompts are ordered static-first; `pipeline_prompt_order` = `legacy` puts
+// them back as they were. The same card run both ways must be given the same
+// text, section for section — only the order may differ.
+describe("prompt order, through the runner", () => {
+  /** A prompt with what differs between two runs of the same card taken out. */
+  const normal = (prompt: string, card: { id: string; pipeline: { name: string } }) => prompt
+    .replaceAll(card.id, "CARD").replaceAll(card.pipeline.name, "PIPELINE")
+    .replaceAll(/BEGIN untrusted handoff ([0-9a-f]{8})/.exec(prompt)?.[1] ?? "no nonce", "NONCE")
+    .replace(/(handoff|report)-[0-9a-z]+-/g, "$1-GEN-")
+    .replace(/capturedAt:\d+/g, "capturedAt:T");
+  const paragraphs = (prompt: string) => prompt.split("\n\n").sort();
+
+  test("a run in the old order and a run in the new are given the same paragraphs in every step, pre-loaded sections and the decision policy included", async () => {
+    const r = await makeRepo();
+    const head = await r.commit({ "src/tax.ts": numbered(31, "tax") });
+    r.writeMap(mapFor(head, MAP_BODY));
+    preferences.set(PIPELINE_DECISIONS_PREF, JSON.stringify({ mode: "planner-recommendation", projects: [r.repo] }));
+
+    const run = async (order: string) => {
+      preferences.set(STEP_PROMPT_ORDER_PREF, order);
+      const card = await makeCard(r.repo);
+      switchOn(card.pipeline.name, [card.id]);
+      await start(card.id);
+      const done = await until(card.id, (x) => x.status === "done", "the run done");
+      return { card, prompts: done.history.map((h) => normal(tasks.get(h.taskId)!.prompt, card)) };
+    };
+    const legacy = await run("legacy");
+    const now = await run("");
+    expect(now.prompts).toHaveLength(4);
+    for (const [i, prompt] of now.prompts.entries()) {
+      const before = legacy.prompts[i]!;
+      // Review's bundle is rewritten per visit with the step's number, not its text: the same in both.
+      expect(paragraphs(prompt)).toEqual(paragraphs(before));
+      expect(prompt.length).toBe(before.length);
+      expect(prompt).not.toBe(before);
+      expect(before.startsWith('# Pipeline "PIPELINE" — step')).toBe(true);
+      expect(prompt.startsWith("You are one step of a multi-step pipeline.")).toBe(true);
+      expect(prompt).toContain("## Planner recommendations and retrospective human follow-up");
+    }
+    // The start of a step's prompt is now the same on every visit of it: here, up to the card's own text.
+    const [buildNow, buildBefore] = [now.prompts[1]!, legacy.prompts[1]!];
+    expect(buildNow.indexOf("## Your step")).toBeLessThan(buildNow.indexOf('# Pipeline "PIPELINE" — step 2'));
+    expect(buildBefore.indexOf("## Your step")).toBeGreaterThan(buildBefore.indexOf('# Pipeline "PIPELINE" — step 2'));
+  }, 90_000);
 });

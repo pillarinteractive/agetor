@@ -1724,8 +1724,8 @@ map, outside the working tree — and Review starts from it instead of assemblin
 
 - **Once per visit**: rewritten at every launch of Review (written beside and renamed, so never half there), with
   the step number, the time and the HEAD it was written for. It is added to the step task's references.
-- **In the prompt**: `## File map` after the goal and `## Review bundle: the change` after the context from the
-  previous step — the bundle's path, the hunk index and the diff within the diff budget (20,000 tokens, 6,000 a
+- **In the prompt**: `## File map` with the card's context and `## Review bundle: the change` after the context
+  from the previous step — the bundle's path, the hunk index and the diff within the diff budget (20,000 tokens, 6,000 a
   file, largest trimmed first and named). The goal is not repeated; the section points at "Overall goal". The file
   keeps the diff whole (a file up to 200,000 characters, 2,000,000 in all).
 - **A card that never visited Build** — Understand's trivial change, routed to Review once Pillar's prompt sync
@@ -1736,3 +1736,49 @@ map, outside the working tree — and Review starts from it instead of assemblin
 
 Not done: Finish and Understand are not pre-loaded; a check-feedback turn (the same Review session) gets no new
 bundle — the next launch does.
+
+### Step prompts, static first (`pipeline_prompt_order`)
+
+Agetor does not write a harness's system prompt; this is about the text it sends as the step's first message
+(`composeStepPrompt`, `src/shared/pipeline.ts`). That text began with `# Pipeline "…" — step 5 of at most 14: Build`,
+so two prompts differed from their first line. It is now assembled from whole sections in one place and ordered by
+how widely each is shared; **no sentence was added, removed or reworded**.
+
+| | Order |
+| --- | --- |
+| Before (`legacy`) | [base moved] · title · intro · Overall goal · [File map] · Context from previous step(s) · [pre-loaded code / diff / bundle] · [Step goal] · Your step · [Checks] · [Running in parallel] · Delegation · Working economically · Handoff (required) · [Feedback from the owner] · [Planner recommendations] · [manual-Advance note] · [Machine test capacity · sign-off / publish note] · [wrap-up] · [input note] |
+| Now (`static-first`) | [base moved] · **repository:** intro · [Machine test capacity] · **step:** Delegation · Handoff (required) · [Step goal] · Your step · [Checks] · **card:** [sign-off / publish note] · [Planner recommendations] · [File map] · Overall goal · **visit:** title · Context from previous step(s) · Working economically · [Running in parallel] · [pre-loaded code / diff / bundle] · [Feedback from the owner] · [manual-Advance note] · [wrap-up] · [input note] |
+
+- **Kept where their own words need them**: the base-moved note stays first (it ends "then carry on with your step
+  as written below"; it is there only when `pipeline_sync_base` applies); "Working economically", the same for every
+  step, stays after the context ("the handoffs and reports quoted above"); Checks stays right after Your step
+  ("listed in your step above"); the manual-Advance note stays after the context ("the preceding verdict"); the
+  wrap-up stays last but for the input note, so nothing after it reads as taking it back.
+- **One thing read the old order back**: position resolution decides whether Understand's handoff can be reused by
+  finding the card's goal, word for word, in Understand's prompt — by the heading that followed it. It now asks
+  `promptCarriesGoal`, which knows what follows the goal in either order (and that the pre-loaded file map may), so
+  prompts stored before this build are still read. The goal is kept last of the card's sections for it. The
+  instruction refresh (`withStepInstructions`) finds `## Your step` as before.
+- **The runner's own sections** (the base-moved note, the owner's feedback, the decision policy, the manual-Advance
+  note, machine capacity, the sign-off note, the wrap-up, the input note) used to be strings wrapped around the
+  composed prompt in `launchStep`; they are passed to the composer as `extras` and placed with the rest.
+- **Unconditional, with a way back**: `agetor config pipeline_prompt_order legacy` restores the old order at the
+  next launch, without a rebuild; anything else, or nothing, is static-first.
+- **The proof** (`src/shared/prompt-order.test.ts`): `src/shared/fixtures/step-prompt-legacy/` holds what the
+  composer returned for seven representative launches at the last commit with the old order. The legacy order must
+  still return those bytes, wrapped as the runner wrapped them; the new order must return the same multiset of
+  paragraphs and of sections, at the same length. `src/bun/pipeline-preload.test.ts` runs the same card through the
+  runner both ways and compares the stored prompts of all four steps the same way.
+
+What it is worth: a harness that caches by prompt prefix (Codex: Review, Finish and follow-ups on this board) can now
+reuse the start of a step's prompt — the intro, machine capacity, delegation, the handoff contract and the step's
+instructions, 3–5k tokens for Review — across cards and visits, on the first call of each session; before, only the
+profile's instructions ahead of it were shared. Claude Code marks its cache at message boundaries, so a shared start
+inside the first message is not expected to hit: for Claude steps this changes the order and nothing else. Measure
+it with `scripts/step-tokens.ts` (the `input` and `cache read` columns of first calls), do not assume it.
+
+Not done, and not testable here: the handoff contract now sits before the goal and the context rather than after
+them. It was never last (the decision policy and machine capacity followed it), but if steps start forgetting the
+handoff block — `agetor blocks` for `handoff-missing` — set `pipeline_prompt_order` to `legacy` and say so. One
+difference in content, for gemini only: when a prompt is recomposed without inlined handoffs to fit gemini's argv
+cap, the input note is now kept; it used to be lost in that recomposition.

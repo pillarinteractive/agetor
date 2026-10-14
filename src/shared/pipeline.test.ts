@@ -1944,7 +1944,9 @@ describe("composeStepPrompt", () => {
     expect(beginIdx).toBeGreaterThan(warningIdx);
     expect(jsonIdx).toBeGreaterThan(beginIdx);
     expect(endIdx).toBeGreaterThan(jsonIdx);
-    expect(yourStepIdx).toBeGreaterThan(endIdx);
+    // The step's own instructions are outside the span, wherever the order puts them.
+    expect(yourStepIdx).toBeGreaterThan(-1);
+    expect(yourStepIdx < warningIdx || yourStepIdx > endIdx).toBe(true);
   });
 
   test("fences the too-large-with-file-pointer placeholder between BEGIN/END markers carrying the call's nonce", () => {
@@ -2989,7 +2991,9 @@ describe("a step's final report", () => {
     const end = prompt.indexOf("--- END untrusted handoff abcd1234 ---");
     const own = prompt.indexOf("## Your step");
     expect(begin).toBeGreaterThan(-1);
-    expect([begin, json, body, end, own]).toEqual([begin, json, body, end, own].slice().sort((a, b) => a - b));
+    expect([begin, json, body, end]).toEqual([begin, json, body, end].slice().sort((a, b) => a - b));
+    // The step's own instructions are outside the span, wherever the order puts them.
+    expect(own > -1 && (own < begin || own > end)).toBe(true);
     expect(prompt).toContain('(The same report from "Review" is also saved to /data/report-x-3.md.)');
     expect(prompt).not.toContain("omitted here");
   });
@@ -3043,8 +3047,8 @@ describe("a step's final report", () => {
   });
 });
 
-test("every step's prompt carries the usage guidance, between its instructions and the handoff contract", () => {
-  const prompt = composeStepPrompt({
+test("every step's prompt carries the usage guidance, after the handoffs it calls \"quoted above\"", () => {
+  const input: Parameters<typeof composeStepPrompt>[0] = {
     pipelineName: "P",
     step: newStep({ name: "Build", instructions: "Do the work." }),
     stepIndex: 2,
@@ -3057,10 +3061,14 @@ test("every step's prompt carries the usage guidance, between its instructions a
     subagentCap: null,
     inlineHandoff: true,
     parallelSiblings: [],
-  });
+  };
+  const prompt = composeStepPrompt(input);
   const at = prompt.indexOf("## Working economically");
-  expect(at).toBeGreaterThan(prompt.indexOf("## Your step"));
-  expect(at).toBeLessThan(prompt.indexOf("## Handoff (required)"));
+  expect(at).toBeGreaterThan(prompt.indexOf("## Context from previous step(s)"));
+  // In the order prompts had before they were reordered: between the instructions and the contract.
+  const legacy = composeStepPrompt({ ...input, order: "legacy" });
+  expect(legacy.indexOf("## Working economically")).toBeGreaterThan(legacy.indexOf("## Your step"));
+  expect(legacy.indexOf("## Working economically")).toBeLessThan(legacy.indexOf("## Handoff (required)"));
   expect(prompt).toContain(STEP_ECONOMY_GUIDANCE);
   // Short enough to cost nothing next to what it saves, and project-agnostic.
   expect(STEP_ECONOMY_GUIDANCE.length).toBeLessThan(1200);

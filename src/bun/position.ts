@@ -16,7 +16,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { builtinCheck } from "../shared/checks.ts";
-import { defaultChecksOf, stepGate } from "../shared/pipeline.ts";
+import { defaultChecksOf, promptCarriesGoal, stepGate } from "../shared/pipeline.ts";
 import {
   forwardPath, parseFeedbackLog, resolvePosition, stepsFrom, voidEntries, type OwnerFeedback, type Position, type StepEvidence,
 } from "../shared/position.ts";
@@ -100,7 +100,7 @@ export async function readPosition(input: {
   const start = path[0]!;
   const startRec = run.history.filter((h) => h.stepId === start.id && (h.outcome === "succeeded" || h.outcome === "advanced-manually") && h.handoff).sort((a, b) => b.seq - a.seq)[0];
   const startPrompt = startRec ? positionDeps.stepPrompt(startRec.taskId) : null;
-  const goalUnchanged = !!startPrompt && startPrompt.includes(`## Overall goal\n\n${parent.prompt}\n\n## Context from previous step(s)`);
+  const goalUnchanged = !!startPrompt && promptCarriesGoal(startPrompt, parent.prompt);
 
   return resolvePosition({
     graph: snapshot.graph, history: run.history, ledger: readCheckLedger(parent.id, run), key, evidence, publish,

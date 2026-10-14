@@ -525,20 +525,28 @@ describe("composeStepPrompt with pre-loaded sections", () => {
 
   test("with nothing pre-loaded the prompt is byte for byte the prompt without the parameter", async () => {
     const { composeStepPrompt } = await import("./pipeline.ts");
-    const plain = composeStepPrompt(args);
-    for (const preload of [undefined, null, { card: null, visit: null }, { card: "", visit: "" }]) {
-      expect(composeStepPrompt({ ...args, preload })).toBe(plain);
+    for (const order of ["static-first", "legacy"] as const) {
+      const plain = composeStepPrompt({ ...args, order });
+      for (const preload of [undefined, null, { card: null, visit: null }, { card: "", visit: "" }]) {
+        expect(composeStepPrompt({ ...args, order, preload })).toBe(plain);
+      }
     }
   });
 
-  test("the map follows the goal; what was read for this visit follows the context and comes before the step's instructions", async () => {
+  test("the map is with the card's context, before the goal; what was read for this visit follows the context from the previous step", async () => {
     const { composeStepPrompt } = await import("./pipeline.ts");
-    const plain = composeStepPrompt(args);
-    const prompt = composeStepPrompt({ ...args, preload: { card: "## File map\n\nMAP", visit: "## Code at the file map's ranges\n\nSLICES" } });
-    const order = ["## Overall goal", "## File map", "## Context from previous step(s)", "## Code at the file map's ranges", "## Your step", "## Handoff (required)"].map((h) => prompt.indexOf(`\n\n${h}\n\n`));
+    const preload = { card: "## File map\n\nMAP", visit: "## Code at the file map's ranges\n\nSLICES" };
+    const prompt = composeStepPrompt({ ...args, preload });
+    const order = ["## Handoff (required)", "## Your step", "## File map", "## Overall goal", "## Context from previous step(s)", "## Code at the file map's ranges"].map((h) => prompt.indexOf(`\n\n${h}\n\n`));
     expect(order.every((at) => at > 0)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
     // Nothing else moved or changed: taking the two sections out gives the plain prompt.
-    expect(prompt.replace("\n\n## File map\n\nMAP", "").replace("\n\n## Code at the file map's ranges\n\nSLICES", "")).toBe(plain);
+    expect(prompt.replace("\n\n## File map\n\nMAP", "").replace("\n\n## Code at the file map's ranges\n\nSLICES", "")).toBe(composeStepPrompt(args));
+    // In the order prompts had before the reorder: the map after the goal, the visit's reading before the instructions.
+    const legacy = composeStepPrompt({ ...args, preload, order: "legacy" });
+    const was = ["## Overall goal", "## File map", "## Context from previous step(s)", "## Code at the file map's ranges", "## Your step", "## Handoff (required)"].map((h) => legacy.indexOf(`\n\n${h}\n\n`));
+    expect(was.every((at) => at > 0)).toBe(true);
+    expect([...was].sort((a, b) => a - b)).toEqual(was);
+    expect(legacy.replace("\n\n## File map\n\nMAP", "").replace("\n\n## Code at the file map's ranges\n\nSLICES", "")).toBe(composeStepPrompt({ ...args, order: "legacy" }));
   });
 });

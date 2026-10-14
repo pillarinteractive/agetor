@@ -102,6 +102,9 @@ import {
   composeHandoffReminder,
   composeLimitResumeNote,
   composeStepPrompt,
+  parseStepPromptOrder,
+  STEP_PROMPT_ORDER_PREF,
+  type StepPromptExtras,
   deriveRunStatus,
   effectiveStepCap,
   exhaustedEdge,
@@ -2397,38 +2400,40 @@ async function launchStep(
   // file this launch just wrote.
   const references: TaskReference[] = [...(parent.references ?? []), ...handoffRefs];
 
-  // A base branch that moved ahead gets merged in before this step verifies
-  // (`pipeline_sync_base`, src/bun/sync-base.ts).
-  // Never for the writer of an Agetor-run Finish: the head is published, and
-  // merging is the one thing its turn must not do.
   const syncNote = publishBrief ? null : await syncBaseNote(parent, step.name).catch(() => null);
-  const withSync = (prompt: string) => (syncNote ? `${syncNote}\n\n${prompt}` : prompt);
   const manuallyRouted = previous.some((p) => run.history.some((h) => h.seq === p.seq && h.stepId === p.stepId && h.outcome === "advanced-manually"));
-  const withRouting = (prompt: string) => manuallyRouted
-    ? `${prompt}\n\nThis step was explicitly selected by manual Advance. The preceding verdict and findings are preserved for you to address. This routing decision is not approval of the change and grants no additional permissions.`
-    : prompt;
-  const withDecisions = (prompt: string) => snapshot.decisionPolicy
-    ? `${prompt}\n\n${plannerDecisionInstructions(parent.id, snapshot.capturedAt, snapshot.decisionPolicy)}` : prompt;
   const managedRoot=managedPillarRoot(parent.worktreePath??parent.workdir);
   const approvalNote=step.name==='Review'
-    ? `\n\nAutomatic sign-off requires explicit independent approval of this exact head and all issue acceptance. Map every acceptance criterion to checked evidence in your summary. In the handoff add "reviewApproval":{"verdict":"approved"|"changes-requested","headSha":"<full 40-character git rev-parse HEAD>","issueUrl":${JSON.stringify(parent.issueUrl??'')},"acceptanceComplete":true|false,"findings":[]}. Only use approved/true/empty findings when all required criteria are met and no finding remains. Otherwise record all findings, set changes-requested/false and choose Build. A succeeded/done review turn or Finish choice is not approval.`
-    :step.name==='Finish'&&!publishBrief?`\n\nPublish only the exact independently approved head: do not merge, rebase or amend the branch in this step (GitHub CI already tests the pull request merged with its base). A change to reviewed code or a different head requires Build/Review again; passing verification alone is not independent approval.`:'';
-  const withMachineCapacity=(prompt:string)=>managedRoot
-    ? `${prompt}\n\n## Machine test capacity\n${HEAVY_INSTRUCTIONS}${approvalNote}`:prompt;
+    ? `Automatic sign-off requires explicit independent approval of this exact head and all issue acceptance. Map every acceptance criterion to checked evidence in your summary. In the handoff add "reviewApproval":{"verdict":"approved"|"changes-requested","headSha":"<full 40-character git rev-parse HEAD>","issueUrl":${JSON.stringify(parent.issueUrl??'')},"acceptanceComplete":true|false,"findings":[]}. Only use approved/true/empty findings when all required criteria are met and no finding remains. Otherwise record all findings, set changes-requested/false and choose Build. A succeeded/done review turn or Finish choice is not approval.`
+    :step.name==='Finish'&&!publishBrief?`Publish only the exact independently approved head: do not merge, rebase or amend the branch in this step (GitHub CI already tests the pull request merged with its base). A change to reviewed code or a different head requires Build/Review again; passing verification alone is not independent approval.`:'';
   // The owner's notes for a run they reopened (`steerPipelineRun`): carried
   // by this step and the steps after it until each has finished once since.
   // Never by the writer of an Agetor-run Finish or the wrap-up, whose turn
   // must not change the head. A run with no note has no such section.
   const ownerNotes = publishBrief || wrapUp ? [] : applicableFeedback(
     readFeedback(parent.id, run), forwardPath(snapshot.graph, run.history) ?? [], run.history, step.id);
-  const feedbackSection = renderOwnerFeedback(ownerNotes, { stepId: step.id, nameOf: (id) => stepNameById(snapshot.graph, id) });
-  const withFeedback = (prompt: string) => (feedbackSection ? `${prompt}\n\n${feedbackSection}` : prompt);
-  // Last, so nothing after it reads as taking the wrap-up back.
-  const withWrapUp = (prompt: string) => wrapUp
-    ? `${prompt}\n\n${capWrapUpSection({ stepCap: effectiveStepCap(run), issueUrl: parent.issueUrl, prUrl: parent.prUrl })}`
-    : prompt;
-  let composed = withWrapUp(withMachineCapacity(withSync(withRouting(withDecisions(withFeedback(composeStepPrompt({ ...composeArgs, inlineHandoff: true, preload: preload?.inline })))))));
-  if(inputReconciliation.note)composed+=`\n\n${inputReconciliation.note}`;
+  // The runner's own sections. `composeStepPrompt` places them: what is the
+  // same for every card first, this visit's own last (`pipeline_prompt_order`
+  // = `legacy` puts them back where they were, around the pipeline's text).
+  const extras: StepPromptExtras = {
+    // A base branch that moved ahead gets merged in before this step verifies
+    // (`pipeline_sync_base`, src/bun/sync-base.ts). Never for the writer of an
+    // Agetor-run Finish: the head is published, and merging is the one thing
+    // its turn must not do.
+    syncNote,
+    feedback: renderOwnerFeedback(ownerNotes, { stepId: step.id, nameOf: (id) => stepNameById(snapshot.graph, id) }),
+    decisions: snapshot.decisionPolicy ? plannerDecisionInstructions(parent.id, snapshot.capturedAt, snapshot.decisionPolicy) : null,
+    routing: manuallyRouted
+      ? "This step was explicitly selected by manual Advance. The preceding verdict and findings are preserved for you to address. This routing decision is not approval of the change and grants no additional permissions."
+      : null,
+    machineCapacity: managedRoot ? `## Machine test capacity\n${HEAVY_INSTRUCTIONS}` : null,
+    approvalNote: managedRoot ? approvalNote : null,
+    // Last, so nothing after it reads as taking the wrap-up back.
+    wrapUp: wrapUp ? capWrapUpSection({ stepCap: effectiveStepCap(run), issueUrl: parent.issueUrl, prUrl: parent.prUrl }) : null,
+    inputNote: inputReconciliation.note ?? null,
+  };
+  const order = parseStepPromptOrder(preferences.get(STEP_PROMPT_ORDER_PREF));
+  let composed = composeStepPrompt({ ...composeArgs, inlineHandoff: true, preload: preload?.inline, extras, order });
   // m12/D10: measure the SAME wrapping `startTaskInner` will actually launch
   // with — `composeLaunchPrompt` (the profile's instructions/skills
   // preamble) then `appendReferences` (the references block) — not the raw
@@ -2439,7 +2444,7 @@ async function launchStep(
     if (promptByteOverage("gemini", fullPrompt)) {
       // Nothing is inlined for a harness with a short prompt: not the
       // handoffs, and not what was pre-loaded — only where the files are.
-      composed = withWrapUp(withMachineCapacity(withSync(withRouting(withDecisions(withFeedback(composeStepPrompt({ ...composeArgs, inlineHandoff: false, preload: preload?.reference })))))));
+      composed = composeStepPrompt({ ...composeArgs, inlineHandoff: false, preload: preload?.reference, extras, order });
     }
   }
 
