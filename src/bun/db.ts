@@ -11,6 +11,7 @@ import { PIPELINE_CONTROL_CHAR_RE, validatePipelineGraph } from "../shared/pipel
 import { migrate } from "./migrate.ts";
 import { migrations } from "./migrations/index.ts";
 import { coreCredsPath } from "./core-creds.ts";
+import { sanitizeNoChangeLoop } from "../shared/no-change-loop.ts";
 // Interactions live in-memory in `interactions.ts`. The import creates a
 // cycle: db.ts → interactions.ts → db.ts (for `tasks`). It is safe ONLY
 // because both modules access each other's exports exclusively from
@@ -808,6 +809,10 @@ export const parsePipelineRunState = (raw: string | null): PipelineRunState | nu
     ...(() => {
       const ladder = sanitizeLadder(rec.ladder);
       return ladder ? { ladder } : {};
+    })(),
+    ...(() => {
+      const noChangeLoop = sanitizeNoChangeLoop(rec.noChangeLoop);
+      return noChangeLoop ? { noChangeLoop } : {};
     })(),
     ...(() => {
       const publish = sanitizePublish(rec.publish);

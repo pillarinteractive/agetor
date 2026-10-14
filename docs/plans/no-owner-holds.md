@@ -149,3 +149,14 @@ A step parked on its own `agetor-await` waits for nobody but the command; a comm
 process group (SIGTERM, SIGKILL 30 s later, on the watcher's tick), records exit 124 and wakes the same step with the
 log's tail, once. A record whose process is gone with no exit code is closed and woken at once. The deadline is
 stored in the record, so a core restart keeps it. See FORK.md, "An await has a deadline".
+
+## A Build that changes nothing
+
+A finding no step can fix (it needs a host run, hardware, a receipt, the owner) sent Build and Review round in circles
+on one commit until the step cap (2026-10-14, eight rounds in twelve minutes). The runner now reads HEAD and its tree
+as each Build and Review settles (`src/shared/no-change-loop.ts`, `guardNoChangeLoop`). After two rounds in a row in
+which Build ended on the head Review sent back, the next Review's prompt says, from the runner: do not send such
+findings back; approve what is done, file one follow-up issue per finding, close with `Refs`; return to Build only
+for a change Build can make, named. If that Review sends the same head back anyway, the run goes to the step-cap
+wrap-up through Finish (`run.capWrapUp.closeout`): published unapproved, issues filed, nothing merged. The count is on
+the run (`run.noChangeLoop`) and survives a restart. Unattended runs with `owner_holds` = resolve only.

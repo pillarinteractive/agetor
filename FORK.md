@@ -1870,3 +1870,27 @@ read "active" for 25 hours and nothing woke it. Now every await has a deadline (
 - **Gone with no exit record** (a crash, a reboot): the watcher writes `exit` = `lost` at once and the step is woken
   ("stopped without an exit code") as before, now with the record closed.
 - Awaits already running when this ships get the default deadline from their start time.
+
+### A Build that changes nothing twice (`feat/await-limit-loop-guard`)
+
+Seen 2026-10-14: after a restart a card went Build → Review → Build → Review eight times in twelve minutes on one
+unchanged commit. Each Build said "no code change possible" for a finding that needs evidence only an authorized host
+run can produce; each Review sent it back again, and the loop burned the step cap. Now
+(`src/shared/no-change-loop.ts`, pure; the runner's `guardNoChangeLoop` in `src/bun/pipeline-runner.ts`):
+
+- **Detect**: at each Build and Review settle the runner reads the worktree's HEAD and its tree
+  (`loopGuardDeps.readHead`). A round is a Review that sent the work back to Build on a head, followed by a Build that
+  ended on that same head — compared by tree, so an empty or reworded commit is no change. A Build that changes the
+  head, a Review that routes anywhere but Build, or a different head reaching Review resets the count.
+- **Second round in a row**: the next Review carries a runner-written section in its prompt (the `routing` slot,
+  "## Build made no change — decide what Build can still fix"): findings that need resources, hardware, a host run,
+  an external receipt or the owner's authority must not go back to Build; approve the work that is done, file one
+  follow-up issue per such finding (agent-followups mode), close with `Refs`; return to Build only for a finding Build
+  can fix with a code or file change, naming it. Once per run; one activity line ("Resolving without you: …").
+- **That Review sends the same head back to Build again**: the Build launch becomes the existing step-cap wrap-up
+  through the terminal step (`run.capWrapUp = {fromStepId: Build, closeout: {issues: [], why}}`): it publishes, says
+  the head is not approved, files one issue per unresolved finding, closes with `Refs`; never merges, never approves.
+  If the run's wrap-up is already used, the step cap ends it as before.
+- **State**: `run.noChangeLoop` (`reviewed`, `key`, `rounds`, `instructedAt`, `wrappedAt`), kept by the run sanitizer
+  in `db.ts`, so a restart keeps the count; cleared when a person reopens the run. Only unattended runs with
+  `owner_holds` = `resolve`; a card a person runs and `park` are unchanged. No preference of its own.

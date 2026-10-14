@@ -50,6 +50,7 @@ import {
   unresolvedItems, type OwnerHoldAction, type OwnerHoldKind,
 } from "../shared/owner-holds.ts";
 import { decisionPolicyForProject, PIPELINE_DECISIONS_PREF, plannerDecisionInstructions } from "../shared/pipeline-decisions.ts";
+import { buildSettled, noChangeReviewNote, reviewSettled, type HeadAt } from "../shared/no-change-loop.ts";
 import {
   PIPELINE_GATES_PREF, gateUnmatchedLine, initialPublishState, parsePipelineGate, publishBlockMessage, publishGateOn, publishStepOf, publishVisitOver,
   unmatchedGateRefs, type GateUnmatched, type PipelineGateName,
@@ -1109,6 +1110,85 @@ const ownerHoldsMode = () => parseOwnerHoldsMode(preferences.get(OWNER_HOLDS_PRE
 /** The ladder applies to this run now. */
 function ladderApplies(run: PipelineRunState): boolean {
   return !!run.snapshot?.decisionPolicy && run.ladder?.userStop == null && ownerHoldsMode() === "resolve";
+}
+
+// ── The no-change Build ↔ Review loop guard ──────────────────────────────
+
+/** The head a step left behind — replaceable in tests (no git). */
+export const loopGuardDeps = {
+  readHead: async (checkout: string): Promise<HeadAt> => {
+    const rev = async (what: string) => {
+      const r = await runCommand(["git", "rev-parse", "--verify", "--quiet", what], checkout, 30_000, process.env).catch(() => null);
+      return r && r.ok && r.stdout.trim() ? r.stdout.trim() : null;
+    };
+    const head = await rev("HEAD");
+    return { head, tree: head ? await rev("HEAD^{tree}") : null };
+  },
+};
+
+const parentForGuard = (parentId: string, parent: Task): Task => tasks.get(parentId) ?? parent;
+
+/**
+ * Called as a Build or Review execution settles with its route decided, in
+ * an unattended run whose owner holds are resolved. Keeps `run.noChangeLoop`
+ * (persisted with the run by the caller) and acts on it: on the second
+ * round in a row in which Build left the head Review sent back unchanged,
+ * the next Review carries a runner-written section (`noChangeReviewNote`,
+ * read by `launchStep`); a Review that then sends that same head back to
+ * Build has its Build launch turned into the step-cap wrap-up through the
+ * terminal step (`run.capWrapUp.closeout`): published unapproved, issues
+ * filed for what is open, nothing merged or approved.
+ */
+async function guardNoChangeLoop(
+  parent: Task,
+  run: PipelineRunState,
+  stepName: string,
+  stepId: string,
+  resolved: ReturnType<typeof resolveNextSteps>,
+): Promise<void> {
+  const role = stepRole(stepName, stepId);
+  if (role !== "build" && role !== "review") return;
+  if (!ladderApplies(run) || !run.snapshot) {
+    delete run.noChangeLoop;
+    return;
+  }
+  const graph = run.snapshot.graph;
+  const checkout = parent.worktreePath ?? parent.workdir;
+  const at = checkout ? await loopGuardDeps.readHead(checkout).catch(() => ({ head: null, tree: null })) : { head: null, tree: null };
+  const now = Date.now();
+  const short = (at.head ?? at.tree ?? "").slice(0, 8);
+  if (role === "build") {
+    const r = buildSettled(run.noChangeLoop, at, now);
+    if (r.state) run.noChangeLoop = r.state;
+    else delete run.noChangeLoop;
+    if (r.action === "instruct") {
+      recordActivity(parent.id, {
+        kind: "step", tone: "warning",
+        text: `${RESOLVING_PREFIX}Build made no change ${r.state!.rounds} times in a row on ${short} — telling Review to stop returning findings Build cannot fix`,
+      });
+    }
+    return;
+  }
+  const buildIds = resolved.kind === "steps"
+    ? resolved.stepIds.filter((id) => stepRole(stepNameById(graph, id), id) === "build")
+    : [];
+  const r = reviewSettled(run.noChangeLoop, at, buildIds.length > 0, now);
+  if (r.state) run.noChangeLoop = r.state;
+  else delete run.noChangeLoop;
+  if (r.action !== "wrap-up") return;
+  if (run.capWrapUp || !capWrapUpStep(graph)) {
+    recordActivity(parent.id, {
+      kind: "step", tone: "warning",
+      text: `${RESOLVING_PREFIX}Review sent unchanged ${short} back to Build again after being told; the run's wrap-up is already used — the step cap ends it`,
+    });
+    return;
+  }
+  const why = `Build made no change ${r.state!.rounds} times for the same findings on ${short}, and Review sent it back again after being told what Build cannot fix`;
+  run.capWrapUp = { at: now, fromStepId: buildIds[0]!, closeout: { issues: [], why } };
+  recordActivity(parent.id, {
+    kind: "step", tone: "warning",
+    text: `${RESOLVING_PREFIX}Review sent unchanged ${short} back to Build a third time — finishing through ${capWrapUpStep(graph)!.name}: published as not approved, one issue per unresolved finding, nothing merged`,
+  });
 }
 
 /** What the ladder reads from and does to the rest of the core — replaceable
@@ -3266,9 +3346,15 @@ async function launchStep(
     syncNote,
     feedback: renderOwnerFeedback(ownerNotes, { stepId: step.id, nameOf: (id) => stepNameById(snapshot.graph, id) }),
     decisions: snapshot.decisionPolicy ? plannerDecisionInstructions(parent.id, snapshot.capturedAt, snapshot.decisionPolicy) : null,
-    routing: manuallyRouted
-      ? "This step was explicitly selected by manual Advance. The preceding verdict and findings are preserved for you to address. This routing decision is not approval of the change and grants no additional permissions."
-      : null,
+    routing: [
+      manuallyRouted
+        ? "This step was explicitly selected by manual Advance. The preceding verdict and findings are preserved for you to address. This routing decision is not approval of the change and grants no additional permissions."
+        : null,
+      // Build left the head unchanged twice (src/shared/no-change-loop.ts).
+      !wrapUp && run.noChangeLoop?.instructedAt != null && run.noChangeLoop.wrappedAt == null && stepRole(step.name, step.id) === "review" && ladderApplies(run)
+        ? noChangeReviewNote(run.noChangeLoop.rounds)
+        : null,
+    ].filter(Boolean).join("\n\n") || null,
     machineCapacity: managedRoot ? `## Machine test capacity\n${HEAVY_INSTRUCTIONS}` : null,
     approvalNote: managedRoot ? approvalNote : null,
     // Last, so nothing after it reads as taking the wrap-up back.
@@ -4569,6 +4655,7 @@ function reopenRunState(run: PipelineRunState, snapshot: PipelineRunSnapshot, pa
   delete run.publish;
   // A person reopened the run: the no-owner-holds ladder starts over.
   delete run.ladder;
+  delete run.noChangeLoop;
   run.snapshot = snapshot;
   run.status = "running";
   run.endedAt = null;
@@ -5715,6 +5802,10 @@ async function settleStepRun(
           return null;
         }
       }
+
+      // A Build that keeps leaving the head Review sent back unchanged
+      // (src/shared/no-change-loop.ts): tell the next Review, then wrap up.
+      if (!freshSession) await guardNoChangeLoop(parentForGuard(parentId, parent), run, stepName, activeEntry.stepId, resolved);
 
       // M-R2: decided BEFORE this execution is removed from `active` —
       // `isDeliberateWholeRunStop` counts the OTHER live siblings, so the

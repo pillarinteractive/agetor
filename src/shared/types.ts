@@ -1033,6 +1033,11 @@ export interface PipelineRunState {
    *  the current base, once. Carried onto the restarted run, so a second cap
    *  hit there closes out on an issue instead. */
   capRestart?: PipelineCapRestart;
+  /** The no-change Build ↔ Review loop guard (src/shared/no-change-loop.ts):
+   *  rounds in which Build left the head Review sent back unchanged, and
+   *  whether Review was told and the run sent to the wrap-up. Unattended runs
+   *  with owner holds resolved only. */
+  noChangeLoop?: import("./no-change-loop.ts").NoChangeLoopState;
   /** An automatic retry of a step that failed for a reason a person can't
    *  fix — a usage limit (`quota`: waits for the reset, never gives up) or a
    *  transient failure (crash, overload, launch flake; a few attempts with

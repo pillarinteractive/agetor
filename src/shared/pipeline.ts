@@ -1375,7 +1375,8 @@ export function capWrapUpSection(input: {
         "No earlier step will run again; what is still open is handed to people as GitHub issues instead.",
       filed
         ? `- Agetor already filed ${filed} for what stopped the run: reference ${input.closeout.issues.length === 1 ? "it" : "them"}, do not file ${input.closeout.issues.length === 1 ? "it" : "them"} again.`
-        : "- Agetor could not file the follow-up issue for what stopped the run: file it yourself.",
+        : "- Agetor filed no issue for what stopped the run: file one per unresolved finding yourself (search first and reuse an open one), " +
+          "and close with `Refs`, not `Fixes`: the issue's criteria are not all met.",
       "- Publish the branch as this step normally does (push it, and open or update the pull request). Do not merge it.",
       "- Do not hand back to an earlier step: finish the run from here, whatever the incoming reports ask for.",
       "- For every other unresolved finding, failed check or blocker in the incoming reports, file one GitHub issue " +
