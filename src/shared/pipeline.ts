@@ -1565,17 +1565,134 @@ export const STEP_ECONOMY_GUIDANCE = [
   "None of this replaces checking your work: read what you need to be right, and run the checks your step requires.",
 ].join("\n");
 
+/** How the sections of a step prompt are ordered ({@link composeStepPrompt}). */
+export type StepPromptOrder = "static-first" | "legacy";
+
+/** `legacy` in this preference restores the order prompts had before they
+ *  were reordered static-first, without a rebuild. Anything else, or
+ *  nothing: static-first. Read at each launch. */
+export const STEP_PROMPT_ORDER_PREF = "pipeline_prompt_order";
+
+export function parseStepPromptOrder(raw: string | null | undefined): StepPromptOrder {
+  return raw?.trim().replace(/^"|"$/g, "").toLowerCase() === "legacy" ? "legacy" : "static-first";
+}
+
+/** How widely a section's text is shared: by every step of the repository,
+ *  by every visit of the step, by every visit of the card, or by nothing. */
+export type StepPromptTier = "repo" | "step" | "card" | "visit";
+
+export type StepPromptSectionId =
+  | "sync" | "title" | "intro" | "goal" | "preload-card" | "context" | "preload-visit" | "step-goal" | "your-step" | "checks" | "parallel"
+  | "delegation" | "economy" | "handoff" | "feedback" | "decisions" | "routing" | "machine" | "approval" | "wrap-up" | "input-note";
+
+export interface StepPromptSection {
+  id: StepPromptSectionId;
+  tier: StepPromptTier;
+  text: string;
+}
+
+/** What the runner knows that the pipeline's own text does not: each is a
+ *  whole section, written by the module that owns it, and placed by
+ *  {@link composeStepPrompt}. Absent or empty: no such section. */
+export interface StepPromptExtras {
+  /** The base branch moved: merge it first (src/bun/sync-base.ts). */
+  syncNote?: string | null;
+  /** The owner's notes for a run they reopened (`renderOwnerFeedback`). */
+  feedback?: string | null;
+  /** The decision policy's instructions (`plannerDecisionInstructions`). */
+  decisions?: string | null;
+  /** The step was picked by a manual Advance. */
+  routing?: string | null;
+  /** The machine's test-capacity rules (`HEAVY_INSTRUCTIONS`), with their heading. */
+  machineCapacity?: string | null;
+  /** Review's sign-off contract or Finish's publish rule, for a managed checkout. */
+  approvalNote?: string | null;
+  /** The wrap-up at the step cap (`capWrapUpSection`). */
+  wrapUp?: string | null;
+  /** What changed in the card's inputs since the run started. */
+  inputNote?: string | null;
+}
+
+/** The order prompts had before the reorder: the pipeline's own sections as
+ *  {@link stepPromptSections} builds them, wrapped by the runner's. */
+const LEGACY_ORDER: readonly StepPromptSectionId[] = [
+  "sync", "title", "intro", "goal", "preload-card", "context", "preload-visit", "step-goal", "your-step", "checks", "parallel", "delegation",
+  "economy", "handoff", "feedback", "decisions", "routing", "machine", "approval", "wrap-up", "input-note",
+];
+
+/**
+ * Static first: what every step of the repository gets, then what every
+ * visit of this step gets, then what every visit of this card gets, then
+ * this visit's own. A harness that caches a prompt by its prefix (Codex)
+ * then reuses the start of the prompt across cards and visits; nothing is
+ * added, removed or reworded.
+ *
+ * Three sections keep a place their own words depend on:
+ *   - `sync` stays first: it ends "then carry on with your step as written
+ *     below". It is there only when the base moved.
+ *   - `economy` (the same for every step) stays after `context`: it says
+ *     "the handoffs and reports quoted above".
+ *   - `wrap-up` stays last but for the input note, so nothing after it reads
+ *     as taking it back; `checks` stays after `your-step` ("listed in your
+ *     step above") and `routing` after `context` ("the preceding verdict").
+ */
+const STATIC_FIRST_ORDER: readonly StepPromptSectionId[] = [
+  "sync",
+  // the repository's
+  "intro", "machine",
+  // the step's
+  "delegation", "handoff", "step-goal", "your-step", "checks",
+  // the card's — the goal last, so it is followed by the title
+  // ({@link promptCarriesGoal} reads it back by what follows it)
+  "approval", "decisions", "preload-card", "goal",
+  // this visit's
+  "title", "context", "economy", "parallel", "preload-visit", "feedback", "routing", "wrap-up", "input-note",
+];
+
+/** `sections` in `order`. Every section is kept, whole. Pure. */
+export function orderStepPrompt(sections: readonly StepPromptSection[], order: StepPromptOrder): StepPromptSection[] {
+  const rank = order === "legacy" ? LEGACY_ORDER : STATIC_FIRST_ORDER;
+  return [...sections].sort((a, b) => rank.indexOf(a.id) - rank.indexOf(b.id));
+}
+
+/** What can follow the goal's text in a composed prompt: the title
+ *  (static-first), or the context or the pre-loaded file map (legacy). */
+const AFTER_GOAL = ['# Pipeline "', "## Context from previous step(s)", "## File map\n\n"];
+
+/**
+ * Whether a composed step prompt carries exactly `goal` as its "Overall
+ * goal", in either order. Exact: the goal's text must be followed by the
+ * section that follows it, so a goal that is a shorter or longer version of
+ * the one in the prompt does not count. Pure.
+ */
+export function promptCarriesGoal(prompt: string, goal: string): boolean {
+  return AFTER_GOAL.some((next) => prompt.includes(`## Overall goal\n\n${goal}\n\n${next}`));
+}
+
+type StepPromptInput = Parameters<typeof stepPromptSections>[0];
+
 /**
  * Compose the (pre-`composeLaunchPrompt`) prompt text for one step's launch,
- * deterministically: pipeline/step header, the overall goal, the previous
+ * deterministically: the sections of {@link stepPromptSections}, in
+ * `order` (static-first unless told otherwise), joined by a blank line. See
+ * D10, `docs/plans/pipelines.md`.
+ */
+export function composeStepPrompt(input: StepPromptInput & { order?: StepPromptOrder }): string {
+  return orderStepPrompt(stepPromptSections(input), input.order ?? "static-first").map((s) => s.text).join("\n\n");
+}
+
+/**
+ * The sections of one step's launch prompt, in the order they were always
+ * written (`legacy`): pipeline/step header, the overall goal, the previous
  * step(s)' handoff context (several entries after a join), this step's own
  * instructions, an optional parallel-siblings warning (fan-out steps sharing
  * the parent's worktree), delegation guidance for the step's allowed
  * subagent profiles, and the handoff contract itself (including the
- * `next`-field rule for this step's outgoing edges). See D10,
- * `docs/plans/pipelines.md`.
+ * `next`-field rule for this step's outgoing edges) — then the runner's own
+ * (`extras`). Each section is its heading and body, whole; the prompt is the
+ * sections joined by a blank line. Pure.
  */
-export function composeStepPrompt(input: {
+export function stepPromptSections(input: {
   pipelineName: string;
   step: PipelineStep;
   stepIndex: number;
@@ -1606,24 +1723,47 @@ export function composeStepPrompt(input: {
    *  the instructions say `{{checks}}`, else in a section after them. Absent:
    *  the prompt is exactly what it was before gates existed. */
   gate?: { goal: string | null; checks: StepCheck[]; issueUrl?: string | null } | null;
+  /** What Agetor read for the step at launch (src/shared/preload.ts), for a
+   *  card the `preload` switch covers: `card` — the file map — follows the
+   *  goal, `visit` — code slices, the branch's diff, the review bundle —
+   *  follows the context from the previous step(s). Absent or empty: the
+   *  prompt is exactly what it is without the switch. */
+  preload?: { card: string | null; visit: string | null } | null;
+  /** The runner's own sections (the base moved, the owner's notes, the
+   *  decision policy, the machine's rules, the wrap-up …). */
+  extras?: StepPromptExtras | null;
   /** Per-call token fencing the untrusted-handoff markers (review finding
    *  #4) — 8 hex chars from {@link randomHandoffNonce} when omitted.
    *  Production callers omit this; tests pass a fixed value for
    *  deterministic marker text. */
   nonce?: string;
-}): string {
-  const parts: string[] = [];
+}): StepPromptSection[] {
+  const sections: StepPromptSection[] = [];
+  let parts: string[] = [];
+  /** Everything pushed since the last call is one section. */
+  const close = (id: StepPromptSectionId, tier: StepPromptTier): void => {
+    if (parts.length > 0) sections.push({ id, tier, text: parts.join("\n\n") });
+    parts = [];
+  };
+  const extra = (id: StepPromptSectionId, tier: StepPromptTier, text: string | null | undefined): void => {
+    if (text) sections.push({ id, tier, text });
+  };
   const nonce = input.nonce ?? randomHandoffNonce();
 
+  extra("sync", "visit", input.extras?.syncNote);
   parts.push(`# Pipeline "${input.pipelineName}" — step ${input.stepIndex} of at most ${input.stepCap}: ${input.step.name}`);
+  close("title", "visit");
   parts.push(
     "You are one step of a multi-step pipeline. You work in a shared worktree alongside the other steps of " +
       "this pipeline, and you are responsible for finishing this step's part of the work only — not the " +
       "whole pipeline.",
   );
 
+  close("intro", "repo");
   parts.push("## Overall goal");
   parts.push(input.goal);
+  close("goal", "card");
+  extra("preload-card", "card", input.preload?.card);
 
   parts.push("## Context from previous step(s)");
   if (input.previous.length === 0) {
@@ -1699,21 +1839,27 @@ export function composeStepPrompt(input: {
     }
   }
 
+  close("context", "visit");
+  extra("preload-visit", "visit", input.preload?.visit);
+
   const gate = input.gate ?? null;
   if (gate?.goal) {
     parts.push("## Step goal");
     parts.push(`What must be true when this step ends: ${gate.goal}`);
   }
+  close("step-goal", "step");
   parts.push("## Your step");
   const roster = gate && gate.checks.length > 0 ? checkRoster(gate.checks, { issueUrl: gate.issueUrl }) : "";
   const inPlace = roster.length > 0 && input.step.instructions.includes(CHECKS_PLACEHOLDER);
   const instructions = inPlace ? input.step.instructions.replaceAll(CHECKS_PLACEHOLDER, roster) : input.step.instructions;
   parts.push(instructions.trim().length > 0 ? instructions : "(no additional instructions)");
+  close("your-step", "step");
   if (roster.length > 0) {
     parts.push("## Checks this step must pass");
     parts.push(inPlace ? CHECK_ROSTER_INTRO.replace(/:$/, " — they are listed in your step above.") : `${CHECK_ROSTER_INTRO}\n${roster}`);
   }
 
+  close("checks", "step");
   if (input.parallelSiblings.length > 0) {
     parts.push("## Running in parallel");
     parts.push(
@@ -1724,6 +1870,7 @@ export function composeStepPrompt(input: {
     );
   }
 
+  close("parallel", "visit");
   parts.push("## Delegation");
   // Codex has no subagent tool; a persona list there would only invite the
   // agent to emulate one on its own (expensive) model. Step text shared by
@@ -1767,8 +1914,10 @@ export function composeStepPrompt(input: {
     parts.push("Do not spawn subagents for this step. Any Scout delegation requested elsewhere is conditional on supported tools and this step's permission; investigate directly with narrow reads instead.");
   }
 
+  close("delegation", "step");
   parts.push("## Working economically");
   parts.push(STEP_ECONOMY_GUIDANCE);
+  close("economy", "repo");
 
   parts.push("## Handoff (required)");
   parts.push(
@@ -1777,8 +1926,17 @@ export function composeStepPrompt(input: {
   );
   parts.push(...renderHandoffContract(input.outgoing, input.transition, input.step.canFinish === true));
   parts.push("If you need the user's input, ask before writing the handoff.");
+  close("handoff", "step");
 
-  return parts.join("\n\n");
+  const x = input.extras ?? {};
+  extra("feedback", "visit", x.feedback);
+  extra("decisions", "card", x.decisions);
+  extra("routing", "visit", x.routing);
+  extra("machine", "repo", x.machineCapacity);
+  extra("approval", "card", x.approvalNote);
+  extra("wrap-up", "visit", x.wrapUp);
+  extra("input-note", "visit", x.inputNote);
+  return sections;
 }
 
 /** Prefix {@link parseHandoff} puts on every JSON-parse-failure `error`

@@ -46,7 +46,9 @@ bun run install:local          # backs up ~/.agetor/agetor.sqlite, moves the old
 ```
 
 Besides swapping the app, `install:local` compiles the CLI to `~/.agetor/bin/agetor` (same commit as the app, so
-their routes match) and installs the keepalive check to `~/.agetor/bin/agetor-keepalive`.
+their routes match), installs the keepalive check to `~/.agetor/bin/agetor-keepalive` and installs `ci-wait`
+(`scripts/ci-wait/ci-wait`, what a Finish step waits for CI with) to `~/.agetor/bin/ci-wait`, replacing the copy that
+used to be kept there by hand.
 
 `install:local` quits Agetor; the user has to confirm the Quit dialog. Agents keep running in tmux and the new app
 reattaches to them. Roll back by quitting, moving the previous app from `~/.agetor/backups/` back into `/Applications`,
@@ -1560,3 +1562,223 @@ card beside it) and `/fixtures/velocity.html?case=<name>` (roadmap, no-forecast,
 `computeVelocity`), import no API client, and are not entries of `vite build`. The run fixture has no canvas, which
 needs the core. `e2e/views-fixtures.spec.ts` runs against them with no backend; set `VIEWS_SHOTS_DIR` to keep its
 screenshots. `e2e/board-context.spec.ts` checks, against the real app, that the board comes back as it was.
+
+## Token savers (`feat/token-savers`)
+
+Five changes the owner approved on 2026-10-13 to cut what a card costs in tokens, one commit each so they can be
+merged apart. The measure for all of them is the first one.
+
+### Tokens per step visit: `scripts/step-tokens.ts`
+
+```bash
+bun scripts/step-tokens.ts --project pillar --pipeline Change --last 10            # a table
+bun scripts/step-tokens.ts --project pillar --pipeline Change --last 10 --json     # the same, for a diff
+```
+
+For the last N finished (`done`) pipeline cards of a project: one row per step visit — step, visit number, harness,
+model, input, output, cache-read and cache-write tokens, model calls and turns — then the median per visit and the
+total per step, for all visits and split into the first visit and the repeats. `weighted` is the one number of the
+cost section above (output×5 + cache write×1.25 + input + cache read×0.1). `--pipeline` is a name prefix.
+
+- **Read-only, and meant for the live board.** The database is opened read-only with `bun:sqlite` (never through
+  `src/bun/db.ts`, which migrates); session files are only read. It is a script, not a CLI command: a command needs a
+  route in the core, so an installed build, before the first number.
+- **How a visit maps to tokens.** A visit is a step task (`tasks.pipeline_parent_id`); its sessions are the ids on its
+  runs (`runs.claude_session_id`, `runs.codex_session_id`). Claude: `<config dir>/projects/<worktree path with every
+  non-alphanumeric as ->/<session>.jsonl`, each response counted once by `message.id` (it is written once per content
+  block), plus the session's `subagents/*.jsonl` (Scouts; their part is `subagents` in the JSON). Codex: the rollout
+  named after the session id under `<codex home>/sessions`, the last cumulative `total_token_usage`. `input` is the
+  uncached part for both. The parsing is `src/shared/step-usage.ts`.
+- **Visit numbers count every run of the card**: a restart's earlier visits are included and marked `*`
+  (`inCurrentRun: false`), as are follow-up steps (grouped as "Follow-up").
+- **What it cannot attribute**, listed under the table with the reason and never estimated: a step task with no
+  session id (never started, or a Finish visit Agetor ran itself — which cost no tokens), a session id whose file is
+  gone (Claude Code deletes old transcripts) and harnesses other than Claude Code and Codex. A visit with some of its
+  session files missing is counted and flagged as a lower bound. A DeepSeek-backed step is counted from its Claude
+  transcript under the model name Claude Code recorded.
+
+Baseline, 2026-10-13, the last 10 finished Change cards of Pillar (349 visits; median per visit, total in brackets):
+
+| Step | Visits | Input | Output | Cache read | Cache write | Calls | Weighted |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Understand | 14 | 124 (1.8k) | 49.6k (0.70M) | 2.72M (40.6M) | 264k (3.56M) | 59 (849) | 0.86M (12.0M) |
+| Build, first | 10 | 110 (1.6k) | 68.9k (0.89M) | 5.56M (106.7M) | 158k (2.47M) | 55 (792) | 1.11M (18.2M) |
+| Build, repeat | 112 | 28 (0.65M) | 4.8k (1.55M) | 0.58M (162.9M) | 33k (6.05M) | 13 (2,463) | 0.13M (32.2M) |
+| Review, first | 10 | 124k (1.50M) | 20.8k (0.21M) | 2.08M (23.9M) | 0 | 24 (263) | 0.50M (4.9M) |
+| Review, repeat | 112 | 66k (8.19M) | 5.5k (0.80M) | 0.52M (85.1M) | 0 | 10 (1,389) | 0.14M (20.7M) |
+| Finish | 79 | 35k (3.22M) | 2.9k (0.27M) | 0.33M (29.0M) | 0 | 11 (888) | 0.08M (7.4M) |
+| Follow-up | 12 | 47k (0.71M) | 3.1k (0.05M) | 0.53M (9.5M) | 0 | 13 (202) | 0.12M (1.9M) |
+
+All ten cards: 97.4M weighted tokens, 6,846 calls, 669 turns. One visit of 349 was a lower bound (one of its three
+session files was gone). Build ran on Claude (Sonnet, with a DeepSeek backup), Review and Finish on Codex.
+
+### CI failures, trimmed (`src/shared/ci-failure.ts`, `scripts/ci-wait/ci-wait`)
+
+Before: a CI failure reached Build as the **last 60 lines** of `gh run view <run> --log-failed` (6,000 characters at
+most), for up to two runs — from `ci-wait` when an agent ran Finish, from `logTail` (`src/bun/merge-rework.ts`) when
+Agetor ran it or the merge queue started a fix round. A failed log ends with the runner cleaning up, so the tail was
+mostly `git config --unset …`: in the saved wait for PR #1539, 40 of the 60 lines were cleanup and one of ten test
+failures was visible.
+
+Now, per failed job: a heading with workflow, job, step and exit code, then the lines that match a failure marker
+(`FAIL`, `Error:`, `error TS<n>`, `panic:`, `--- FAIL:`, `AssertionError`, `✗`, `×`, `##[error]`; case-sensitive) with
+20 lines either side, colour codes and timestamps removed, lines over 400 characters cut, at most 150 log lines a job;
+above them the run's URL and the path of the whole failed log, which is saved.
+
+- **Fitting 150 lines.** Context is narrowed (20, 10, 5, 2, 0 lines) until the excerpt fits; with more failure lines
+  than the cap, the first third and the last two thirds of them are kept. Every cut says `… N lines omitted …`.
+  Context never crosses `Process completed with exit code`: what follows it is cleanup. A job in which nothing
+  matches shows its last 60 lines.
+- **Agetor-run Finish and merge-queue fix rounds** (`src/bun/ci-failure-log.ts`, used by `publish-step.ts` and
+  `merge-rework.ts`): the report is the handoff's `reason`. A handoff field holds 8,000 characters
+  (`PIPELINE_LIMITS.handoffField`), shared by the (at most two) runs, so the cap per job is lowered until it fits and
+  a shortened report ends with the path of the 150-line one. Files, in `<data dir>/pipeline-runs/<card>/`:
+  `ci-failed-<run>.log` (the whole failed log) and `ci-failure-<run>.md` (the full excerpt, written only when the
+  handoff's copy was shortened). One more `gh run view --json workflowName,url` per failed run. The runner-fault
+  decision (`infraReason`) still reads the tail, unchanged.
+- **Agent-run Finish**: `ci-wait` is in the repository now and `install:local` installs it. Exit codes (0, 1, 2, 3,
+  4) and every line it printed are unchanged except the log part of a failure: where it printed
+  `--- last 60 lines of the failed log, run N … ---` and the tail, it prints the report above, and ends with one
+  `ci-wait: failed jobs: …` line so the 60-line tail Agetor quotes when it wakes the step names every failed job. The
+  whole failed log goes to `$(git rev-parse --absolute-git-dir)/agetor/ci-failed-<run>.log`. It reads subprocess
+  output as UTF-8 with replacement, so an odd byte in a log no longer ends the wait with a traceback.
+- **One algorithm, two languages.** `ci-wait` is Python and carries the algorithm itself;
+  `src/shared/ci-failure.test.ts` runs both implementations on the same logs and requires the same bytes, and
+  `src/bun/ci-wait.test.ts` holds `ci-wait` to its contract with stand-in `gh` and `git` (set `CI_WAIT_SCRIPT` to run
+  the same cases against another copy). Change the two together.
+
+Not done: the excerpt is quoted inside the handoff's JSON, so its newlines arrive escaped, as the tail's did; the
+workflow name is not read for a run whose log could not be read; the Finish step's own instructions still say "log
+tail" (they are Pillar's, in `docs/engineering/agetor/`).
+
+### Build starts with its reading done (`pipeline_gates` → `preload`)
+
+**Off unless switched on.** Build's instructions begin "read the file map, then the line ranges it lists"; each of
+those reads is a model call that re-sends the session. For a card the switch covers, Agetor does them when it
+launches Build and puts the result in the prompt. `src/shared/preload.ts` is the pure half (the map parser, the
+budgets, the text), `src/bun/preload.ts` reads the worktree and git, `launchStep` adds the sections.
+
+| Visit | Decided by | What the prompt gets |
+| --- | --- | --- |
+| Build, first | the run's history holds no visit of Build, Review or Finish (`preloadKind`) — whatever came of such a visit | `## File map` (the map itself) and `## Code at the file map's ranges`: the map's Touch points, then Read for context, each headed `path:L<start>-L<end>` and read from the worktree as it is at launch |
+| Build, after anything else ran (Review's findings, Finish's CI failure, a merge-queue fix round, the fresh session after exhausted check turns) | the same test, the other way | `## File map` with a warning that its numbers may have moved, and `## What this branch changes so far`: `git diff -U10 <base>...HEAD`. No slice by line number. What already arrives (the handoff, the report, the CI excerpt) is unchanged |
+
+- **Line numbers are only used when they are true.** Slices are taken only when the commit the map's header names
+  is the worktree's HEAD (`mapHeadMatches`: the full sha or a prefix of at least 7). Another commit, or none named:
+  nothing is sliced, the prompt says which commit the map is for, and only the map is inlined. No map: nothing is
+  added. Each range is checked against the file as read: a range past its end is named as "the map is out of date
+  for it", never cut to fit.
+- **Never inlined, always named**: a path listed under Ruled out (wherever else the map lists it), a file that is
+  not there, a link out of the worktree, a binary, and by name (`excludedPath`, the same test for a slice and a file
+  of a diff) lockfiles, `*.snap`, JSON under `fixtures`/`testdata`/`golden`/`__snapshots__`, generated or vendored
+  code (`*.generated.*`, `*.pb.go`, `*.min.js`, `dist/`, `node_modules/` …). An excluded file of a diff is not even
+  asked of git: `--numstat` first, then the diff for the rest.
+- **Budgets** (`PRELOAD_LIMITS`, tokens at 4 characters): slices 12,000 in all and 400 lines each; a diff 20,000 in
+  all and 6,000 a file; the map 4,000. Over a budget the **largest items go first**, each with a
+  `- trimmed: read <path> yourself (<why>)` line; context ranges only get what touch points leave. Nothing is
+  dropped without a line. They are sized to what Build reads at its start anyway (the cost section above: a 50–57k
+  starting context, ~55 calls a first Build): what is saved is the calls, not the carrying.
+- **Today's loose maps** are read as they are: sections by their first words ("Touch points (done)", "Additional
+  touch points confirmed by Review"), the header's commit as `HEAD: <sha>`, `commit: <sha>` or `Header: commit
+  <sha>`, quoted or not; entries as `path:L12-L40`, `path:12-40`, `path:375–380,463–471`, `` `path` :277–279 ``,
+  `(new, 1–496)`, with or without quotes. A single line (`:88`, `L12`) gets a window (5 before, 40 after). An entry
+  with no range is named, not sliced. On the nine maps on the board on 2026-10-13 this finds every header commit
+  and 0–8 sliceable ranges a map; the exact `path:L<start>-L<end>` format Pillar's prompts are moving to is what
+  makes it worth switching on.
+- **Other prompt-size rules are untouched and separate**: the handoff's 16 KB and the report's 24 KB stay as they
+  are, and the budgets above are on top. A harness with a short prompt (gemini's argv cap) gets no inlined content,
+  only the map's path, in the same recomposition that already drops the inlined handoff. A Claude step prompt was
+  already over the 4 KB argv limit and pasted; it is pasted the same way, larger, with control characters removed
+  from everything inlined.
+
+**The switch** is `pipeline_gates`, under its own key, with the entries the gates have:
+
+```json
+{"preload": {"pipelines": ["<pipeline id>"], "cards": ["<task id>", "<task id>"]}}
+```
+
+`pipelines` (ids or exact names) turns it on; `cards` is the trial list, and leaving it out covers every card of
+those pipelines; an entry that matches nothing is reported like a gate's (`unmatchedGateRefs`). Unlike a gate it is
+**not adopted by a run**: nothing is stored on the card, it is read at each launch, and it takes effect at the next
+launch of Build with no refresh. With it off — or the card not named — prompts are byte for byte what they were, and
+no file or git command is read for them. It can be combined with `publish` and `steps` in the same preference.
+
+Not done: a Retry re-sends the visit's stored prompt, so what was inlined is as old as the launch (the sections say
+so and tell the step the worktree is newer); the base is the one last fetched, nothing is fetched; a pasted prompt
+of this size (up to ~100 KB more) has been exercised with the scripted agent only, not in a real Claude session.
+
+### One review bundle on entering Review (the same `preload` switch)
+
+When Review is launched for a covered card, Agetor writes `<git dir>/agetor/review-bundle.md` — beside the file
+map, outside the working tree — and Review starts from it instead of assembling the same things call by call:
+
+1. **Acceptance criteria**: the card's goal as the run has it (`task.prompt`, the issue snapshot every step is
+   given as "Overall goal") and the issue's URL. GitHub is not called: the runner does not read the issue at this
+   point, and the bundle does not make it.
+2. **The file map**, whole (or a line saying there is none).
+3. **`git diff -U5 <base>...HEAD`**: the files changed with their counts, then the diff, with the same files named
+   and left out as on a Build visit.
+4. **What each hunk is inside**: per file, `L<start>-L<end> in <line>` — the text git itself puts after `@@` in a
+   hunk header (its own function-context rules for the file type), with the hunk's lines in the new file. Nothing
+   else is parsed: where git finds no enclosing line, the entry is the range alone.
+
+- **Once per visit**: rewritten at every launch of Review (written beside and renamed, so never half there), with
+  the step number, the time and the HEAD it was written for. It is added to the step task's references.
+- **In the prompt**: `## File map` with the card's context and `## Review bundle: the change` after the context
+  from the previous step — the bundle's path, the hunk index and the diff within the diff budget (20,000 tokens, 6,000 a
+  file, largest trimmed first and named). The goal is not repeated; the section points at "Overall goal". The file
+  keeps the diff whole (a file up to 200,000 characters, 2,000,000 in all).
+- **A card that never visited Build** — Understand's trivial change, routed to Review once Pillar's prompt sync
+  moves that edge — gets the same bundle: it needs no Build handoff, no Build record and no map, only the worktree
+  and the base. With the edge still going to Finish, no Review runs on that route and nothing is written.
+- Nothing committed, or no base ref to diff against: the bundle and the prompt say so. A bundle that cannot be
+  written does not stop the launch: the prompt carries what it would have held.
+
+Not done: Finish and Understand are not pre-loaded; a check-feedback turn (the same Review session) gets no new
+bundle — the next launch does.
+
+### Step prompts, static first (`pipeline_prompt_order`)
+
+Agetor does not write a harness's system prompt; this is about the text it sends as the step's first message
+(`composeStepPrompt`, `src/shared/pipeline.ts`). That text began with `# Pipeline "…" — step 5 of at most 14: Build`,
+so two prompts differed from their first line. It is now assembled from whole sections in one place and ordered by
+how widely each is shared; **no sentence was added, removed or reworded**.
+
+| | Order |
+| --- | --- |
+| Before (`legacy`) | [base moved] · title · intro · Overall goal · [File map] · Context from previous step(s) · [pre-loaded code / diff / bundle] · [Step goal] · Your step · [Checks] · [Running in parallel] · Delegation · Working economically · Handoff (required) · [Feedback from the owner] · [Planner recommendations] · [manual-Advance note] · [Machine test capacity · sign-off / publish note] · [wrap-up] · [input note] |
+| Now (`static-first`) | [base moved] · **repository:** intro · [Machine test capacity] · **step:** Delegation · Handoff (required) · [Step goal] · Your step · [Checks] · **card:** [sign-off / publish note] · [Planner recommendations] · [File map] · Overall goal · **visit:** title · Context from previous step(s) · Working economically · [Running in parallel] · [pre-loaded code / diff / bundle] · [Feedback from the owner] · [manual-Advance note] · [wrap-up] · [input note] |
+
+- **Kept where their own words need them**: the base-moved note stays first (it ends "then carry on with your step
+  as written below"; it is there only when `pipeline_sync_base` applies); "Working economically", the same for every
+  step, stays after the context ("the handoffs and reports quoted above"); Checks stays right after Your step
+  ("listed in your step above"); the manual-Advance note stays after the context ("the preceding verdict"); the
+  wrap-up stays last but for the input note, so nothing after it reads as taking it back.
+- **One thing read the old order back**: position resolution decides whether Understand's handoff can be reused by
+  finding the card's goal, word for word, in Understand's prompt — by the heading that followed it. It now asks
+  `promptCarriesGoal`, which knows what follows the goal in either order (and that the pre-loaded file map may), so
+  prompts stored before this build are still read. The goal is kept last of the card's sections for it. The
+  instruction refresh (`withStepInstructions`) finds `## Your step` as before.
+- **The runner's own sections** (the base-moved note, the owner's feedback, the decision policy, the manual-Advance
+  note, machine capacity, the sign-off note, the wrap-up, the input note) used to be strings wrapped around the
+  composed prompt in `launchStep`; they are passed to the composer as `extras` and placed with the rest.
+- **Unconditional, with a way back**: `agetor config pipeline_prompt_order legacy` restores the old order at the
+  next launch, without a rebuild; anything else, or nothing, is static-first.
+- **The proof** (`src/shared/prompt-order.test.ts`): `src/shared/fixtures/step-prompt-legacy/` holds what the
+  composer returned for seven representative launches at the last commit with the old order. The legacy order must
+  still return those bytes, wrapped as the runner wrapped them; the new order must return the same multiset of
+  paragraphs and of sections, at the same length. `src/bun/pipeline-preload.test.ts` runs the same card through the
+  runner both ways and compares the stored prompts of all four steps the same way.
+
+What it is worth: a harness that caches by prompt prefix (Codex: Review, Finish and follow-ups on this board) can now
+reuse the start of a step's prompt — the intro, machine capacity, delegation, the handoff contract and the step's
+instructions, 3–5k tokens for Review — across cards and visits, on the first call of each session; before, only the
+profile's instructions ahead of it were shared. Claude Code marks its cache at message boundaries, so a shared start
+inside the first message is not expected to hit: for Claude steps this changes the order and nothing else. Measure
+it with `scripts/step-tokens.ts` (the `input` and `cache read` columns of first calls), do not assume it.
+
+Not done, and not testable here: the handoff contract now sits before the goal and the context rather than after
+them. It was never last (the decision policy and machine capacity followed it), but if steps start forgetting the
+handoff block — `agetor blocks` for `handoff-missing` — set `pipeline_prompt_order` to `legacy` and say so. One
+difference in content, for gemini only: when a prompt is recomposed without inlined handoffs to fit gemini's argv
+cap, the input note is now kept; it used to be lost in that recomposition.

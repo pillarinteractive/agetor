@@ -4,7 +4,7 @@ import type { CheckRunLike } from "./check-runs.ts";
 import {
   PUBLISH_MAX_TRIES, PUBLISH_NO_CHECKS_MS, PUBLISH_PR_LAG_MS, PUBLISH_RERUN_SETTLE_MS,
   applyPublish, approvedHeadFor, baseHealth, baseVerdicts, decidePublish, failingCauses, initialPublishState, parsePublishGate,
-  publishBuildHandoff, publishEvidenceComment, publishGateOn, publishStepOf, publishVisitOver, publishWriterBrief, verdictsSettled,
+  parsePipelineGate, publishBuildHandoff, publishEvidenceComment, publishGateOn, publishStepOf, publishVisitOver, publishWriterBrief, verdictsSettled,
   gateUnmatchedLine, unmatchedGateRefs,
   type PublishAction, type PublishObservation, type PullSeen,
 } from "./publish.ts";
@@ -352,11 +352,30 @@ describe("pipeline_gates entries that match nothing", () => {
     ["a prefix of an id is not the id", { steps: { pipelines: ["deec"] } }, { pipelines: ["steps: deec"], cards: [] }],
     ["each gate is reported by name", { publish: { pipelines: ["Change"] }, steps: { pipelines: ["Change", "Branch review"] } }, { pipelines: ["publish: Change", "steps: Change"], cards: [] }],
     ["a card id no task has", { publish: { pipelines: ["deec4252"], cards: ["card-1", "card-9"] } }, { pipelines: [], cards: ["publish: card-9"] }],
+    ["`preload` is switched and checked the same way", { preload: { pipelines: ["Change", "deec4252"], cards: ["card-1", "card-9"] } }, { pipelines: ["preload: Change"], cards: ["preload: card-9"] }],
     ["nothing set", null, { pipelines: [], cards: [] }],
   ];
   for (const [name, value, want] of cases) {
     test(name, () => expect(unmatchedGateRefs(value === null ? null : pref(value), known)).toEqual(want));
   }
+
+  test("`preload` has its own entry: off unless named, a trial list when `cards` is there, and independent of the gates", () => {
+    const card = { id: "card-1", pipelineId: "deec4252", pipelineName: "Change: Understand, Build, Review, Finish" };
+    const on = (v: unknown) => publishGateOn(parsePipelineGate(pref(v), "preload"), card);
+    const cases: [unknown, boolean][] = [
+      [{}, false],
+      [{ publish: { pipelines: ["deec4252"] }, steps: { pipelines: ["deec4252"] } }, false],
+      [{ preload: { pipelines: ["deec4252"] } }, true],
+      [{ preload: { pipelines: ["change: understand, build, review, finish"] } }, true],
+      [{ preload: { pipelines: ["Change"] } }, false],
+      [{ preload: { pipelines: ["deec4252"], cards: ["card-1", "card-2"] } }, true],
+      [{ preload: { pipelines: ["deec4252"], cards: ["card-2"] } }, false],
+      [{ preload: { pipelines: ["deec4252"], cards: "card-1" } }, false],
+      [{ preload: { cards: ["card-1"] } }, false],
+      [{ preload: true }, false],
+    ];
+    for (const [value, want] of cases) expect(`${JSON.stringify(value)} → ${on(value)}`).toBe(`${JSON.stringify(value)} → ${want}`);
+  });
 
   test("the switch itself takes an id or the exact name, never a prefix", () => {
     const card = { id: "card-1", pipelineId: "deec4252", pipelineName: "Change: Understand, Build, Review, Finish" };

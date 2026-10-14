@@ -1,0 +1,315 @@
+#!/usr/bin/env python3
+"""ci-wait [--timeout MINUTES]
+
+Waits for GitHub CI on the pushed HEAD of the current branch's pull request and
+exits 0 when the `required` check passes. This is how a card verifies on this
+machine: CI runs the selected suites on the runners, nothing heavy runs locally.
+
+Run it through agetor-await and end your turn:
+
+    agetor-await "ci" -- ci-wait
+
+Exit codes: 0 passed; 1 CI failed (failing jobs and log tail are printed);
+2 not ready to wait (unpushed HEAD or no pull request); 3 timed out;
+4 the pull request conflicts with its base, so CI cannot run.
+
+On a failure, each failed job is printed with its workflow, job, step and exit
+code over the log lines that match a failure marker, with context, colour codes
+and timestamps removed, at most 150 lines a job. The whole failed log is saved
+under the worktree's git directory and its path is printed.
+
+This file lives in the Agetor repository (scripts/ci-wait/ci-wait) and is
+installed to ~/.agetor/bin/ci-wait by `bun run install:local`; edits to the
+installed copy are overwritten. The trimming is the same algorithm as
+src/shared/ci-failure.ts, which Agetor uses when it runs Finish itself:
+src/shared/ci-failure.test.ts runs both on the same logs and requires the same
+bytes, so change them together.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+# GitHub allows 5,000 REST calls an hour across every agent on this account.
+# One call per poll, two minutes apart: 15 waiting cards cost 450 an hour.
+POLL_SECONDS = 120
+MERGEABLE_EVERY = 5  # polls between pull-request state checks
+
+# --- the failed log, cut down (src/shared/ci-failure.ts in Python) -----------
+
+FAILURE_MARKER = re.compile(r"FAIL|Error:|error TS[0-9]+|panic:|AssertionError|\u2717|\u00d7|##\[error\]")
+EXIT_LINE = re.compile(r"##\[error\]Process completed with exit code ([0-9]+)")
+ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+CONTROL = re.compile("[\x00-\x08\x0b-\x1f\x7f\ufeff]")
+TIMESTAMP = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z ?")
+TRAILING_BLANKS = re.compile(r"[ \t]+$")
+BLANK = re.compile(r"^[ \t]*$")
+CONTEXT = 20          # lines kept either side of a failure line
+MAX_LINES = 150       # log lines kept per job, at most
+TAIL_LINES = 60       # lines kept from the end of a job with no failure line
+MAX_LINE_CHARS = 400  # characters kept of one line
+CONTEXT_LADDER = [20, 10, 5, 2, 0]
+
+
+def clean_ci_line(text, max_chars=MAX_LINE_CHARS):
+    clean = TRAILING_BLANKS.sub("", TIMESTAMP.sub("", CONTROL.sub("", ANSI.sub("", text))))
+    if len(clean) > max_chars:
+        return f"{clean[:max_chars]} \u2026 [+{len(clean) - max_chars} chars]"
+    return clean
+
+
+def parse_failed_log(raw):
+    """`gh run view --log-failed` output as (job, step, text) lines."""
+    lines = []
+    for line in raw.split("\n"):
+        if line.endswith("\r"):
+            line = line[:-1]
+        if BLANK.match(line):
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 3:
+            lines.append((parts[0], parts[1], clean_ci_line("\t".join(parts[2:]))))
+        else:
+            lines.append(("", "", clean_ci_line(line)))
+    return lines
+
+
+def distill_job(job, lines, context=CONTEXT, max_lines=MAX_LINES, tail_lines=TAIL_LINES):
+    hits = []
+    exits = []
+    exit_code = None
+    for i, (_, _, text) in enumerate(lines):
+        if not FAILURE_MARKER.search(text):
+            continue
+        hits.append(i)
+        found = EXIT_LINE.search(text)
+        if found:
+            exit_code = int(found.group(1))
+            exits.append(i)
+    exit_at = exits[-1] if exits else -1
+    keep = []
+    used = None
+    if not hits:
+        keep = list(range(max(0, len(lines) - tail_lines), len(lines)))
+    else:
+        for ctx in [c for c in CONTEXT_LADDER if c <= context]:
+            chosen = set()
+            for i in hits:
+                # Context never crosses "Process completed with exit code": what
+                # follows it is the runner cleaning up, not part of the failure
+                # before it, and a later failure's context starts after it.
+                start = max(0, i - ctx)
+                end = min(len(lines) - 1, i + ctx)
+                for e in exits:
+                    if e < i:
+                        start = max(start, e + 1)
+                    else:
+                        end = min(end, e)
+                chosen.update(range(start, end + 1))
+            keep = sorted(chosen)
+            used = ctx
+            if len(keep) <= max_lines:
+                break
+        if len(keep) > max_lines:
+            # More failure lines than the cap: the first third and the last two thirds.
+            head = max_lines // 3
+            keep = hits[:head] + hits[len(hits) - (max_lines - head):]
+    shown = []
+    previous = -1
+
+    def omitted(count):
+        if count > 0:
+            shown.append(f"\u2026 {count} line{'' if count == 1 else 's'} omitted \u2026")
+
+    for i in keep:
+        omitted(i - previous - 1)
+        shown.append(lines[i][2])
+        previous = i
+    omitted(len(lines) - 1 - previous)
+    step_at = exit_at if exit_at >= 0 else hits[-1] if hits else len(lines) - 1
+    return {
+        "job": job, "step": lines[step_at][1] if lines else "", "exit_code": exit_code, "total": len(lines),
+        "failures": len(hits), "shown": len(keep), "context": used, "lines": shown,
+    }
+
+
+def distill_failed_log(raw, max_lines=MAX_LINES):
+    """One excerpt per job of a failed run's log, in the log's order."""
+    jobs = {}
+    for line in parse_failed_log(raw):
+        jobs.setdefault(line[0], []).append(line)
+    return [distill_job(job, lines, max_lines=max(1, max_lines)) for job, lines in jobs.items()]
+
+
+def exit_words(job, short=False):
+    if job["exit_code"] is None:
+        return "exit code not in the log"
+    return f"exit {job['exit_code']}" if short else f"exit code {job['exit_code']}"
+
+
+def render_ci_failure(run_id, url, workflow, log_path, jobs):
+    """A failed run as text: where the whole thing is, then each failed job's
+    workflow, job, step and exit code over its excerpt."""
+    lines = [
+        f"Run {run_id}{': ' + url if url else ''}",
+        f"Full log: {log_path or 'not saved'} (or `gh run view {run_id} --log-failed`)",
+    ]
+    if not jobs:
+        lines.append("(the failed log is empty: the job failed before any of its steps ran)")
+    for job in jobs:
+        step = f'step "{job["step"]}"' if job["step"] else None
+        where = " / ".join(s for s in [workflow, job["job"], step] if s)
+        lines.append(f"--- failed: {where or '(job not named in the log)'} \u2014 {exit_words(job)} ---")
+        if job["context"] is None:
+            lines.append(f"(no line matches a failure marker: the last {job['shown']} of {job['total']} log lines)")
+        else:
+            around = f" with up to {job['context']} lines either side" if job["context"] > 0 else ""
+            cut = ", first and last only" if job["shown"] < job["failures"] else ""
+            lines.append(f"({job['shown']} of {job['total']} log lines: the {job['failures']} failure "
+                         f"line{'' if job['failures'] == 1 else 's'}{around}{cut})")
+        lines.extend(job["lines"])
+    return "\n".join(lines)
+
+
+def ci_failure_index(workflow, jobs):
+    """One line naming every failed job of a run."""
+    parts = []
+    for job in jobs:
+        where = " / ".join(s for s in [workflow, job["job"]] if s) or "(job not named)"
+        step = f', step "{job["step"]}"' if job["step"] else ""
+        parts.append(f"{where} ({exit_words(job, short=True)}{step})")
+    return "; ".join(parts)
+
+
+def save_failed_log(run_id, log):
+    """The whole failed log, kept outside the working tree; its path, or None."""
+    code, git_dir, _ = out("git", "rev-parse", "--absolute-git-dir")
+    if code != 0 or not git_dir:
+        return None
+    try:
+        folder = os.path.join(git_dir, "agetor")
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, f"ci-failed-{run_id}.log")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(log + "\n")
+        return path
+    except OSError:
+        return None
+
+
+def out(*cmd):
+    p = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace")
+    return p.returncode, p.stdout.strip(), p.stderr.strip()
+
+
+def gh_json(*args):
+    code, stdout, _ = out("gh", *args)
+    if code != 0 or not stdout:
+        return None
+    try:
+        return json.loads(stdout)
+    except ValueError:
+        return None
+
+
+def main(argv):
+    timeout_min = 90
+    if "--timeout" in argv:
+        timeout_min = int(argv[argv.index("--timeout") + 1])
+    if "-h" in argv or "--help" in argv:
+        print(__doc__)
+        return 0
+
+    _, head, _ = out("git", "rev-parse", "HEAD")
+    _, branch, _ = out("git", "rev-parse", "--abbrev-ref", "HEAD")
+    _, dirty, _ = out("git", "status", "--porcelain", "--untracked-files=no")
+    if dirty:
+        print("ci-wait: tracked files have uncommitted changes; CI verifies the pushed commit, so commit first")
+        return 2
+    _, remote, _ = out("git", "ls-remote", "origin", f"refs/heads/{branch}")
+    if not remote.startswith(head):
+        print(f"ci-wait: HEAD {head[:9]} is not what origin/{branch} points at; run `git push -u origin {branch}` first")
+        return 2
+    pr = gh_json("pr", "view", branch, "--json", "number,url,isDraft,baseRefName,state")
+    if not pr or pr.get("state") != "OPEN":
+        print(f"ci-wait: no open pull request for {branch}; open one first: "
+              f"`gh pr create --draft --base develop --head {branch} ...`")
+        return 2
+    print(f"ci-wait: PR #{pr['number']} {pr['url']} head {head[:9]} (draft={pr['isDraft']}, base {pr['baseRefName']})")
+    repo = gh_json("repo", "view", "--json", "nameWithOwner")["nameWithOwner"]
+
+    deadline = time.monotonic() + timeout_min * 60
+    last = ""
+    polls = 0
+    while time.monotonic() < deadline:
+        state = (gh_json("pr", "view", str(pr["number"]), "--json", "mergeable,headRefOid") or {}) if polls % MERGEABLE_EVERY == 0 else {}
+        polls += 1
+        if state.get("headRefOid") and state["headRefOid"] != head:
+            print(f"ci-wait: the PR head moved to {state['headRefOid'][:9]}; this wait was for {head[:9]}")
+            return 2
+        if state.get("mergeable") == "CONFLICTING":
+            print(f"ci-wait: PR #{pr['number']} conflicts with {pr['baseRefName']}, so CI cannot run. "
+                  f"Merge origin/{pr['baseRefName']} and resolve, then push and wait again.")
+            return 4
+        listing = gh_json("api", f"repos/{repo}/commits/{head}/check-runs?per_page=100")
+        if listing is None:
+            # Rate limited or offline: say so once and wait longer, never spin.
+            if last != "unreachable":
+                print("ci-wait: GitHub did not answer (rate limit or network); waiting", flush=True)
+                last = "unreachable"
+            time.sleep(POLL_SECONDS * 3)
+            continue
+        runs = listing.get("check_runs", [])
+        required = [r for r in runs if r["name"] == "required"]
+        done = sum(1 for r in runs if r["status"] == "completed")
+        line = f"{done}/{len(runs)} checks complete"
+        if line != last:
+            print(f"ci-wait: {line}", flush=True)
+            last = line
+        # `required` only aggregates the other jobs, and on a busy day it can sit
+        # queued for an hour behind `select` jobs on the two control runners.
+        # When `select` and every suite job have finished, their results are
+        # the answer; do not wait for the aggregator to be scheduled.
+        others = [r for r in runs if r["name"] != "required"]
+        ci_jobs = [r for r in others if "/" in r["name"] or r["name"] == "select"]
+        selected = any(r["name"] == "select" and r["status"] == "completed" and r["conclusion"] == "success" for r in others)
+        if (selected and ci_jobs and all(r["status"] == "completed" for r in ci_jobs)
+                and not (required and all(r["status"] == "completed" for r in required))):
+            bad = [r for r in ci_jobs if r["conclusion"] not in ("success", "skipped", "neutral")]
+            if not bad:
+                print(f"ci-wait: PASSED — select and all {len(ci_jobs) - 1} suite jobs succeeded for {head[:9]}; "
+                      f"the `required` aggregator is still queued (it must finish before the PR can merge): {pr['url']}/checks")
+                return 0
+        if required and all(r["status"] == "completed" for r in required):
+            newest = max(required, key=lambda r: r.get("started_at") or "")
+            failed = [r for r in runs if r["status"] == "completed"
+                      and r["conclusion"] not in ("success", "skipped", "neutral")]
+            if newest["conclusion"] == "success":
+                print(f"ci-wait: PASSED — `required` succeeded for {head[:9]}: {newest['html_url']}")
+                return 0
+            print(f"ci-wait: FAILED — `required` is {newest['conclusion']} for {head[:9]}")
+            for r in failed:
+                print(f"  failed: {r['name']} ({r['conclusion']}) {r['html_url']}")
+            run_ids = sorted({r["html_url"].split("/runs/")[1].split("/")[0] for r in failed if "/runs/" in r["html_url"]})
+            index = []
+            for run_id in run_ids[:2]:
+                _, log, _ = out("gh", "run", "view", run_id, "--log-failed")
+                run = gh_json("run", "view", run_id, "--json", "workflowName,url") or {}
+                jobs = distill_failed_log(log)
+                print(render_ci_failure(run_id, run.get("url"), run.get("workflowName"), save_failed_log(run_id, log), jobs))
+                if jobs:
+                    index.append(ci_failure_index(run.get("workflowName"), jobs))
+            if index:
+                # Last, so the tail Agetor quotes when it wakes the step names every failed job.
+                print(f"ci-wait: failed jobs: {'; '.join(index)}. Their excerpts are above; read the full log only where they are not enough.")
+            return 1
+        time.sleep(POLL_SECONDS)
+    print(f"ci-wait: timed out after {timeout_min} minutes waiting for `required` on {head[:9]}; "
+          f"see `gh pr checks {pr['number']}`")
+    return 3
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

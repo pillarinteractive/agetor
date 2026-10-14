@@ -382,7 +382,9 @@ describe("words", () => {
     const step = newStep({ name: "Build", instructions: "Do it. {{checks}}", goal: "Committed." });
     const plain = composeStepPrompt({ ...base, step });
     expect(composeStepPrompt({ ...base, step, gate: null })).toBe(plain);
-    expect(plain).toContain("## Your step\n\nDo it. {{checks}}\n\n## Delegation");
+    // Nothing of a gate between the instructions and what follows them, in either order.
+    expect(plain).toContain("## Your step\n\nDo it. {{checks}}\n\n## Overall goal");
+    expect(composeStepPrompt({ ...base, step, order: "legacy" })).toContain("## Your step\n\nDo it. {{checks}}\n\n## Delegation");
     expect(plain).not.toContain("Step goal");
   });
   test("with a gate: the goal apart from the instructions, the roster after them", () => {
@@ -391,7 +393,8 @@ describe("words", () => {
     expect(prompt).toContain("## Step goal\n\nWhat must be true when this step ends: The change is committed.\n\n## Your step\n\nDo it.\n\n## Checks this step must pass\n\n");
     expect(prompt).toContain("- `tree-clean` — ");
     expect(prompt).toContain("- `diff-nonempty` — ");
-    expect(prompt.indexOf("## Checks this step must pass")).toBeLessThan(prompt.indexOf("## Delegation"));
+    // With the step's own text, before anything of the card.
+    expect(prompt.indexOf("## Checks this step must pass")).toBeLessThan(prompt.indexOf("## Overall goal"));
     // No goal: no goal section, the roster still there.
     expect(composeStepPrompt({ ...base, step, gate: { goal: null, checks: [builtinCheck("tree-clean")] } })).not.toContain("## Step goal");
   });

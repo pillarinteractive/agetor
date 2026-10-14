@@ -50,7 +50,8 @@ import { recordActivity } from "./activity.ts";
 import { getGitHubPullChecks, rerunGitHubWorkflowRun, run as exec } from "./github.ts";
 import { setMergeQueued } from "./merge-intent.ts";
 import { pipelineUpdateColumn } from "./orchestrator.ts";
-import { reworkPipelineRun } from "./pipeline-runner.ts";
+import { failedRunReports, readFailedRun, type FailedRunLog } from "./ci-failure-log.ts";
+import { pipelineRunsDir, reworkPipelineRun } from "./pipeline-runner.ts";
 import { invalidatePrStatus, newestPerName, ownFailures } from "./pr-watch.ts";
 
 export const MERGE_REWORK_PREF = "merge_queue_rework";
@@ -217,8 +218,11 @@ export interface CiFailureDetails {
   /** The PR's head as GitHub has it now; null when it couldn't be read. */
   headSha: string | null;
   checks: FailedCheck[];
-  /** The tail of each failed run's log (`gh run view --log-failed`). */
-  logs: { runId: number; tail: string }[];
+  /** Each failed run's log (`gh run view --log-failed`): `tail` is its last
+   *  lines, read for the runner-fault decision; `report` is what Build is
+   *  shown — each failed job's failure lines with context
+   *  (src/shared/ci-failure.ts). Without a `report` the tail is shown. */
+  logs: { runId: number; tail: string; report?: string }[];
 }
 
 const INFRA_LOG_RE = new RegExp(
@@ -325,8 +329,8 @@ export function ciFailureHandoff(input: {
   const base = pr.baseRef ?? "the base branch";
   const runUrls = [...new Set(details.checks.map((c) => c.url).filter((u): u is string => !!u))];
   const jobs = details.checks.map((c) => `- ${c.name}${c.conclusion ? ` (${c.conclusion})` : ""}${c.url ? ` ${c.url}` : ""}`).join("\n");
-  const logs = details.logs.filter((l) => l.tail.trim()).map((l) =>
-    `--- last lines of the failed log, run ${l.runId} (full: gh run view ${l.runId} --log-failed) ---\n${l.tail}`).join("\n\n");
+  const logs = details.logs.filter((l) => (l.report ?? l.tail).trim()).map((l) =>
+    l.report ?? `--- last lines of the failed log, run ${l.runId} (full: gh run view ${l.runId} --log-failed) ---\n${l.tail}`).join("\n\n");
   return {
     schemaVersion: 1,
     status: "done",
@@ -392,12 +396,12 @@ export const reworkDeps = {
     const live = await getGitHubPullChecks({ dir: task.workdir, number: pr.number });
     const conclusions = new Map(live.ok ? newestPerName(live.checkRuns).map((r) => [r.name, r.conclusion] as const) : []);
     const checks: FailedCheck[] = own.map((c) => ({ name: c.name, url: c.url, conclusion: conclusions.get(c.name) ?? null, runId: runIdFromCheckUrl(c.url) }));
-    const logs: CiFailureDetails["logs"] = [];
+    const runs: FailedRunLog[] = [];
     for (const runId of [...new Set(checks.map((c) => c.runId).filter((n): n is number => n != null))].slice(0, 2)) {
-      const r = await exec(["gh", "run", "view", String(runId), "--log-failed"], task.workdir, 60_000, process.env);
-      if (r.ok) logs.push({ runId, tail: logTail(r.stdout) });
+      const read = await readFailedRun(task.workdir, runId);
+      if (read) runs.push(read);
     }
-    return { headSha: live.ok ? live.sha : null, checks, logs };
+    return { headSha: live.ok ? live.sha : null, checks, logs: failedRunReports(runs, pipelineRunsDir(task.id), logTail) };
   },
   /** The files that conflict between the PR's branch and its base, and the
    *  branch's head on the remote. */

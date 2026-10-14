@@ -34,11 +34,12 @@ import {
 import { tasks } from "./db.ts";
 import { recordActivity } from "./activity.ts";
 import {
-  createGitHubComment, createGitHubPull, findGitHubPullForBranch, getGitHubRefCheckRuns, rerunGitHubWorkflowRun, run as exec, setGitHubPullDraft,
+  createGitHubComment, createGitHubPull, findGitHubPullForBranch, getGitHubRefCheckRuns, rerunGitHubWorkflowRun, setGitHubPullDraft,
 } from "./github.ts";
-import { ciFailureHandoff, conflictHandoff, infraReason, logTail, runIdFromCheckUrl, type FailedCheck } from "./merge-rework.ts";
+import { failedRunReports, readFailedRun, type FailedRunLog } from "./ci-failure-log.ts";
+import { ciFailureHandoff, conflictHandoff, infraReason, logTail, runIdFromCheckUrl, type CiFailureDetails, type FailedCheck } from "./merge-rework.ts";
 import { invalidatePrStatus, issueNumberForTask, prBase } from "./pr-watch.ts";
-import { launchPublishAgent, publishHooks, publishStepFor, routeFromPublish, stopPublishForOwner, updatePublish } from "./pipeline-runner.ts";
+import { launchPublishAgent, pipelineRunsDir, publishHooks, publishStepFor, routeFromPublish, stopPublishForOwner, updatePublish } from "./pipeline-runner.ts";
 
 const TICK_MS = 60_000;
 /** How often a card that only waits on the base (not on its own CI) looks. */
@@ -92,12 +93,10 @@ export const publishDeps = {
     const r = await getGitHubRefCheckRuns({ dir: task.workdir, ref: sha });
     return r.ok ? r.checkRuns : null;
   },
-  /** The tail of a failed run's log. Read for the runner-fault decision and
-   *  quoted to Build; never compared with the base's. */
-  async failedLog(task: Task, runId: number): Promise<string | null> {
-    const r = await exec(["gh", "run", "view", String(runId), "--log-failed"], task.workdir, 60_000, process.env);
-    return r.ok ? logTail(r.stdout) : null;
-  },
+  /** A failed run's log, whole, with the run's workflow and page. Its tail is
+   *  read for the runner-fault decision and its failure lines are quoted to
+   *  Build (src/shared/ci-failure.ts); never compared with the base's. */
+  failedLog: (task: Task, runId: number): Promise<FailedRunLog | null> => readFailedRun(task.workdir, runId),
   async rerunFailed(task: Task, runId: number): Promise<{ ok: boolean; error?: string }> {
     const r = await rerunGitHubWorkflowRun({ dir: task.workdir, runId, failedOnly: true });
     return r.ok ? { ok: true } : { ok: false, error: r.error };
@@ -267,14 +266,17 @@ async function observe(task: Task, run: PipelineRunState, p: PipelinePublishStat
   }
 }
 
-async function failureDetails(task: Task, failing: { name: string; url: string | null; conclusion: string | null }[]): Promise<{ checks: FailedCheck[]; logs: { runId: number; tail: string }[] }> {
+/** The failing checks with their runs' logs. `save`: the logs are kept in
+ *  the card's run folder and the report names them — for the handoff to
+ *  Build, not for the look that only asks whether a runner was at fault. */
+async function failureDetails(task: Task, failing: { name: string; url: string | null; conclusion: string | null }[], save = false): Promise<Pick<CiFailureDetails, "checks" | "logs">> {
   const checks: FailedCheck[] = failing.map((c) => ({ ...c, runId: runIdFromCheckUrl(c.url) }));
-  const logs: { runId: number; tail: string }[] = [];
+  const runs: FailedRunLog[] = [];
   for (const runId of [...new Set(checks.map((c) => c.runId).filter((n): n is number => n != null))].slice(0, 2)) {
-    const tail = await publishDeps.failedLog(task, runId);
-    if (tail !== null) logs.push({ runId, tail });
+    const read = await publishDeps.failedLog(task, runId);
+    if (read !== null) runs.push(read);
   }
-  return { checks, logs };
+  return { checks, logs: failedRunReports(runs, save ? pipelineRunsDir(task.id) : null, logTail) };
 }
 
 // ---------------------------------------------------------------------------
@@ -310,7 +312,7 @@ async function buildHandoff(task: Task, run: PipelineRunState, p: PipelinePublis
   const back = `sent back to ${shape.build.name} without an agent turn on ${shape.finish.name}`;
   switch (cause.kind) {
     case "ci": {
-      const details = await failureDetails(task, cause.checks);
+      const details = await failureDetails(task, cause.checks, true);
       return {
         toStepId: shape.build.id,
         handoff: ciFailureHandoff({ shape, pr, details, inherited: cause.inherited, round: 0, maxRounds: 0, signedOff: false, inRun: true }),
