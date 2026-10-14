@@ -29,6 +29,8 @@ import type { Task, TaskPrStatus } from "../shared/types.ts";
 import { preferences, tasks, isSqliteBusy } from "./db.ts";
 import { recordActivity } from "./activity.ts";
 import { run } from "./github.ts";
+import { classifyRefsVerdict, parseRefsClosePref, REFS_CLOSE_PREF, refsCloseMarker, releaseGateBody, releaseGateCloseComment, releaseGateTitle, type RefsCloseDecision, type RefsClosePolicy } from "../shared/refs-close.ts";
+import { decisionPolicyForProject, PIPELINE_DECISIONS_PREF } from "../shared/pipeline-decisions.ts";
 import { askThread, taggedJson, type ThreadAnswer } from "./codex-thread.ts";
 import { createTaskFromIssue } from "./issue-queue.ts";
 import { setMergeQueued } from "./merge-intent.ts";
@@ -226,6 +228,18 @@ export interface RoadmapStuck {
   excerpt?: string | null;
   /** `prIssueMentionLine`: the sentence shown to the owner. */
   detail?: string | null;
+  /** The release-gate rule's judgement of the PR's `Refs` verdict
+   *  (src/shared/refs-close.ts), made once when the rule applies. */
+  gate?: { decision: RefsCloseDecision; why: string; items: string[]; line: string | null } | null;
+  /** The release-gate follow-up filed (or found) for this step. */
+  gateFollowup?: { number: number; url: string } | null;
+  /** A follow-up create was attempted; search before creating again. */
+  gatePending?: boolean;
+  /** The last GitHub failure of the rule, the failures in a row, and when
+   *  it may try again. */
+  gateError?: string | null;
+  gateFailures?: number;
+  gateRetryAt?: number;
 }
 
 export interface RoadmapRedo {
@@ -958,6 +972,9 @@ export interface RoadmapDeps {
   mergedPr(t: Task): number | null;
   /** A PR's description; null when it couldn't be read. */
   prBody(t: Task, pr: number): Promise<string | null>;
+  /** The release-gate rule's GitHub effects (owner decision 2026-10-14);
+   *  without it a pass never closes an issue. */
+  refsClose?: RefsCloseDeps;
   /** Cards whose sign-off the user withdrew. */
   handsOff(): ReadonlySet<string>;
   quotaPaused(t: Pick<Task, "pipelineRun">): boolean;
@@ -991,6 +1008,74 @@ export interface RoadmapDeps {
    *  Best-effort; a pass works the same without it. */
   velocity?(input: VelocityPassInput): void;
   now(): number;
+}
+
+/** What the release-gate rule needs: whether it applies to the project, and
+ *  the three GitHub calls. Every call reports failure instead of throwing. */
+export interface RefsCloseDeps {
+  /** The rule's settings, or null when it doesn't apply (the project isn't
+   *  `agent-followups` in `pipeline_decisions`, or `refs_close` is off). */
+  policy(project: string): RefsClosePolicy | null;
+  /** An open or closed issue whose body carries `marker`. */
+  findFollowup(project: string, marker: string): Promise<{ number: number; url: string } | null | { error: string }>;
+  createFollowup(project: string, input: { title: string; body: string; milestone: string | null; label: string | null }): Promise<{ number: number; url: string } | { error: string }>;
+  closeIssue(project: string, issue: number, comment: string): Promise<{ ok: true } | { error: string }>;
+}
+
+/** The rule's GitHub retries: 5 min, doubling, at most 6 h. */
+const GATE_BACKOFF_MS = 5 * 60_000;
+const GATE_BACKOFF_MAX_MS = 6 * 60 * 60_000;
+
+/**
+ * The release-gate rule (owner decision 2026-10-14) for one stuck step whose
+ * PR merged with a `Refs #N` verdict: when every item still listed is human
+ * approval or external evidence, file one release-gate follow-up (found by
+ * its marker if it exists), close #N as completed with a comment linking
+ * both, and say so on the card. True when #N was closed. Any GitHub failure
+ * leaves the stuck entry, notes the error once and backs off.
+ */
+async function releaseGateStep(cfg: AutopilotConfig, policy: RefsClosePolicy, n: number, title: string, entry: RoadmapStuck, gh: RefsCloseDeps, deps: RoadmapDeps, save: () => void): Promise<boolean> {
+  const gate = entry.gate;
+  if (!gate || gate.decision !== "close" || entry.pr == null) return false;
+  if (entry.gateRetryAt && deps.now() < entry.gateRetryAt) return false;
+  const pr = entry.pr;
+  const fail = (what: string, error: string) => {
+    const failures = (entry.gateFailures ?? 0) + 1;
+    const message = `${what}: ${error}`.slice(0, 300);
+    if (entry.gateError !== message) deps.activity(entry.cardId, `Autopilot: the release-gate rule couldn't finish #${n} — ${message}. Leaving it for you; retrying later`, "warning");
+    Object.assign(entry, { gateError: message, gateFailures: failures, gateRetryAt: deps.now() + Math.min(GATE_BACKOFF_MS * 2 ** (failures - 1), GATE_BACKOFF_MAX_MS) });
+    return false;
+  };
+  let followup = entry.gateFollowup ?? null;
+  if (!followup) {
+    const found = await gh.findFollowup(cfg.project, refsCloseMarker(n)).catch((e: unknown) => ({ error: String(e) }));
+    if (found && "error" in found) return fail("searching for its follow-up failed", found.error);
+    followup = found;
+  }
+  if (!followup) {
+    entry.gatePending = true;
+    save(); // a durable claim before the remote create
+    const verdict = { ...gate, engineering: [], unmatched: [] };
+    const made = await gh.createFollowup(cfg.project, {
+      title: releaseGateTitle(n, title),
+      body: releaseGateBody({ issue: n, pr, prUrl: entry.prUrl ?? null, verdict }),
+      milestone: policy.milestone,
+      label: policy.label,
+    }).catch((e: unknown) => ({ error: String(e) }));
+    if ("error" in made) return fail("filing its release-gate follow-up failed", made.error);
+    followup = made;
+  }
+  entry.gateFollowup = followup;
+  entry.gatePending = false;
+  save();
+  const closed = await gh.closeIssue(cfg.project, n, releaseGateCloseComment({ pr, prUrl: entry.prUrl ?? null, followup })).catch((e: unknown) => ({ error: String(e) }));
+  if ("error" in closed) return fail(`closing it failed (follow-up #${followup.number} is filed)`, closed.error);
+  deps.activity(
+    entry.cardId,
+    `Autopilot: closed #${n} under the owner's release-gate rule of 2026-10-14 — PR #${pr}'s “Refs” verdict lists only approval or evidence (${gate.items.join("; ")}). Follow-up #${followup.number} tracks it; reopen #${n} if any item is engineering`,
+    "info",
+  );
+  return true;
 }
 
 const isOpenStep = (v: RoadmapStepView) => v.status !== "complete" && v.status !== "declined";
@@ -1127,6 +1212,30 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
   }
   for (const key of Object.keys(state.roadmapStuck)) {
     if (!openByIssue.has(Number(key))) delete state.roadmapStuck[key]; // closed since
+  }
+  // The release-gate rule (owner decision 2026-10-14): a merged PR whose
+  // `Refs` verdict lists only approval or evidence closes its step here. A
+  // closed step counts as settling for the rest of this pass (nothing starts
+  // for it; the next pass reads it closed).
+  const gatePolicy = deps.refsClose?.policy(cfg.project) ?? null;
+  if (deps.refsClose && gatePolicy && gatePolicy.mode !== "off") {
+    for (const [key, entry] of Object.entries(state.roadmapStuck)) {
+      const n = Number(key);
+      if (entry.pr == null || (entry.kind !== "merged" && entry.kind !== "done")) continue;
+      if (entry.gate === undefined) {
+        const card = all.find((x) => x.id === entry.cardId) ?? own.find((x) => x.id === entry.cardId);
+        if (!card) continue; // can't read the PR without its card; the owner decides
+        const body = await deps.prBody(card, entry.pr);
+        if (body == null) continue; // read again next pass
+        const v = classifyRefsVerdict(body, n);
+        entry.gate = { decision: v.decision, why: v.why, items: v.items, line: v.line };
+        if (v.decision === "keep") deps.activity(entry.cardId, `Autopilot: the release-gate rule leaves #${n} for you — ${v.why}`, "muted");
+      }
+      if (await releaseGateStep(cfg, gatePolicy, n, openByIssue.get(n)?.title ?? "", entry, deps.refsClose, deps, () => deps.save(state))) {
+        delete state.roadmapStuck[key];
+        settling.add(n);
+      }
+    }
   }
   if (settling.size > 0) deps.recheck(60_000);
   const stuck = new Map<number, RoadmapNeedsUser>(
@@ -1692,6 +1801,38 @@ export const ROADMAP_DEPS: RoadmapDeps = {
   async prBody(t, pr) {
     const r = await run(["gh", "pr", "view", String(pr), "--json", "body", "-q", ".body"], t.workdir, 30_000, process.env);
     return r.ok ? (r.stdout ?? "") : null;
+  },
+  refsClose: {
+    policy(project) {
+      if (decisionPolicyForProject(preferences.get(PIPELINE_DECISIONS_PREF), project) !== "agent-followups") return null;
+      const p = parseRefsClosePref(preferences.get(REFS_CLOSE_PREF));
+      return p.mode === "off" ? null : p;
+    },
+    async findFollowup(project, marker) {
+      const needle = marker.replace(/^<!--\s*|\s*-->$/g, "");
+      const r = await run(["gh", "issue", "list", "--state", "all", "--search", `"${needle}" in:body`, "--json", "number,url,body", "--limit", "10"], project, 30_000, process.env);
+      if (!r.ok) return { error: (r.stderr || r.stdout || "gh issue list failed").trim().slice(-200) };
+      try {
+        const hit = (JSON.parse(r.stdout) as { number: number; url: string; body?: string }[]).find((x) => (x.body ?? "").includes(marker));
+        return hit ? { number: hit.number, url: hit.url } : null;
+      } catch {
+        return { error: "gh issue list returned unreadable JSON" };
+      }
+    },
+    async createFollowup(project, input) {
+      const create = (label: string | null) =>
+        run(["gh", "issue", "create", "--title", input.title, "--body", input.body, ...(label ? ["--label", label] : []), ...(input.milestone ? ["--milestone", input.milestone] : [])], project, 30_000, process.env);
+      let r = await create(input.label);
+      if (!r.ok && input.label) r = await create(null); // a label the repository lacks
+      if (!r.ok) return { error: (r.stderr || r.stdout || "gh issue create failed").trim().slice(-200) };
+      const url = r.stdout.trim().split(/\s+/).find((w) => /\/issues\/\d+$/.test(w)) ?? "";
+      const number = Number(/\/issues\/(\d+)$/.exec(url)?.[1]);
+      return Number.isSafeInteger(number) && number > 0 ? { number, url } : { error: `gh issue create printed no issue URL: ${r.stdout.trim().slice(0, 120)}` };
+    },
+    async closeIssue(project, issue, comment) {
+      const r = await run(["gh", "issue", "close", String(issue), "--reason", "completed", "--comment", comment], project, 30_000, process.env);
+      return r.ok ? { ok: true } : { error: (r.stderr || r.stdout || "gh issue close failed").trim().slice(-200) };
+    },
   },
   handsOff: () => new Set(readHandsOff()),
   quotaPaused: quotaPausedCard,

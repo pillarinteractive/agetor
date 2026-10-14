@@ -1452,6 +1452,36 @@ nothing-to-build decision and no audit: the table decides the order.
   Merge; and each `roadmapStuck` entry gets its PR's stated reason filled in (one `gh pr view` per entry) with a
   timeline note. Nothing is closed and no card is started by the upgrade itself.
 
+## Refs verdicts that leave only evidence close themselves (`feat/refs-close-release-gate`)
+
+Owner decision 2026-10-14. A roadmap step whose PR merged with a `Refs #N` closing verdict used to wait in
+Needs-you ("PR merged but the issue is still open — close it or reopen the work"). When everything that verdict
+still lists is human approval or external evidence — nothing an agent could build — the pass now closes #N itself.
+
+- **When**: a `roadmapStuck` entry of kind `merged` (or `done` with a merged PR), in a project that is
+  `agent-followups` in `pipeline_decisions`, with the `refs_close` preference not `off`.
+- **The rule** (`classifyRefsVerdict`, `src/shared/refs-close.ts`, pure, unit-tested): read the line
+  `Refs #N — <items> remain pending.` (any dash or a colon; a trailing "remain pending / recorded gaps (#M)" is
+  dropped; a verdict that only says "see below" takes the body's "… remain pending" sentences). Items split on
+  commas, semicolons and "and". It closes only when **every** item names evidence/approval vocabulary (approval,
+  authorization, sign-off, receipt, qualification, measurement, invoice, custody, physical, hardware, host,
+  elapsed, human, owner, participant, consent, external review, keys, disposition) **and no** item names
+  engineering vocabulary (implement, integrate, wire, emit/emission, execute, migrate, refactor, test coverage,
+  fix, build, code, endpoint, schema, harness, runtime integration, "not yet implemented"). No verdict, a bare
+  `Refs #N`, an empty list, a mixed list or an item naming neither (e.g. "acquisition-mode compatibility") keeps
+  today's stuck entry, and the card says why once. The PR body is read once per entry for this.
+- **The action** (`releaseGateStep`, `src/bun/autopilot.ts`): find an issue (open or closed) carrying
+  `<!-- agetor-refs-close:#N -->`, else file "Release gate: remaining qualification of #N (<title>)" with the items
+  verbatim, the merged PR and "Required before the main release; not a develop prerequisite. Reopen #N if any item
+  is engineering work."; then close #N as completed with a comment linking the PR and the follow-up. The follow-up
+  is remembered on the entry before closing, so a failed close never files twice. An activity line on the card;
+  the stuck entry goes, and nothing starts for #N in that pass.
+- **Failures**: any GitHub call failing keeps the stuck entry, logs the error on the card once, and retries after
+  5 min, doubling to at most 6 h.
+- **Preference** `refs_close`: `"release-gate"` (default when unset), `"off"`, or JSON
+  `{"mode": "release-gate", "milestone": "H — Owner decisions", "label": "follow-up"}` — milestone default none,
+  label default `follow-up` (`null` for none; a label the repository lacks is dropped and the create retried).
+
 ## Velocity: how fast the roadmap run is going (`feat/roadmap-autopilot`)
 
 Tracker order keeps a record of the run and reports on it: the one-line summary beside the rocket ("20 done · 6.0/day ·

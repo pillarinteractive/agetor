@@ -1598,7 +1598,7 @@ test("resolve: recomputed when applied — no entry, an issue already closed, Gi
   expect(e.log.gh).toEqual([]);
 });
 
-test("a pass never closes an issue: only resolve does, and only when asked", async () => {
+test("without the release-gate rule a pass never closes an issue: only resolve does, and only when asked", async () => {
   const { roadmapPass } = await import("./autopilot.ts");
   const state = await stuckState();
   const done = roadmapCard("c12", 12, "done", { updatedAt: NOW - 10 * 60_000 });
@@ -1607,7 +1607,7 @@ test("a pass never closes an issue: only resolve does, and only when asked", asy
   expect(Object.keys(state.roadmapStuck)).toEqual(["12"]);
   expect(log.started).toEqual([]);
   expect(log.done).toEqual([]);
-  // RoadmapDeps has no way to write to GitHub at all.
+  // Without `refsClose` (the release-gate rule), RoadmapDeps has no way to write to GitHub at all.
   expect(Object.keys(deps).some((k) => /gh|close|comment/i.test(k))).toBe(false);
 });
 
@@ -2071,4 +2071,140 @@ test("POST /autopilot/roadmap/continue: applied between passes — the config ga
     expect(await m.applyRoadmapContinue("accept")).toEqual({ error: "no milestone follows the scope (or the first pass hasn't finished yet)" });
     expect(m.autopilotSnapshot().config.milestones).toEqual([M01, M02]);
   });
+});
+
+// ── Release-gate rule (owner decision 2026-10-14) ──────────────────────────
+const GATE_BODY = "## Summary\nLanded the harness.\n\nRefs #12 — owner approval, #877 measurement and host qualification receipts remain pending.\n";
+const MIXED_BODY = "Refs #12 — owner approval and wiring the nightly exporter remain pending.";
+
+function fakeGate(opts: { policy?: import("../shared/refs-close.ts").RefsClosePolicy | null; existing?: { number: number; url: string; body: string }[]; fail?: "find" | "create" | "close" } = {}) {
+  const issues = [...(opts.existing ?? [])];
+  const calls = { find: 0, create: [] as { title: string; body: string; milestone: string | null; label: string | null }[], close: [] as { issue: number; comment: string }[] };
+  const gh: import("./autopilot.ts").RefsCloseDeps = {
+    policy: () => (opts.policy === undefined ? { mode: "release-gate", milestone: "H — Owner decisions", label: "follow-up" } : opts.policy),
+    findFollowup: async (_p, marker) => {
+      calls.find++;
+      if (opts.fail === "find") return { error: "search is down" };
+      const hit = issues.find((i) => i.body.includes(marker));
+      return hit ? { number: hit.number, url: hit.url } : null;
+    },
+    createFollowup: async (_p, input) => {
+      calls.create.push(input);
+      if (opts.fail === "create") return { error: "HTTP 502" };
+      const number = 900 + calls.create.length;
+      issues.push({ number, url: `https://github.com/o/r/issues/${number}`, body: input.body });
+      return { number, url: `https://github.com/o/r/issues/${number}` };
+    },
+    closeIssue: async (_p, issue, comment) => {
+      calls.close.push({ issue, comment });
+      return opts.fail === "close" ? { error: "HTTP 403" } : { ok: true };
+    },
+  };
+  return { gh, calls, issues };
+}
+
+test("release gate: an evidence-only Refs verdict closes the step once, with one follow-up and a comment linking both", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  const state = await roadmapState();
+  state.notifiedHuman = [11];
+  const done = roadmapCard("c12", 12, "done", { updatedAt: NOW - 10 * 60_000, prUrl: "https://github.com/o/r/pull/77" });
+  const { gh, calls } = fakeGate();
+  const { deps, log } = roadmapDeps({}, { mergedPr: () => 77, prBody: async () => GATE_BODY, refsClose: gh });
+  await roadmapPass(roadmapCfg, state, [done], [done], deps);
+  expect(calls.create).toHaveLength(1);
+  expect(calls.create[0]!.title).toBe("Release gate: remaining qualification of #12 (Inventory the widgets)");
+  expect(calls.create[0]!.body).toContain("<!-- agetor-refs-close:#12 -->");
+  expect(calls.create[0]!.body).toContain("- owner approval\n- #877 measurement\n- host qualification receipts");
+  expect(calls.create[0]!.body).toContain("Required before the main release; not a develop prerequisite. Reopen #12 if any item is engineering work.");
+  expect(calls.create[0]).toMatchObject({ milestone: "H — Owner decisions", label: "follow-up" });
+  expect(calls.close).toEqual([{ issue: 12, comment: expect.stringContaining("#901") }]);
+  expect(calls.close[0]!.comment).toContain("https://github.com/o/r/pull/77");
+  expect(calls.close[0]!.comment).toContain("owner's rule of 2026-10-14");
+  expect(state.roadmapStuck).toEqual({});
+  expect(state.roadmap!.needsUser).toEqual([]);
+  expect(log.started).toEqual([]); // nothing starts for #12 (or behind it) in the pass that closed it
+  expect(log.activity.some((a) => a.includes("closed #12 under the owner's release-gate rule") && a.includes("#901"))).toBe(true);
+
+  // GitHub hasn't caught up yet: the issue still reads open, and the card is
+  // still Done. The guard comes back, but the follow-up is found by its
+  // marker, not filed twice.
+  await roadmapPass(roadmapCfg, state, [done], [done], deps);
+  expect(calls.create).toHaveLength(1);
+  expect(calls.close).toHaveLength(2);
+  expect(calls.close[1]!.comment).toContain("#901");
+});
+
+test("release gate: an existing follow-up carrying the marker is reused, open or closed", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  const state = await roadmapState();
+  const done = roadmapCard("c12", 12, "done", { updatedAt: NOW - 10 * 60_000 });
+  const { gh, calls } = fakeGate({ existing: [{ number: 450, url: "https://github.com/o/r/issues/450", body: "<!-- agetor-refs-close:#12 -->\nold" }] });
+  const { deps } = roadmapDeps({}, { mergedPr: () => 77, prBody: async () => GATE_BODY, refsClose: gh });
+  await roadmapPass(roadmapCfg, state, [done], [done], deps);
+  expect(calls.create).toEqual([]);
+  expect(calls.close).toEqual([{ issue: 12, comment: expect.stringContaining("#450") }]);
+});
+
+test("release gate: a mixed or bare verdict leaves the stuck entry for the owner, saying why once", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  for (const body of [MIXED_BODY, "Refs #12", "No verdict at all"]) {
+    const state = await roadmapState();
+    const done = roadmapCard("c12", 12, "done", { updatedAt: NOW - 10 * 60_000 });
+    const { gh, calls } = fakeGate();
+    let reads = 0;
+    const { deps, log } = roadmapDeps({}, { mergedPr: () => 77, prBody: async () => (reads++, body), refsClose: gh });
+    await roadmapPass(roadmapCfg, state, [done], [done], deps);
+    await roadmapPass(roadmapCfg, state, [done], [done], deps);
+    expect(calls).toEqual({ find: 0, create: [], close: [] });
+    expect(state.roadmapStuck["12"]).toMatchObject({ kind: "merged", gate: { decision: "keep" } });
+    expect(state.roadmap!.needsUser.map((u) => u.issue)).toEqual([12]);
+    expect(log.activity.filter((a) => a.includes("release-gate rule leaves #12 for you"))).toHaveLength(1);
+    expect(reads).toBe(2); // once for the owner's detail, once for the rule — never again
+  }
+});
+
+test("release gate: off (or a project that isn't agent-followups) changes nothing", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  for (const policy of [null, { mode: "off" as const, milestone: null, label: null }]) {
+    const state = await roadmapState();
+    const done = roadmapCard("c12", 12, "done", { updatedAt: NOW - 10 * 60_000 });
+    const { gh, calls } = fakeGate({ policy });
+    const { deps } = roadmapDeps({}, { mergedPr: () => 77, prBody: async () => GATE_BODY, refsClose: gh });
+    await roadmapPass(roadmapCfg, state, [done], [done], deps);
+    expect(calls).toEqual({ find: 0, create: [], close: [] });
+    expect(state.roadmapStuck["12"]).toMatchObject({ kind: "merged" });
+    expect(state.roadmapStuck["12"]!.gate).toBeUndefined();
+  }
+});
+
+test("release gate: a GitHub failure keeps the stuck entry, notes the error once and backs off", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  for (const fail of ["find", "create", "close"] as const) {
+    const state = await roadmapState();
+    const done = roadmapCard("c12", 12, "done", { updatedAt: NOW - 10 * 60_000 });
+    const { gh, calls } = fakeGate({ fail });
+    let now = NOW;
+    const { deps, log } = roadmapDeps({}, { mergedPr: () => 77, prBody: async () => GATE_BODY, refsClose: gh, now: () => now });
+    await roadmapPass(roadmapCfg, state, [done], [done], deps);
+    const entry = state.roadmapStuck["12"]!;
+    expect(entry).toMatchObject({ kind: "merged", gateFailures: 1, gateRetryAt: NOW + 5 * 60_000 });
+    expect(state.roadmap!.needsUser.map((u) => u.issue)).toEqual([12]);
+    const tries = () => calls.find + calls.create.length + calls.close.length;
+    const after1 = tries();
+    // Inside the backoff: no GitHub call at all.
+    now = NOW + 60_000;
+    await roadmapPass(roadmapCfg, state, [done], [done], deps);
+    expect(tries()).toBe(after1);
+    // After it: one more try, a longer backoff, and the error isn't repeated.
+    now = NOW + 6 * 60_000;
+    await roadmapPass(roadmapCfg, state, [done], [done], deps);
+    expect(tries()).toBeGreaterThan(after1);
+    expect(state.roadmapStuck["12"]).toMatchObject({ gateFailures: 2, gateRetryAt: now + 10 * 60_000 });
+    expect(log.activity.filter((a) => a.includes("release-gate rule couldn't finish #12"))).toHaveLength(1);
+    // A close that failed after filing keeps the follow-up and never files twice.
+    if (fail === "close") {
+      expect(calls.create).toHaveLength(1);
+      expect(state.roadmapStuck["12"]!.gateFollowup).toEqual({ number: 901, url: "https://github.com/o/r/issues/901" });
+    }
+  }
 });
