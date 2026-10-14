@@ -336,7 +336,11 @@ export type PublishObservation =
   | { state: "verify-head"; dirty: string[]; head: string; tree: string; approval: PublishApproval; unreviewed: string[] }
   | { state: "check-merge" | "refresh"; baseTip: string; contains: boolean; merge: MergeProbe | null }
   | { state: "hold-base"; baseTip: string; checks: CheckRunLike[] }
-  | { state: "push"; branch: string; localHead: string; remoteHead: string | null; remoteIsAncestor: boolean }
+  | { state: "push"; branch: string; localHead: string; remoteHead: string | null; remoteIsAncestor: boolean;
+      /** The remote head is the same change as HEAD: the same tree, and every
+       *  parent already in HEAD's history — e.g. GitHub's "Update branch"
+       *  merged the same base commit Agetor merged here. */
+      remoteSameChange?: boolean }
   | { state: "pr"; pull: PullSeen | null }
   | { state: "wait-ci" | "finalize"; pull: PullSeen | null; checks: CheckRunLike[] }
   | { state: "classify"; checks: CheckRunLike[]; baseCommits: CheckRunLike[][]; infra: string | null }
@@ -360,6 +364,7 @@ export type PublishAction =
   | { kind: "wait"; note: string; set?: Partial<PipelinePublishState> }
   /** Fast-forward the worktree to `commit` (the base merged into the head). */
   | { kind: "merge-base"; commit: string; baseTip: string; then: PublishStateName }
+  | { kind: "adopt-remote"; commit: string }
   | { kind: "push" }
   | { kind: "open-pr" }
   /** Re-run the head's failed (or cancelled) jobs, once per head and reason. */
@@ -448,6 +453,7 @@ export function decidePublish(p: PipelinePublishState, obs: PublishObservation, 
         return { kind: "owner", why: `the card's branch is "${obs.branch}" — Agetor never pushes to a base branch` };
       }
       if (obs.remoteHead === p.head) return { kind: "advance", to: "pr" };
+      if (obs.remoteHead && !obs.remoteIsAncestor && obs.remoteSameChange) return { kind: "adopt-remote", commit: obs.remoteHead };
       if (obs.remoteHead && !obs.remoteIsAncestor) {
         return { kind: "owner", why: `origin/${obs.branch} (${short(obs.remoteHead)}) holds commits this worktree does not have — Agetor never force-pushes` };
       }
@@ -579,6 +585,9 @@ export function applyPublish(p: PipelinePublishState, action: PublishAction, res
     case "merge-base":
       if (!result.ok) return failed("merging the base in");
       return enter(action.then, { head: result.head ?? action.commit, tree: result.tree ?? p.tree, baseTip: action.baseTip, carried: p.carried + 1 });
+    case "adopt-remote":
+      // The branch already holds this change: nothing to push.
+      return result.ok ? enter("pr", { head: action.commit, tree: result.tree ?? p.tree }) : failed("taking the remote's identical merge");
     case "push":
       return result.ok ? enter("pr") : failed("the push");
     case "open-pr":

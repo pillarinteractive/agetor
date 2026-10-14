@@ -165,6 +165,7 @@ describe("decidePublish: one action from the state and what Agetor observed", ()
     { name: "push: the remote already has this head → skip", p: state("push"), obs: { state: "push", branch: "claude/x", localHead: HEAD, remoteHead: HEAD, remoteIsAncestor: true }, want: "advance:pr" },
     { name: "push: the remote is behind → fast-forward push", p: state("push"), obs: { state: "push", branch: "claude/x", localHead: HEAD, remoteHead: TIP, remoteIsAncestor: true }, want: "push" },
     { name: "push: the remote diverged → the owner; never a force-push", p: state("push"), obs: { state: "push", branch: "claude/x", localHead: HEAD, remoteHead: TIP, remoteIsAncestor: false }, want: "owner" },
+    { name: "push: the remote holds the same change (GitHub's Update branch) → take that commit", p: state("push"), obs: { state: "push", branch: "claude/x", localHead: HEAD, remoteHead: TIP, remoteIsAncestor: false, remoteSameChange: true }, want: "adopt-remote" },
     { name: "push: HEAD is no longer the verified head → verify again", p: state("push"), obs: { state: "push", branch: "claude/x", localHead: MERGED, remoteHead: null, remoteIsAncestor: false }, want: "advance:verify-head" },
     { name: "push: the card's branch is the base → never", p: state("push"), obs: { state: "push", branch: "develop", localHead: HEAD, remoteHead: null, remoteIsAncestor: false }, want: "owner" },
     { name: "push: the card's branch is main → never", p: state("push", { base: "develop" }), obs: { state: "push", branch: "main", localHead: HEAD, remoteHead: null, remoteIsAncestor: false }, want: "owner" },
@@ -277,6 +278,8 @@ describe("applyPublish: an action's result folded into the state", () => {
     expect(approvedHeadFor(undefined, HEAD)).toBe(HEAD);
   });
   test("a re-run is remembered per head and reason, and the visit waits for CI again", () => {
+    expect(applyPublish(state("push"), { kind: "adopt-remote", commit: TIP }, { ok: true, tree: "t2" }, NOW)).toMatchObject({ state: "pr", head: TIP, tree: "t2" });
+    expect(applyPublish(state("push"), { kind: "adopt-remote", commit: TIP }, { ok: false, error: "x" }, NOW)).toMatchObject({ state: "push", tries: 1 });
     const next = applyPublish(state("classify"), { kind: "rerun", why: "infra", reason: "x" }, { ok: true }, NOW);
     expect(next).toMatchObject({ state: "wait-ci", reran: [{ head: HEAD, why: "infra", at: NOW }] });
     expect(applyPublish(state("classify"), { kind: "rerun", why: "infra", reason: "x" }, { ok: false, error: "403" }, NOW)).toMatchObject({ state: "classify", tries: 1 });

@@ -287,7 +287,18 @@ async function observe(task: Task, run: PipelineRunState, p: PipelinePublishStat
         if (!(await git(["cat-file", "-e", `${remoteHead}^{commit}`], checkout)).ok) await git(["fetch", "--quiet", "origin", task.branch], checkout);
         remoteIsAncestor = (await git(["merge-base", "--is-ancestor", remoteHead, "HEAD"], checkout)).ok;
       }
-      return { state: "push", branch: task.branch, localHead, remoteHead, remoteIsAncestor };
+      let remoteSameChange = false;
+      if (remoteHead && !remoteIsAncestor) {
+        const [remoteTree, localTree, parents] = [await rev(`${remoteHead}^{tree}`), await rev("HEAD^{tree}"),
+          await git(["log", "-1", "--format=%P", remoteHead], checkout)];
+        const ps = parents.ok ? parents.stdout.split(/\s+/).filter(Boolean) : [];
+        remoteSameChange = !!remoteTree && remoteTree === localTree && ps.length > 0;
+        for (const parent of ps) {
+          if (!remoteSameChange) break;
+          remoteSameChange = (await git(["merge-base", "--is-ancestor", parent, "HEAD"], checkout)).ok;
+        }
+      }
+      return { state: "push", branch: task.branch, localHead, remoteHead, remoteIsAncestor, remoteSameChange };
     }
     case "pr": {
       const found = await publishDeps.findPull(task);
@@ -427,6 +438,21 @@ async function perform(task: Task, run: PipelineRunState, p: PipelinePublishStat
       if (next) {
         say(task.id, `Finish (run by Agetor): merged origin/${p.base} into the approved head — the merge is clean and the change's own diff is unchanged, so Review's approval carries over (no agent step)`, "info");
       }
+      return next ? "again" : "stop";
+    }
+    case "adopt-remote": {
+      // GitHub's "Update branch" (or another merge) put the same change on
+      // the branch: move HEAD to that commit — same tree, nothing in the
+      // worktree changes — instead of stopping on a branch that "diverged".
+      const head = await git(["rev-parse", "HEAD"], checkout);
+      if (!p.head || !head.ok || head.stdout !== p.head) return failed("HEAD is no longer the verified head");
+      const before = await git(["rev-parse", "HEAD^{tree}"], checkout);
+      const target = await git(["rev-parse", `${action.commit}^{tree}`], checkout);
+      if (!before.ok || !target.ok || before.stdout !== target.stdout) return failed("the remote commit is not the same tree");
+      const reset = await git(["reset", "--keep", "--quiet", action.commit], checkout);
+      if (!reset.ok) return failed(reset.stderr || "moving HEAD to the remote's commit did not apply");
+      const next = await store({ ok: true, tree: target.stdout });
+      if (next) say(task.id, `Finish (run by Agetor): origin/${task.branch} already holds this change as ${action.commit.slice(0, 8)} (same tree, e.g. GitHub's "Update branch") — taking that commit instead of pushing`, "info");
       return next ? "again" : "stop";
     }
     case "push": {
