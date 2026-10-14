@@ -22,6 +22,17 @@
  * every meter that is not scoped to one model counts. A meter whose reset
  * time has passed is ignored, so steps return to the primary harness once
  * the window resets. Steps already running are not moved.
+ *
+ * Several harnesses: the preference may be a list of such rules, for example
+ *   [{"enabled": true, "from": ["claude-code"], "harness": "claude-deepseek", "atPercent": 92},
+ *    {"enabled": true, "from": ["codex"], "harness": "claude-deepseek", "model": "opus-5.5", "atPercent": 92}]
+ * The first enabled rule that covers a harness applies to it.
+ *
+ * A backup of another kind (Codex steps on a Claude Code harness) is used only
+ * when its rule names `"model"`, the backup's model for those steps: the
+ * profile's own model belongs to the other provider. The step keeps its
+ * effort where the backup's kind accepts it, and runs in that kind's default
+ * mode (pipeline-runner.ts `launchOnFallback`).
  */
 import { harnesses, harnessUsage, preferences } from "./db.ts";
 
@@ -38,6 +49,8 @@ export interface QuotaFallbackConfig {
   atPercent?: number;
   /** Meter ids that count toward `atPercent`; default: every unscoped meter. */
   meters?: string[];
+  /** The model to run on a backup of another kind; required for one. */
+  model?: string;
 }
 
 export function parseQuotaFallback(raw: string | null | undefined): QuotaFallbackConfig | null {
@@ -49,10 +62,47 @@ export function parseQuotaFallback(raw: string | null | undefined): QuotaFallbac
     if (v.enabled !== true || !harness || from.length === 0) return null;
     const atPercent = typeof v.atPercent === "number" && v.atPercent >= 1 && v.atPercent <= 100 ? v.atPercent : undefined;
     const meters = Array.isArray(v.meters) ? v.meters.filter((s: unknown): s is string => typeof s === "string" && !!s.trim()) : [];
-    return { enabled: true, from, harness, ...(atPercent !== undefined ? { atPercent } : {}), ...(atPercent !== undefined && meters.length ? { meters } : {}) };
+    const model = typeof v.model === "string" ? v.model.trim() : "";
+    return { enabled: true, from, harness, ...(atPercent !== undefined ? { atPercent } : {}), ...(atPercent !== undefined && meters.length ? { meters } : {}), ...(model ? { model } : {}) };
   } catch {
     return null;
   }
+}
+
+/** Every enabled rule in the preference, in order: one object or a list of them. */
+export function parseQuotaFallbackRules(raw: string | null | undefined): QuotaFallbackConfig[] {
+  let v: unknown;
+  try {
+    v = raw ? JSON.parse(raw) : null;
+  } catch {
+    return [];
+  }
+  const items = Array.isArray(v) ? v : v ? [v] : [];
+  return items.map((item) => parseQuotaFallback(JSON.stringify(item))).filter((r): r is QuotaFallbackConfig => r !== null);
+}
+
+/** What a step on a covered harness starts on instead. `model` is set only
+ *  for a backup of another kind, and replaces the profile's model there. */
+export interface QuotaFallback {
+  harness: string;
+  model: string | null;
+  rule: QuotaFallbackConfig;
+}
+
+/** The first rule covering `agent` whose backup is usable, or null: none
+ *  covers it, the backup is missing, disabled or `agent` itself, or it is of
+ *  another kind and the rule names no model for it. */
+export function quotaFallbackFor(agent: string): QuotaFallback | null {
+  const primary = harnesses.getByIdOrKind(agent);
+  if (!primary) return null;
+  for (const rule of parseQuotaFallbackRules(preferences.get(QUOTA_FALLBACK_PREF))) {
+    if (agent === rule.harness || !(rule.from.includes(agent) || rule.from.includes(primary.kind))) continue;
+    const backup = harnesses.get(rule.harness);
+    if (!backup || !backup.enabled) continue;
+    if (backup.kind === primary.kind) return { harness: backup.id, model: null, rule };
+    if (rule.model) return { harness: backup.id, model: rule.model, rule };
+  }
+  return null;
 }
 
 function readUntil(): Record<string, number> {
@@ -64,17 +114,10 @@ function readUntil(): Record<string, number> {
   }
 }
 
-/** The backup harness id for steps on `agent`, or null when none applies:
- *  not configured, `agent` is not covered, or the backup is missing, disabled,
- *  of another kind, or `agent` itself. */
+/** The backup harness id for steps on `agent`, or null when none applies
+ *  (see {@link quotaFallbackFor}). */
 export function fallbackHarnessFor(agent: string): string | null {
-  const config = parseQuotaFallback(preferences.get(QUOTA_FALLBACK_PREF));
-  if (!config || agent === config.harness) return null;
-  const primary = harnesses.getByIdOrKind(agent);
-  if (!primary || !(config.from.includes(agent) || config.from.includes(primary.kind))) return null;
-  const backup = harnesses.get(config.harness);
-  if (!backup || !backup.enabled || backup.kind !== primary.kind) return null;
-  return backup.id;
+  return quotaFallbackFor(agent)?.harness ?? null;
 }
 
 /** Remember that `agent` is at its usage limit until `resetAt`. */
@@ -89,11 +132,18 @@ export function quotaLimited(agent: string, now: number = Date.now()): boolean {
   return (readUntil()[agent] ?? 0) > now;
 }
 
+/** The first rule that lists `agent` (or its kind), usable backup or not. */
+function quotaRuleCovering(agent: string): QuotaFallbackConfig | null {
+  const kind = harnesses.getByIdOrKind(agent)?.kind;
+  return parseQuotaFallbackRules(preferences.get(QUOTA_FALLBACK_PREF))
+    .find((r) => agent !== r.harness && (r.from.includes(agent) || (!!kind && r.from.includes(kind)))) ?? null;
+}
+
 /** Whether `agent`'s latest usage snapshot shows a counted meter at or above
  *  the configured `atPercent`. False without a threshold, without a usable
  *  snapshot, or when every such meter's window has already reset. */
 export function usageAtThreshold(agent: string, now: number = Date.now()): boolean {
-  const config = parseQuotaFallback(preferences.get(QUOTA_FALLBACK_PREF));
+  const config = quotaRuleCovering(agent);
   if (!config || config.atPercent === undefined) return false;
   const snapshot = harnessUsage.get(agent);
   if (!snapshot || snapshot.status !== "ok" || !Array.isArray(snapshot.meters)) return false;
@@ -109,5 +159,11 @@ export function usageAtThreshold(agent: string, now: number = Date.now()): boole
  *  while a remembered limit lasts or usage is at the configured threshold,
  *  and a backup applies; otherwise `agent`. */
 export function harnessDuringLimit(agent: string, now: number = Date.now()): string {
-  return quotaLimited(agent, now) || usageAtThreshold(agent, now) ? (fallbackHarnessFor(agent) ?? agent) : agent;
+  return fallbackDuringLimit(agent, now)?.harness ?? agent;
+}
+
+/** The fallback a new step for `agent` should start on right now, or null
+ *  when it starts on `agent` itself. */
+export function fallbackDuringLimit(agent: string, now: number = Date.now()): QuotaFallback | null {
+  return quotaLimited(agent, now) || usageAtThreshold(agent, now) ? quotaFallbackFor(agent) : null;
 }

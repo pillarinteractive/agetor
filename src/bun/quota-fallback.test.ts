@@ -7,8 +7,8 @@ import { rmTestDataDir } from "./test-data-dir.ts";
 const dir = mkdtempSync(join(tmpdir(), "agetor-quota-fallback-"));
 process.env.AGETOR_DATA_DIR = dir;
 const { harnesses, harnessUsage, preferences } = await import("./db.ts");
-const { QUOTA_FALLBACK_PREF, QUOTA_FALLBACK_UNTIL_PREF, UNKNOWN_RESET_WINDOW_MS, fallbackHarnessFor, harnessDuringLimit, noteQuotaLimit,
-  parseQuotaFallback, quotaLimited, usageAtThreshold } = await import("./quota-fallback.ts");
+const { QUOTA_FALLBACK_PREF, QUOTA_FALLBACK_UNTIL_PREF, UNKNOWN_RESET_WINDOW_MS, fallbackDuringLimit, fallbackHarnessFor, harnessDuringLimit, noteQuotaLimit,
+  parseQuotaFallback, parseQuotaFallbackRules, quotaFallbackFor, quotaLimited, usageAtThreshold } = await import("./quota-fallback.ts");
 harnesses.insert({ id: "claude-backup", kind: "claude-code", label: "Claude via backup" });
 harnesses.insert({ id: "codex-backup", kind: "codex", label: "Codex via backup" });
 const configure = (v: unknown) => preferences.set(QUOTA_FALLBACK_PREF, JSON.stringify(v));
@@ -128,4 +128,39 @@ test("no snapshot, a failed snapshot, or no usable backup keeps the step on its 
   harnesses.setEnabled("claude-backup", false);
   expect(usageAtThreshold("claude-code", 2_000)).toBe(true);
   expect(harnessDuringLimit("claude-code", 2_000)).toBe("claude-code");
+});
+
+test("a list of rules gives each covered harness its own backup", () => {
+  configure([
+    { enabled: true, from: ["claude-code"], harness: "claude-backup" },
+    { enabled: true, from: ["codex"], harness: "codex-backup" },
+  ]);
+  expect(fallbackHarnessFor("claude-code")).toBe("claude-backup");
+  expect(fallbackHarnessFor("codex")).toBe("codex-backup");
+  expect(parseQuotaFallbackRules(JSON.stringify([{ enabled: false, harness: "x" }, "junk", { enabled: true, harness: "y" }])))
+    .toEqual([{ enabled: true, from: ["claude-code"], harness: "y" }]);
+  expect(parseQuotaFallbackRules("not json")).toEqual([]);
+});
+
+test("a backup of another kind needs the model to run there, and replaces the step's model", () => {
+  configure({ enabled: true, from: ["codex"], harness: "claude-backup" });
+  expect(quotaFallbackFor("codex")).toBeNull(); // a gpt model would reach the Claude CLI
+  configure({ enabled: true, from: ["codex"], harness: "claude-backup", model: "opus-5.5" });
+  expect(quotaFallbackFor("codex")).toMatchObject({ harness: "claude-backup", model: "opus-5.5" });
+  expect(quotaFallbackFor("claude-code")).toBeNull(); // not covered
+  configure({ enabled: true, from: ["claude-code"], harness: "claude-backup", model: "opus-5.5" });
+  expect(quotaFallbackFor("claude-code")).toMatchObject({ harness: "claude-backup", model: null }); // same kind keeps the profile's model
+});
+
+test("each rule's own atPercent decides its early switch", () => {
+  configure([
+    { enabled: true, from: ["claude-code"], harness: "claude-backup" },
+    { enabled: true, from: ["codex"], harness: "claude-backup", model: "opus-5.5", atPercent: 92 },
+  ]);
+  harnessUsage.upsert({ harnessId: "codex", kind: "codex", planType: "pro", status: "ok" as never, source: "api" as never, fetchedAtMs: 1_000,
+    meters: [{ id: "weekly", label: "Weekly", usedPercent: 93, resetsAtMs: 10_000 }], reason: null });
+  usage([{ id: "session", usedPercent: 99, resetsAtMs: 10_000 }]);
+  expect(harnessDuringLimit("claude-code", 2_000)).toBe("claude-code"); // its rule has no atPercent
+  expect(fallbackDuringLimit("codex", 2_000)).toMatchObject({ harness: "claude-backup", model: "opus-5.5" });
+  expect(fallbackDuringLimit("codex", 10_000)).toBeNull(); // the weekly window reset
 });

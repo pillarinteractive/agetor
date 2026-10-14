@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { boardHealth, boardSignal, levelOf, waitGroups, whyStopped } from "./board-health.ts";
+import { backupHarnessesInUse, boardHealth, boardSignal, levelOf, waitGroups, whyStopped } from "./board-health.ts";
 import type { PipelineBlock, Task, TaskPrStatus } from "../../shared/types.ts";
 
 const STEPS = [{ id: "build", name: "Build" }, { id: "review", name: "Review" }, { id: "finish", name: "Finish" }];
@@ -138,6 +138,15 @@ describe("boardHealth", () => {
     expect(boardHealth([], NONE, limited, at, label).fallback).toBeNull();
     const noBackup = { ...limited, quota_fallback: JSON.stringify({ enabled: false, harness: "claude-deepseek" }) };
     expect(boardHealth([], NONE, noBackup, at - 1, label).fallback!.startsWith("Claude Code at its limit until ")).toBe(true);
+    const codex = {
+      ...limited,
+      quota_fallback: JSON.stringify([
+        { enabled: true, from: ["claude-code"], harness: "claude-deepseek" },
+        { enabled: true, from: ["codex"], harness: "claude-deepseek", model: "opus-5.5" },
+      ]),
+      quota_fallback_until: JSON.stringify({ codex: at }),
+    };
+    expect(boardHealth([], NONE, codex, at - 60_000, (id) => id).fallback!.startsWith("codex at its limit → claude-deepseek until ")).toBe(true);
   });
 });
 
@@ -178,5 +187,20 @@ describe("whyStopped", () => {
   test("a retryable stop offers retry", () => {
     const [task] = card("blocked", [{ kind: "handoff-missing", message: "still no valid handoff after one reminder" }]);
     expect(whyStopped(task!)).toMatchObject({ cause: "no-handoff", action: "retry", lines: ["still no valid handoff after one reminder"] });
+  });
+});
+
+describe("backupHarnessesInUse", () => {
+  test("names a harness only while it runs a step in place of its profile's harness", () => {
+    const step = (agent: string, column: Task["column"], extra: Partial<Task> = {}) =>
+      ({ id: `${agent}-${column}`, agent, column, archivedAt: null, agentProfile: { harness: "codex" }, ...extra }) as unknown as Task;
+    const tasks = [
+      step("claude-deepseek", "running"),
+      step("codex", "running"), // on its own harness
+      step("claude-other", "review"), // finished its turn
+      step("claude-gone", "running", { archivedAt: 1 }),
+      step("claude-plain", "running", { agentProfile: null }), // no profile to differ from
+    ];
+    expect([...backupHarnessesInUse(tasks)]).toEqual(["claude-deepseek"]);
   });
 });

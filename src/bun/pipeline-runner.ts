@@ -39,7 +39,8 @@ import { isPriority, priorityFirst } from "./priority.ts";
 import { awaitsFor, listAwaits, resourceBlockedAwaits } from "./awaits.ts";
 import {HEAVY_INSTRUCTIONS,managedPillarRoot} from './heavy-jobs.ts';
 import { classifyFailure, formatRetryTime, harnessQuotaNotice, isQuotaPaused, nextRetryAt, TRANSIENT_RETRY_MAX, type FailureClass } from "./usage-limit.ts";
-import { fallbackHarnessFor, harnessDuringLimit, noteQuotaLimit } from "./quota-fallback.ts";
+import { fallbackDuringLimit, noteQuotaLimit, quotaFallbackFor, type QuotaFallback } from "./quota-fallback.ts";
+import { getDiscoveredEfforts } from "./agent-discovery.ts";
 import { listLeases } from "./lease-watch.ts";
 import { invalidatePrStatus, issueNumberForTask, ownFailures, prBase, prStatusForTask } from "./pr-watch.ts";
 import { baseBranchFor } from "./base-branch.ts";
@@ -164,6 +165,7 @@ import type {
   TaskPrStatus,
   TaskReference,
 } from "../shared/types.ts";
+import { defaultModeFor, supportedEfforts } from "../shared/types.ts";
 
 /** `dataDir/pipeline-runs/<parentId>` — where every step's handoff JSON
  *  (see D10) is written, and what `cascadePipelineDelete` removes wholesale. */
@@ -408,6 +410,24 @@ function quotaNoticeFrom(events: MainStreamEvent[]): FailureClass | null {
 /** Pause before a step restarts on its backup harness after a usage limit. */
 const QUOTA_FALLBACK_DELAY_MS = 3_000;
 
+/** A step's launch settings on its quota backup. A backup of the same kind
+ *  changes only the harness. One of another kind (Codex steps on DeepSeek
+ *  through Claude Code) runs the rule's model, keeps the step's effort where
+ *  that kind accepts it, and runs in that kind's default mode: mode ids do
+ *  not mean the same across kinds (Codex "ask" is read-only, Claude Code
+ *  "ask" prompts for every change and would stall an unattended step). */
+export function launchOnFallback(
+  fallback: QuotaFallback,
+  step: { model: string | null; effort: string | null; mode: string | null },
+): { agent: string; model: string | null; effort: string | null; mode: string | null } {
+  if (!fallback.model) return { agent: fallback.harness, ...step };
+  const kind = harnesses.get(fallback.harness)!.kind;
+  const model = fallback.model;
+  const efforts = supportedEfforts(kind, model, getDiscoveredEfforts(kind, model, fallback.harness));
+  const effort = step.effort && efforts.some((o) => o.id === step.effort) ? step.effort : defaultEffortFor(kind, model, fallback.harness);
+  return { agent: fallback.harness, model, effort, mode: defaultModeFor(kind) };
+}
+
 function scheduleAutoRetry(
   parentId: string,
   run: PipelineRunState,
@@ -438,9 +458,10 @@ function scheduleAutoRetry(
     const limited = tasks.get(run.active.find((a) => a.stepId === stepId)?.taskId ?? "");
     if (limited) {
       noteQuotaLimit(limited.agent, failure?.resetAt ?? null, now);
-      const backup = fallbackHarnessFor(limited.agent);
-      if (backup) {
-        tasks.update(limited.id, { agent: backup });
+      const fallback = quotaFallbackFor(limited.agent);
+      if (fallback) {
+        const backup = fallback.harness;
+        tasks.update(limited.id, launchOnFallback(fallback, limited));
         const at = now + QUOTA_FALLBACK_DELAY_MS;
         run.autoRetry = { stepId, kind, attempt: 1, at, reason };
         recordActivity(parentId, {
@@ -3378,14 +3399,19 @@ async function launchStep(
   }
 
   const now = Date.now();
+  const effort = profile.effort ?? defaultEffortFor(profile.harnessKind, profile.model, profile.harness);
+  // While the profile's harness is at a known usage limit, start on its
+  // configured backup (quota-fallback.ts); otherwise this is the profile's.
+  const fallback = fallbackDuringLimit(profile.harness);
+  const launch = fallback
+    ? launchOnFallback(fallback, { model: profile.model, effort, mode: profile.mode })
+    : { agent: profile.harness, model: profile.model, effort, mode: profile.mode };
   tasks.insert({
     id: childId,
     title: `${run.pipelineName} · ${step.name}`,
     prompt: composed,
     column: "ready",
-    // While the profile's harness is at a known usage limit, start on its
-    // configured backup (quota-fallback.ts); otherwise this is the profile's.
-    agent: harnessDuringLimit(profile.harness),
+    agent: launch.agent,
     workdir: parent.workdir,
     isolation: parent.isolation,
     taskType: parent.taskType,
@@ -3395,9 +3421,9 @@ async function launchStep(
     baseRef: parent.baseRef,
     prUrl: null,
     issueUrl: null,
-    mode: profile.mode,
-    model: profile.model,
-    effort: profile.effort ?? defaultEffortFor(profile.harnessKind, profile.model, profile.harness),
+    mode: launch.mode,
+    model: launch.model,
+    effort: launch.effort,
     fast: profile.fast,
     maxMode: profile.maxMode,
     agentProfileId: profile.id,

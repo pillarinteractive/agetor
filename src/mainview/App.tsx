@@ -38,6 +38,7 @@ import { Button } from "@/components/ui/button";
 import { boardColumnOf, clampFontSizePercent, COLUMNS, USAGE_SUPPORTED_KINDS, type AgentStatus, type ColumnId, type GlobalEvent, type Harness, type HarnessQuota, type LeaseStatus, type Project, type TaskPrStatus, type TaskProgress, type Task } from "../shared/types.ts";
 import { parseIssueUrl } from "../shared/issue-task.ts";
 import { isPipelineColumnRunnerOwned } from "../shared/pipeline.ts";
+import { backupHarnessesInUse } from "@/lib/board-health";
 import { LeaseContext } from "@/lib/leases";
 import { PrContext } from "@/lib/prs";
 import { ProgressContext, RoadmapCardsContext } from "@/lib/progress";
@@ -1494,6 +1495,8 @@ function AppInner() {
     () => tasks.filter((t) => t.pipelineParentId == null),
     [tasks],
   );
+  // Harnesses standing in for one at its usage limit; their top-bar dot blinks.
+  const backupInUse = useMemo(() => backupHarnessesInUse(tasks), [tasks]);
 
   // The top bar's search box and its View menu (active / all / archived).
   const visibleTasks = useMemo(() => {
@@ -2328,6 +2331,8 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
           <div className="electrobun-webkit-app-region-no-drag flex items-center gap-2 text-xs text-muted-foreground">
             {visibleTopbarAgents(agents, harnesses).map((a) => {
               const harness = harnesses.find((h) => h.id === a.harnessId);
+              // A quota backup running a step blinks (board-health.ts).
+              const standingIn = a.available && backupInUse.has(a.harnessId);
               const displayName = harness?.label ?? a.harnessId;
               const q = usage[a.harnessId];
               const loggedOut = a.available && a.loggedIn === false;
@@ -2335,7 +2340,8 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
                 <span
                   className={
                     "inline-block size-1.5 rounded-full " +
-                    (!a.available ? "bg-danger-solid" : loggedOut ? "bg-warning-solid" : "bg-success-solid")
+                    (!a.available ? "bg-danger-solid" : loggedOut ? "bg-warning-solid" : "bg-success-solid") +
+                    (standingIn ? " animate-pulse" : "")
                   }
                 />
               );
@@ -2351,7 +2357,7 @@ const runTaskMenuAction = useCallback((action: TaskMenuAction, snapshot: Task) =
               const chip = (
                 <span
                   className="flex items-center gap-1"
-                  title={loggedOut ? (a.authHelp ?? "Not logged in") : (a.reason ?? a.path ?? "")}
+                  title={loggedOut ? (a.authHelp ?? "Not logged in") : standingIn ? "Running steps in place of a harness at its usage limit" : (a.reason ?? a.path ?? "")}
                 >
                   <AgentIcon kind={a.kind} className="size-3" />
                   {displayName}

@@ -209,13 +209,17 @@ export function boardHealth(
   const queuedWhy = [...reasons.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
 
   const base = groups.find((g) => g.cause === "base")?.cards[0];
-  const fallbackConfig = parse<{ enabled?: boolean; harness?: string }>(preferences.quota_fallback, {});
+  // One rule or a list of them (quota-fallback.ts); a rule's `from` defaults to claude-code.
+  const rules = parse<unknown>(preferences.quota_fallback, null);
+  const fallbackRules = (Array.isArray(rules) ? rules : rules ? [rules] : []) as { enabled?: boolean; harness?: string; from?: string[] }[];
   const until = parse<Record<string, number>>(preferences.quota_fallback_until, {});
   const limited = Object.entries(until).filter(([, at]) => typeof at === "number" && at > now).sort((a, b) => b[1] - a[1])[0];
   let fallback: string | null = null;
   if (limited) {
     const when = new Date(limited[1]).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-    const to = fallbackConfig.enabled && fallbackConfig.harness && fallbackConfig.harness !== limited[0] ? ` → ${harnessLabel(fallbackConfig.harness)}` : "";
+    const rule = fallbackRules.find((r) => r && r.enabled === true && r.harness && r.harness !== limited[0]
+      && (Array.isArray(r.from) ? r.from : ["claude-code"]).includes(limited[0]));
+    const to = rule ? ` → ${harnessLabel(rule.harness!)}` : "";
     fallback = `${harnessLabel(limited[0])} at its limit${to} until ${when}`;
   }
   return {
@@ -229,4 +233,16 @@ export function boardHealth(
     fallback,
     needsYou: count("you"),
   };
+}
+
+/** Harnesses running a step in place of its profile's own harness right now,
+ *  that is, a quota backup in use (quota-fallback.ts). The top bar blinks
+ *  their dot. */
+export function backupHarnessesInUse(tasks: readonly Task[]): Set<string> {
+  const inUse = new Set<string>();
+  for (const task of tasks) {
+    if (task.archivedAt != null || task.column !== "running" || !task.agentProfile) continue;
+    if (task.agent !== task.agentProfile.harness) inUse.add(task.agent);
+  }
+  return inUse;
 }
