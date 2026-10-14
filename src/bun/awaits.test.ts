@@ -140,3 +140,165 @@ test("the helper runs the command detached and records its exit code", async () 
   const [a] = listAwaits(awaits);
   expect(a).toMatchObject({ label: "quick", finished: true, exitCode: 3 });
 });
+
+// ── Deadlines (no sleeps: time is the `now` argument, liveness a set) ─────
+
+import { existsSync, readFileSync } from "node:fs";
+import {
+  AWAIT_KILL_GRACE_MS,
+  awaitLimitMs,
+  ciWaitTimeoutMinutes,
+  enforceAwaitDeadlines,
+  parseAwaitMaxMinutes,
+  resetAwaitCacheForTests,
+} from "./awaits.ts";
+
+const MIN = 60_000;
+const parked = (wt: string) =>
+  [
+    {
+      id: "p",
+      archivedAt: null,
+      worktreePath: wt,
+      pipelineRun: {
+        blocked: [{ taskId: "s1", stepId: "review", kind: "await", message: "" }],
+        history: [{ taskId: "s1", stepId: "review", seq: 1, startedAt: 1_000_000 }],
+        active: [{ taskId: "s1", stepId: "review", seq: 1 }],
+      },
+    },
+  ] as unknown as Task[];
+
+test("deadline: 2 h by default, the preference, --max from the record; capped at 12 h", () => {
+  expect(parseAwaitMaxMinutes(null)).toBe(120);
+  expect(parseAwaitMaxMinutes("240")).toBe(240);
+  expect(parseAwaitMaxMinutes('{"minutes": 30}')).toBe(30);
+  expect(parseAwaitMaxMinutes("0")).toBe(120);
+  expect(parseAwaitMaxMinutes("soon")).toBe(120);
+  expect(parseAwaitMaxMinutes("5000")).toBe(720);
+  const cmd = "python3 poll.py ";
+  expect(awaitLimitMs({ cmd, maxSeconds: null })).toBe(120 * MIN);
+  expect(awaitLimitMs({ cmd, maxSeconds: null }, 45)).toBe(45 * MIN);
+  expect(awaitLimitMs({ cmd, maxSeconds: 4 * 3600 }, 45)).toBe(240 * MIN);
+  expect(awaitLimitMs({ cmd, maxSeconds: 20 * 3600 })).toBe(720 * MIN);
+
+  // Written into the record on first sight.
+  const root = mkdtempSync(path.join(tmpdir(), "awaits-"));
+  record(root, "d", { cwd: "/w", started: 1000, pid: 4242 });
+  writeFileSync(path.join(root, "d", "max"), String(4 * 3600)); // as `--max 4h` leaves it
+  resetAwaitCacheForTests();
+  const live = (pid: number | null) => pid === 4242;
+  enforceAwaitDeadlines(listAwaits(root, live), 1_000_000, { prefMinutes: 30, kill: () => {} }, live);
+  expect(Number(readFileSync(path.join(root, "d", "deadline"), "utf8"))).toBe(1000 + 4 * 3600);
+});
+
+test("deadline: a ci-wait is never cut shorter than its own --timeout", () => {
+  expect(ciWaitTimeoutMinutes("/Users/x/.agetor/bin/ci-wait --timeout 240 ")).toBe(240);
+  expect(ciWaitTimeoutMinutes("ci-wait ")).toBe(90);
+  expect(ciWaitTimeoutMinutes("make test ")).toBeNull();
+  expect(awaitLimitMs({ cmd: "/Users/x/.agetor/bin/ci-wait --timeout 240 ", maxSeconds: null })).toBe(255 * MIN);
+  expect(awaitLimitMs({ cmd: "ci-wait --timeout 240 ", maxSeconds: 3600 })).toBe(255 * MIN);
+  expect(awaitLimitMs({ cmd: "ci-wait --timeout 900 ", maxSeconds: null })).toBe(915 * MIN); // its floor is not capped
+  expect(awaitLimitMs({ cmd: "ci-wait ", maxSeconds: null })).toBe(120 * MIN);
+  expect(awaitLimitMs({ cmd: "ci-wait ", maxSeconds: null }, 600)).toBe(600 * MIN);
+});
+
+test("expiry: SIGTERM at the deadline, SIGKILL a grace later, exit 124, the step woken once", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "awaits-"));
+  const wt = mkdtempSync(path.join(tmpdir(), "wt-"));
+  record(root, "h", { cwd: wt, started: 1000, pid: 4242, log: "waiting for results.json\n" });
+  resetAwaitCacheForTests();
+  const pids = new Set([4242]);
+  const live = (pid: number | null) => pid != null && pids.has(pid);
+  const kills: string[] = [];
+  const notes: string[] = [];
+  const deps = { prefMinutes: 120, kill: (pid: number, sig: string) => void kills.push(`${pid}:${sig}`), note: (_: unknown, t: string) => void notes.push(t) };
+  const t0 = 1000 * 1000;
+  const pass = (now: number) => enforceAwaitDeadlines(listAwaits(root, live), now, deps, live);
+
+  pass(t0 + 119 * MIN);
+  expect(kills).toEqual([]);
+  expect(readyToWake(parked(wt), listAwaits(root, live))).toEqual([]);
+  const due = t0 + 120 * MIN;
+  pass(due);
+  expect(kills).toEqual(["4242:SIGTERM"]);
+  expect(notes).toEqual(['"run h" ran past its limit of 2.0 h — stopped it (exit 124); the step will be woken with its last lines']);
+  pass(due + 15_000); // one tick later, inside the grace
+  expect(kills).toEqual(["4242:SIGTERM"]);
+  expect(readyToWake(parked(wt), listAwaits(root, live))).toEqual([]); // still running
+  pass(due + AWAIT_KILL_GRACE_MS);
+  expect(kills).toEqual(["4242:SIGTERM", "4242:SIGKILL"]);
+  pids.delete(4242); // gone
+  pass(due + AWAIT_KILL_GRACE_MS + 15_000);
+  expect(readFileSync(path.join(root, "h", "exit"), "utf8")).toBe("124");
+  const [a] = listAwaits(root, live);
+  expect(a).toMatchObject({ finished: true, exitCode: 124, timedOutAt: due, deadlineAt: due });
+  expect(readyToWake(parked(wt), listAwaits(root, live)).map((w) => w.done.map((x) => x.id))).toEqual([["h"]]);
+  const msg = awaitResultMessage([a!]);
+  expect(msg).toContain('"run h" was stopped by Agetor after 2.0 h: it ran past its limit of 2.0 h (exit 124, like timeout(1))');
+  expect(msg).toContain("waiting for results.json");
+  // Told once; nothing more to do for it.
+  writeFileSync(path.join(root, "h", "notified"), "1");
+  expect(readyToWake(parked(wt), listAwaits(root, live))).toEqual([]);
+  expect(pass(due + 60 * MIN)).toEqual([]);
+  expect(kills).toHaveLength(2);
+  expect(notes).toHaveLength(1);
+});
+
+test("restart: the stored deadline holds, and an await already past it is stopped on the first pass", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "awaits-"));
+  record(root, "r", { cwd: "/w", started: 1000, pid: 4242 });
+  resetAwaitCacheForTests();
+  const live = (pid: number | null) => pid === 4242;
+  const kills: string[] = [];
+  const kill = (pid: number, sig: string) => void kills.push(sig);
+  enforceAwaitDeadlines(listAwaits(root, live), 1000 * 1000 + MIN, { prefMinutes: 120, kill }, live);
+  expect(existsSync(path.join(root, "r", "deadline"))).toBe(true);
+  // The core restarts (nothing cached) with a longer preference, 25 h later:
+  // the deadline recorded at the start still applies.
+  resetAwaitCacheForTests();
+  enforceAwaitDeadlines(listAwaits(root, live), 1000 * 1000 + 25 * 60 * MIN, { prefMinutes: 600, kill }, live);
+  expect(kills).toEqual(["SIGTERM"]);
+  // Restarted again inside the grace: the stop resumes (SIGKILL), not repeated.
+  resetAwaitCacheForTests();
+  enforceAwaitDeadlines(listAwaits(root, live), 1000 * 1000 + 25 * 60 * MIN + AWAIT_KILL_GRACE_MS, { prefMinutes: 600, kill }, live);
+  expect(kills).toEqual(["SIGTERM", "SIGKILL"]);
+});
+
+test("a process gone with no exit record gets one at once and wakes its step", () => {
+  const root = mkdtempSync(path.join(tmpdir(), "awaits-"));
+  const wt = mkdtempSync(path.join(tmpdir(), "wt-"));
+  record(root, "g", { cwd: wt, started: 1000, pid: 4243 });
+  resetAwaitCacheForTests();
+  const dead = () => false;
+  const kills: string[] = [];
+  const changed = enforceAwaitDeadlines(listAwaits(root, dead), 1000 * 1000 + MIN, { kill: (_p, s) => void kills.push(s) }, dead);
+  expect(changed.map((a) => a.id)).toEqual(["g"]);
+  expect(kills).toEqual([]);
+  expect(readFileSync(path.join(root, "g", "exit"), "utf8")).toBe("lost");
+  const all = listAwaits(root, dead);
+  expect(all[0]).toMatchObject({ finished: true, exitCode: null, timedOutAt: null });
+  expect(readyToWake(parked(wt), all).map((w) => w.stepTaskId)).toEqual(["s1"]);
+  expect(awaitResultMessage(all)).toContain("stopped without an exit code");
+  // Recorded once.
+  expect(enforceAwaitDeadlines(listAwaits(root, dead), 1000 * 1000 + 2 * MIN, {}, dead)).toEqual([]);
+});
+
+test("the helper records --max (4h, minutes, capped at 12h) and refuses a bad one", () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "await-bin-"));
+  const awaits = path.join(dir, "awaits");
+  const bin = path.join(dir, "agetor-await");
+  writeFileSync(bin, AWAIT_SCRIPT.replace(/d="[^"]*\/\$id"/, `d="${awaits}/$id"`), { mode: 0o755 });
+  const run = (...args: string[]) => Bun.spawnSync([bin, ...args], { cwd: dir });
+  const maxOf = (out: string) => {
+    const d = /log: (.*)\/log/.exec(out)![1]!;
+    return existsSync(path.join(d, "max")) ? readFileSync(path.join(d, "max"), "utf8") : null;
+  };
+  expect(maxOf(run("--max", "4h", "a", "--", "true").stdout.toString())).toBe("14400");
+  expect(maxOf(run("--max=90", "b", "--", "true").stdout.toString())).toBe("5400");
+  expect(maxOf(run("--max", "030m", "b", "--", "true").stdout.toString())).toBe("1800");
+  const capped = run("--max", "13h", "c", "--", "true");
+  expect(maxOf(capped.stdout.toString())).toBe("43200");
+  expect(capped.stderr.toString()).toContain("capped at 12h");
+  expect(maxOf(run("d", "--", "true").stdout.toString())).toBeNull();
+  for (const bad of ["4x", "0", "h", ""]) expect(run("--max", bad, "e", "--", "true").exitCode).toBe(2);
+});

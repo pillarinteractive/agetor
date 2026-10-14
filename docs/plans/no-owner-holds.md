@@ -140,3 +140,12 @@ block rate stays measurable. Velocity counts none of it as "Held for you"; that 
 The step cap extends once then wraps up through Finish and files issues (and then restarts once from the base, above); Agetor merges a moved base when clean with
 unchanged patch-id and carries approval over; edited instructions reach unfinished runs; publication is verified in
 GitHub CI only; usage-limit handling; the merge queue's fresh rule. Nothing here merges or approves anything.
+
+## Awaits end
+
+A step parked on its own `agetor-await` waits for nobody but the command; a command that never ends held the card
+"active" for 25 hours (2026-10-14). Every await now has a deadline: `--max` on the command (at most 12 h), else
+`await_max_minutes` (default 120); a `ci-wait` at least its own `--timeout` + 15 min. Past it Agetor stops the
+process group (SIGTERM, SIGKILL 30 s later, on the watcher's tick), records exit 124 and wakes the same step with the
+log's tail, once. A record whose process is gone with no exit code is closed and woken at once. The deadline is
+stored in the record, so a core restart keeps it. See FORK.md, "An await has a deadline".

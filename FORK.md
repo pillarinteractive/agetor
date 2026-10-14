@@ -1844,3 +1844,29 @@ sees instead is GitHub issues labelled `agetor-owner-decision`, not parked cards
   closed-out card reads as a Dependency naming its issue. Every action writes an activity line that starts with
   "Resolving without you: " — the velocity ledger reads it as time that is not the owner's, and the roadmap pass
   observes such cards as `waiting`. The amber "Needs you" state stays for manual runs and pending questions on them.
+
+### An await has a deadline (`feat/await-limit-loop-guard`)
+
+Seen 2026-10-14: a Review started `agetor-await` on a loop that polled the log of a test run that had died; the step
+read "active" for 25 hours and nothing woke it. Now every await has a deadline (`src/bun/awaits.ts`,
+`enforceAwaitDeadlines`, run at the start of every watcher tick):
+
+- **How long**: `agetor-await --max 4h "<label>" -- <cmd>` (`30m`, `4h`, a bare number is minutes; at most `12h`,
+  more is capped with a note, a bad value exits 2), else the preference **`await_max_minutes`** (a number of minutes,
+  bare or `{"minutes": N}`; default **120**, at most 720). The helper writes `--max` to the record's `max` file; the
+  watcher writes `deadline` (epoch seconds) the first time it sees the record, so a later preference change or a
+  core restart never moves it.
+- **ci-wait** gives up by itself at its own `--timeout` (Finish passes 240; 90 when absent). Its await lasts at least
+  that **plus 15 minutes**, read from the command (`ciWaitTimeoutMinutes`), and this floor is not capped: Agetor
+  only ever stops a ci-wait that hung past its own timeout.
+- **Past the deadline**: the watcher writes `timed-out`, sends SIGTERM to the await's process group (the helper
+  starts it under `setsid`), and SIGKILL once 30 s (`AWAIT_KILL_GRACE_MS`) have passed — both on its 15 s tick,
+  never a sleep. When the process is gone it writes `exit` = 124 (as `timeout(1)`), and the step is woken through
+  the ordinary path, exactly once (`notified`): "… was stopped by Agetor after N min: it ran past its limit of M min
+  (exit 124, like timeout(1))", advice not to restart the same wait unchanged, and the log's last 60 lines. One
+  activity line when it is stopped; the wake-up line reads "timed out after N min".
+- **Restart**: everything is in the record's files; the first tick after boot stops an expired await, or resumes a
+  stop in progress (SIGKILL), without repeating it.
+- **Gone with no exit record** (a crash, a reboot): the watcher writes `exit` = `lost` at once and the step is woken
+  ("stopped without an exit code") as before, now with the record closed.
+- Awaits already running when this ships get the default deadline from their start time.

@@ -17,11 +17,19 @@
  * `label`, `cwd` (the checkout it ran in), `cmd`, `started` (epoch seconds),
  * `pid`, `log`, then `exit` once it finished and `notified` once a step was
  * told — so the shell helper needs no JSON and a restart loses nothing.
+ *
+ * Every await has a deadline (`deadline`, epoch seconds, written by the
+ * watcher on first sight, so a restart keeps it): `--max` on the command,
+ * else the `await_max_minutes` preference, else 2 h; at most 12 h. A
+ * `ci-wait` is never cut shorter than its own `--timeout` plus 15 min. Past
+ * it the watcher stops the process group (SIGTERM, then SIGKILL a grace
+ * later, both on its tick), writes `timed-out` and `exit` 124 like
+ * timeout(1), and the step is woken as for any finished await.
  */
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type { PipelineRunState, Task } from "../shared/types.ts";
-import { dataDir, runs, tasks } from "./db.ts";
+import { dataDir, preferences, runs, tasks } from "./db.ts";
 import { recordActivity } from "./activity.ts";
 import { isTaskRunLive, sendInput } from "./orchestrator.ts";
 import { currentSlots, slotDecision, slotUse } from "./step-slots.ts";
@@ -37,13 +45,87 @@ const TAIL_LINES = 60;
 /** Finished, told awaits are swept after this long. */
 const KEEP_MS = 3 * 24 * 3600_000;
 
+// ── The deadline ─────────────────────────────────────────────────────────
+/** Preference: minutes an await may run when its command gives no `--max`. */
+export const AWAIT_MAX_PREF = "await_max_minutes";
+export const AWAIT_DEFAULT_MAX_MIN = 120;
+/** No `--max` or preference goes past this. */
+export const AWAIT_CAP_MIN = 12 * 60;
+/** `ci-wait` gives up by itself at its `--timeout` (90 min when not given);
+ *  its await lasts at least that plus this margin, so Agetor never cuts it
+ *  short and only stops a ci-wait that hung past its own timeout. */
+export const CI_WAIT_DEFAULT_TIMEOUT_MIN = 90;
+export const CI_WAIT_MARGIN_MIN = 15;
+/** Between SIGTERM and SIGKILL. Checked on the tick, never slept. */
+export const AWAIT_KILL_GRACE_MS = 30_000;
+/** The exit code an await that ran out of time records, like timeout(1). */
+export const AWAIT_TIMEOUT_EXIT = 124;
+
+/** `await_max_minutes`: a positive number of minutes, bare or JSON
+ *  (`120`, `"240"`, `{"minutes": 240}`), at most 12 h. Anything else is
+ *  the default, 120. */
+export function parseAwaitMaxMinutes(raw: string | null | undefined): number {
+  let v: unknown = raw ?? null;
+  if (typeof v === "string") {
+    const str = v.trim();
+    try {
+      v = JSON.parse(str);
+    } catch {
+      v = str;
+    }
+  }
+  if (v && typeof v === "object" && !Array.isArray(v)) v = (v as Record<string, unknown>).minutes;
+  const n = typeof v === "number" ? v : typeof v === "string" && /^\d+(\.\d+)?$/.test(v) ? Number(v) : NaN;
+  return Number.isFinite(n) && n > 0 ? Math.min(n, AWAIT_CAP_MIN) : AWAIT_DEFAULT_MAX_MIN;
+}
+
+/** The minutes a `ci-wait` command gives itself, or null when the await is
+ *  not a ci-wait. */
+export function ciWaitTimeoutMinutes(cmd: string): number | null {
+  if (!/(^|[\s/])ci-wait(\s|$)/.test(cmd)) return null;
+  const m = /(?:^|\s)--timeout(?:=|\s+)(\d+)(?=\s|$)/.exec(cmd);
+  const n = m ? Number(m[1]) : CI_WAIT_DEFAULT_TIMEOUT_MIN;
+  return Number.isFinite(n) && n > 0 ? n : CI_WAIT_DEFAULT_TIMEOUT_MIN;
+}
+
+/** How long an await may run: its `--max` (seconds in the record), else the
+ *  preference; capped at 12 h; a ci-wait at least its own timeout + 15 min
+ *  (that floor is not capped: ci-wait ends itself at its timeout). */
+export function awaitLimitMs(a: Pick<AwaitRecord, "cmd" | "maxSeconds">, prefMinutes = AWAIT_DEFAULT_MAX_MIN): number {
+  const cap = AWAIT_CAP_MIN * 60_000;
+  const own = Math.min(a.maxSeconds != null && a.maxSeconds > 0 ? a.maxSeconds * 1000 : prefMinutes * 60_000, cap);
+  const ci = ciWaitTimeoutMinutes(a.cmd);
+  return ci == null ? own : Math.max(own, (ci + CI_WAIT_MARGIN_MIN) * 60_000);
+}
+
 /** The helper agents call. Plain sh + perl (for setsid), both on every Mac. */
 export const AWAIT_SCRIPT = `#!/bin/sh
-# agetor-await <label> -- <command> [args...]
+# agetor-await [--max DURATION] <label> -- <command> [args...]
 # Runs a long command detached and returns at once. End your turn after it:
 # Agetor messages you with the exit code and the log's tail when it finishes.
-# (Installed by Agetor — src/bun/awaits.ts; edits are overwritten.)
-[ $# -ge 2 ] || { echo "usage: agetor-await <label> -- <command> [args...]" >&2; exit 2; }
+# DURATION (30m, 4h, 90 = minutes; at most 12h) bounds the command: past it
+# Agetor stops it and wakes you with exit 124. Default: the await_max_minutes
+# preference, 2 h. (Installed by Agetor — src/bun/awaits.ts; edits are overwritten.)
+usage() { echo "usage: agetor-await [--max 30m|4h] <label> -- <command> [args...]" >&2; exit 2; }
+max= given=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --max) [ $# -ge 2 ] || usage; max=$2; given=1; shift 2 ;;
+    --max=*) max=\${1#--max=}; given=1; shift ;;
+    *) break ;;
+  esac
+done
+[ $# -ge 2 ] || usage
+secs=
+if [ -n "$given" ]; then
+  num=\${max%[smh]}; unit=\${max#"$num"}
+  case "$num" in ''|*[!0-9]*) echo "agetor-await: --max $max: use minutes (90), 30m or 4h" >&2; exit 2 ;; esac
+  num=$(printf '%s' "$num" | sed 's/^0*//'); [ -n "$num" ] || num=0
+  [ \${#num} -le 6 ] || num=999999
+  case "$unit" in s) secs=$num ;; h) secs=$((num * 3600)) ;; *) secs=$((num * 60)) ;; esac
+  [ "$secs" -gt 0 ] || { echo "agetor-await: --max must be more than zero" >&2; exit 2; }
+  [ "$secs" -le 43200 ] || { echo "agetor-await: --max $max is over 12h; capped at 12h" >&2; secs=43200; }
+fi
 label=$1; shift
 [ "$1" = "--" ] && shift
 [ $# -ge 1 ] || { echo "agetor-await: no command given" >&2; exit 2; }
@@ -54,6 +136,7 @@ mkdir -p "$d" || exit 1
 printf '%s' "$label" > "$d/label"
 printf '%s' "$root" > "$d/cwd"
 printf '%s ' "$@" > "$d/cmd"
+[ -n "$secs" ] && printf '%s' "$secs" > "$d/max"
 date +%s > "$d/started"
 perl -MPOSIX -e 'POSIX::setsid(); exec @ARGV' /bin/sh -c 'AGETOR_AWAIT_RECORD="$0" "$@" > "$0/log" 2>&1; echo $? > "$0/exit.tmp"; mv "$0/exit.tmp" "$0/exit"' "$d" "$@" </dev/null >/dev/null 2>&1 &
 echo $! > "$d/pid"
@@ -88,6 +171,12 @@ export interface AwaitRecord {
   finished: boolean;
   notified: boolean;
   resourceState?: 'waiting'|'running'|'finished';
+  /** `--max` given to the helper, in seconds; null when not given. */
+  maxSeconds?: number | null;
+  /** When the watcher stops it (epoch ms); null until the watcher first saw it. */
+  deadlineAt?: number | null;
+  /** When the watcher began stopping it for running past its deadline (epoch ms). */
+  timedOutAt?: number | null;
 }
 
 const read = (f: string): string | null => {
@@ -98,7 +187,7 @@ const read = (f: string): string | null => {
   }
 };
 
-function alive(pid: number | null): boolean {
+export function alive(pid: number | null): boolean {
   if (!pid) return false;
   try {
     process.kill(pid, 0);
@@ -123,10 +212,19 @@ interface CachedAwait {
   started: number;
   pid: number | null;
   exit: string | null;
+  maxSeconds: number | null;
+  /** undefined: not read yet; null: no file (re-read while no exit code). */
+  deadline: number | null | undefined;
+  timedOut: number | null | undefined;
 }
 const awaitCache = new Map<string, CachedAwait>();
 
-export function listAwaits(root = AWAITS_DIR): AwaitRecord[] {
+/** Forget what listAwaits cached, as a new core process starts with nothing. */
+export function resetAwaitCacheForTests(): void {
+  awaitCache.clear();
+}
+
+export function listAwaits(root = AWAITS_DIR, isAlive: (pid: number | null) => boolean = alive): AwaitRecord[] {
   let ids: string[];
   try {
     ids = readdirSync(root);
@@ -160,16 +258,24 @@ export function listAwaits(root = AWAITS_DIR): AwaitRecord[] {
         started,
         pid: null,
         exit: null,
+        maxSeconds: Number(read(path.join(dir, "max"))) || null, // written before `started`
+        deadline: undefined,
+        timedOut: undefined,
       };
       awaitCache.set(dir, c);
     }
     seen.add(dir);
     if (c.pid == null) c.pid = Number(read(path.join(dir, "pid"))) || null;
+    // `deadline` and `timed-out` are written by the watcher before it writes
+    // `exit`: read once a record has finished, and while it has not.
+    if (c.deadline === undefined || (c.deadline === null && !c.exit)) c.deadline = Number(read(path.join(dir, "deadline"))) || null;
+    if (c.timedOut === undefined || (c.timedOut === null && !c.exit)) c.timedOut = Number(read(path.join(dir, "timed-out"))) || null;
     if (!c.exit) c.exit = read(path.join(dir, "exit")); // an empty exit file is re-read until it has the code
     const { pid, exit } = c;
     // No exit file and the process is gone: it was killed (or the machine
     // restarted) — finished, outcome unknown.
-    const finished = exit != null || (pid != null && !alive(pid));
+    const finished = exit != null || (pid != null && !isAlive(pid));
+    const code = exit != null && exit !== "" && Number.isFinite(Number(exit)) ? Number(exit) : null;
     out.push({
       id,
       dir,
@@ -178,9 +284,12 @@ export function listAwaits(root = AWAITS_DIR): AwaitRecord[] {
       cmd: c.cmd,
       startedAt: c.started * 1000,
       pid,
-      exitCode: exit != null && exit !== "" && Number.isFinite(Number(exit)) ? Number(exit) : null,
+      exitCode: c.timedOut != null && finished ? AWAIT_TIMEOUT_EXIT : code,
       finished,
       notified: existsSync(path.join(dir, "notified")),
+      maxSeconds: c.maxSeconds,
+      deadlineAt: c.deadline != null ? c.deadline * 1000 : null,
+      timedOutAt: c.timedOut,
       ...(()=>{const phase=read(path.join(dir,'resource-state'))??read(path.join(dir,'phase'));return phase==='executing'?{resourceState:'running' as const}:['waiting','running','finished'].includes(phase??'')?{resourceState:phase as AwaitRecord['resourceState']}:{};})(),
     });
   }
@@ -218,7 +327,10 @@ function minutes(ms: number): string {
 /** The message that wakes the step. Exported for tests. */
 export function awaitResultMessage(done: AwaitRecord[], now = Date.now()): string {
   const parts = done.map((a) => {
-    const outcome = a.exitCode == null ? "stopped without an exit code (killed, or the machine restarted)" : a.exitCode === 0 ? "exited 0 (success)" : `exited ${a.exitCode} (failure)`;
+    const limit = a.deadlineAt != null ? a.deadlineAt - a.startedAt : null;
+    const outcome = a.timedOutAt != null
+      ? `was stopped by Agetor after ${minutes((a.timedOutAt ?? now) - a.startedAt)}: it ran past its limit${limit != null ? ` of ${minutes(limit)}` : ""} (exit ${AWAIT_TIMEOUT_EXIT}, like timeout(1))`
+      : a.exitCode == null ? "stopped without an exit code (killed, or the machine restarted)" : a.exitCode === 0 ? "exited 0 (success)" : `exited ${a.exitCode} (failure)`;
     const log = path.join(a.dir, "log");
     const ended = (() => {
       try {
@@ -228,7 +340,10 @@ export function awaitResultMessage(done: AwaitRecord[], now = Date.now()): strin
       }
     })();
     return [
-      `"${a.label}" ${outcome} after ${minutes(ended - a.startedAt)}.`,
+      a.timedOutAt != null ? `"${a.label}" ${outcome}.` : `"${a.label}" ${outcome} after ${minutes(ended - a.startedAt)}.`,
+      ...(a.timedOutAt != null
+        ? ["Do not start the same wait again unchanged: read the log for why it never ended (a process it watched may have died). If the work really needs longer, rerun it with `agetor-await --max 4h …` (at most 12h)."]
+        : []),
       `Command: ${a.cmd.trim()}`,
       `Full log: ${log}`,
       `Last ${TAIL_LINES} lines:`,
@@ -373,13 +488,96 @@ export function readyToWake(
   return out;
 }
 
+export interface DeadlineDeps {
+  /** Minutes an await gets with no `--max` (the preference). */
+  prefMinutes?: number;
+  /** Signals a process group; tests record the calls. */
+  kill?: (pid: number, signal: "SIGTERM" | "SIGKILL") => void;
+  /** Activity line for the card working in `cwd` (none when no card is). */
+  note?: (a: AwaitRecord, text: string) => void;
+}
+
+function killGroup(pid: number, signal: "SIGTERM" | "SIGKILL"): void {
+  // The helper starts the command under setsid: its pid leads the group.
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    try {
+      process.kill(pid, signal);
+    } catch {
+      // gone already
+    }
+  }
+}
+
+/**
+ * Hold every unfinished await to its deadline. One pass, driven by the
+ * watcher's tick (no sleeps), so a restart simply resumes here:
+ *  - first sight: write `deadline` (epoch s) from `--max` / the preference;
+ *  - past it, still running: write `timed-out` and SIGTERM its group;
+ *  - still running a grace later: SIGKILL;
+ *  - gone with no `exit`: write `exit` (124 when it timed out, else `lost`:
+ *    it died unrecorded — a crash or a reboot), so it wakes its step once
+ *    through the ordinary path.
+ * Returns the records it changed. Exported for tests.
+ */
+export function enforceAwaitDeadlines(all: AwaitRecord[], now: number, deps: DeadlineDeps = {}, isAlive: (pid: number | null) => boolean = alive): AwaitRecord[] {
+  const kill = deps.kill ?? killGroup;
+  const changed: AwaitRecord[] = [];
+  const write = (a: AwaitRecord, f: string, v: string) => {
+    try {
+      writeFileSync(path.join(a.dir, `${f}.tmp`), v);
+      renameSync(path.join(a.dir, `${f}.tmp`), path.join(a.dir, f));
+    } catch {
+      // the record was swept or is unwritable: nothing to hold
+    }
+  };
+  for (const a of all) {
+    if (a.notified || existsSync(path.join(a.dir, "exit"))) continue;
+    const running = a.pid != null && isAlive(a.pid);
+    const deadline = a.deadlineAt ?? a.startedAt + awaitLimitMs(a, deps.prefMinutes ?? AWAIT_DEFAULT_MAX_MIN);
+    if (a.deadlineAt == null) write(a, "deadline", String(Math.ceil(deadline / 1000)));
+    if (a.pid != null && !running) {
+      // Gone, nothing recorded: stopped by us, or it died by itself.
+      write(a, "exit", a.timedOutAt != null ? String(AWAIT_TIMEOUT_EXIT) : "lost");
+      changed.push(a);
+      continue;
+    }
+    if (now < deadline) continue;
+    if (a.pid == null) {
+      // The helper never recorded a pid: nothing to signal.
+      write(a, "timed-out", String(now));
+      write(a, "exit", String(AWAIT_TIMEOUT_EXIT));
+      changed.push(a);
+      continue;
+    }
+    if (a.pid === process.pid || a.pid <= 1) continue; // never this process or init
+    if (a.timedOutAt == null) {
+      write(a, "timed-out", String(now));
+      kill(a.pid, "SIGTERM");
+      deps.note?.(a, `"${a.label}" ran past its limit of ${minutes(deadline - a.startedAt)} — stopped it (exit ${AWAIT_TIMEOUT_EXIT}); the step will be woken with its last lines`);
+      changed.push(a);
+    } else if (now - a.timedOutAt >= AWAIT_KILL_GRACE_MS) {
+      kill(a.pid, "SIGKILL");
+      changed.push(a);
+    }
+  }
+  return changed;
+}
+
 /** One pass: wake every step whose awaits all finished (when a slot allows),
  *  and sweep old records. Exported for tests. */
 const notificationClaims=new Set<string>();
 
 export async function awaitTick(now = Date.now()): Promise<number> {
+  const live=tasks.listLive();
+  const cardOf=(a:AwaitRecord)=>live.find(t=>t.pipelineRun&&t.worktreePath&&!t.pipelineParentId&&samePath(t.worktreePath,a.cwd));
+  enforceAwaitDeadlines(listAwaits(),now,{
+    prefMinutes:parseAwaitMaxMinutes(preferences.get(AWAIT_MAX_PREF)),
+    note:(a,text)=>{const card=cardOf(a);if(card)recordActivity(card.id,{kind:'auto',text,tone:'warning'});},
+  });
   const all = listAwaits();
-  const initial=tasks.listLive();
+  const initial=live;
   let woke = 0;
   for (const candidate of readyToWake(initial, all)) {
     const originalChild=initial.find(t=>t.id===candidate.stepTaskId);
@@ -413,7 +611,7 @@ export async function awaitTick(now = Date.now()): Promise<number> {
       const sent = await sendInput(originalChild.runId, awaitResultMessage(w.done, now)).catch((e: Error) => ({ delivered: false, reason: e.message }));
       if (!sent.delivered) continue;
       for (const a of w.done) writeFileSync(path.join(a.dir, "notified"), String(now));
-      const what = w.done.map((a) => `"${a.label}" ${a.exitCode === 0 ? "passed" : a.exitCode == null ? "stopped" : `failed (exit ${a.exitCode})`}`).join(", ");
+      const what = w.done.map((a) => `"${a.label}" ${a.timedOutAt != null ? `timed out after ${minutes(a.timedOutAt - a.startedAt)}` : a.exitCode === 0 ? "passed" : a.exitCode == null ? "stopped" : `failed (exit ${a.exitCode})`}`).join(", ");
       recordActivity(w.parent.id, { kind: "auto", text: `${what} — woke ${step?.name ?? "the step"} to carry on`, tone: w.done.every((a) => a.exitCode === 0) ? "success" : "warning" });
       woke++;
     } finally {
