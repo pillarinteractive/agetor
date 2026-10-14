@@ -24,9 +24,18 @@ let parents: string[] = [];
 let filed: { key: string; title: string; body: string }[] = [];
 let commits = false;
 
+// Other test files leave step rows behind in this shared process; without
+// room of its own a step here would queue behind them (as merge-rework.test.ts).
+const SLOTS = JSON.stringify({ max: 200, heavy: { max: 200, steps: [] }, ci: { max: 200, exempt: [] } });
+let slotsBefore: string | null = null;
+
 beforeAll(async () => {
   const { initPipelineRunner } = await import("./pipeline-runner.ts");
   initPipelineRunner();
+  const { preferences } = await import("./db.ts");
+  const { STEP_SLOTS_PREF } = await import("./step-slots.ts");
+  slotsBefore = preferences.get(STEP_SLOTS_PREF) ?? null;
+  preferences.set(STEP_SLOTS_PREF, SLOTS);
 });
 
 afterEach(async () => {
@@ -46,6 +55,9 @@ afterEach(async () => {
 });
 
 afterAll(async () => {
+  const { preferences } = await import("./db.ts");
+  const { STEP_SLOTS_PREF } = await import("./step-slots.ts");
+  preferences.set(STEP_SLOTS_PREF, slotsBefore ?? "");
   await new Promise((r) => setTimeout(r, 150));
   rmTestDataDir(DATA_DIR);
 });
