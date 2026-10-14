@@ -374,6 +374,49 @@ test("live #639 scans past dependency and concurrent ownership holds across mile
   expect(f.log.notified.some(s => s.includes('next milestone'))).toBe(false);
 });
 
+test("bug lane: open bugs outside the roadmap start first, at most two, then the roadmap fills what is left", async () => {
+  const { assembleQueue } = await import('../shared/canonical-roadmap.ts');
+  const { roadmapPass } = await import('./autopilot.ts');
+  const { BUG_LANE_DEFAULT } = await import('../shared/bug-lane.ts');
+  const { createHash } = await import('node:crypto');
+  const table = '## Numbered completion order\n|Step|Task|Milestone|Predecessor steps|\n|---|---|---|---|\n'
+    + [1, 2, 3, 4].map((n, i) => `|${i + 1}|#${n} Work|M09|none|`).join('\n');
+  const contract = '## Dependencies and required inputs\nThis is the sole controlling whole-task predecessor list.\nNone.'
+    + '\n### Conditional and action-specific input predicates\nNo additional conditional predicate is recorded.';
+  const states = new Map([1, 2, 3, 4].map(n => [n, { ...OPEN, body: contract, updatedAt: 'current', url: `https://github.com/o/r/issues/${n}`, milestone: { number: 9, title: 'M09' } }]));
+  const queue = assembleQueue({ body: table, states, membership: [...states.keys()], supplements: [],
+    sources: [], version: 'live-v1', hash: s => createHash('sha256').update(s).digest('hex') });
+  const bug = (number: number, labels = ['bug', 'follow-up']) => ({ number, title: `Bug ${number}`, labels });
+  let remaining = 3;
+  const f = roadmapDeps({}, {
+    loadQueue: async () => ({ ...queue, states, body: table, url: 'https://github.com/o/r/issues/639' }),
+    runnerFree: () => remaining,
+    bugs: async () => ({ config: BUG_LANE_DEFAULT, open: [
+      bug(703), bug(701), bug(700), bug(2), // #2 is a roadmap step: the roadmap's
+      bug(702, ['bug', 'manual']), // a person's
+      bug(704), // its earlier card finished with the issue still open: the owner settles it
+    ] }),
+  });
+  const start = f.deps.startCard;
+  f.deps.startCard = async input => { const r = await start(input); remaining--; return r; };
+  const state = await roadmapState();
+  const finished = roadmapCard('done-704', 704, 'done');
+  await roadmapPass({ ...roadmapCfg, maxInFlight: 8, roadmap: { issue: 639 } }, state, [finished], [], f.deps);
+  // Oldest bugs first, two at most; the one slot left goes to the roadmap's first step.
+  expect(f.log.started.map(s => s.number)).toEqual([700, 701, 1]);
+  expect(f.log.started[0]!.extraPrompt).toContain('## Bug lane');
+  expect(f.log.started[0]!.extraPrompt).toContain('Fixes #700');
+  expect(state.cards).toEqual(expect.arrayContaining(['new-700', 'new-701']));
+  expect(f.log.activity.filter(a => a.includes('ahead of roadmap cards'))).toHaveLength(2);
+
+  // Two bugs running: the lane is full, the roadmap gets the slots.
+  remaining = 3;
+  f.log.started.length = 0;
+  const running = [700, 701].map(n => roadmapCard(`new-${n}`, n, 'running', { pipelineRun: RUNNING_RUN }));
+  await roadmapPass({ ...roadmapCfg, maxInFlight: 8, roadmap: { issue: 639 } }, state, [finished, ...running], [], f.deps);
+  expect(f.log.started.map(s => s.number).filter(n => n >= 700)).toEqual([]);
+});
+
 test("roadmap: starts the ready agent steps in step order; the human step is announced once, never started", async () => {
   const { roadmapPass } = await import("./autopilot.ts");
   const state = await roadmapState();

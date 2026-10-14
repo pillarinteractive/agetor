@@ -51,6 +51,7 @@ import { listLeases } from "./lease-watch.ts";
 import { blockedCardLine } from "../shared/block-reason.ts";
 import { loadCanonicalQueue, loadRoadmapStates, loadRoadmapTracker } from "./roadmap-fetch.ts";
 import { recordVelocityPass, type VelocityPassInput } from "./roadmap-velocity.ts";
+import { BUG_LANE_PREF, bugCardPrompt, parseBugLane, pickBugs, type BugIssue, type BugLaneConfig } from "../shared/bug-lane.ts";
 import {
   currentRoadmapStatus,
   displayText,
@@ -981,6 +982,9 @@ export interface RoadmapDeps {
   /** Labels of the project's watched leases (for the wait queue's lines). */
   leaseLabels?(project: string): string[];
   pipelineId(cfg: AutopilotConfig): string | null;
+  /** The bug lane (src/shared/bug-lane.ts): its settings and the open
+   *  issues with its label, or null when the lane is off. */
+  bugs?(project: string): Promise<{ config: BugLaneConfig; open: BugIssue[] } | { error: string } | null>;
   /** Create a card for the issue and start it. */
   startCard(input: { dir: string; number: number; pipelineId: string; extraPrompt: string;validate?:()=>Promise<string|null>;onCreated?:(task:Task)=>void }): Promise<{ task: Task } | { error: string }>;
   /** Create a card for the issue in the Backlog, not started. */
@@ -1330,7 +1334,7 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
   }
   const scoped = scope ? views.filter((v) => scope!.steps.has(v.step)) : views;
 
-  const free = fullQueue ? Math.min(deps.cardFree?.()??cfg.maxInFlight-Math.max(ownLive,inFlight.length),deps.runnerFree?.()??Infinity)
+  let free = fullQueue ? Math.min(deps.cardFree?.()??cfg.maxInFlight-Math.max(ownLive,inFlight.length),deps.runnerFree?.()??Infinity)
     : cfg.maxInFlight - Math.max(ownLive, inFlight.length);
   // The started live card of each issue, for the status' links.
   const liveCards = new Map<number, string>();
@@ -1352,6 +1356,32 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
   let error: string | null = null;
   const started = new Set<number>();
   const startedIds = new Map<number, string>();
+
+  // The bug lane: open `bug` issues outside the roadmap start first, a few
+  // at a time (src/shared/bug-lane.ts). They take slots the roadmap would.
+  if (fullQueue && deps.bugs && pipelineId && !quotaWait && free > 0 && !deps.outdated()) {
+    const found = await deps.bugs(cfg.project);
+    if (found && "error" in found) error = `bug lane: ${found.error}`;
+    else if (found) {
+      const cards = all
+        .filter((t) => !t.pipelineParentId && t.archivedAt == null && sameDir(t.workdir, cfg.project))
+        .flatMap((t) => { const n = issueOf(t); return n == null ? [] : [{ issue: n, live: live(t) }]; });
+      const pick = pickBugs({ open: found.open, config: found.config, roadmap: new Set(views.map((v) => v.issue)), cards, free });
+      for (const bug of pick.start) {
+        if (deps.outdated() || (deps.runnerFree?.() ?? Infinity) <= 0 || (deps.cardFree?.() ?? Infinity) <= 0) break;
+        const r = await deps.startCard({ dir: cfg.project, number: bug.number, pipelineId, extraPrompt: bugCardPrompt(bug, found.config.label) });
+        if ("error" in r) {
+          error ??= `bug #${bug.number}: ${r.error}`;
+          continue;
+        }
+        free -= 1;
+        state.cards.push(r.task.id);
+        deps.save(state);
+        deps.activity(r.task.id, `Autopilot started this for bug #${bug.number}, ahead of roadmap cards (bug lane: at most ${found.config.max} at once)`, "info");
+      }
+    }
+  }
+
   if (picks.start.length > 0 && !quotaWait) {
     if (!pipelineId) error = noPipeline;
     else {
@@ -1792,6 +1822,19 @@ export const ROADMAP_DEPS: RoadmapDeps = {
   freeze:freezeCardInputs,
   loadTracker: loadRoadmapTracker,
   loadStates: loadRoadmapStates,
+  async bugs(project) {
+    const config = parseBugLane(preferences.get(BUG_LANE_PREF));
+    if (!config) return null;
+    const r = await run(["gh", "issue", "list", "--state", "open", "--label", config.label, "--json", "number,title,labels", "--limit", "100"], project, 30_000, process.env);
+    if (!r.ok) return { error: (r.stderr || r.stdout || "gh issue list failed").trim().slice(-200) };
+    try {
+      const open = (JSON.parse(r.stdout) as { number: number; title: string; labels: { name: string }[] }[])
+        .map((i) => ({ number: i.number, title: i.title, labels: i.labels.map((l) => l.name) }));
+      return { config, open };
+    } catch {
+      return { error: "gh issue list returned unreadable JSON" };
+    }
+  },
   aheadCount: (t) => NO_WORK_DEPS.aheadCount(t),
   hasNoPr: (t) => NO_WORK_DEPS.hasNoPr(t),
   mergedPr: (t) => {
