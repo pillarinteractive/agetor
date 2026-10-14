@@ -43,18 +43,19 @@ for(const changed of ['configuration','selection'] as const) {
 }
 
 function externalFixture() {
- const pid=process.pid+1000;let cwd='/p/packages/core-go',readable=true,state:'alive'|'dead'|'unknown'='alive',untracked='packages/core-go/new.go\0',tracked='docs/guide.md\0';
+ const pid=process.pid+1000;let cwd='/p/packages/core-go',branch='feature/other',ahead=1,readable=true,state:'alive'|'dead'|'unknown'='alive',untracked='packages/core-go/new.go\0',tracked='docs/guide.md\0';
  const deps:ExternalOwnershipDeps={cards:()=>[],pidState:()=>state,command:async args=>{
   let stdout='';
   if(args[0]==='ps')stdout=`${pid} /usr/local/bin/claude`;
   else if(args[0]==='lsof')return {ok:readable,stdout:readable?`p${pid}\nn${cwd}\n`:'',stderr:'',exitCode:readable?0:1};
   else if(args[0]==='gh')stdout='[]';
-  else if(args.includes('worktree'))stdout='worktree /p\nbranch refs/heads/feature/other\n';
+  else if(args.includes('worktree'))stdout=`worktree /p\nbranch refs/heads/${branch}\n`;
+  else if(args.includes('rev-list'))stdout=`${ahead}\n`;
   else if(args.includes('diff'))stdout=tracked;
   else if(args.includes('ls-files'))stdout=untracked;
   return {ok:true,stdout,stderr:'',exitCode:0};
  }};
- return {deps,setRead:(v:boolean)=>{readable=v;},setState:(v:typeof state)=>{state=v;},setCwd:(v:string)=>{cwd=v;},setUntracked:(v:string)=>{untracked=v;},setTracked:(v:string)=>{tracked=v;}};
+ return {deps,setRead:(v:boolean)=>{readable=v;},setState:(v:typeof state)=>{state=v;},setCwd:(v:string)=>{cwd=v;},setUntracked:(v:string)=>{untracked=v;},setTracked:(v:string)=>{tracked=v;},setBranch:(v:string)=>{branch=v;},setAhead:(v:number)=>{ahead=v;}};
 }
 test('unreadable live or uncertain worker cwd is a hold; proven dead worker is absent',async()=>{
  const f=externalFixture();f.setRead(false);
@@ -103,4 +104,11 @@ test('contract changed during new input fetch retains a coherent-read hold',asyn
  // Use copies: a real network response never mutates the earlier response.
  const copied:typeof f.read=async(p,n)=>{const result=await read(p,n);return 'error'in result?result:new Map([...result].map(([k,v])=>[k,{...v}]));};
  expect((await reconcileCardInputs(f.id,copied)).hold).toContain('coherent fresh read');
+});
+test('a session in the project checkout with no tracked change and nothing unpushed owns nothing',async()=>{
+ const f=externalFixture();f.setBranch('develop');f.setTracked('');f.setUntracked('docs/plans/owner-notes.md\0');f.setAhead(0);f.setCwd('/p');
+ expect(await externalIssueHold('/p',2,[],f.deps)).toBeNull();
+ expect(await externalIssueHold('/p',2,['docs/plans'],f.deps)).toBeNull();
+ f.setAhead(1);expect(await externalIssueHold('/p',2,['docs/plans'],f.deps)).toContain('overlapping');
+ f.setAhead(0);f.setTracked('docs/plans/x.md\0');expect(await externalIssueHold('/p',2,['docs/plans'],f.deps)).toContain('overlapping');
 });

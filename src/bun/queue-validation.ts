@@ -118,6 +118,15 @@ export async function externalIssueHold(project:string,issue:number,paths:string
         command(['git','diff','--name-only','-z','HEAD'],tree.path!,10_000,process.env),
         command(['git','ls-files','--others','--exclude-standard','-z'],tree.path!,10_000,process.env),
       ]);
+      // The project's own checkout with no tracked change and nothing unpushed
+      // is where the owner's interactive sessions sit: it is not building an
+      // issue (that needs a branch or a commit), and its untracked files are
+      // the owner's notes. Counting it held every candidate while such a
+      // session stayed open (2026-10-14: no card started for 8 hours).
+      if(tree===worktrees[0]&&diff.ok&&!diff.stdout.replace(/\0/g,'')) {
+        const ahead=await command(['git','rev-list','--count','@{upstream}..HEAD'],tree.path!,10_000,process.env);
+        if(ahead.ok&&ahead.stdout.trim()==='0')continue;
+      }
       if(!diff.ok||!untracked.ok||!paths.length)return `external worker ${workers[i]} in ${cwd} has unresolved ownership for this candidate`;
       const touched=[...diff.stdout.split('\0'),...untracked.stdout.split('\0')].filter(Boolean);
       const pr=open.find(p=>p.headRefName===tree.branch);
