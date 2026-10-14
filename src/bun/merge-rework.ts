@@ -229,7 +229,7 @@ export interface CiFailureDetails {
    *  lines, read for the runner-fault decision; `report` is what Build is
    *  shown — each failed job's failure lines with context
    *  (src/shared/ci-failure.ts). Without a `report` the tail is shown. */
-  logs: { runId: number; tail: string; report?: string }[];
+  logs: { runId: number; tail: string; report?: string; jobs?: Record<string, string> }[];
 }
 
 const INFRA_LOG_RE = new RegExp(
@@ -249,6 +249,12 @@ const INFRA_LOG_RE = new RegExp(
     "failed to connect to github\\.com",
     "unable to access 'https://github\\.com",
     "rate limit exceeded",
+    // Package mirrors and registries: apk, apt, Docker Hub.
+    "DNS: transient error",
+    "temporary error \\(try again later\\)",
+    "\\btoomanyrequests\\b",
+    "dial tcp [^\\n]*: i/o timeout",
+    "connection reset by peer",
   ].join("|"),
   "i",
 );
@@ -271,11 +277,15 @@ export function infraReason(details: Pick<CiFailureDetails, "checks" | "logs">):
     if (c.runId == null) return null;
     const log = details.logs.find((l) => l.runId === c.runId);
     if (!log) return null;
-    if (log.tail.trim() === "") {
+    // The check's own job when the log names it: a run's log ends with its
+    // roll-up jobs and cleanup, which would push a job's error out of the tail.
+    const own = log.jobs?.[c.name];
+    const text = own ?? log.tail;
+    if (text.trim() === "") {
       reasons.push(`${c.name} failed before any of its steps ran`);
       continue;
     }
-    const hit = INFRA_LOG_RE.exec(log.tail);
+    const hit = INFRA_LOG_RE.exec(text);
     if (!hit) return null;
     reasons.push(`${c.name}: "${hit[0]}"`);
   }

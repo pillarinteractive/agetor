@@ -340,6 +340,12 @@ const list = (names: readonly string[], max = 4) =>
 const reran = (p: PipelinePublishState, why: PipelinePublishState["reran"][number]["why"]) =>
   p.reran.some((r) => r.head === p.head && r.why === why);
 
+/** Re-runs of one head for a runner or network fault before the failure is
+ *  treated as the change's own. Two: blips come in bursts (a mirror's DNS),
+ *  and each one sent to Build costs a Build and a Review that change nothing. */
+export const INFRA_RERUNS = 2;
+const infraReruns = (p: PipelinePublishState) => p.reran.filter((r) => r.head === p.head && r.why === "infra").length;
+
 /** The failing checks that can be a cause (never the roll-up), newest per name. */
 export function failingCauses(checks: readonly CheckRunLike[]): PublishFailedCheck[] {
   return newestPerName(checks)
@@ -464,7 +470,7 @@ export function decidePublish(p: PipelinePublishState, obs: PublishObservation, 
         if (!reran(p, "cancelled")) return { kind: "rerun", why: "cancelled", reason: "the roll-up check failed with no failed suite behind it" };
         return { kind: "owner", why: `the roll-up check failed on ${short(p.head)} with no failed suite behind it, again after one re-run` };
       }
-      if (obs.infra && !reran(p, "infra")) return { kind: "rerun", why: "infra", reason: obs.infra };
+      if (obs.infra && infraReruns(p) < INFRA_RERUNS) return { kind: "rerun", why: "infra", reason: obs.infra };
       const verdicts = baseVerdicts(failing.map((f) => f.name), obs.baseCommits);
       const own = failing.filter((f) => verdicts[f.name] === "passed" || verdicts[f.name] === "never");
       const inherited = failing.filter((f) => verdicts[f.name] === "failed").map((f) => f.name);

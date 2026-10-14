@@ -19,6 +19,27 @@ export interface FailedRunLog {
   url: string | null;
 }
 
+/** Lines of a job kept for the runner-fault decision: enough to reach an
+ *  error above the job's own cleanup output. */
+const JOB_TAIL_LINES = 150;
+
+/** Each job's last lines from `gh run view --log-failed` output, whose lines
+ *  are `job<TAB>step<TAB>text`; the job column is the check's name. Pure. */
+export function jobTails(raw: string): Record<string, string> {
+  const byJob = new Map<string, string[]>();
+  for (const line of raw.split("\n")) {
+    const tab = line.indexOf("\t");
+    if (tab <= 0 || !line.trim()) continue;
+    const job = line.slice(0, tab);
+    const text = line.split("\t").slice(2).join("\t");
+    const lines = byJob.get(job) ?? [];
+    lines.push(text);
+    if (lines.length > JOB_TAIL_LINES) lines.shift();
+    byJob.set(job, lines);
+  }
+  return Object.fromEntries([...byJob].map(([job, lines]) => [job, lines.join("\n")]));
+}
+
 /** One failed run as a handoff carries it. */
 export interface FailedRunReport {
   runId: number;
@@ -27,6 +48,8 @@ export interface FailedRunReport {
   tail: string;
   /** What Build is shown: each failed job's failure lines with context. */
   report: string;
+  /** Each failed job's last lines, by job (check) name, for `infraReason`. */
+  jobs?: Record<string, string>;
 }
 
 /** The failed log of `runId` and the run's workflow and page, or null when
@@ -78,8 +101,8 @@ export function failedRunReports(runs: readonly FailedRunLog[], saveDir: string 
     const fitted = ciFailureForHandoff(run.raw, meta, { maxChars: share, excerptPath });
     // Only a shortened report points at the larger one, so only then is it written.
     if (fitted.inline !== fitted.full && save(`ci-failure-${run.runId}.md`, fitted.full) === null) {
-      return { runId: run.runId, tail: tailOf(run.raw), report: ciFailureForHandoff(run.raw, meta, { maxChars: share, excerptPath: null }).inline };
+      return { runId: run.runId, tail: tailOf(run.raw), report: ciFailureForHandoff(run.raw, meta, { maxChars: share, excerptPath: null }).inline, jobs: jobTails(run.raw) };
     }
-    return { runId: run.runId, tail: tailOf(run.raw), report: fitted.inline };
+    return { runId: run.runId, tail: tailOf(run.raw), report: fitted.inline, jobs: jobTails(run.raw) };
   });
 }

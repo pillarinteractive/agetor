@@ -322,6 +322,26 @@ test("what counts as the runner's failure", () => {
   expect(rework.logTail("job\tstep\t2026-10-12T00:00:00Z line one\n\njob\tstep\tline two")).toBe("2026-10-12T00:00:00Z line one\nline two");
 });
 
+test("a job's own lines decide, not the run's tail: a package mirror's DNS error above the roll-up jobs", async () => {
+  const { jobTails } = await import("./ci-failure-log.ts");
+  const docker = "observer / Docker build (production default + dev-synthetic)";
+  const raw = [
+    `${docker}\tUNKNOWN STEP\t#10 5.069 WARNING: fetching https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/APKINDEX.tar.gz: DNS: transient error (try again later)`,
+    `${docker}\tUNKNOWN STEP\t#10 ERROR: process "/bin/sh -c apk add --no-cache tzdata" did not complete successfully: exit code: 1`,
+    ...Array.from({ length: 80 }, (_, i) => `${docker}\tPost Run\tcleanup ${i}`),
+    ...Array.from({ length: 60 }, (_, i) => `suites\tsummarize\tsuite line ${i}`),
+    "required\tgate\tA required suite failed",
+  ].join("\n");
+  const check = { name: docker, url: null, conclusion: "failure", runId: 1 };
+  const tail = rework.logTail(raw);
+  expect(rework.infraReason({ checks: [check], logs: [{ runId: 1, tail }] })).toBeNull(); // the tail alone misses it
+  expect(rework.infraReason({ checks: [check], logs: [{ runId: 1, tail, jobs: jobTails(raw) }] })).toContain("DNS: transient error");
+  // A test failure in the job's own lines is still the change's.
+  const failing = `${docker}\tbuild\t--- FAIL: TestCart\n${docker}\tbuild\tFAIL`;
+  expect(rework.infraReason({ checks: [check], logs: [{ runId: 1, tail: "", jobs: jobTails(failing) }] })).toBeNull();
+  expect(jobTails("a\ts\tone\nb\ts\ttwo\na\ts\tthree")).toEqual({ a: "one\nthree", b: "two" });
+});
+
 test("a stale PR status (the head moved on) starts nothing", async () => {
   const { tasks } = await import("./db.ts");
   const { isMergeQueued } = await import("./merge-intent.ts");

@@ -122,6 +122,7 @@ import {
   isFollowUpStepId,
   normalizeHandoff,
   reviewedPipelineShape,
+  reviewApprovalMatches,
   reviewRequiresRepair,
   outgoingSteps,
   capWrapUpStep,
@@ -1210,6 +1211,42 @@ async function guardNoChangeLoop(
     kind: "step", tone: "warning",
     text: `${RESOLVING_PREFIX}Review sent unchanged ${short} back to Build a third time — finishing through ${capWrapUpStep(graph)!.name}: published as not approved, one issue per unresolved finding, nothing merged`,
   });
+}
+
+/**
+ * A Build that Finish sent back (CI failed on the published head, typically a
+ * runner or network fault) and that ended without changing anything goes
+ * straight back to Finish: Review's approval names that exact head, so a
+ * second Review of it reviews nothing. Once per approval: if Finish sends the
+ * same head back again, the next Build goes to Review as usual, so a failure
+ * Build cannot fix still meets Review and the no-change guard.
+ */
+export async function skipReviewOfApprovedHead(
+  parent: Task,
+  run: PipelineRunState,
+  stepName: string,
+  entry: { stepId: string; seq: number },
+  resolved: { kind: "steps"; stepIds: string[] },
+): Promise<{ kind: "steps"; stepIds: string[] }> {
+  if (!run.snapshot || stepRole(stepName, entry.stepId) !== "build" || resolved.stepIds.length !== 1) return resolved;
+  const graph = run.snapshot.graph;
+  if (stepRole(stepNameById(graph, resolved.stepIds[0]!), resolved.stepIds[0]!) !== "review") return resolved;
+  const finish = publishStepFor(parent, run);
+  if (!finish || !parent.issueUrl) return resolved;
+  const before = run.history.filter((h) => h.seq < entry.seq);
+  if (before.at(-1)?.stepId !== finish.id) return resolved;
+  const lastReview = before.findLast((h) => stepRole(stepNameById(graph, h.stepId), h.stepId) === "review" && h.handoff);
+  if (!lastReview?.handoff) return resolved;
+  const since = before.filter((h) => h.seq > lastReview.seq);
+  if (since.some((h) => stepRole(stepNameById(graph, h.stepId), h.stepId) === "build" && (h.nextStepIds ?? []).includes(finish.id))) return resolved;
+  const checkout = parent.worktreePath ?? parent.workdir;
+  const at = checkout ? await loopGuardDeps.readHead(checkout).catch(() => ({ head: null, tree: null })) : { head: null, tree: null };
+  if (!at.head || !reviewApprovalMatches(lastReview.handoff, parent.issueUrl, at.head)) return resolved;
+  recordActivity(parent.id, {
+    kind: "step", tone: "info",
+    text: `${stepName} changed nothing after ${finish.name} found a failure; Review already approved ${at.head.slice(0, 8)} — back to ${finish.name} without another Review`,
+  });
+  return { kind: "steps", stepIds: [finish.id] };
 }
 
 /** What the ladder reads from and does to the rest of the core — replaceable
@@ -5801,6 +5838,11 @@ async function settleStepRun(
           upsertBlocked(run,{taskId,stepId:activeEntry.stepId,kind:'step-blocked',message:'Review requires repair; no permitted corrective route can be followed'});
           checkJoinIncomplete(run);persist(parentId,run);return null;
         }
+      }
+      // A Build sent back by a failed publication that changed nothing: the
+      // head Review approved is still the head, so it returns to Finish.
+      if (!freshSession && resolved.kind === "steps") {
+        resolved = await skipReviewOfApprovedHead(parentForGuard(parentId, parent), run, stepName, activeEntry, resolved);
       }
       if (!freshSession && (resolved.kind === "ambiguous" || resolved.kind === "unknown")) {
         // Low: a parsed handoff whose `next` didn't resolve to a real
