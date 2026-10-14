@@ -104,6 +104,8 @@ The `pipeline_decisions` preference is an explicit project opt-in:
 `{"mode":"planner-recommendation","projects":["/absolute/project/path"]}`.
 The exact project path and policy are captured at a fresh run's start; existing
 snapshots and other projects keep their current instructions and permissions.
+A second mode, `agent-followups`, differs only in who files the follow-up
+issue; see "Pillar's instruction policy" below.
 
 With that policy, every step chooses the planner's supported recommendation
 for ordinary implementation, design and product choices within the issue's
@@ -443,8 +445,8 @@ suggestion rules are gone.
 
 ### An unattended run that reaches its step cap finishes once (`fix/step-cap-wrap-up`)
 
-A planner-recommendation run that reaches its step cap after the automatic extension is used no longer waits for a
-person. It launches the step the run ends through (`capWrapUpStep` in `src/shared/pipeline.ts`: the step with no
+A run with a decision policy (`planner-recommendation` or `agent-followups`) that reaches its step cap after the
+automatic extension is used no longer waits for a person. It launches the step the run ends through (`capWrapUpStep` in `src/shared/pipeline.ts`: the step with no
 outgoing edge, or `canFinish`; when several can end the run — Change's Understand may, for a card that needs no
 change — the last of them, the one no other end is reachable from) in place of the requested step, with the same arrivals and an added prompt section
 (`capWrapUpSection`): publish as usual, do not hand back, file one GitHub issue per unresolved finding and list them
@@ -756,7 +758,9 @@ definition is not run again. `required: false`: reported, never gates. The built
 | `pr-required-check` | the PR's `required` check (the whole set without one) passed for HEAD; not applicable with no PR; still running → `halt` | GitHub, read-only |
 
 **Defaults.** A step that declares no `checks` gets, in a reviewed pipeline (Build → Review → Finish,
-`reviewedPipelineShape`): **Build** `tree-clean` + `diff-nonempty`; **Review** `tree-clean` + `review-verdict`. Every
+`reviewedPipelineShape`): **Build** `tree-clean` + `diff-nonempty`; **Review** `tree-clean` + `review-verdict`. Review's
+`tree-clean` stands on Build's gate: on a visit that another step handed the work to (Understand's trivial change,
+where the graph routes it through Review) it is reported and not required (`defaultChecksOf`). Every
 other step has no gate; `"checks": []` on a step says "no gate" on purpose. No test suite, linter, type checker or
 build is a default, and none runs on this Mac unless a pipeline declares a command check.
 
@@ -815,8 +819,9 @@ the routes below answer 409 for it. `src/shared/position.ts` is the pure half (t
 
 **The position** is the first step whose gate is not satisfied *now*. `resolvePosition` walks the run's forward path
 (`forwardPath`: from the start step, the edge that leads to a step not yet on the path — Review → Finish, not Review →
-Build; where a step has several, or may end the run itself, the one its last finished visit took) and a step is
-satisfied when all of these hold:
+Build; where a step has several, or may end the run itself, the one its last finished visit took; a trivial change's
+shortcut past Build ends once a later step has sent the work to Build and Build has finished, after which the path is
+Understand, Build, Review, Finish again) and a step is satisfied when all of these hold:
 
 | | Still satisfied when | Voided by |
 | --- | --- | --- |
@@ -888,6 +893,43 @@ that step like any other (the step panel's message box still talks to a live ste
 step's ordinary turn allowance, not a single turn; the card's strip still colours a segment by a succeeded execution,
 not by the position; fan-out and join graphs; and position resolution reads GitHub only for a Finish Agetor ran — an
 agent-run Finish is judged by its finished visit alone.
+
+## Pillar's instruction policy (`feat/instruction-policy-compatible`)
+
+Pillar versions its profile and step instructions in `docs/engineering/agetor/` and applies them with
+`sync_policy.py`, which talks to Agetor only through the CLI. This branch adds what that script needs and nothing
+that changes how a run is published, capped or verified: `docs/plans/instruction-policy.md` records what was taken
+from the other session's commit (`004f16e`) and the four behaviours of `release` that were kept.
+
+- **`agetor pipeline edit <ref> --file <pipeline.json|->`** replaces an existing pipeline's name, description, graph
+  and step cap (`PATCH /pipelines/:id`), keeping its id. `<ref>` is the id or the unique name; `-` reads stdin; the
+  file is the `PipelineInput` JSON that `pipeline export` writes and is validated like an import (`profileName`
+  hints are not remapped). With `--json` it prints the updated pipeline. `agetor pipeline --help` names the verb,
+  which the script checks before it changes anything. Saving does what saving a template always does: unfinished
+  runs take edited step text by themselves and keep their own routing, agents and cap.
+- **`agent-followups`** is a second `pipeline_decisions` mode:
+  `{"mode":"agent-followups","projects":["/absolute/project/path"]}`. The decision command still writes the private
+  ledger and deduplicates by question, but never creates or updates a GitHub issue; it answers with a stable
+  `followupMarker` (`<!-- agetor-decision:<source issue>:<decision id> -->`) and `publication: "agent-managed"`, and
+  the step's prompt tells the agent to search for the marker and file or reuse one issue per decision. Everything
+  else a decision policy switches on is the same in both modes: routine choices continue the same card, the step cap
+  extends once and then wraps up through Finish, a missing handoff and an interrupted launch are retried. The mode is
+  one value for the whole preference, so a project list cannot mix the two.
+- **The trivial change through Review.** The script moves Change's "trivial change made" edge from Understand →
+  Finish to Understand → Review. Runs started before the edit keep the old edge, so both graphs run side by side:
+
+  | | trivial → Finish (today) | trivial → Review |
+  | --- | --- | --- |
+  | `reviewedPipelineShape`, `publishStepOf`, `capWrapUpStep` | Build, Review, Finish; Finish is published and is the wrap-up | the same |
+  | Finish run by Agetor | no Review visit, so no approved head: the visit is the agent's | publishes the head Review approved; a dirty tree goes to Build |
+  | Review's default checks | handed the work only by Build: `tree-clean` + `review-verdict` | from Understand: `review-verdict`, with `tree-clean` reported; from Build: both |
+  | position | Understand, Finish | Understand, Review, Finish; a new commit resumes at Review with Understand's handoff |
+  | after Review or Finish sent it to Build, and Build finished | Understand, Build, Review, Finish | the same |
+  | lifecycle sign-off (`reviewedPillarPipeline`) | not while no Review has seen the change; after a round through Build and Review, as on any card | when Review approved the published head |
+
+Not done here: nothing checks that Understand committed anything before it chose the trivial route (Build's
+`diff-nonempty` has no counterpart there); `profile edit --instructions-file` trims the text it stores, so the
+script's comparison, which keeps a trailing newline, reports every profile as changed on each preview.
 
 ## Priority cards (`feat/priority-cards`)
 
