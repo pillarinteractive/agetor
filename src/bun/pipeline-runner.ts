@@ -1836,7 +1836,7 @@ export function publishGatePref(parent: Pick<Task, "id" | "pipelineId">, run: Pi
  *  `pipeline_gates` works at once: its steps advance on their handoffs again
  *  from the next turn that ends. */
 export function stepGateFor(parent: Pick<Task, "id" | "pipelineId">, run: PipelineRunState, step: PipelineStep): StepGate | null {
-  const gate = stepGate(run.snapshot, step);
+  const gate = stepGate(run.snapshot, step, run.history);
   return gate && gatePref("steps", parent, run) ? gate : null;
 }
 
@@ -3173,7 +3173,7 @@ export async function advancePipeline(
     // Advancing past a gate the step did not pass is a waiver, and is
     // recorded as one: a waived check never reads as a pass.
     const waivedStep = graph.steps.find((s) => s.id === activeEntry.stepId);
-    const waivedGate = waivedStep && run.blocked.some((b) => b.taskId === targetTaskId && b.kind === "check-failed") ? stepGate(run.snapshot, waivedStep) : null;
+    const waivedGate = waivedStep && run.blocked.some((b) => b.taskId === targetTaskId && b.kind === "check-failed") ? stepGate(run.snapshot, waivedStep, run.history) : null;
     if (waivedStep && waivedGate && historyEntry?.gate?.failed.length) {
       recordWaivedChecks({ parent, run, step: waivedStep, seq: activeEntry.seq, checks: waivedGate.checks, ids: historyEntry.gate.failed });
       recordActivity(parentId, { kind: "step", tone: "warning", text: `Advanced past ${waivedStep.name}'s failing checks (${historyEntry.gate.failed.join(", ")}) — recorded as waived` });

@@ -124,13 +124,17 @@ const commit = async (repo: string, file: string) => {
 /** The board's Change shape — Understand (may finish), Build, Review, Finish
  *  and its loops — with scripted agents. Build has the default checks; the
  *  scripted Review cannot write a verdict, so its gate is a command check. */
-async function makeCard(o: { workdir: string; build?: Partial<PipelineStep>; review?: Partial<PipelineStep>; script?: { review?: string }; goal?: string }) {
+async function makeCard(o: {
+  workdir: string; build?: Partial<PipelineStep>; review?: Partial<PipelineStep>; script?: { understand?: string; review?: string }; goal?: string;
+  /** Where "trivial change made" leads: Finish on the board's graph today, Review under Pillar's instruction policy. */
+  trivialTo?: "finish" | "review";
+}) {
   const profile = agentProfiles.insert({
     name: `position-${randomUUID()}`, harness: "claude-code", model: "fake-model", effort: null, mode: null, fast: false, maxMode: false, instructions: "", skills: [],
   });
   const step = (name: string, next: string, extra: Partial<PipelineStep> = {}) =>
     newStep({ name, agentProfileId: profile.id, instructions: `Do the ${name} work. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:${next}`, ...extra });
-  const understand = step("Understand", "Build", { canFinish: true });
+  const understand = step("Understand", o.script?.understand ?? "Build", { canFinish: true });
   const build = step("Build", "Review", o.build);
   const review = step("Review", o.script?.review ?? "Finish", { checks: [cmd("reviewed", "true")], ...o.review });
   const finish = step("Finish", "done", { canFinish: true });
@@ -138,7 +142,7 @@ async function makeCard(o: { workdir: string; build?: Partial<PipelineStep>; rev
     steps: [understand, build, review, finish],
     edges: [
       { id: "understand-build", from: understand.id, to: build.id, label: "build" },
-      { id: "understand-finish", from: understand.id, to: finish.id, label: "trivial change made" },
+      { id: "understand-trivial", from: understand.id, to: o.trivialTo === "review" ? review.id : finish.id, label: "trivial change made" },
       { id: "build-review", from: build.id, to: review.id, label: "" },
       { id: "review-build", from: review.id, to: build.id, label: "changes requested" },
       { id: "review-finish", from: review.id, to: finish.id, label: "approved" },
@@ -250,6 +254,39 @@ test("a gated card: Restart resumes at the first step whose gate is not satisfie
   expect(await sh(repo, "git", "rev-parse", "HEAD")).toBe(head);
   expect(await sh(repo, "git", "ls-remote", "origin", "refs/heads/claude/x")).toBe("");
 }, 120_000);
+
+test("a trivial change, on either route: the position follows the steps the run took, and a restart resumes at Review where the route has one", async () => {
+  for (const trivialTo of ["finish", "review"] as const) {
+    const repo = await repoWithChange();
+    const card = await makeCard({ workdir: repo, trivialTo, script: { understand: trivialTo === "review" ? "Review" : "Finish" } });
+    gateOn(card.pipeline.id);
+    await start(card.id);
+    const took = trivialTo === "review" ? ["Understand", "Review", "Finish"] : ["Understand", "Finish"];
+    const first = await settled(card.id, "done", took.length);
+    expect(names(card.id, first)).toEqual(took.map((n, i) => `${i + 1} ${n} succeeded`));
+    const view = await runner.pipelinePosition(card.id);
+    expect(view).toMatchObject({ gated: true, position: { kind: "complete" }, line: `Every step is still satisfied (${took.join(", ")}): there is nothing to resume` });
+    expect("steps" in view && view.steps.map((s) => s.name)).toEqual(took);
+
+    // A new commit. → Finish: no step the run took has a gate, so nothing moves.
+    const head = await commit(repo, "second.txt");
+    const moved = await runner.pipelinePosition(card.id);
+    if (trivialTo === "finish") {
+      expect(moved).toMatchObject({ position: { kind: "complete" } });
+      continue;
+    }
+    // → Review: its result was for another head. Build was skipped and is not asked for.
+    expect(moved).toMatchObject({ position: { kind: "step", stepId: card.review.id, satisfied: [{ stepId: card.understand.id, seq: 1 }], arrivals: [{ stepId: card.understand.id, seq: 1 }] } });
+    const restarted = await runner.startPipelineRun(tasks.get(card.id)!, { restart: true });
+    expect(restarted).toMatchObject({ resumed: { stepId: card.review.id, stepName: "Review", kept: [{ stepName: "Understand" }] } });
+    const resumed = await settled(card.id, "done", 5);
+    expect(names(card.id, resumed)).toEqual(["1 Understand succeeded", "2 Review succeeded", "3 Finish succeeded", "4 Review succeeded", "5 Finish succeeded"]);
+    expect(promptOf(card.id, 4)).toContain('### From "Understand"');
+    expect(readCheckLedger(card.id, resumed).filter((e) => e.checkId === "reviewed").map((e) => [e.seq, e.outcome, e.key.head === head])).toEqual([[2, "pass", false], [4, "pass", true]]);
+    expect(tasks.stepsForParent(card.id).filter((t) => t.pipelineStepId === card.build.id)).toEqual([]);
+    expect(await runner.pipelinePosition(card.id)).toMatchObject({ position: { kind: "complete" } });
+  }
+}, 180_000);
 
 test("rewind: the step's and every later step's evidence is void in the ledger, history and git are kept, and the run goes on from the step", async () => {
   const repo = await repoWithChange();

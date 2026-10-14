@@ -52,11 +52,23 @@ const finished = (r: Pick<PipelineStepRecord, "outcome" | "handoff">) =>
  * visits them. From the start step, the next step is the one outgoing edge
  * that leads to a step not yet on the path (Review → Finish, not Review →
  * Build). Where a step has several such edges (Understand → Build, or →
- * Finish for a trivial change), or may end the run itself (`canFinish`, or
- * no outgoing edge), the path follows the one its last finished visit took;
- * with no such visit, or one that named no step ahead, the path ends there. Null when the graph is not one path with loops: no start
- * step, or a step on the way that fans out (`transition: "all"`) or joins
- * (`join: "all"`), which position resolution is not defined for.
+ * Finish — or → Review — for a trivial change), or may end the run itself
+ * (`canFinish`, or no outgoing edge), the path follows the one its last
+ * finished visit took; with no such visit, or one that named no step ahead,
+ * the path ends there.
+ *
+ * A choice that skipped steps is a shortcut (the trivial change skips Build,
+ * and where it goes straight to Finish, Review too). The run leaves it when a
+ * later step sends the work to a step it skipped: Review's "changes
+ * requested" or Finish's "verification failed" → Build. Once that step has
+ * finished, the path goes through it again — Understand, Build, Review,
+ * Finish — so the steps after it are judged as they are on any other card.
+ * Until then the path stays the one the visits took, which hands the skipped
+ * step the findings of the step that sent the work to it.
+ *
+ * Null when the graph is not one path with loops: no start step, or a step
+ * on the way that fans out (`transition: "all"`) or joins (`join: "all"`),
+ * which position resolution is not defined for.
  */
 export function forwardPath(graph: PipelineGraph, history: readonly Record_[]): PipelineStep[] | null {
   const start = resolveStartStep(graph);
@@ -80,10 +92,34 @@ export function forwardPath(graph: PipelineGraph, history: readonly Record_[]): 
       const last = history.filter((h) => h.stepId === at!.id && finished(h)).sort((a, b) => b.seq - a.seq)[0];
       const chosen = (last?.nextStepIds ?? []).filter((id) => forward.includes(id));
       next = chosen.length === 1 ? chosen[0] : undefined;
+      if (next && last) {
+        // The visit took a shortcut, and a step it skipped has finished since.
+        const target = next;
+        const skipped = forward.filter((id) => id !== target &&
+          history.some((h) => h.stepId === id && finished(h) && h.seq > last.seq) && leadsThrough(graph, id, target, seen));
+        if (skipped.length === 1) next = skipped[0];
+      }
     }
     at = next ? byId.get(next) : undefined;
   }
   return path;
+}
+
+/** Whether a run that never goes back can pass from `from` through `via` and
+ *  end: some route visits no step twice and none of `closed` (the steps
+ *  already on the path), reaches `via`, and from there a step that may end
+ *  the run. So Build leads through Review or Finish, and neither of them
+ *  through Build: Review → Build and Finish → Build go back, and the route
+ *  they start cannot end. */
+function leadsThrough(graph: PipelineGraph, from: string, via: string, closed: ReadonlySet<string>): boolean {
+  const mayEnd = (id: string) => graph.steps.some((s) => s.id === id && s.canFinish === true) || !graph.edges.some((e) => e.from === id);
+  const walk = (at: string, used: ReadonlySet<string>, passed: boolean): boolean => {
+    const through = passed || at === via;
+    if (through && mayEnd(at)) return true;
+    return graph.edges.some((e) => e.from === at && !used.has(e.to) && !closed.has(e.to) && !isFollowUpStepId(e.to) &&
+      walk(e.to, new Set(used).add(e.to), through));
+  };
+  return walk(from, new Set([from]), false);
 }
 
 /** `stepId` and every step after it on the path; empty when it is not on it. */
@@ -298,7 +334,10 @@ export function resolvePosition(input: PositionInput): Position {
       };
     }
 
-    if (p && p.stepId === step.id) {
+    // Not when the visit sent the work on to a step it had skipped (Finish
+    // after a trivial change, "verification failed" → Build): it published
+    // nothing that should hold, and the step ahead is the position.
+    if (p && p.stepId === step.id && !(next && rec.nextStepIds.includes(next.id))) {
       if (!p.head || !input.key.head || p.head.toLowerCase() !== input.key.head.toLowerCase()) {
         return here(`${step.name} published ${short(p.head)}, but HEAD is ${short(input.key.head)}`);
       }

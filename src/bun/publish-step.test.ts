@@ -24,7 +24,7 @@ process.env.AGETOR_TMUX_BIN = "/bin/echo";
 const { tasks, preferences, parsePipelineRunState } = await import("./db.ts");
 const { newStep } = await import("../shared/pipeline.ts");
 const { PIPELINE_GATES_PREF, initialPublishState } = await import("../shared/publish.ts");
-const { publishCard, publishTick, publishDeps, publishDraftBody, resetPublishForTests, BASE_LOOK_MS } = await import("./publish-step.ts");
+const { publishApproval, publishCard, publishTick, publishDeps, publishDraftBody, resetPublishForTests, BASE_LOOK_MS } = await import("./publish-step.ts");
 const { adoptPipelineGates, retryPipelineStep, withPipelineLock } = await import("./pipeline-runner.ts");
 const { slotUse } = await import("./step-slots.ts");
 const { reviewedPillarPipeline } = await import("./autopilot.ts");
@@ -147,6 +147,10 @@ interface Card {
 function makeCard(repo: string, approval: Handoff | null, o: {
   publish?: Partial<PipelinePublishState>; branch?: string; maxTraversals?: number; history?: PipelineRunState["history"]; gates?: boolean;
   profiles?: PipelineRunState["snapshot"] extends infer S ? (S extends { profiles: infer P } ? P : never) : never; prompt?: string;
+  /** The Change graph's start step, and a run on its trivial route: Understand
+   *  made the change and handed it to Finish (the board's graph today, no
+   *  Review visit) or to Review (Pillar's instruction policy). */
+  trivial?: "finish" | "review";
 } = {}): Card {
   const build = newStep({ name: "Build", agentProfileId: "missing-profile", instructions: "Build it." });
   const review = newStep({ name: "Review", agentProfileId: "missing-profile", instructions: "Review it." });
@@ -155,16 +159,25 @@ function makeCard(repo: string, approval: Handoff | null, o: {
   const reviewRecord = (seq: number, handoff: Handoff | null) => ({
     seq, stepId: review.id, taskId: `review-${seq}`, startedAt: T0 - 10 * MIN, endedAt: T0 - 5 * MIN, outcome: "succeeded" as const, handoff, nextStepIds: [finish.id],
   });
-  const history = o.history ?? [
-    { seq: 1, stepId: build.id, taskId: "build-1", startedAt: T0 - 20 * MIN, endedAt: T0 - 10 * MIN, outcome: "succeeded" as const, handoff: null, nextStepIds: [review.id] },
-    reviewRecord(2, approval),
-  ];
+  const understand = newStep({ name: "Understand", agentProfileId: "missing-profile", instructions: "Understand it.", canFinish: true });
+  const first = (step: PipelineStep, to: PipelineStep) =>
+    ({ seq: 1, stepId: step.id, taskId: `${step.name.toLowerCase()}-1`, startedAt: T0 - 20 * MIN, endedAt: T0 - 10 * MIN, outcome: "succeeded" as const, handoff: null, nextStepIds: [to.id] });
+  const history = o.history ?? (
+    o.trivial === "finish" ? [first(understand, finish)]
+    : o.trivial === "review" ? [first(understand, review), reviewRecord(2, approval)]
+    : [first(build, review), reviewRecord(2, approval)]);
+  const arrival = history.at(-1)!;
   const run: PipelineRunState = {
     pipelineId: "p-change", pipelineName: "Change", status: "running", active: [], joins: {}, history, stepCount: history.length, startedAt: T0 - 30 * MIN, endedAt: null,
     snapshot: {
       graph: {
-        steps: [build, review, finish], startStepId: build.id,
+        steps: [...(o.trivial ? [understand] : []), build, review, finish], startStepId: o.trivial ? understand.id : build.id,
         edges: [
+          ...(o.trivial ? [
+            { id: "e0", from: understand.id, to: build.id, label: "build" },
+            { id: "e4", from: understand.id, to: o.trivial === "finish" ? finish.id : review.id, label: "trivial change made" },
+            { id: "e5", from: review.id, to: build.id, label: "changes requested" },
+          ] : []),
           { id: "e1", from: build.id, to: review.id, label: "" },
           { id: "e2", from: review.id, to: finish.id, label: "approved" },
           { id: "e3", from: finish.id, to: build.id, label: "verification failed", ...(o.maxTraversals ? { maxTraversals: o.maxTraversals } : {}) },
@@ -173,7 +186,7 @@ function makeCard(repo: string, approval: Handoff | null, o: {
       maxSteps: 14, profiles: o.profiles ?? {}, capturedAt: T0 - 30 * MIN, ...(o.gates === false ? {} : { gates: { publish: true as const } }),
     },
     blocked: [{
-      taskId: null, stepId: finish.id, kind: "await", message: "Finish is run by Agetor", pending: { stepId: finish.id, arrivals: [{ fromStepId: review.id, seq: 2, handoff: approval }] },
+      taskId: null, stepId: finish.id, kind: "await", message: "Finish is run by Agetor", pending: { stepId: finish.id, arrivals: [{ fromStepId: arrival.stepId, seq: arrival.seq, handoff: arrival.handoff }] },
     }],
     publish: { ...initialPublishState(finish.id, T0 - MIN), ...o.publish },
   };
@@ -625,6 +638,44 @@ describe("the switch", () => {
     expect(run.publish!.brief).toBeUndefined();
     expect(run.blocked.map((b) => [b.kind, b.stepId])).toEqual([["profile-missing", card.finish.id]]);
     expect(await repos.remote("claude/x")).toBeNull();
+  }, 60_000);
+
+  test("trivial change → Finish: no Review saw it, so there is no approved head and the visit is the agent's", async () => {
+    const repos = await makeRepos();
+    fakeGitHub(repos);
+    const card = makeCard(repos.repo, null, { trivial: "finish" });
+    expect(publishApproval(tasks.get(card.id)!, runOf(card))).toEqual({ kind: "none" });
+    await publishCard(card.id, T0);
+    const run = runOf(card);
+    expect(run.publish!.state).toBe("agent");
+    expect(run.blocked.map((b) => [b.kind, b.stepId])).toEqual([["profile-missing", card.finish.id]]);
+    expect(await repos.remote("claude/x")).toBeNull();
+  }, 60_000);
+
+  test("trivial change → Review: the head Review approved goes out by Agetor, with no Build visit in the run", async () => {
+    const repos = await makeRepos();
+    fakeGitHub(repos);
+    gh.checks.set(repos.baseTip, GREEN);
+    const card = makeCard(repos.repo, approvalHandoff(repos.head), { trivial: "review" });
+    expect(publishApproval(tasks.get(card.id)!, runOf(card))).toEqual({ kind: "approved", headSha: repos.head });
+    await publishCard(card.id, T0);
+    expect(stateOf(card)).toBe("wait-ci");
+    expect(await repos.remote("claude/x")).toBe(repos.head);
+    expect(runOf(card).publish).toMatchObject({ head: repos.head, approvedHead: repos.head, carried: 0 });
+    expectNothingSpent(card);
+  }, 60_000);
+
+  test("trivial change → Review: what Understand left uncommitted goes to Build, not out", async () => {
+    const repos = await makeRepos();
+    fakeGitHub(repos);
+    const card = makeCard(repos.repo, approvalHandoff(repos.head), { trivial: "review" });
+    writeFileSync(path.join(repos.repo, "a.txt"), "scribble\n");
+    await publishCard(card.id, T0);
+    const run = runOf(card);
+    expect(await repos.remote("claude/x")).toBeNull();
+    expect(run.publish).toBeUndefined();
+    expect(run.history.at(-1)).toMatchObject({ stepId: card.finish.id, nextStepIds: [card.build.id] });
+    expect(run.history.at(-1)!.handoff!.summary).toContain("- a.txt");
   }, 60_000);
 
   test("taken out of pipeline_gates while held: the agent runs Finish again, at once", async () => {

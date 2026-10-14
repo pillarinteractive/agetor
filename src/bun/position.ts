@@ -15,8 +15,8 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { builtinCheck, defaultStepChecks } from "../shared/checks.ts";
-import { reviewedPipelineShape, stepGate } from "../shared/pipeline.ts";
+import { builtinCheck } from "../shared/checks.ts";
+import { defaultChecksOf, stepGate } from "../shared/pipeline.ts";
 import {
   forwardPath, parseFeedbackLog, resolvePosition, stepsFrom, voidEntries, type OwnerFeedback, type Position, type StepEvidence,
 } from "../shared/position.ts";
@@ -48,11 +48,11 @@ export const positionDeps = {
  * adopted the `steps` gate; otherwise — a run that adopted only `publish` —
  * the defaults for Build and Review of a reviewed pipeline, which is what
  * the design's table reads from the tree (§6). Any other step has none.
+ * `history` is the run's (`defaultChecksOf`).
  */
-export function positionChecks(snapshot: Pick<PipelineRunSnapshot, "graph" | "gates">, step: PipelineStep): StepCheck[] {
-  if (snapshot.gates?.steps) return stepGate(snapshot, step)?.checks ?? [];
-  const shape = reviewedPipelineShape(snapshot.graph);
-  return defaultStepChecks(shape?.build.id === step.id ? "build" : shape?.review.id === step.id ? "review" : null);
+export function positionChecks(snapshot: Pick<PipelineRunSnapshot, "graph" | "gates">, step: PipelineStep, history: PipelineRunState["history"] = []): StepCheck[] {
+  if (snapshot.gates?.steps) return stepGate(snapshot, step, history)?.checks ?? [];
+  return defaultChecksOf(snapshot.graph, step, history);
 }
 
 /**
@@ -71,7 +71,7 @@ export async function readPosition(input: {
   let key = { head: null as string | null, tree: null as string | null, baseTip: null as string | null };
   let read = false;
   for (const step of path) {
-    const checks = positionChecks(snapshot, step);
+    const checks = positionChecks(snapshot, step, run.history);
     const probe = await probeBuiltinChecks({ parent, run, checks });
     if (!read) {
       key = probe.key;
@@ -120,7 +120,7 @@ export function voidStepEvidence(input: { parent: Task; run: PipelineRunState; s
   const ledger = readCheckLedger(input.parent.id, input.run);
   const entries: CheckLedgerEntry[] = voidEntries({
     at: checkDeps.now(), seq: input.run.stepCount, why: input.why, ledger,
-    steps: steps.map((step) => ({ step, checks: positionChecks(input.snapshot, step) })),
+    steps: steps.map((step) => ({ step, checks: positionChecks(input.snapshot, step, input.run.history) })),
   });
   appendCheckLedger(input.parent.id, input.run, entries);
   return steps;

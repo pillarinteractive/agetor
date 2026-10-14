@@ -1363,6 +1363,15 @@ describe("capWrapUpStep / capWrapUpSection", () => {
     expect(capWrapUpStep(g)?.id).toBe("finish");
   });
 
+  test("Change with the trivial change routed through Review: Finish is the wrap-up there too", () => {
+    for (const to of ["finish", "review"] as const) {
+      const g = changeGraph(to);
+      expect(validatePipelineGraph(g).ok).toBe(true);
+      expect(capWrapUpStep(g)?.id).toBe("finish");
+      expect(resolveNextSteps(g, "finish", null)).toEqual({ kind: "terminal" });
+    }
+  });
+
   test("two ends that lead to each other, or to neither, are not a wrap-up", () => {
     const a = { ...makeStep({ id: "a", name: "A" }), canFinish: true }, b = { ...makeStep({ id: "b", name: "B" }), canFinish: true };
     expect(capWrapUpStep(makeGraph({ steps: [a, b], edges: [edge("a", "b"), edge("b", "a")] }))).toBeNull();
@@ -3063,13 +3072,16 @@ test("every step's prompt carries the usage guidance, between its instructions a
 // ---------------------------------------------------------------------------
 
 /** The live "Change" pipeline's shape: Understand, Build, Review, Finish. */
-function changeGraph(): PipelineGraph {
+/** "Change: Understand, Build, Review, Finish". The trivial change goes to
+ *  Finish on the board's graph today, and to Review once Pillar's instruction
+ *  policy is applied (`sync_policy.py` moves that one edge). */
+function changeGraph(trivialTo: "finish" | "review" = "finish"): PipelineGraph {
   const step = (id: string, name: string, canFinish = false) => ({ ...newStep({ id, name, agentProfileId: "p" }), ...(canFinish ? { canFinish: true } : {}) });
   return {
     steps: [step("understand", "Understand", true), step("build", "Build"), step("review", "Review"), step("finish", "Finish", true)],
     edges: [
       { id: "understand-build", from: "understand", to: "build", label: "build" },
-      { id: "understand-finish", from: "understand", to: "finish", label: "trivial change made" },
+      { id: "understand-finish", from: "understand", to: trivialTo, label: "trivial change made" },
       { id: "build-review", from: "build", to: "review", label: "" },
       { id: "review-build", from: "review", to: "build", label: "changes requested" },
       { id: "review-finish", from: "review", to: "finish", label: "approved" },
@@ -3120,6 +3132,15 @@ describe("reviewedPipelineShape", () => {
     const noLoop = changeGraph();
     noLoop.edges = noLoop.edges.filter((e) => e.id !== "finish-build");
     expect(reviewedPipelineShape(noLoop)?.viaEdge).toBeNull();
+  });
+
+  test("the same shape whichever step the trivial change is handed to", () => {
+    for (const to of ["finish", "review"] as const) {
+      const g = changeGraph(to);
+      expect(g.edges.find((e) => e.label === "trivial change made")).toMatchObject({ from: "understand", to });
+      const shape = reviewedPipelineShape(g);
+      expect(shape && [shape.build.id, shape.review.id, shape.finish.id, shape.viaEdge?.id]).toEqual(["build", "review", "finish", "finish-build"]);
+    }
   });
 
   test("anything else is not that shape", () => {
