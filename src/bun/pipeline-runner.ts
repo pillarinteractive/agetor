@@ -2173,7 +2173,7 @@ async function launchStep(
   // the loop the cap exists for, and waits for someone.
   if (
     run.stepCount >= effectiveStepCap(run) &&
-    snapshot.decisionPolicy === "planner-recommendation" &&
+    snapshot.decisionPolicy &&
     (run.capExtensions ?? 0) < AUTO_CAP_EXTENSIONS
   ) {
     const before = effectiveStepCap(run);
@@ -2192,7 +2192,7 @@ async function launchStep(
   let wrapUp = false;
   if (
     run.stepCount >= effectiveStepCap(run) &&
-    snapshot.decisionPolicy === "planner-recommendation" &&
+    snapshot.decisionPolicy &&
     run.capWrapUp?.seq === undefined
   ) {
     const terminal = capWrapUpStep(snapshot.graph);
@@ -2399,8 +2399,8 @@ async function launchStep(
   const withRouting = (prompt: string) => manuallyRouted
     ? `${prompt}\n\nThis step was explicitly selected by manual Advance. The preceding verdict and findings are preserved for you to address. This routing decision is not approval of the change and grants no additional permissions.`
     : prompt;
-  const withDecisions = (prompt: string) => snapshot.decisionPolicy === "planner-recommendation"
-    ? `${prompt}\n\n${plannerDecisionInstructions(parent.id, snapshot.capturedAt)}` : prompt;
+  const withDecisions = (prompt: string) => snapshot.decisionPolicy
+    ? `${prompt}\n\n${plannerDecisionInstructions(parent.id, snapshot.capturedAt, snapshot.decisionPolicy)}` : prompt;
   const managedRoot=managedPillarRoot(parent.worktreePath??parent.workdir);
   const approvalNote=step.name==='Review'
     ? `\n\nAutomatic sign-off requires explicit independent approval of this exact head and all issue acceptance. Map every acceptance criterion to checked evidence in your summary. In the handoff add "reviewApproval":{"verdict":"approved"|"changes-requested","headSha":"<full 40-character git rev-parse HEAD>","issueUrl":${JSON.stringify(parent.issueUrl??'')},"acceptanceComplete":true|false,"findings":[]}. Only use approved/true/empty findings when all required criteria are met and no finding remains. Otherwise record all findings, set changes-requested/false and choose Build. A succeeded/done review turn or Finish choice is not approval.`
@@ -2586,7 +2586,7 @@ function isDatabaseBusy(error: string): boolean {
 }
 function recordLaunchRefusal(parentId: string, run: PipelineRunState, taskId: string, stepId: string, message: string): void {
   upsertBlocked(run, { taskId, stepId, kind: isCapacityRefusal(message) ? 'slot-wait' : 'step-failed', message });
-  if (isDatabaseBusy(message) && run.snapshot?.decisionPolicy === 'planner-recommendation' && !isTaskRunLive(taskId)) {
+  if (isDatabaseBusy(message) && run.snapshot?.decisionPolicy && !isTaskRunLive(taskId)) {
     scheduleLaunchRetry(parentId, run, taskId, stepId, 'could not acquire the database writer');
   }
 }
@@ -4173,7 +4173,7 @@ function attemptHandoffReminderOrBlock(input: {
     // Nothing here needs a person: the step simply ended without saying
     // what happens next. On an unattended board, start it again (bounded,
     // with backoff) before leaving the block for someone.
-    if (run.snapshot?.decisionPolicy === "planner-recommendation") {
+    if (run.snapshot?.decisionPolicy) {
       scheduleAutoRetry(parentId, run, activeEntry.stepId, null, "ended without a handoff");
     }
     checkJoinIncomplete(run);
@@ -5440,7 +5440,7 @@ function markStepNeverStarted(parentId: string, taskId: string): void {
   }
   // This is an interrupted child launch, not a planner question. Preserve
   // a pending/exhausted/cancelled retry record across repeated boot sweeps.
-  if (run.snapshot?.decisionPolicy === 'planner-recommendation' && !run.autoRetry && !run.launchRetries?.[taskId]) {
+  if (run.snapshot?.decisionPolicy && !run.autoRetry && !run.launchRetries?.[taskId]) {
     scheduleLaunchRetry(parentId, run, taskId, entry.stepId, 'was interrupted before its worker started');
   }
   checkJoinIncomplete(run);
@@ -5486,7 +5486,7 @@ export async function reconcilePipelineRuns(): Promise<number> {
       const run = fresh?.pipelineRun;
       if (!fresh || !run || fresh.archivedAt != null || !['running', 'blocked'].includes(run.status)) return;
       for (const active of run.active) retireStaleQueuedReminder(parent.id, run, active.taskId);
-      if (run.snapshot?.decisionPolicy !== 'planner-recommendation' || run.autoRetry?.at === null) return;
+      if (!run.snapshot?.decisionPolicy || run.autoRetry?.at === null) return;
       let changed = false;
       for (const block of run.blocked) {
         if (block.kind !== 'step-failed' || !block.taskId || !block.stepId) continue;

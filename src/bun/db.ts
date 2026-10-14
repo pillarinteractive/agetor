@@ -718,7 +718,7 @@ const sanitizeRunSnapshot = (raw: unknown): PipelineRunSnapshot | null => {
   const capturedAt = isFiniteNumber(rec.capturedAt) ? rec.capturedAt : 0;
 
   return { graph, profiles, maxSteps, capturedAt,
-    ...(rec.decisionPolicy === "planner-recommendation" ? { decisionPolicy: "planner-recommendation" as const } : {}),
+    ...((rec.decisionPolicy === "planner-recommendation" || rec.decisionPolicy === "agent-followups") ? { decisionPolicy: rec.decisionPolicy } : {}),
     ...(() => {
       // Each gate is kept only as the literal `true` the runner wrote.
       const g = isPlainObject(rec.gates) ? rec.gates : {};

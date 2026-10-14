@@ -820,7 +820,7 @@ export interface PipelineRunSnapshot {
   profiles: Record<string, AgentProfileSnapshot>;
   capturedAt: number;
   /** Explicit project opt-in; instructions only, never an action approval. */
-  decisionPolicy?: "planner-recommendation";
+  decisionPolicy?: "planner-recommendation" | "agent-followups";
   /** Check gates this run adopted (`pipeline_gates`, src/shared/publish.ts):
    *  captured when the run starts, or on an explicit refresh — never by
    *  itself. `publish`: the pipeline's Finish step is run by Agetor. `steps`:

@@ -1703,7 +1703,9 @@ export function composeStepPrompt(input: {
 
   parts.push("## Delegation");
   // Codex has no subagent tool; a persona list there would only invite the
-  // agent to emulate one on its own (expensive) model.
+  // agent to emulate one on its own (expensive) model. Step text shared by
+  // several harnesses may still ask for a Scout: the line below says what
+  // that means for a step that cannot delegate.
   const canDelegate = !input.parentHarnessKind || input.parentHarnessKind === "claude-code";
   if (input.subagentProfiles.length > 0 && canDelegate) {
     parts.push(
@@ -1739,7 +1741,7 @@ export function composeStepPrompt(input: {
       );
     }
   } else {
-    parts.push("Do not spawn subagents for this step.");
+    parts.push("Do not spawn subagents for this step. Any Scout delegation requested elsewhere is conditional on supported tools and this step's permission; investigate directly with narrow reads instead.");
   }
 
   parts.push("## Working economically");

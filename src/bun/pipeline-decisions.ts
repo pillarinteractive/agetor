@@ -19,7 +19,7 @@ interface Ledger {
   capturedAt: number;
   runStartedAt: number;
   records: Array<DecisionRecord & { id: string; recordedAt: number; revisions?: DecisionRecord[] }>;
-  publication: "not-attempted" | "pending" | "published" | "uncertain" | "unavailable";
+  publication: "not-attempted" | "pending" | "published" | "uncertain" | "unavailable" | "agent-managed";
   publicationDirty?: boolean;
   /** Frozen at first record, including before a repository lookup fails. */
   sourceIssue?: string | null;
@@ -105,7 +105,7 @@ export async function recordPipelineDecision(id: string, input: unknown, deps = 
   const run = parent?.pipelineRun;
   const record = parseDecisionRecord(input);
   if (!record) return { error: "decision requires category, capturedAt, question, explicit recommendation, rationale, evidence and affectedArtifacts" };
-  if (!parent || parent.archivedAt != null || run?.snapshot?.decisionPolicy !== "planner-recommendation") return { error: "planner decisions are not enabled for this run" };
+  if (!parent || parent.archivedAt != null || !run?.snapshot?.decisionPolicy) return { error: "planner decisions are not enabled for this run" };
   if (record.capturedAt !== run.snapshot.capturedAt || run.status !== "running" || run.active.length === 0) return { error: "run changed or is not executing; no decision recorded" };
   if (claims.has(id)) return { error: "a decision is already being recorded; retry this same record" };
   claims.add(id);
@@ -149,6 +149,13 @@ export async function recordPipelineDecision(id: string, input: unknown, deps = 
       ledger.publicationDirty = true;
       save(file, ledger);
       recordActivity(id, { kind: "auto", text: `Recorded planner decision ${key} for human follow-up (${record.category}); no permission granted`, tone: "info" });
+    }
+    if (run.snapshot.decisionPolicy === "agent-followups") {
+      // Existing publication identities are retained for inspection. This
+      // mode never invokes the remote adapters, including on revised records.
+      if (!ledger.issueNumber && ledger.publication !== "pending" && ledger.publication !== "uncertain") ledger.publication = "agent-managed";
+      save(file, ledger);
+      return { ...result(), decisionId: key, followupMarker: `<!-- agetor-decision:${ledger.sourceIssue ?? "no-source-issue"}:${key} -->` };
     }
     if (ledger.publication !== "not-attempted" && ledger.publication !== "unavailable" && !(ledger.publication === "published" && ledger.issueNumber && ledger.publicationDirty)) return result();
     const origin = parseIssueUrl(ledger.sourceIssue);
