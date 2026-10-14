@@ -3,9 +3,9 @@ import type { PipelineGraph } from "./types.ts";
 import { newStep } from "./pipeline.ts";
 import {
   PRELOAD_LIMITS, bounceDiffSection, buildSlices, diffSelection, estimateTokens, excludedPath, fenceFor, fileMapSection, fitDiff, fitLargestFirst,
-  looksBinary, mapHeadMatches, parseFileMap, parseNumstat, planSlices, preloadKind, preloadReference, printable, slicesSection, splitDiff,
-  staleMapNote,
-  type FileRead, type SlicePlan,
+  hunkIndex, looksBinary, mapHeadMatches, parseFileMap, parseNumstat, planSlices, preloadKind, preloadReference, printable, renderReviewBundle,
+  reviewBundleSections, slicesSection, splitDiff, staleMapNote,
+  type FileRead, type ReviewBundleInput, type SlicePlan,
 } from "./preload.ts";
 
 const HEAD = "98301de7e9bd90e34b310425e45244ef2c25a359";
@@ -344,6 +344,9 @@ describe("the diff", () => {
       { start: 41, end: 42, inside: "class Tax" },
     ]);
     expect(files[1]!.hunks).toEqual([{ start: 1, end: 2, inside: "" }]);
+    expect(hunkIndex(files)).toBe([
+      "- src/total.ts", "  - L10-L17 in `export function total(cart: Cart): number {`", "  - L41-L42 in `class Tax`", "- docs/notes.md", "  - L1-L2",
+    ].join("\n"));
     expect(splitDiff("")).toEqual([]);
     expect(splitDiff('diff --git "a/caf\\303\\251.md" "b/caf\\303\\251.md"\n+x').map((f) => f.path)).toEqual(['"a/caf\\303\\251.md" "b/caf\\303\\251.md"']);
   });
@@ -380,7 +383,8 @@ describe("preloadKind", () => {
         { name: "Build after a Build that was cancelled or failed", step: build, history: [visit(understand), visit(build)], want: "build-bounce" },
         { name: "Build after the trivial route went through Review or Finish, with no Build yet", step: build, history: [visit(understand), visit(review)], want: "build-bounce" },
         { name: "Build after only Finish ran (trivial → Finish, then verification failed)", step: build, history: [visit(understand), visit(finish)], want: "build-bounce" },
-        { name: "Review", step: review, history: [visit(understand), visit(build)], want: null },
+        { name: "Review after Build", step: review, history: [visit(understand), visit(build)], want: "review" },
+        { name: "Review that never had a Build before it", step: review, history: [visit(understand)], want: "review" },
         { name: "Understand", step: understand, history: [], want: null },
         { name: "Finish", step: finish, history: [visit(understand), visit(build), visit(review)], want: null },
       ];
@@ -445,8 +449,69 @@ describe("the prompt sections", () => {
   });
 
   test("preloadReference names the files and inlines nothing", () => {
-    expect(preloadReference({ mapPath: "/g/agetor/file-map.md" })).toEqual({ card: "## File map\n\nThe card's file map is at /g/agetor/file-map.md.", visit: null });
-    expect(preloadReference({ mapPath: null })).toEqual({ card: null, visit: null });
+    expect(preloadReference({ mapPath: "/g/agetor/file-map.md", bundlePath: "/g/agetor/review-bundle.md" })).toEqual({
+      card: "## File map\n\nThe card's file map is at /g/agetor/file-map.md.",
+      visit: "## Review bundle\n\nAgetor wrote this visit's review bundle (acceptance criteria, file map, diff) to /g/agetor/review-bundle.md — read it before you start.",
+    });
+    expect(preloadReference({ mapPath: null, bundlePath: null })).toEqual({ card: null, visit: null });
+  });
+});
+
+describe("the review bundle", () => {
+  const bundle = (over: Partial<ReviewBundleInput> = {}): ReviewBundleInput => ({
+    cardTitle: "Issue #974: Select one filesystem waiting source", goal: "Acceptance:\n- CA01 the profile exists\n- CA02 it is validated",
+    issueUrl: "https://github.com/o/r/issues/974", stepNumber: 3, writtenAt: "2026-10-13T20:00:00.000Z", head: HEAD, base: "origin/develop",
+    baseTip: "5f9f49457a498d60a2fc858546e45ba3e775cc75", mapPath: "/g/agetor/file-map.md", map: "# File map\n- `src/total.ts:L10-L17`",
+    stats: parseNumstat("3\t1\tsrc/total.ts\n2\t0\tdocs/notes.md\n-\t-\tassets/logo.png"), files: splitDiff(DIFF),
+    named: [{ what: "assets/logo.png", why: "a binary file", trimmed: false }], ...over,
+  });
+
+  test("the file holds the acceptance criteria, the map, the files changed, each hunk's place and the diff", () => {
+    const file = renderReviewBundle(bundle());
+    expect(file.split("\n")[0]).toBe("# Review bundle — Issue #974: Select one filesystem waiting source");
+    expect(file).toContain(`Written by Agetor when Review was launched (step 3, 2026-10-13T20:00:00.000Z). HEAD ${HEAD}; base origin/develop at 5f9f4945`);
+    expect(file).toContain("## Acceptance criteria\n\nThe card's goal as this run has it (https://github.com/o/r/issues/974):\n\n```markdown\nAcceptance:\n- CA01 the profile exists\n- CA02 it is validated\n```");
+    expect(file).toContain("## File map\n\n```markdown\n# File map\n- `src/total.ts:L10-L17`\n```");
+    expect(file).toContain("## Changes: `git diff -U5 origin/develop...HEAD`\n\nFiles changed (3):\n- src/total.ts (+3 −1)\n- docs/notes.md (+2 −0)\n- assets/logo.png (binary)");
+    expect(file).toContain("  - L10-L17 in `export function total(cart: Cart): number {`");
+    expect(file).toContain(`\`\`\`diff\n${DIFF}\n\`\`\``);
+    expect(file).toEndWith("Not included:\n- not inlined: assets/logo.png — a binary file\n");
+  });
+
+  test("a card with no map and no change still gets a bundle that says so", () => {
+    const file = renderReviewBundle(bundle({ map: null, stats: [], files: [], named: [], issueUrl: null, baseTip: null }));
+    expect(file).toContain("(no file map at /g/agetor/file-map.md)");
+    expect(file).toContain("(HEAD has no change against the base)");
+    expect(file).not.toContain("```diff");
+  });
+
+  test("the prompt gets the map and the diff, not the goal a second time", () => {
+    const sections = reviewBundleSections({ ...bundle(), bundlePath: "/g/agetor/review-bundle.md" });
+    expect(sections.card).toContain("## File map");
+    expect(sections.visit!.startsWith("## Review bundle: the change\n\nAgetor wrote this visit's review bundle to /g/agetor/review-bundle.md")).toBe(true);
+    expect(sections.visit).toContain('the acceptance criteria (the "Overall goal" of this prompt)');
+    expect(sections.visit).not.toContain("CA01");
+    expect(sections.visit).toContain("What each hunk is inside, by git's own hunk headers");
+    expect(sections.visit).toContain(`\`\`\`diff\n${DIFF}\n\`\`\``);
+    expect(sections.visit).toContain("- not inlined: assets/logo.png — a binary file");
+  });
+
+  test("a diff over the budget is inlined as far as it fits and the rest is named; the file keeps all of it", () => {
+    const big = Array.from({ length: 6 }, (_, i) => ({ path: `src/f${i}.ts`, text: `diff --git a/src/f${i}.ts b/src/f${i}.ts\n${"+x\n".repeat(5_000 + i)}`, hunks: [] }));
+    const sections = reviewBundleSections({ ...bundle({ files: big, named: [] }), bundlePath: "/g/agetor/review-bundle.md" });
+    const inlined = /```diff\n([\s\S]*)\n```/.exec(sections.visit!)![1]!;
+    expect(inlined.length).toBeLessThanOrEqual(PRELOAD_LIMITS.diffTokens * PRELOAD_LIMITS.charsPerToken);
+    // Six files of ~15,000 characters against 80,000: the largest is dropped.
+    expect(sections.visit).toContain("- trimmed: read src/f5.ts yourself (its diff is");
+    expect(sections.visit).not.toContain("trimmed: read src/f0.ts");
+    for (const f of big) expect(renderReviewBundle(bundle({ files: big }))).toContain(`diff --git a/${f.path}`);
+  });
+
+  test("no map, no change, no file: the sections say what is so", () => {
+    const sections = reviewBundleSections({ ...bundle({ map: null, stats: [], files: [], named: [] }), bundlePath: null });
+    expect(sections.card).toBeNull();
+    expect(sections.visit).toContain("Agetor could not write this visit's review bundle file");
+    expect(sections.visit).toContain("there is no committed change to review");
   });
 });
 

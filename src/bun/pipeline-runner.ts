@@ -2367,11 +2367,12 @@ async function launchStep(
 
   const stepChecks = publishBrief || wrapUp ? null : stepGateFor(parent, run, step);
   // What Agetor reads for the step at launch (`pipeline_gates`' `preload`):
-  // the file map and the code it points at, the branch's diff. Never for
-  // the writer of an Agetor-run Finish or the wrap-up, and
+  // the file map and the code it points at, the branch's diff, Review's
+  // bundle. Never for the writer of an Agetor-run Finish or the wrap-up, and
   // never a reason for a launch to fail: unreadable means none.
   const preload = publishBrief || wrapUp || !gatePref("preload", parent, run) ? null
-    : await stepPreload({ parent, graph: snapshot.graph, step, history: run.history }).catch(() => null);
+    : await stepPreload({ parent, graph: snapshot.graph, step, history: run.history, stepNumber: seq }).catch(() => null);
+  if (preload?.bundlePath) handoffRefs.push({ path: preload.bundlePath, isDirectory: false });
   const composeArgs = {
     pipelineName: run.pipelineName,
     // The writer's turn of an Agetor-run Finish: the brief is its whole job.

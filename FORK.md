@@ -1706,3 +1706,33 @@ no file or git command is read for them. It can be combined with `publish` and `
 Not done: a Retry re-sends the visit's stored prompt, so what was inlined is as old as the launch (the sections say
 so and tell the step the worktree is newer); the base is the one last fetched, nothing is fetched; a pasted prompt
 of this size (up to ~100 KB more) has been exercised with the scripted agent only, not in a real Claude session.
+
+### One review bundle on entering Review (the same `preload` switch)
+
+When Review is launched for a covered card, Agetor writes `<git dir>/agetor/review-bundle.md` — beside the file
+map, outside the working tree — and Review starts from it instead of assembling the same things call by call:
+
+1. **Acceptance criteria**: the card's goal as the run has it (`task.prompt`, the issue snapshot every step is
+   given as "Overall goal") and the issue's URL. GitHub is not called: the runner does not read the issue at this
+   point, and the bundle does not make it.
+2. **The file map**, whole (or a line saying there is none).
+3. **`git diff -U5 <base>...HEAD`**: the files changed with their counts, then the diff, with the same files named
+   and left out as on a Build visit.
+4. **What each hunk is inside**: per file, `L<start>-L<end> in <line>` — the text git itself puts after `@@` in a
+   hunk header (its own function-context rules for the file type), with the hunk's lines in the new file. Nothing
+   else is parsed: where git finds no enclosing line, the entry is the range alone.
+
+- **Once per visit**: rewritten at every launch of Review (written beside and renamed, so never half there), with
+  the step number, the time and the HEAD it was written for. It is added to the step task's references.
+- **In the prompt**: `## File map` after the goal and `## Review bundle: the change` after the context from the
+  previous step — the bundle's path, the hunk index and the diff within the diff budget (20,000 tokens, 6,000 a
+  file, largest trimmed first and named). The goal is not repeated; the section points at "Overall goal". The file
+  keeps the diff whole (a file up to 200,000 characters, 2,000,000 in all).
+- **A card that never visited Build** — Understand's trivial change, routed to Review once Pillar's prompt sync
+  moves that edge — gets the same bundle: it needs no Build handoff, no Build record and no map, only the worktree
+  and the base. With the edge still going to Finish, no Review runs on that route and nothing is written.
+- Nothing committed, or no base ref to diff against: the bundle and the prompt say so. A bundle that cannot be
+  written does not stop the launch: the prompt carries what it would have held.
+
+Not done: Finish and Understand are not pre-loaded; a check-feedback turn (the same Review session) gets no new
+bundle — the next launch does.

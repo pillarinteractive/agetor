@@ -1,5 +1,5 @@
 import { test, expect, describe, beforeAll, beforeEach, afterEach, afterAll } from "bun:test";
-import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -119,7 +119,7 @@ async function makeRepo() {
     mkdirSync(path.join(gitDir, "agetor"), { recursive: true });
     writeFileSync(path.join(gitDir, "agetor", "file-map.md"), text);
   };
-  return { root, repo, gitDir, head, commit, writeMap, mapPath: path.join(gitDir, "agetor", "file-map.md") };
+  return { root, repo, gitDir, head, commit, writeMap, mapPath: path.join(gitDir, "agetor", "file-map.md"), bundlePath: path.join(gitDir, "agetor", "review-bundle.md") };
 }
 type Repo = Awaited<ReturnType<typeof makeRepo>>;
 
@@ -162,7 +162,7 @@ const cardOf = (r: Repo, over: Partial<Task> = {}) => ({
 }) as Task;
 const visit = (s: PipelineStep) => ({ stepId: s.id });
 const load = (r: Repo, step: PipelineStep, history: { stepId: string }[], over: Partial<Task> = {}) =>
-  stepPreload({ parent: cardOf(r, over), graph: GRAPH, step, history });
+  stepPreload({ parent: cardOf(r, over), graph: GRAPH, step, history, stepNumber: history.length + 1 });
 
 describe("Build's first visit", () => {
   test("the map and the code at its ranges, read from the worktree; everything not inlined is named with its reason", async () => {
@@ -174,6 +174,7 @@ describe("Build's first visit", () => {
     r.writeMap(mapFor(head, MAP_BODY));
     const got = (await load(r, build, [visit(understand)]))!;
     expect(got.kind).toBe("build-first");
+    expect(got.bundlePath).toBeNull();
     expect(got.inline.card).toContain(`The card's file map (${r.mapPath})`);
     expect(got.inline.card).toContain("- `src/total.ts:L10-L14` — the rounding");
     const visitText = got.inline.visit!;
@@ -312,14 +313,76 @@ describe("a Build visit after other steps ran", () => {
   }, 30_000);
 });
 
-test("Understand, Review and Finish are not pre-loaded, and a folder that is no git repository is no reason to fail", async () => {
+describe("Review's bundle", () => {
+  test("written once per visit beside the file map: acceptance criteria, map, the diff with five lines of context, each hunk's place", async () => {
+    const r = await makeRepo();
+    r.writeMap(mapFor(await r.head(), MAP_BODY));
+    const head = await r.commit({ "src/total.ts": numbered(60, "total").replace("total 30\n", "total thirty\n"), "pnpm-lock.yaml": numbered(41, "lock") });
+    const got = (await load(r, review, [visit(understand), visit(build)]))!;
+    expect(got.kind).toBe("review");
+    expect(got.bundlePath).toBe(r.bundlePath);
+    const file = readFileSync(r.bundlePath, "utf8");
+    expect(file).toContain(`Written by Agetor when Review was launched (step 3, 2026-10-13T20:00:00.000Z). HEAD ${head}; base origin/develop at `);
+    expect(file).toContain("The card's goal as this run has it (https://github.com/o/r/issues/7):\n\n```markdown\nAcceptance:\n- CA01 totals are rounded\n```");
+    expect(file).toContain("- `src/total.ts:L10-L14` — the rounding");
+    expect(file).toContain("Files changed (2):\n- pnpm-lock.yaml (+1 −0)\n- src/total.ts (+1 −1)");
+    expect(file).toContain("- src/total.ts\n  - L25-L35 in `total 24`");
+    expect(file).toContain("\n total 25\n");
+    expect(file).not.toContain("\n total 24\n");
+    expect(file).toContain("-total 30\n+total thirty");
+    expect(file).toContain("Not included:\n- not inlined: pnpm-lock.yaml — a lockfile (+1 −0)");
+    expect(file).not.toContain("lock 41");
+    expect(existsSync(`${r.bundlePath}.tmp`)).toBe(false);
+    // The prompt: the map as the card's context, the diff as this visit's, the goal not repeated.
+    expect(got.inline.card).toContain("## File map");
+    expect(got.inline.visit).toContain(`Agetor wrote this visit's review bundle to ${r.bundlePath}`);
+    expect(got.inline.visit).toContain("-total 30\n+total thirty");
+    expect(got.inline.visit).not.toContain("CA01");
+    expect(got.reference.visit).toContain(r.bundlePath);
+
+    // The next visit rewrites it for the head it finds.
+    preloadDeps.now = () => NOW + 3_600_000;
+    const next = await r.commit({ "src/tax.ts": numbered(31, "tax") });
+    await load(r, review, [visit(understand), visit(build), visit(review), visit(build)]);
+    const rewritten = readFileSync(r.bundlePath, "utf8");
+    expect(rewritten).toContain(`(step 5, 2026-10-13T21:00:00.000Z). HEAD ${next};`);
+    expect(rewritten).toContain("+tax 31");
+  }, 30_000);
+
+  test("a card that never visited Build (Understand's trivial change): no Build record, no map — the bundle is still written and inlined", async () => {
+    const r = await makeRepo();
+    const head = await r.commit({ "src/tax.ts": numbered(30, "tax").replace("tax 9\n", "tax nine\n") }, "trivial: fix the rate");
+    const got = (await load(r, review, [visit(understand)]))!;
+    expect(got.kind).toBe("review");
+    const file = readFileSync(r.bundlePath, "utf8");
+    expect(file).toContain(`(step 2, 2026-10-13T20:00:00.000Z). HEAD ${head};`);
+    expect(file).toContain(`(no file map at ${r.mapPath})`);
+    expect(file).toContain("-tax 9\n+tax nine");
+    expect(got.inline.card).toBeNull();
+    expect(got.inline.visit).toContain("-tax 9\n+tax nine");
+    expect(got.reference).toEqual({ card: null, visit: expect.stringContaining(r.bundlePath) });
+  }, 30_000);
+
+  test("nothing committed, or no base to diff against: the bundle says so", async () => {
+    const r = await makeRepo();
+    const empty = (await load(r, review, [visit(understand)]))!;
+    expect(empty.inline.visit).toContain("there is no committed change to review");
+    expect(readFileSync(r.bundlePath, "utf8")).toContain("(HEAD has no change against the base)");
+    checkDeps.base = async () => "no-such-branch";
+    await load(r, review, [visit(understand)]);
+    expect(readFileSync(r.bundlePath, "utf8")).toContain("- not inlined: the diff — no local ref for the base branch, or git could not diff against it");
+  }, 30_000);
+});
+
+test("Understand and Finish are never pre-loaded, and a folder that is no git repository is no reason to fail", async () => {
   const r = await makeRepo();
   r.writeMap(mapFor(await r.head(), MAP_BODY));
   expect(await load(r, understand, [])).toBeNull();
-  expect(await load(r, review, [visit(understand), visit(build)])).toBeNull();
   expect(await load(r, finish, [visit(understand), visit(build), visit(review)])).toBeNull();
+  expect(existsSync(r.bundlePath)).toBe(false);
   const plain = mkdtempSync(path.join(tmpdir(), "agetor-preload-plain-"));
   expect(await load(r, build, [visit(understand)], { workdir: plain })).toBeNull();
+  expect(await load(r, review, [visit(understand)], { workdir: plain })).toBeNull();
 }, 30_000);
 
 // ---------------------------------------------------------------------------
@@ -382,7 +445,7 @@ async function start(id: string) {
   const started = await startTask(id);
   if ("error" in started) throw new Error(started.error);
 }
-const PRELOAD_HEADINGS = ["## File map", "## Code at the file map's ranges", "## What this branch changes so far"];
+const PRELOAD_HEADINGS = ["## File map", "## Code at the file map's ranges", "## What this branch changes so far", "## Review bundle"];
 
 describe("through the runner", () => {
   test("switch off: no prompt has a pre-loaded section and nothing is read for one — also for a card left out of the trial list", async () => {
@@ -399,9 +462,10 @@ describe("through the runner", () => {
     const left = await until(other.id, (run) => run.status === "done", "the run done");
     for (const h of left.history) for (const heading of PRELOAD_HEADINGS) expect(tasks.get(h.taskId)!.prompt).not.toContain(heading);
     expect(gitCalls).toBe(0);
+    expect(existsSync(r.bundlePath)).toBe(false);
   }, 60_000);
 
-  test("switch on, for a card on the trial list: Build starts with the map and its code; the other steps are as they were", async () => {
+  test("switch on, for a card on the trial list: Build starts with the map and its code, Review with its bundle; Understand and Finish are as they were", async () => {
     const r = await makeRepo();
     const head = await r.commit({ "src/tax.ts": numbered(31, "tax") });
     r.writeMap(mapFor(head, MAP_BODY));
@@ -419,7 +483,13 @@ describe("through the runner", () => {
     expect(buildTask.prompt).toContain("### src/total.ts:L10-L14\n\n```\ntotal 10\ntotal 11\ntotal 12\ntotal 13\ntotal 14\n```");
     expect(buildTask.prompt).not.toContain("## What this branch changes so far");
 
-    for (const step of [card.understand, card.review, card.finish]) {
+    const reviewTask = promptsOf(run, card.review)[0]!;
+    expect(reviewTask.prompt).toContain(`Agetor wrote this visit's review bundle to ${r.bundlePath}`);
+    expect(reviewTask.prompt).toContain("+tax 31");
+    expect(reviewTask.references.map((ref) => ref.path)).toContain(r.bundlePath);
+    expect(readFileSync(r.bundlePath, "utf8")).toContain(`HEAD ${head}; base origin/develop`);
+
+    for (const step of [card.understand, card.finish]) {
       for (const heading of PRELOAD_HEADINGS) expect(promptsOf(run, step)[0]!.prompt).not.toContain(heading);
     }
   }, 60_000);
@@ -442,6 +512,22 @@ describe("through the runner", () => {
     // What already arrived still does: Review's handoff, in its untrusted span.
     expect(bounce!.prompt).toContain('### From "Review"');
     expect(bounce!.prompt.indexOf('### From "Review"')).toBeLessThan(bounce!.prompt.indexOf("## What this branch changes so far"));
+  }, 60_000);
+
+  test("the trivial route (Understand → Review, never Build): Review still gets its bundle", async () => {
+    const r = await makeRepo();
+    await r.commit({ "src/tax.ts": numbered(30, "tax").replace("tax 9\n", "tax nine\n") }, "trivial: fix the rate");
+    // The scripted agent names the step; the edge it takes is "trivial change made".
+    const card = await makeCard(r.repo, { understand: "Review" });
+    switchOn(card.pipeline.id);
+    await start(card.id);
+    const run = await until(card.id, (x) => x.status === "done", "the run done");
+    expect(run.history.map((h) => h.stepId)).toEqual([card.understand.id, card.review.id, card.finish.id]);
+    const reviewTask = promptsOf(run, card.review)[0]!;
+    expect(reviewTask.prompt).toContain("## Review bundle: the change");
+    expect(reviewTask.prompt).toContain("-tax 9\n+tax nine");
+    expect(reviewTask.prompt).not.toContain("## File map");
+    expect(readFileSync(r.bundlePath, "utf8")).toContain(`(no file map at ${r.mapPath})`);
   }, 60_000);
 
   test("switch on where nothing can be read: the run goes on exactly as without it", async () => {
