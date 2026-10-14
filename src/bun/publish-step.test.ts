@@ -1,5 +1,5 @@
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -114,7 +114,7 @@ function fakeGitHub(repos: Awaited<ReturnType<typeof makeRepos>>): void {
     return { ok: true, pr: { number: 7, url: gh.pull.url } };
   };
   publishDeps.checks = async (_task, sha) => (gh.readable ? (gh.checks.get(sha) ?? []) : null);
-  publishDeps.failedLog = async () => gh.log;
+  publishDeps.failedLog = async (_task, runId) => ({ runId, raw: gh.log, workflow: "ci", url: `https://github.com/o/r/actions/runs/${runId}` });
   publishDeps.rerunFailed = async (_task, runId) => {
     gh.reruns.push(runId);
     return { ok: true };
@@ -488,9 +488,45 @@ describe("failures of the change's own", () => {
     expect(record.handoff!.summary).toContain("- web (failure)");
     expect(record.handoff!.reason).toContain("test failed: expected 1, got 2");
     expect(record.handoff!.summary).not.toContain("fix round");
+    // Build is shown each failed job's failure lines, not the log's tail:
+    // the run, the saved log, then job, step and exit code over the lines.
+    const reason = record.handoff!.reason.split("\n");
+    expect(reason[0]).toBe("Run 9001: https://github.com/o/r/actions/runs/9001");
+    const saved = /^Full log: (\S+) /.exec(reason[1]!)?.[1];
+    expect(saved).toEndWith("ci-failed-9001.log");
+    expect(readFileSync(saved!, "utf8")).toBe(`${gh.log}\n`);
+    expect(reason[2]).toBe("--- failed: ci — exit code not in the log ---");
     // The record has a hidden task of its own, so the card's strip can open it.
     expect(tasks.get(record.taskId)).toMatchObject({ pipelineParentId: card.id, pipelineStepId: card.finish.id, column: "done", runId: null });
     expect(gh.reruns).toEqual([]);
+  }, 60_000);
+
+  test("Build gets the failure lines of each failed job, without timestamps, colour or the runner's cleanup", async () => {
+    const repos = await makeRepos();
+    fakeGitHub(repos);
+    gh.checks.set(repos.baseTip, GREEN);
+    const line = (job: string, step: string, text: string) => `${job}\t${step}\t2026-10-14T00:48:29.3248291Z ${text}`;
+    gh.log = [
+      ...Array.from({ length: 300 }, (_, i) => line("web / unit", "Run tests", `ok case ${i}`)),
+      line("web / unit", "Run tests", "\x1b[31m ✗ adds an item\x1b[0m"),
+      line("web / unit", "Run tests", "AssertionError: expected 1 to be 2"),
+      line("web / unit", "Run tests", "##[error]Process completed with exit code 1."),
+      ...Array.from({ length: 80 }, (_, i) => line("web / unit", "Post Run actions/checkout", `[command]/usr/bin/git config --unset ${i}`)),
+    ].join("\n");
+    const card = makeCard(repos.repo, approvalHandoff(repos.head));
+    await publishCard(card.id, T0);
+    gh.checks.set(repos.head, RED);
+    await publishCard(card.id, T0 + MIN);
+    const reason = runOf(card).history.at(-1)!.handoff!.reason;
+    expect(reason).toContain('--- failed: ci / web / unit / step "Run tests" — exit code 1 ---');
+    expect(reason).toContain("(23 of 383 log lines: the 3 failure lines with up to 20 lines either side)");
+    expect(reason).toContain(" ✗ adds an item\nAssertionError: expected 1 to be 2\n##[error]Process completed with exit code 1.");
+    expect(reason).toContain("… 80 lines omitted …");
+    expect(reason).not.toContain("git config --unset");
+    expect(reason).not.toContain("2026-10-14T00:48");
+    expect(reason).not.toContain("\x1b");
+    // The roll-up check is not a cause: only the failing suite's run is read.
+    expect(reason.match(/^Run \d+/gm)).toEqual(["Run 9001"]);
   }, 60_000);
 
   test("the suite was not selected on the base tip: an older base commit that ran it decides", async () => {

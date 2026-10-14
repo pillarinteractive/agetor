@@ -46,7 +46,9 @@ bun run install:local          # backs up ~/.agetor/agetor.sqlite, moves the old
 ```
 
 Besides swapping the app, `install:local` compiles the CLI to `~/.agetor/bin/agetor` (same commit as the app, so
-their routes match) and installs the keepalive check to `~/.agetor/bin/agetor-keepalive`.
+their routes match), installs the keepalive check to `~/.agetor/bin/agetor-keepalive` and installs `ci-wait`
+(`scripts/ci-wait/ci-wait`, what a Finish step waits for CI with) to `~/.agetor/bin/ci-wait`, replacing the copy that
+used to be kept there by hand.
 
 `install:local` quits Agetor; the user has to confirm the Quit dialog. Agents keep running in tmux and the new app
 reattaches to them. Roll back by quitting, moving the previous app from `~/.agetor/backups/` back into `/Applications`,
@@ -1609,3 +1611,42 @@ Baseline, 2026-10-13, the last 10 finished Change cards of Pillar (349 visits; m
 
 All ten cards: 97.4M weighted tokens, 6,846 calls, 669 turns. One visit of 349 was a lower bound (one of its three
 session files was gone). Build ran on Claude (Sonnet, with a DeepSeek backup), Review and Finish on Codex.
+
+### CI failures, trimmed (`src/shared/ci-failure.ts`, `scripts/ci-wait/ci-wait`)
+
+Before: a CI failure reached Build as the **last 60 lines** of `gh run view <run> --log-failed` (6,000 characters at
+most), for up to two runs — from `ci-wait` when an agent ran Finish, from `logTail` (`src/bun/merge-rework.ts`) when
+Agetor ran it or the merge queue started a fix round. A failed log ends with the runner cleaning up, so the tail was
+mostly `git config --unset …`: in the saved wait for PR #1539, 40 of the 60 lines were cleanup and one of ten test
+failures was visible.
+
+Now, per failed job: a heading with workflow, job, step and exit code, then the lines that match a failure marker
+(`FAIL`, `Error:`, `error TS<n>`, `panic:`, `--- FAIL:`, `AssertionError`, `✗`, `×`, `##[error]`; case-sensitive) with
+20 lines either side, colour codes and timestamps removed, lines over 400 characters cut, at most 150 log lines a job;
+above them the run's URL and the path of the whole failed log, which is saved.
+
+- **Fitting 150 lines.** Context is narrowed (20, 10, 5, 2, 0 lines) until the excerpt fits; with more failure lines
+  than the cap, the first third and the last two thirds of them are kept. Every cut says `… N lines omitted …`.
+  Context never crosses `Process completed with exit code`: what follows it is cleanup. A job in which nothing
+  matches shows its last 60 lines.
+- **Agetor-run Finish and merge-queue fix rounds** (`src/bun/ci-failure-log.ts`, used by `publish-step.ts` and
+  `merge-rework.ts`): the report is the handoff's `reason`. A handoff field holds 8,000 characters
+  (`PIPELINE_LIMITS.handoffField`), shared by the (at most two) runs, so the cap per job is lowered until it fits and
+  a shortened report ends with the path of the 150-line one. Files, in `<data dir>/pipeline-runs/<card>/`:
+  `ci-failed-<run>.log` (the whole failed log) and `ci-failure-<run>.md` (the full excerpt, written only when the
+  handoff's copy was shortened). One more `gh run view --json workflowName,url` per failed run. The runner-fault
+  decision (`infraReason`) still reads the tail, unchanged.
+- **Agent-run Finish**: `ci-wait` is in the repository now and `install:local` installs it. Exit codes (0, 1, 2, 3,
+  4) and every line it printed are unchanged except the log part of a failure: where it printed
+  `--- last 60 lines of the failed log, run N … ---` and the tail, it prints the report above, and ends with one
+  `ci-wait: failed jobs: …` line so the 60-line tail Agetor quotes when it wakes the step names every failed job. The
+  whole failed log goes to `$(git rev-parse --absolute-git-dir)/agetor/ci-failed-<run>.log`. It reads subprocess
+  output as UTF-8 with replacement, so an odd byte in a log no longer ends the wait with a traceback.
+- **One algorithm, two languages.** `ci-wait` is Python and carries the algorithm itself;
+  `src/shared/ci-failure.test.ts` runs both implementations on the same logs and requires the same bytes, and
+  `src/bun/ci-wait.test.ts` holds `ci-wait` to its contract with stand-in `gh` and `git` (set `CI_WAIT_SCRIPT` to run
+  the same cases against another copy). Change the two together.
+
+Not done: the excerpt is quoted inside the handoff's JSON, so its newlines arrive escaped, as the tail's did; the
+workflow name is not read for a run whose log could not be read; the Finish step's own instructions still say "log
+tail" (they are Pillar's, in `docs/engineering/agetor/`).

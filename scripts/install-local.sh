@@ -42,6 +42,10 @@ echo "installed CLI → $DATA_DIR/bin/agetor"
 # (src/bun/keepalive.ts). Installing it changes nothing until then.
 install -m 755 "$ROOT/scripts/keepalive/agetor-keepalive.sh" "$DATA_DIR/bin/agetor-keepalive"
 echo "installed keepalive check → $DATA_DIR/bin/agetor-keepalive"
+# What a Finish step waits for CI with (`agetor-await "ci" -- ci-wait`). Its
+# failure output is trimmed as Agetor trims it (src/shared/ci-failure.ts).
+install -m 755 "$ROOT/scripts/ci-wait/ci-wait" "$DATA_DIR/bin/ci-wait"
+echo "installed ci-wait → $DATA_DIR/bin/ci-wait"
 
 mkdir -p "$BACKUPS"
 if [ -f "$DATA_DIR/agetor.sqlite" ]; then
