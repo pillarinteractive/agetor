@@ -15,7 +15,7 @@
 import type { FollowUpAction, Task, TaskPrStatus } from "../shared/types.ts";
 import { agentProfiles, preferences, tasks } from "./db.ts";
 import { run as run_, createGitHubPull, gitPushWithRetry, findGitHubPullForBranch, getGitHubCompare, getGitHubPullChecks, getGitHubPullReviewThreads, createGitHubComment, getGitHubIssueThread, getGitHubRefCheckRuns, updateGitHubIssue, updateGitHubPullBranch } from "./github.ts";
-import { runPipelineFollowUp } from "./pipeline-runner.ts";
+import { runPipelineFollowUp, settleMergedRun } from "./pipeline-runner.ts";
 import { parseIssueUrl } from "../shared/issue-task.ts";
 import { ROLLUP_CHECKS, checksState, failedConclusion, newestPerName, type CheckRunLike } from "../shared/check-runs.ts";
 export { ROLLUP_CHECKS, newestPerName, type CheckRunLike };
@@ -373,6 +373,10 @@ export async function prWatchTick(opts: { column?: Task["column"] } = {}): Promi
       for (const e of prActivity(prev, next)) (prev ? recordActivity : recordActivityOnce)(task.id, e);
       if (!task.prUrl && next.url) tasks.update(task.id, { prUrl: next.url });
       if (next.state === "merged" && prev?.state !== "merged" && canMoveToDone(task)) moveMergedTaskToDone(task.id);
+      // Merged while its run sat parked (a step cap, a hold, a wait): nothing
+      // would ever move it, so finish the run here. Checked on every probe,
+      // not only on the transition, so a card parked before this ran settles.
+      else if (next.state === "merged" && task.column !== "done" && !canMoveToDone(task) && (await settleMergedRun(task.id, next.number ?? null))) moveMergedTaskToDone(task.id);
       if (next.state === "merged") await closeIssueForMergedPr(task, next);
       if (!same(prev, next)) changed = true;
       await maybeAutoUpdateBranch(task, next);

@@ -4835,6 +4835,28 @@ export async function steerPipelineRun(
  * set kept so Run retries them"). 409 when nothing is actually live
  * (M5 — `isTaskRunLive`, not `column`).
  */
+/**
+ * A card whose pull request was merged while its run was parked (blocked,
+ * waiting, or stopped at a cap) has nothing left to do: finish the run so
+ * the card can move to Done. A step still executing is left alone; the PR
+ * watcher asks again on its next tick. Returns whether the run is now done.
+ */
+export async function settleMergedRun(parentId: string, prNumber: number | null): Promise<boolean> {
+  return runExclusive(parentId, async () => {
+    const run = tasks.get(parentId)?.pipelineRun;
+    if (!run) return false;
+    if (run.status === "done") return true;
+    if (run.status === "cancelled" || run.active.length > 0) return false;
+    run.status = "done";
+    run.blocked = [];
+    delete run.wait;
+    run.endedAt = Date.now();
+    persist(parentId, run);
+    recordActivity(parentId, { kind: "step", text: `${prNumber != null ? `PR #${prNumber}` : "Its pull request"} was merged while the run was parked; the run is finished`, tone: "success" });
+    return true;
+  }).catch(() => false);
+}
+
 export async function cancelPipelineRun(parentId: string): Promise<{ task: Task } | { error: string; status: 404 | 409 }> {
   return runExclusive(parentId, async () => {
     const parent = tasks.get(parentId);

@@ -193,3 +193,20 @@ test("the counter is kept on the run across a reload (the run sanitizer keeps it
   tasks.setPipelineRun(parentId, { ...run, noChangeLoop: state });
   expect(tasks.get(parentId)!.pipelineRun!.noChangeLoop).toEqual(state);
 });
+
+test("a run parked at its step cap whose pull request was merged is finished by settleMergedRun", async () => {
+  await stubHeads((i) => ({ head: `h${i}`, tree: `t${i}` }));
+  const { parentId } = await start({ unattended: false, maxSteps: 2 });
+  const run = await ended(parentId);
+  expect(run.status).toBe("blocked");
+  expect(run.blocked.some((b) => b.kind === "step-cap")).toBe(true);
+  const { settleMergedRun } = await import("./pipeline-runner.ts");
+  expect(await settleMergedRun(parentId, 42)).toBe(true);
+  const { tasks } = await import("./db.ts");
+  const after = tasks.get(parentId)!.pipelineRun!;
+  expect(after.status).toBe("done");
+  expect(after.blocked).toEqual([]);
+  expect(after.endedAt).not.toBeNull();
+  // Idempotent: a later probe finds it done and changes nothing.
+  expect(await settleMergedRun(parentId, 42)).toBe(true);
+});
