@@ -1370,6 +1370,22 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
       const cards = projectCards.flatMap((t) => { const n = issueOf(t); return n == null ? [] : [{ issue: n, live: !finished(t) }]; });
       const roadmapIssues = new Set(views.map((v) => v.issue));
       const pick = pickBugs({ open: found.open, config: found.config, roadmap: roadmapIssues, cards, free });
+      // Autopilot's cards outside the roadmap (the bug lane's) that finished
+      // without a PR and whose issue has since closed are done.
+      const settled = projectCards.filter((t) => {
+        const n = issueOf(t);
+        return n != null && state.cards.includes(t.id) && t.column === "review" && finished(t) && !t.prUrl
+          && !roadmapIssues.has(n) && !found.open.some((b) => b.number === n);
+      });
+      if (settled.length > 0) {
+        const st = await deps.loadStates(cfg.project, settled.map((t) => issueOf(t)!)).catch(() => null);
+        for (const t of settled) {
+          const issue = st && !("error" in st) ? st.get(issueOf(t)!) : null;
+          if (issue?.state !== "CLOSED") continue;
+          deps.moveToDone(t);
+          deps.activity(t.id, `Autopilot: #${issueOf(t)} is closed and this card finished without a PR — moved it to Done`, "info");
+        }
+      }
       // A bug whose card finished without a PR while the issue stays open —
       // typically "already fixed on develop" — is the owner's to settle.
       for (const bug of found.open) {

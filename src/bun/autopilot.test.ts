@@ -425,6 +425,16 @@ test("bug lane: open bugs outside the roadmap start first, at most two, then the
   const parked = [700, 701].map(n => roadmapCard(`new-${n}`, n, 'review', { pipelineRun: DONE_RUN }));
   await roadmapPass({ ...roadmapCfg, maxInFlight: 8, roadmap: { issue: 639 } }, state, [finished, ...parked], [], f.deps);
   expect(f.log.started.map(s => s.number).filter(n => n >= 700)).toEqual([703]);
+
+  // A finished card whose issue has closed is moved to Done.
+  const closedCard = roadmapCard('bug-705', 705, 'review', { pipelineRun: DONE_RUN });
+  state.cards.push('bug-705');
+  const g = roadmapDeps({ 705: COMPLETED }, {
+    loadQueue: f.deps.loadQueue, runnerFree: () => 3,
+    bugs: async () => ({ config: BUG_LANE_DEFAULT, open: [bug(703)] }),
+  });
+  await roadmapPass({ ...roadmapCfg, maxInFlight: 8, roadmap: { issue: 639 } }, state, [closedCard], [], g.deps);
+  expect(g.log.done).toEqual(['bug-705']);
 });
 
 test("roadmap: starts the ready agent steps in step order; the human step is announced once, never started", async () => {
