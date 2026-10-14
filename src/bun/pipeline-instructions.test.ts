@@ -229,3 +229,56 @@ test("revisions are checked only when given; a template with other agents still 
   pipelines.delete(template.id);
   expect(await refreshPipelineInstructions(parent.id)).toMatchObject({ status: 404, error: expect.stringContaining("template") });
 });
+
+// What Pillar's `sync_policy.py` saves in one `agetor pipeline edit`: new step
+// text, and "trivial change made" moved from Finish to Review.
+test("one edit of step text and of the trivial route: an unfinished run takes the text and keeps its route; a run started afterwards has both", async () => {
+  const { agentProfiles, pipelines, tasks } = await import("./db.ts");
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { newStep, reviewedPipelineShape } = await import("../shared/pipeline.ts");
+  const { refreshPipelineRuns } = await import("./pipeline-runner.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER: marker } = await import("./agents.ts");
+  const profile = agentProfiles.insert({ name: randomUUID(), harness: "claude-code", model: "fake-model", effort: null,
+    mode: null, fast: false, maxMode: false, instructions: "", skills: [] });
+  const step = (name: string, canFinish = false) => newStep({ name, agentProfileId: profile.id, instructions: `Old ${name} text. ${marker}:blocked`, ...(canFinish ? { canFinish } : {}) });
+  const understand = step("Understand", true), build = step("Build"), review = step("Review"), finish = step("Finish", true);
+  const edges = (trivialTo: string) => [
+    { id: "understand-build", from: understand.id, to: build.id, label: "build" }, { id: "understand-finish", from: understand.id, to: trivialTo, label: "trivial change made" },
+    { id: "build-review", from: build.id, to: review.id, label: "" }, { id: "review-build", from: review.id, to: build.id, label: "changes requested" },
+    { id: "review-finish", from: review.id, to: finish.id, label: "approved" }, { id: "finish-build", from: finish.id, to: build.id, label: "verification failed" },
+  ];
+  const pipeline = pipelines.insert({ name: randomUUID(), graph: { steps: [understand, build, review, finish], edges: edges(finish.id), startStepId: understand.id }, maxSteps: 14 });
+  const launch = async () => {
+    const created = await createTask({ title: "policy", prompt: "goal", isolation: "none", workdir: mkdtempSync(path.join(tmpdir(), "agetor-instructions-wd-")), pipelineId: pipeline.id });
+    if ("error" in created) throw new Error(created.error);
+    parents.push(created.task.id);
+    const started = await startTask(created.task.id);
+    if ("error" in started) throw new Error(started.error);
+    return until(() => {
+      const t = tasks.get(created.task.id);
+      return t?.pipelineRun?.status === "blocked" ? t : undefined;
+    });
+  };
+  const trivial = (id: string) => tasks.get(id)!.pipelineRun!.snapshot!.graph.edges.find((e) => e.label === "trivial change made")!.to;
+  const text = (id: string) => tasks.get(id)!.pipelineRun!.snapshot!.graph.steps.map((s) => s.instructions);
+  const before = await launch();
+
+  const edited = [understand, build, review, finish].map((s) => ({ ...s, instructions: `New ${s.name} text. ${marker}:blocked` }));
+  pipelines.update(pipeline.id, { graph: { steps: edited, edges: edges(review.id), startStepId: understand.id } });
+  const results = await refreshPipelineRuns(pipeline.id);
+  const result = results.find((r) => r.taskId === before.id)!;
+  expect(result.error).toBeUndefined();
+  expect(result).toMatchObject({ stepIds: [understand.id, build.id, review.id, finish.id], unmatched: [], skippedPrompts: [] });
+
+  const run = tasks.get(before.id)!.pipelineRun!;
+  expect(text(before.id)).toEqual(edited.map((s) => s.instructions));
+  expect(trivial(before.id)).toBe(finish.id);
+  expect(run.history).toEqual(before.pipelineRun!.history);
+  expect(tasks.get(run.active[0]!.taskId)!.prompt).toContain("New Understand text.");
+  expect(reviewedPipelineShape(run.snapshot!.graph)?.finish.id).toBe(finish.id);
+
+  const after = await launch();
+  expect(text(after.id)).toEqual(edited.map((s) => s.instructions));
+  expect(trivial(after.id)).toBe(review.id);
+  expect(reviewedPipelineShape(after.pipelineRun!.snapshot!.graph)?.finish.id).toBe(finish.id);
+});
