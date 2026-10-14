@@ -1357,16 +1357,30 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
   const started = new Set<number>();
   const startedIds = new Map<number, string>();
 
+  const bugsNeedYou: RoadmapStatus["needsUser"] = [];
   // The bug lane: open `bug` issues outside the roadmap start first, a few
   // at a time (src/shared/bug-lane.ts). They take slots the roadmap would.
   if (fullQueue && deps.bugs && pipelineId && !quotaWait && free > 0 && !deps.outdated()) {
     const found = await deps.bugs(cfg.project);
     if (found && "error" in found) error = `bug lane: ${found.error}`;
     else if (found) {
-      const cards = all
-        .filter((t) => !t.pipelineParentId && t.archivedAt == null && sameDir(t.workdir, cfg.project))
-        .flatMap((t) => { const n = issueOf(t); return n == null ? [] : [{ issue: n, live: live(t) }]; });
-      const pick = pickBugs({ open: found.open, config: found.config, roadmap: new Set(views.map((v) => v.issue)), cards, free });
+      const projectCards = all.filter((t) => !t.pipelineParentId && t.archivedAt == null && sameDir(t.workdir, cfg.project));
+      // A card whose run has finished takes no lane slot, wherever it sits.
+      const finished = (t: Task) => !live(t) || t.pipelineRun?.status === "done";
+      const cards = projectCards.flatMap((t) => { const n = issueOf(t); return n == null ? [] : [{ issue: n, live: !finished(t) }]; });
+      const roadmapIssues = new Set(views.map((v) => v.issue));
+      const pick = pickBugs({ open: found.open, config: found.config, roadmap: roadmapIssues, cards, free });
+      // A bug whose card finished without a PR while the issue stays open —
+      // typically "already fixed on develop" — is the owner's to settle.
+      for (const bug of found.open) {
+        if (roadmapIssues.has(bug.number)) continue;
+        const t = projectCards.find((c) => issueOf(c) === bug.number && finished(c) && !c.prUrl);
+        if (!t || !deps.hasNoPr(t) || (await deps.aheadCount(t).catch(() => 1)) !== 0) continue;
+        const last = t.pipelineRun?.history.at(-1)?.handoff?.summary ?? "";
+        bugsNeedYou.push({ step: "bug", issue: bug.number, title: bug.title, url: t.issueUrl ?? null, kind: "stuck" as const,
+          reason: "its bug card finished without a change or PR, and the issue is still open — close it or reopen the work",
+          pr: null, prUrl: null, detail: last ? displayText(last, 300) : null, taskId: t.id });
+      }
       for (const bug of pick.start) {
         if (deps.outdated() || (deps.runnerFree?.() ?? Infinity) <= 0 || (deps.cardFree?.() ?? Infinity) <= 0) break;
         const r = await deps.startCard({ dir: cfg.project, number: bug.number, pipelineId, extraPrompt: bugCardPrompt(bug, found.config.label) });
@@ -1515,6 +1529,7 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
       }
     }
   }
+  if (bugsNeedYou.length > 0) status.needsUser = [...status.needsUser, ...bugsNeedYou];
   state.roadmap = status;
   state.lastError = error ?? (queue?.errors.length ? queue.errors.join('; ') : null);
 

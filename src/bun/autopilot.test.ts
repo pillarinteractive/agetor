@@ -408,6 +408,8 @@ test("bug lane: open bugs outside the roadmap start first, at most two, then the
   expect(f.log.started[0]!.extraPrompt).toContain('Fixes #700');
   expect(state.cards).toEqual(expect.arrayContaining(['new-700', 'new-701']));
   expect(f.log.activity.filter(a => a.includes('ahead of roadmap cards'))).toHaveLength(2);
+  // Its finished card found nothing to do: shown to the owner, not restarted.
+  expect(state.roadmap!.needsUser.find(n => n.issue === 704)).toMatchObject({ step: 'bug', taskId: 'done-704' });
 
   // Two bugs running: the lane is full, the roadmap gets the slots.
   remaining = 3;
@@ -415,6 +417,14 @@ test("bug lane: open bugs outside the roadmap start first, at most two, then the
   const running = [700, 701].map(n => roadmapCard(`new-${n}`, n, 'running', { pipelineRun: RUNNING_RUN }));
   await roadmapPass({ ...roadmapCfg, maxInFlight: 8, roadmap: { issue: 639 } }, state, [finished, ...running], [], f.deps);
   expect(f.log.started.map(s => s.number).filter(n => n >= 700)).toEqual([]);
+
+  // Finished runs waiting in In Review take no lane slot.
+  remaining = 3;
+  f.log.started.length = 0;
+  const DONE_RUN = { status: 'done', active: [], blocked: [], history: [], joins: {} };
+  const parked = [700, 701].map(n => roadmapCard(`new-${n}`, n, 'review', { pipelineRun: DONE_RUN }));
+  await roadmapPass({ ...roadmapCfg, maxInFlight: 8, roadmap: { issue: 639 } }, state, [finished, ...parked], [], f.deps);
+  expect(f.log.started.map(s => s.number).filter(n => n >= 700)).toEqual([703]);
 });
 
 test("roadmap: starts the ready agent steps in step order; the human step is announced once, never started", async () => {
