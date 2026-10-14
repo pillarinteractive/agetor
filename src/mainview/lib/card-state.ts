@@ -16,6 +16,7 @@ import type { RoadmapCardInfo } from "../../shared/roadmap.ts";
 import { neverStarted } from "../../shared/autopilot.ts";
 import { blockReasonLine, effectiveStepCap, handoffHeadline, isFollowUpStepId, resolveStartStep } from "../../shared/pipeline.ts";
 import { escalatedWait, escalationLine, issueRef, queuedWait, waitingInQueue, waitLine } from "../../shared/block-wait.ts";
+import { resolvingHold } from "../../shared/owner-holds.ts";
 import { ordinal } from "../../shared/block-reason.ts";
 import type { TaskLeaseInfo } from "./leases.ts";
 import { causeOf, WAIT_CAUSE_ORDER, type WaitCause } from "./board-health.ts";
@@ -374,6 +375,12 @@ export function cardState(task: Task, ctx: CardStateContext): CardState {
           );
         }
         return make("waiting", "auto-retry", "Auto retry", reason.charAt(0).toUpperCase() + reason.slice(1), { kind: "inspect", label: "Inspect retry" }, waited);
+      }
+      // No owner holds (src/shared/owner-holds.ts): Agetor is taking the
+      // stop through its ladder — answer, reroute, close out — by itself.
+      const resolving = resolvingHold(run);
+      if (resolving) {
+        return make("waiting", "auto-retry", "Resolving", `Agetor is resolving this without you · ${resolving.note}`, { kind: "inspect", label: "Inspect retry" }, Math.max(0, now - resolving.since));
       }
       // The queue gave it up: the owner's now, with what was tried.
       const gaveUp = escalatedWait(run);

@@ -205,6 +205,23 @@ describe("cardState — one case per state", () => {
     expect(free).toMatchObject({ state: "needs", reason: "lab is free now", action: { kind: "retry", label: "Retry Build", stepTaskId: "s2" } });
   });
 
+  test("No owner holds: an unattended stop the ladder is resolving is blue, and a card closed out on its follow-up issue is a dependency wait naming it", () => {
+    // The same escalated wait that reads "Needs you" above, on a run the ladder has.
+    const gaveUp = wait({ state: "escalated", attempt: 3, at: null, escalation: "still blocked after 3 automatic retries", reason: "the fixture service did not come up" });
+    const resolving = run({ status: "blocked", blocked: stepBlocked(), ...building, wait: gaveUp, ladder: { steps: {}, reroutes: 0, resolving: { since: NOW - 2 * MIN, note: "Build: the fixture service did not come up" } } });
+    const s = state(task({ column: "blocked", pipelineRun: resolving }));
+    expect(s).toMatchObject({ state: "waiting", label: "Resolving", reason: "Agetor is resolving this without you · Build: the fixture service did not come up", elapsedMs: 2 * MIN, step: { name: "Build" } });
+    expect(s.state).not.toBe("needs");
+    expect(cardStatus(task({ column: "blocked", pipelineRun: resolving }), { pr: null, lease: noLease, now: NOW } as never).needsYou).toBeNull();
+
+    const closed = run({
+      status: "blocked", blocked: stepBlocked(), ...building, ladder: { steps: {}, reroutes: 0, closed: { at: NOW - 30 * MIN, mode: "depend", issues: [1502] } },
+      wait: wait({ category: "dependency", source: "signal", what: "#1502", ref: "#1502", attempt: 0, max: 0, tried: [], deadline: Number.MAX_SAFE_INTEGER, endless: true, closeout: true }),
+    });
+    expect(state(task({ column: "blocked", pipelineRun: closed }))).toMatchObject({ state: "waiting", kind: "dependency", label: "Dependency", reason: "Waiting on #1502 (filed for the owner) — resumes when it is closed" });
+    expect(cardStatus(task({ column: "blocked", pipelineRun: closed }), { pr: null, lease: noLease, now: NOW } as never)).toMatchObject({ line: "Build waiting on #1502 (filed for the owner) — resumes when it is closed", needsYou: null });
+  });
+
   test("Failed: a step that crashed or has no profile is red; a usage limit with no retry scheduled is amber", () => {
     const failed = (message: string, kind: "step-failed" | "profile-missing" = "step-failed") => state(task({ column: "blocked", pipelineRun: run({ status: "blocked", ...building, blocked: [{ taskId: "s2", stepId: "build", kind, message }] }) }));
     expect(failed('step "Build" failed — exit code 1')).toMatchObject({ kind: "failed", state: "failed", label: "Failed", icon: "x", reason: "exit code 1", action: { kind: "retry", label: "Retry Build", stepTaskId: "s2" } });

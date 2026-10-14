@@ -16,6 +16,10 @@ export interface BlockLogEntry {
   step: string;
   kind: string;
   message: string;
+  /** Which rung of the no-owner-holds ladder handled it (src/shared/
+   *  owner-holds.ts `RESOLUTION`): answered, rerouted, fresh-session,
+   *  waiting, closed-published, closed-dependency. Absent: nothing did. */
+  resolution?: string;
 }
 
 const file = () => path.join(dataDir, "blocks.jsonl");
@@ -38,21 +42,43 @@ export function logBlocks(entries: Omit<BlockLogEntry, "ts">[], now = Date.now()
   }
 }
 
+/** Record which rung handled a block already in the log: a line of its
+ *  own (the log is append-only), folded onto the block by `readBlockLog`,
+ *  so the block rate stays what it was. */
+export function logBlockResolution(entry: Omit<BlockLogEntry, "ts"> & { resolution: string }, now = Date.now()): void {
+  try {
+    appendFileSync(file(), `${JSON.stringify({ ts: now, ...entry, resolves: true })}\n`);
+  } catch {
+    // best-effort
+  }
+}
+
+const sameBlock = (a: BlockLogEntry, b: BlockLogEntry) => a.taskId === b.taskId && a.step === b.step && a.kind === b.kind && a.message === b.message;
+
 export function readBlockLog(sinceMs = 0): BlockLogEntry[] {
   if (!existsSync(file())) return [];
   try {
-    return readFileSync(file(), "utf8")
-      .split("\n")
-      .filter(Boolean)
-      .slice(-MAX_READ)
-      .flatMap((l) => {
-        try {
-          const e = JSON.parse(l) as BlockLogEntry;
-          return e.ts >= sinceMs ? [e] : [];
-        } catch {
-          return [];
+    const out: BlockLogEntry[] = [];
+    for (const l of readFileSync(file(), "utf8").split("\n").filter(Boolean).slice(-MAX_READ)) {
+      let e: BlockLogEntry & { resolves?: boolean };
+      try {
+        e = JSON.parse(l) as BlockLogEntry & { resolves?: boolean };
+      } catch {
+        continue;
+      }
+      if (e.resolves) {
+        // The newest earlier block it names (a later rung overrides).
+        for (let i = out.length - 1; i >= 0; i--) {
+          if (sameBlock(out[i]!, e)) {
+            out[i] = { ...out[i]!, resolution: e.resolution };
+            break;
+          }
         }
-      });
+        continue;
+      }
+      out.push(e);
+    }
+    return out.filter((e) => e.ts >= sinceMs);
   } catch {
     return [];
   }

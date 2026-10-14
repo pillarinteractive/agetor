@@ -672,6 +672,13 @@ export interface Handoff {
    *  run: it only decides between waiting-and-retrying this same step and
    *  leaving it for the owner, and `owner` always wins. */
   waitingOn?: HandoffWait;
+  /** On a `blocked` handoff of an unattended run: the step says it stopped
+   *  for one of the three reasons that are really the owner's — credentials
+   *  or access it lacks, a destructive or irreversible action, or something
+   *  touching main, a release or production (docs/plans/no-owner-holds.md).
+   *  Parsed leniently (`parseHardStop`, src/shared/owner-holds.ts). The run
+   *  files a follow-up issue and closes the card out; it never asks again. */
+  hardStop?: { kind: "credentials" | "destructive" | "protected"; detail: string };
 }
 
 /** What a blocked step says it waits on. */
@@ -732,6 +739,14 @@ export interface PipelineBlockWait {
   escalatedAt?: number;
   /** Why it was given up. */
   escalation?: string;
+  /** No owner holds (`owner_holds` = resolve): a self-clearing wait that is
+   *  never escalated — once its retries are spent it is re-checked at the
+   *  long interval for as long as it takes. */
+  endless?: true;
+  /** The ladder closed the card out on a follow-up issue (`ref` "#N"): it
+   *  is never resumed on a timer, only when that issue is closed. A run-level
+   *  stop has no execution: `taskId` is then "". */
+  closeout?: true;
 }
 
 /** Lifecycle state of a {@link PipelineRunState}, mirrored by the parent
@@ -999,7 +1014,19 @@ export interface PipelineRunState {
    *  the cap; `seq` is the wrap-up execution, absent until its step task
    *  exists (a launch still queued for a slot has none yet). One per run:
    *  the cap blocks as usual after it. */
-  capWrapUp?: { at: number; fromStepId: string; seq?: number };
+  capWrapUp?: {
+    at: number;
+    fromStepId: string;
+    seq?: number;
+    /** The ladder's close-out (`owner_holds`), not the step count: the
+     *  wrap-up runs whatever the count, and its prompt lists the follow-up
+     *  issues filed for what is unresolved. */
+    closeout?: { issues: number[]; why: string };
+  };
+  /** The no-owner-holds ladder's bookkeeping (src/shared/owner-holds.ts),
+   *  persisted so a core restart resumes at the same rung and no rung
+   *  repeats for the same step execution. */
+  ladder?: PipelineLadderState;
   /** An automatic retry of a step that failed for a reason a person can't
    *  fix — a usage limit (`quota`: waits for the reset, never gives up) or a
    *  transient failure (crash, overload, launch flake; a few attempts with
@@ -1034,6 +1061,22 @@ export interface PipelineStepReport {
   endedAt: number | null;
   handoff: Handoff | null;
   report: string | null;
+}
+
+export interface PipelineLadderState {
+  /** Rungs spent, per step execution ("<taskId>#<seq>", or "<kind>@<stepId>"
+   *  for a run-level stop). */
+  steps: Record<string, { answers: number; fresh: number; reroutes: number; interactions?: number }>;
+  /** Reroutes to Build the run has taken in all. */
+  reroutes: number;
+  /** Set when the ladder closed the run out (once per run). */
+  closed?: { at: number; mode: "publish" | "depend"; issues: number[] };
+  /** A Stop the user pressed: the ladder leaves the run alone until a person
+   *  starts it again. */
+  userStop?: number;
+  /** A stop the ladder has seen and is about to act on: the card reads as
+   *  being resolved, not as needing the owner. */
+  resolving?: { since: number; note: string };
 }
 
 export interface PipelineAutoRetry {

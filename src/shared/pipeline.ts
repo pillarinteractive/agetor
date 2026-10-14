@@ -21,6 +21,7 @@ import type {
 } from "./types.ts";
 import { PIPELINE_LIMITS } from "./types.ts";
 import { asksTheOwner, parseWaitingOn } from "./block-wait.ts";
+import { HARD_STOP_LABEL, parseHardStop } from "./owner-holds.ts";
 import {
   CHECK_LIMITS, CHECK_ROSTER_INTRO, CHECKS_PLACEHOLDER, checkRoster, defaultStepChecks, renderCheckFailures, validateStepChecks,
   type CheckResult,
@@ -790,6 +791,12 @@ export function normalizeHandoff(input: unknown): Handoff {
   if (invalidStatus || invalidSchema || invalidQuestions || invalidWait || waitingOn || handoff.openQuestions.some((q) => q.trim())) {
     handoff.status = "blocked";
   }
+  // A declared hard stop (src/shared/owner-holds.ts) is a stop.
+  const hardStop = parseHardStop(parsed);
+  if (hardStop) {
+    handoff.hardStop = hardStop;
+    handoff.status = "blocked";
+  }
   if (waitingOn) handoff.waitingOn = waitingOn;
   else if (invalidQuestions) handoff.waitingOn = { on: handoff.openQuestions.some((q) => q.trim()) ? "owner" : "other" };
   else if (invalidWait) handoff.waitingOn = { on: "other" };
@@ -1351,9 +1358,33 @@ export function capWrapUpStep(g: PipelineGraph): PipelineStep | null {
 
 /** The section a cap wrap-up launch appends to the step's prompt, after
  *  everything else, so it is the last thing the agent reads. */
-export function capWrapUpSection(input: { stepCap: number; issueUrl?: string | null; prUrl?: string | null }): string {
+export function capWrapUpSection(input: {
+  stepCap: number;
+  issueUrl?: string | null;
+  prUrl?: string | null;
+  /** The no-owner-holds close-out (src/shared/owner-holds.ts), not the cap. */
+  closeout?: { issues: number[]; why: string } | null;
+}): string {
   const issue = input.issueUrl ? `this card's issue (${input.issueUrl})` : "this card's issue";
   const pr = input.prUrl ? `its pull request (${input.prUrl})` : "its pull request";
+  if (input.closeout) {
+    const filed = input.closeout.issues.map((n) => `#${n}`).join(", ");
+    return [
+      "## Closing out without the owner — wrap up this run",
+      `This run stopped on something nobody will answer (${input.closeout.why}), so this is its last step. ` +
+        "No earlier step will run again; what is still open is handed to people as GitHub issues instead.",
+      filed
+        ? `- Agetor already filed ${filed} for what stopped the run: reference ${input.closeout.issues.length === 1 ? "it" : "them"}, do not file ${input.closeout.issues.length === 1 ? "it" : "them"} again.`
+        : "- Agetor could not file the follow-up issue for what stopped the run: file it yourself.",
+      "- Publish the branch as this step normally does (push it, and open or update the pull request). Do not merge it.",
+      "- Do not hand back to an earlier step: finish the run from here, whatever the incoming reports ask for.",
+      "- For every other unresolved finding, failed check or blocker in the incoming reports, file one GitHub issue " +
+        `(\`gh issue create\`, after searching for an existing one) that states the problem and the evidence, and references ${issue} and ${pr}.`,
+      "- List all those issue numbers in the pull request description and in your handoff summary.",
+      "Publishing here is not approval: if the incoming reports do not approve this exact head, say in the pull " +
+        "request description that it is published unapproved, closed out without the owner.",
+    ].join("\n");
+  }
   return [
     "## Step cap reached — wrap up this run",
     `This run reached its ${input.stepCap}-step cap, so this is its last step. No earlier step will run again; ` +
@@ -2119,8 +2150,10 @@ export function composeBlockedResumeNote(input: {
   outgoing: { name: string; label: string }[];
   transition: "choose" | "all";
   canFinish?: boolean;
+  /** A self-clearing wait that is never given up (`owner_holds` resolve). */
+  endless?: boolean;
 }): string {
-  const last = input.attempt >= input.max;
+  const last = input.attempt >= input.max && !input.endless;
   const parts: string[] = [
     `You handed off step "${input.stepName}" as blocked, so it was NOT handed to the next step and that handoff is ` +
       `void. Your stated reason was: ${JSON.stringify(input.reason.slice(0, 600))}`,
@@ -2132,10 +2165,63 @@ export function composeBlockedResumeNote(input: {
     'If it has not, hand off "blocked" again and say exactly what you are waiting for in "reason" and "waitingOn". ' +
       'If what you need is the user, say so ("waitingOn":"owner") and put your question in "openQuestions". ' +
       "Do not work around the block, do not decide for the user, and do not weaken a check to get past it. " +
-      (last
+      (input.endless
+        ? "Agetor keeps checking at long intervals for as long as this takes; nobody else will act on it, so say exactly what you wait on."
+        : last
         ? "This was the last automatic retry: if you are still blocked, the user takes over from your handoff, so make it complete."
         : `This is automatic retry ${input.attempt} of ${input.max}.`),
     "End your final message with a NEW handoff block, in exactly this format:",
+    ...renderHandoffContract(input.outgoing, input.transition, input.canFinish === true),
+  ];
+  return parts.join("\n\n");
+}
+
+/**
+ * The no-owner-holds ladder's first rung (src/shared/owner-holds.ts): the
+ * message a stopped step is resumed with, in its own session, when its stop
+ * would have waited for the owner. Nobody will answer; it is told what to do
+ * instead, and that the only stops left are the three hard stops, declared
+ * in the handoff's `hardStop`. `questions` and `reason` are the step's own,
+ * quoted back to it as data. `asked`: it stopped on a question it asked (a
+ * pending interaction) rather than a handoff.
+ */
+export function composeOwnerHoldAnswer(input: {
+  stepName: string;
+  reason: string;
+  questions: string[];
+  asked?: boolean;
+  hardStop?: { kind: "credentials" | "destructive" | "protected"; detail: string } | null;
+  outgoing: { name: string; label: string }[];
+  transition: "choose" | "all";
+  canFinish?: boolean;
+}): string {
+  const qs = input.questions.map((q) => q.trim()).filter(Boolean).slice(0, 8);
+  const parts: string[] = [
+    "Nobody will answer this. This card runs unattended and there is no owner to reply, now or later — " +
+      (input.asked ? "the question you asked was not shown to anyone." : `so your "blocked" handoff of step "${input.stepName}" is void.`),
+    `Your stated reason was: ${JSON.stringify(input.reason.slice(0, 600))}` +
+      (qs.length ? `\nYour open questions were:\n${qs.map((q) => `- ${JSON.stringify(q.slice(0, 300))}`).join("\n")}` : ""),
+    input.hardStop
+      ? `You declared a hard stop (${input.hardStop.kind}: ${JSON.stringify(input.hardStop.detail.slice(0, 300))}). If it really is one of the three below, ` +
+        "hand off again with the same hardStop and Agetor closes the card out with an issue for the owner. If it is not, do the work as described below."
+      : "Do this instead, in this same session and worktree:",
+    [
+      "- For each open question, take the recommended option (the planner's, or yours) as PROVISIONAL. Record it as provisional — never as approval — " +
+        "with the decision command your instructions name, file or reuse ONE follow-up issue for it (search for an existing one first), and continue.",
+      "- A decision already recorded on an issue or in the decision ledger stands: act on it.",
+      "- A command that was refused: make the same change with your edit tool instead.",
+      "- A command or subagent you started is yours to wait for: wait for it (agetor-await for a long command), do not stop for it.",
+      "- Work larger than one visit: commit it in coherent parts, keep going, and say in your summary what remains.",
+      "- A branch that diverged from its remote: merge the remote branch into yours (never force-push).",
+    ].join("\n"),
+    "The only acceptable reasons to stop are these three hard stops:\n" +
+      `- credentials — ${HARD_STOP_LABEL.credentials};\n` +
+      `- destructive — ${HARD_STOP_LABEL.destructive};\n` +
+      `- protected — ${HARD_STOP_LABEL.protected}.\n` +
+      'Only for one of those, hand off "blocked" and add "hardStop": {"kind": "credentials" | "destructive" | "protected", "detail": "the exact thing needed"}. ' +
+      "Agetor then files an issue for the owner and closes the card out; it will not ask you again. " +
+      "Never do the protected action itself, and never weaken a check to get past a stop.",
+    "Otherwise finish the step and hand off as usual. End your final message with a NEW handoff block, in exactly this format:",
     ...renderHandoffContract(input.outgoing, input.transition, input.canFinish === true),
   ];
   return parts.join("\n\n");

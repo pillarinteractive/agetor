@@ -148,7 +148,8 @@ const RE = {
   holdEnd: /^Autopilot: signed off PR #\d+|the hold is lifted|^Green — waiting|^Joined merge train|^Updated PR #\d+ from /,
   /** pipeline-runner.ts `scheduleAutoRetry` */
   quota: /is waiting on a usage limit/,
-  retry: /retrying automatically/,
+  /** …and the no-owner-holds ladder (src/shared/owner-holds.ts `RESOLVING_PREFIX`) */
+  retry: /retrying automatically|^Resolving without you: /,
   /** pr-watch.ts `maybeAutoFix` */
   fixCi: /^Started Fix CI automatically/,
   /** autopilot.ts `roadmapPass` restart guard */

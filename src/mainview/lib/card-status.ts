@@ -13,6 +13,7 @@ import type { TaskLeaseInfo } from "./leases.ts";
 import { ordinal } from "../../shared/block-reason.ts";
 import { shortCardName } from "./card-names.ts";
 import { escalatedWait, escalationLine, issueRef, waitingInQueue, waitLine } from "../../shared/block-wait.ts";
+import { resolvingHold } from "../../shared/owner-holds.ts";
 
 export type NeedsYouAction = "open" | "retry" | "open-pr";
 
@@ -243,6 +244,9 @@ export function cardStatus(
         const held = onLease && !onLease.free ? ` (held by ${onLease.heldBy}${inLine(onLease)})` : "";
         return { line: held ? line.replace(" — retrying ", `${held} — retrying `) : line, tone: "muted", needsYou: null };
       }
+      // No owner holds: Agetor is resolving the stop by itself.
+      const resolving = resolvingHold(run);
+      if (resolving) return { line: `Agetor is resolving this without you · ${resolving.note}`, tone: "muted", needsYou: null };
       // The queue gave it up: the owner's now, with what was tried.
       const gaveUp = escalatedWait(run);
       if (gaveUp) {

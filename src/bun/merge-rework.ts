@@ -52,6 +52,8 @@ import { setMergeQueued } from "./merge-intent.ts";
 import { pipelineUpdateColumn } from "./orchestrator.ts";
 import { failedRunReports, readFailedRun, type FailedRunLog } from "./ci-failure-log.ts";
 import { pipelineRunsDir, reworkPipelineRun } from "./pipeline-runner.ts";
+import { createHash } from "node:crypto";
+import { followUpIssue, followUpKey, OWNER_HOLDS_PREF, parseOwnerHoldsMode } from "../shared/owner-holds.ts";
 import { invalidatePrStatus, newestPerName, ownFailures } from "./pr-watch.ts";
 
 export const MERGE_REWORK_PREF = "merge_queue_rework";
@@ -106,6 +108,10 @@ export interface ReworkEntry {
    *  left the conflict as it was, so a moved base does not send it to Build
    *  again. */
   heldFor?: "conflict-unresolved";
+  /** No owner holds (`owner_holds`, unattended cards): the follow-up issue
+   *  filed for the owner when the card was held. Closing it lifts the hold
+   *  as a sign-off by hand does: a fresh allowance of rounds. */
+  followUp?: number;
 }
 
 function readState(): Record<string, ReworkEntry> {
@@ -129,6 +135,7 @@ function readState(): Record<string, ReworkEntry> {
         ...(conflict && typeof conflict.baseTip === "string" && conflict.baseTip && typeof conflict.rounds === "number" && Number.isSafeInteger(conflict.rounds) && conflict.rounds >= 0
           ? { conflict: { baseTip: conflict.baseTip, rounds: conflict.rounds } } : {}),
         ...(e.heldFor === "conflict-unresolved" ? { heldFor: "conflict-unresolved" as const } : {}),
+        ...(typeof e.followUp === "number" && Number.isSafeInteger(e.followUp) && e.followUp > 0 ? { followUp: e.followUp } : {}),
       };
     }
     return out;
@@ -435,7 +442,44 @@ export const reworkDeps = {
   },
   rework: reworkPipelineRun,
   now: () => Date.now(),
+  /** Whether this card's holds are resolved without the owner. */
+  resolveHolds: (task: Task): boolean =>
+    !!task.pipelineRun?.snapshot?.decisionPolicy && parseOwnerHoldsMode(preferences.get(OWNER_HOLDS_PREF)) === "resolve",
+  /** File (or reuse) the follow-up issue for a held card. */
+  async fileFollowUp(task: Task, pr: Pick<TaskPrStatus, "number">, what: string, why: string): Promise<{ number: number } | { error: string }> {
+    const { fileOwnerHoldIssue } = await import("./owner-hold-io.ts");
+    const question = `PR #${pr.number}: ${what}, and ${why}. How should it proceed?`;
+    const key = followUpKey({ source: task.issueUrl ?? task.id, step: "merge queue", question: `${what} PR #${pr.number}` }, (x) => createHash("sha256").update(x).digest("hex"));
+    const { title, body } = followUpIssue({
+      key, cardTitle: task.title, cardId: task.id, step: "Merge queue", item: { question, options: [] }, reason: `${what}; ${why}`, hardStop: null,
+      tried: ["fix rounds through Build, Review and Finish"], issueUrl: task.issueUrl ?? null, prUrl: task.prUrl ?? null, close: "depend",
+    });
+    return fileOwnerHoldIssue({ dir: task.workdir, key, title, body });
+  },
+  /** Whether issue `n` is closed. */
+  async issueClosed(task: Task, n: number): Promise<boolean> {
+    const r = await exec(["gh", "api", `repos/{owner}/{repo}/issues/${n}`, "--jq", ".state"], task.workdir, 30_000, process.env).catch(() => null);
+    return !!r?.ok && r.stdout.trim().toLowerCase() === "closed";
+  },
 };
+
+/** When each held card last looked at its follow-up issue. */
+const followUpChecked = new Map<string, number>();
+const FOLLOW_UP_CHECK_MS = 5 * 60_000;
+
+/** A held card whose follow-up issue the owner closed: the hold is lifted as
+ *  a sign-off by hand lifts it (a fresh allowance). True when it was. */
+async function liftByFollowUp(task: Task): Promise<boolean> {
+  const entry = reworkEntry(task.id);
+  if (!entry.held || !entry.followUp) return false;
+  const now = reworkDeps.now();
+  if (now - (followUpChecked.get(task.id) ?? 0) < FOLLOW_UP_CHECK_MS) return false;
+  followUpChecked.set(task.id, now);
+  if (!(await reworkDeps.issueClosed(task, entry.followUp).catch(() => false))) return false;
+  writeEntry(task.id, null);
+  say(task.id, `#${entry.followUp} is closed — the hold is lifted: a fresh set of fix rounds`, "info");
+  return true;
+}
 
 export type ReworkOutcome =
   | { kind: "skipped"; why: string }
@@ -454,13 +498,29 @@ function say(taskId: string, text: string, tone: "info" | "warning" | "danger" |
 
 /** Out of rounds, or a round changed nothing: back to In Review, sign-off
  *  withdrawn, for the owner. Says so once. */
-function hold(task: Task, pr: Pick<TaskPrStatus, "number">, entry: ReworkEntry, what: string, why: string, heldFor?: ReworkEntry["heldFor"]): ReworkOutcome {
+async function hold(task: Task, pr: Pick<TaskPrStatus, "number">, entry: ReworkEntry, what: string, why: string, heldFor?: ReworkEntry["heldFor"]): Promise<ReworkOutcome> {
   if (entry.held) return { kind: "held" };
   const heldRun = tasks.get(task.id)?.pipelineRun?.startedAt ?? task.pipelineRun?.startedAt;
-  const { reopened: _reopened, heldFor: _heldFor, ...rest } = entry;
+  const { reopened: _reopened, heldFor: _heldFor, followUp: _followUp, ...rest } = entry;
   writeEntry(task.id, { ...rest, held: true, ...(heldRun != null ? { heldRun } : {}), ...(heldFor ? { heldFor } : {}) });
   setMergeQueued(task.id, false);
   if (tasks.get(task.id)?.column === "merge") pipelineUpdateColumn(task.id, null, "review");
+  // No owner holds: an unattended card's hold is an issue for the owner, and
+  // closing it lifts the hold (`liftByFollowUp`). Nothing is merged.
+  if (reworkDeps.resolveHolds(task)) {
+    const filed = await reworkDeps.fileFollowUp(task, pr, what, why).catch((e: unknown) => ({ error: String(e) }));
+    if (!("error" in filed)) {
+      const now = readState()[task.id];
+      if (now?.held) writeEntry(task.id, { ...now, followUp: filed.number });
+      say(
+        task.id,
+        `Resolving without you: ${what} on PR #${pr.number}, and ${why}. Filed #${filed.number} for the owner; the card stays in In Review with its sign-off withdrawn, ` +
+          `and gets a fresh set of fix rounds by itself when #${filed.number} is closed. Nothing is merged.`,
+        "warning",
+      );
+      return { kind: "held" };
+    }
+  }
   say(
     task.id,
     `Held for you: ${what} on PR #${pr.number}, and ${why}. The card is in In Review with its sign-off withdrawn and nothing more runs on it by itself — ` +
@@ -526,6 +586,7 @@ export async function reworkCiFailure(task: Task, pr: TaskPrStatus): Promise<Rew
   if (task.pipelineRun?.status !== "done") return { kind: "skipped", why: "the run is not finished" };
   if (pr.state !== "open" || pr.checks !== "failure" || !pr.headSha || ownFailures(pr).length === 0) return { kind: "skipped", why: "no failure of its own" };
   const head = pr.headSha;
+  await liftByFollowUp(task);
   const before = reworkEntry(task.id);
   if (before.held) return { kind: "held" };
   const now = reworkDeps.now();
@@ -584,6 +645,7 @@ export async function reworkConflict(task: Task, pr: TaskPrStatus): Promise<Rewo
   if (task.pipelineRun?.status !== "done") return { kind: "skipped", why: "the run is not finished" };
   if (pr.state !== "open") return { kind: "skipped", why: "the pull request is not open" };
   const base = pr.baseRef ?? "develop";
+  await liftByFollowUp(task);
   const before = reworkEntry(task.id);
   if (before.held) {
     if (before.heldFor === "conflict-unresolved") return { kind: "held" };
@@ -647,5 +709,6 @@ export async function reworkConflict(task: Task, pr: TaskPrStatus): Promise<Rewo
 
 export function resetReworkForTests(): void {
   failedStarts.clear();
+  followUpChecked.clear();
   preferences.set(STATE_PREF, "{}");
 }

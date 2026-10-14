@@ -1782,3 +1782,52 @@ them. It was never last (the decision policy and machine capacity followed it), 
 handoff block — `agetor blocks` for `handoff-missing` — set `pipeline_prompt_order` to `legacy` and say so. One
 difference in content, for gemini only: when a prompt is recomposed without inlined handoffs to fit gemini's argv
 cap, the input note is now kept; it used to be lost in that recomposition.
+
+## No owner holds: every stop resolves by itself (`feat/no-owner-holds`)
+
+An unattended card (a run with a decision policy, `pipeline_decisions`) is never parked "held for you" any more.
+Every stop that used to wait for the owner goes through one bounded ladder and resolves by itself; what the owner
+sees instead is GitHub issues labelled `agetor-owner-decision`, not parked cards. Design note:
+`docs/plans/no-owner-holds.md`.
+
+- **The ladder** (`resolveOwnerHold`, `src/shared/owner-holds.ts`, pure; the runner's `resolveOwnerHolds` finds the
+  stops and carries the decision out, every 30 s and 2 s after a new stop):
+  1. **answer** — the same step, in its own session, with a message that says nobody will answer, take the
+     recommended option as provisional (recorded as provisional, never approval), file or reuse one follow-up
+     issue and continue; a refused command is done with the edit tool; a command or subagent it started is its own
+     to wait for (agetor-await); work larger than one visit is committed in parts and continued; the only stops
+     left are the three hard stops. Once per step execution. A question a step asks (AskUserQuestion, an fx
+     permission request) gets the same message: dismissed or declined, never approved; at most three per execution.
+  2. **reroute / fresh / wait** — a Review or Finish that still cannot proceed sends its reason to Build as Build's
+     arrival (at most two reroutes a run, never over a used-up corrective route); a step that ended without a
+     handoff, failed, or failed its checks gets one fresh session (Retry; checks first for a check gate); what
+     clears by itself (another issue or PR, the base branch's CI, a lease, a usage limit, the environment) stays in
+     the wait queue with no deadline and is re-checked every `longBackoffMin` (120) once its retries are spent.
+  3. **close** — one follow-up issue per unresolved item (deduplicated by a key of card, step and question: local
+     ledger `owner-hold-followups.json`, then a search for the marker `<!-- agetor-owner-hold:KEY -->`), then:
+     committed work → the step-cap wrap-up through Finish, once (publishes; says when the head is not approved;
+     verdict Refs; merges nothing); nothing to publish → a dependency wait on the issue (blue, "waiting on #N (filed
+     for the owner)"), which resumes the card with a fresh allowance when the issue is closed.
+- **Hard stop** — `"hardStop": {"kind": "credentials" | "destructive" | "protected", "detail": "…"}` in a blocked
+  handoff, read leniently (`parseHardStop`; `hard_stop`, a bare string, aliases such as `secret`, `irreversible`,
+  `main`, `production`). Confirmed once by rung 1, then straight to rung 3.
+- **Former owner paths and what they do now**: an owner-classified blocked handoff, a wait that escalated, a second
+  block beside a parked one (`taken`), the queue turned off, `handoff-missing` after its reminder and retries, a
+  `step-failed` whose retries are spent (or not transient), a `check-failed` gate after its feedback turns and fresh
+  session, `step-cap` after the wrap-up, a used-up corrective edge ("three CI failures"), "Review requires repair"
+  with no route, `profile-missing`, `join-incomplete`, an Agetor-run Finish that stopped (`stopPublishForOwner`), a
+  question asked in an unattended run, and the merge-queue rework hold (`merge-rework.ts`: the hold files a follow-up
+  issue; closing it lifts the hold with a fresh allowance, as a sign-off by hand does). The sites still record their
+  block; the block log keeps logging it and gains a `resolution` (`answered`, `rerouted`, `fresh-session`,
+  `waiting`, `closed-published`, `closed-dependency`) folded in from a line of its own.
+- **State**: `run.ladder` (rungs spent per step execution, reroutes, `closed`, `userStop`, `resolving`), written
+  before each action, so a restart resumes at the same rung and nothing repeats. `run.wait.endless` / `closeout`,
+  `run.capWrapUp.closeout`.
+- **The preference** `owner_holds`: `"resolve"` (default) or `"park"` (today's behaviour back), read at every
+  decision. A card a person runs (no decision policy) behaves as before. A Stop the user pressed is never resumed:
+  Stop marks the run (`ladder.userStop`), and only a step that runs again (a person's Retry, Advance, a message)
+  clears it. Stop on a card that reads "Resolving" takes it out of the ladder.
+- **Board and velocity**: a stop the ladder is on reads blue "Resolving — Agetor is resolving this without you"; a
+  closed-out card reads as a Dependency naming its issue. Every action writes an activity line that starts with
+  "Resolving without you: " — the velocity ledger reads it as time that is not the owner's, and the roadmap pass
+  observes such cards as `waiting`. The amber "Needs you" state stays for manual runs and pending questions on them.

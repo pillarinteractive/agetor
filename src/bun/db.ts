@@ -802,6 +802,10 @@ export const parsePipelineRunState = (raw: string | null): PipelineRunState | nu
       })) : undefined,
     wait: sanitizeBlockWait(rec.wait),
     ...(() => {
+      const ladder = sanitizeLadder(rec.ladder);
+      return ladder ? { ladder } : {};
+    })(),
+    ...(() => {
       const publish = sanitizePublish(rec.publish);
       return publish ? { publish } : {};
     })(),
@@ -882,6 +886,42 @@ const sanitizeBlockWait = (raw: unknown): PipelineRunState["wait"] => {
       : [],
     ...(isFiniteNumber(r.escalatedAt) ? { escalatedAt: r.escalatedAt } : {}),
     ...(typeof r.escalation === "string" ? { escalation: r.escalation.slice(0, 300) } : {}),
+    ...(r.endless === true ? { endless: true as const } : {}),
+    ...(r.closeout === true ? { closeout: true as const } : {}),
+  };
+};
+
+/** `run.ladder` — the no-owner-holds ladder's counters (src/shared/
+ *  owner-holds.ts). An unreadable one is dropped: the ladder then starts
+ *  over for the run, bounded as before. */
+const sanitizeLadder = (raw: unknown): PipelineRunState["ladder"] => {
+  if (!isPlainObject(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  const n = (x: unknown) => (Number.isSafeInteger(x) && (x as number) >= 0 ? Math.min(x as number, 100) : 0);
+  const steps: NonNullable<PipelineRunState["ladder"]>["steps"] = {};
+  if (isPlainObject(r.steps)) {
+    for (const [k, v] of Object.entries(r.steps).slice(0, 200)) {
+      if (!isPlainObject(v)) continue;
+      const c = v as Record<string, unknown>;
+      steps[k.slice(0, 200)] = { answers: n(c.answers), fresh: n(c.fresh), reroutes: n(c.reroutes), ...(n(c.interactions) ? { interactions: n(c.interactions) } : {}) };
+    }
+  }
+  const closed = isPlainObject(r.closed) && isFiniteNumber(r.closed.at) && (r.closed.mode === "publish" || r.closed.mode === "depend")
+    ? {
+      at: r.closed.at as number,
+      mode: r.closed.mode as "publish" | "depend",
+      issues: Array.isArray(r.closed.issues) ? r.closed.issues.filter((x): x is number => Number.isSafeInteger(x) && (x as number) > 0).slice(0, 20) : [],
+    }
+    : undefined;
+  const resolving = isPlainObject(r.resolving) && isFiniteNumber(r.resolving.since)
+    ? { since: r.resolving.since as number, note: typeof r.resolving.note === "string" ? r.resolving.note.slice(0, 300) : "" }
+    : undefined;
+  return {
+    steps,
+    reroutes: n(r.reroutes),
+    ...(closed ? { closed } : {}),
+    ...(isFiniteNumber(r.userStop) ? { userStop: r.userStop } : {}),
+    ...(resolving ? { resolving } : {}),
   };
 };
 
@@ -895,6 +935,14 @@ const sanitizeCapWrapUp = (raw: unknown): PipelineRunState["capWrapUp"] => {
     at: r.at,
     fromStepId: r.fromStepId,
     ...(Number.isSafeInteger(r.seq) && (r.seq as number) > 0 ? { seq: r.seq as number } : {}),
+    ...(isPlainObject(r.closeout) && Array.isArray(r.closeout.issues)
+      ? {
+        closeout: {
+          issues: r.closeout.issues.filter((x): x is number => Number.isSafeInteger(x) && (x as number) > 0).slice(0, 20),
+          why: typeof r.closeout.why === "string" ? r.closeout.why.slice(0, 500) : "",
+        },
+      }
+      : {}),
   };
 };
 

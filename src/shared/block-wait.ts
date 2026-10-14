@@ -287,6 +287,11 @@ export function classifyBlock(
 
 export const BLOCK_WAIT_PREF = "blocked_wait";
 
+/** What clears without anyone: never the owner's when holds are resolved. */
+export const SELF_CLEARING_CATEGORIES: readonly BlockWaitCategory[] = ["resource", "dependency", "environment", "limit"];
+/** The deadline of a wait that has none (JSON has no Infinity). */
+export const NO_DEADLINE = Number.MAX_SAFE_INTEGER;
+
 export interface BlockWaitConfig {
   enabled: boolean;
   /** Minutes before each automatic resume, per category; its length is the
@@ -301,6 +306,10 @@ export interface BlockWaitConfig {
   /** Each wait is stretched by up to this fraction, so cards queued
    *  together don't come back together. */
   jitter: number;
+  /** Minutes between re-checks of a self-clearing wait whose retries are
+   *  spent, when owner holds are resolved (`owner_holds`): it is never
+   *  given to the owner. */
+  longBackoffMin: number;
   /** Off (the default): a blocked handoff with open questions is always the
    *  owner's. On: when the step also declares a `waitingOn` other than the
    *  owner, and no question reads as a request to a person, the declaration
@@ -322,6 +331,7 @@ export const DEFAULT_BLOCK_WAIT: BlockWaitConfig = {
   maxResumes: 8,
   maxWaitHours: 24,
   jitter: 0.1,
+  longBackoffMin: 120,
   declaredOutranksQuestions: false,
 };
 
@@ -356,6 +366,7 @@ export function parseBlockWaitConfig(raw: string | null | undefined): BlockWaitC
     maxResumes: Math.floor(num(o.maxResumes, DEFAULT_BLOCK_WAIT.maxResumes, 0, 20)),
     maxWaitHours: num(o.maxWaitHours, DEFAULT_BLOCK_WAIT.maxWaitHours, 0.1, 14 * 24),
     jitter: num(o.jitter, DEFAULT_BLOCK_WAIT.jitter, 0, 0.5),
+    longBackoffMin: num(o.longBackoffMin, DEFAULT_BLOCK_WAIT.longBackoffMin, 15, 24 * 60),
     declaredOutranksQuestions: o.declaredOutranksQuestions === true,
   };
 }
@@ -371,7 +382,10 @@ const oneLine = (s: string, max = 240) => {
  * `prev` is the same execution's entry when the queue had resumed it and it
  * blocked again — its attempts and its start carry over, whatever it waits
  * on now. Out of attempts (the category's, or `maxResumes` in all) or past
- * the deadline, the entry comes back `escalated`. `rng` in [0, 1). Pure.
+ * the deadline, the entry comes back `escalated` — unless `endless` (owner
+ * holds are resolved, `owner_holds`) and it waits on something that clears
+ * by itself: then it has no deadline, and once its retries are spent it is
+ * re-checked every `longBackoffMin`. `rng` in [0, 1). Pure.
  */
 export function planWait(input: {
   stepId: string;
@@ -382,14 +396,16 @@ export function planWait(input: {
   config: BlockWaitConfig;
   now: number;
   rng?: () => number;
+  endless?: boolean;
 }): PipelineBlockWait {
   const { verdict, config, now } = input;
+  const endless = input.endless === true && SELF_CLEARING_CATEGORIES.includes(verdict.category);
   const prev = input.prev && input.prev.taskId === input.taskId && input.prev.stepId === input.stepId ? input.prev : null;
   const attempt = prev?.attempt ?? 0;
   const backoff = config.backoffMin[verdict.category];
   const max = Math.min(backoff.length, config.maxResumes);
   const since = prev?.since ?? now;
-  const deadline = since + config.maxWaitHours * 3_600_000;
+  const deadline = endless ? NO_DEADLINE : since + config.maxWaitHours * 3_600_000;
   const base: PipelineBlockWait = {
     stepId: input.stepId,
     taskId: input.taskId,
@@ -405,7 +421,14 @@ export function planWait(input: {
     at: null,
     deadline,
     tried: (prev?.tried ?? []).slice(-TRIED_MAX),
+    ...(endless ? { endless: true as const } : {}),
   };
+  const stretch = 1 + config.jitter * Math.min(0.999, Math.max(0, (input.rng ?? Math.random)()));
+  if (endless) {
+    const spentOut = attempt >= max || attempt >= config.maxResumes || backoff.length === 0;
+    const minutes = spentOut ? config.longBackoffMin : backoff[Math.min(attempt, backoff.length - 1)]!;
+    return { ...base, at: now + Math.round(minutes * 60_000 * stretch) };
+  }
   const spent = attempt >= max || attempt >= config.maxResumes;
   if (spent || now >= deadline) {
     return {
@@ -420,7 +443,6 @@ export function planWait(input: {
     };
   }
   const delay = backoff[Math.min(attempt, backoff.length - 1)]! * 60_000;
-  const stretch = 1 + config.jitter * Math.min(0.999, Math.max(0, (input.rng ?? Math.random)()));
   return { ...base, at: Math.min(now + Math.round(delay * stretch), deadline) };
 }
 
@@ -482,8 +504,13 @@ const TRIGGER_PHRASE = (w: PipelineBlockWait): string =>
  */
 export function waitLine(stepName: string, w: PipelineBlockWait, now: number, triggered = false): string {
   const max = Math.max(1, w.max);
+  if (w.closeout && w.state !== "resuming") {
+    return w.ref ? `${stepName} waiting on ${w.what} (filed for the owner) — resumes when it is closed` : `${stepName} closing out — filing its follow-up issue again ${w.at != null ? `at ${clock(w.at, now)}` : "soon"}`;
+  }
   if (w.state === "resuming") return `${stepName} resumed to check whether its block has cleared · attempt ${Math.min(Math.max(1, w.attempt), max)} of ${max}`;
-  const n = `attempt ${Math.min(w.attempt + 1, max)} of ${max}`;
+  const n = w.endless && w.attempt >= w.max
+      ? "re-checking until it clears"
+      : `attempt ${Math.min(w.attempt + 1, max)} of ${max}`;
   const when = w.at != null ? `at ${clock(w.at, now)}` : "soon";
   return `${stepName} ${WAIT_PHRASE[w.category](w)} — retrying ${triggered ? `${TRIGGER_PHRASE(w)} or ` : ""}${when} · ${n}`;
 }

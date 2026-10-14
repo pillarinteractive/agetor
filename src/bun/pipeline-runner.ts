@@ -27,10 +27,10 @@
  * say, `wireInteractionBroadcast()` in orchestrator.ts) — `index.ts`/
  * `headless.ts` call it explicitly, once, right before `reconcileOrphans()`.
  */
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { recordActivity } from "./activity.ts";
 import { syncBaseNote } from "./sync-base.ts";
-import { logBlocks, newBlocks } from "./block-log.ts";
+import { logBlockResolution, logBlocks, newBlocks } from "./block-log.ts";
 import { isMergeQueued } from "./merge-intent.ts";
 import { currentSlots, slotDecision, slotUse } from "./step-slots.ts";
 import { reserveRunner, releaseUnspawnedRunner } from './dispatch-claims.ts';
@@ -44,6 +44,10 @@ import { listLeases } from "./lease-watch.ts";
 import { ownFailures, prBase, prStatusForTask } from "./pr-watch.ts";
 import { run as runCommand } from "./github.ts";
 import { waitingOnQuota } from "../shared/autopilot.ts";
+import {
+  followUpIssue, followUpKey, NO_COUNTERS, OWNER_HOLDS_PREF, parseOwnerHoldsMode, RESOLUTION, RESOLVING_PREFIX, resolveOwnerHold, SELF_CLEARING, stepRole,
+  unresolvedItems, type OwnerHoldAction, type OwnerHoldKind,
+} from "../shared/owner-holds.ts";
 import { decisionPolicyForProject, PIPELINE_DECISIONS_PREF, plannerDecisionInstructions } from "../shared/pipeline-decisions.ts";
 import {
   PIPELINE_GATES_PREF, gateUnmatchedLine, initialPublishState, parsePipelineGate, publishBlockMessage, publishGateOn, publishStepOf, publishVisitOver,
@@ -63,6 +67,7 @@ import {
   escalationLine,
   fmtSpan,
   issueRef,
+  NO_DEADLINE,
   parseBlockWaitConfig,
   planWait,
   triedLine,
@@ -101,6 +106,7 @@ import {
   composeCheckFeedback,
   composeHandoffReminder,
   composeLimitResumeNote,
+  composeOwnerHoldAnswer,
   composeStepPrompt,
   parseStepPromptOrder,
   STEP_PROMPT_ORDER_PREF,
@@ -717,8 +723,9 @@ function scheduleBlockWait(
       delete run.wait;
       recordActivity(parentId, {
         kind: "step",
-        text:
-          verdict.category === "owner"
+        text: ladderApplies(run)
+          ? `${RESOLVING_PREFIX}: ${stepName} stopped on something it says only you could settle (${verdict.why}) — Agetor answers it instead`
+          : verdict.category === "owner"
             ? `${stepName} now waits on you (${verdict.why}) — its automatic retries have stopped${prev.attempt ? ` after ${prev.attempt}` : ""}`
             : `${stepName} is still blocked — left for you`,
         tone: "warning",
@@ -736,12 +743,16 @@ function scheduleBlockWait(
     config,
     now,
     rng: blockWaitDeps.rng,
+    // No owner holds: what clears by itself is never given up.
+    endless: ladderApplies(run),
   });
   run.wait = wait;
   if (wait.state === "escalated") {
     recordActivity(parentId, {
       kind: "step",
-      text: `${stepName} ${wait.escalation} — left for you (${triedLine(wait, now)}). It says: ${wait.reason}`,
+      text: ladderApplies(run)
+        ? `${RESOLVING_PREFIX}: ${stepName} ${wait.escalation} (${triedLine(wait, now)}) — Agetor takes it from here. It says: ${wait.reason}`
+        : `${stepName} ${wait.escalation} — left for you (${triedLine(wait, now)}). It says: ${wait.reason}`,
       tone: "danger",
     });
     return "escalated";
@@ -817,6 +828,8 @@ async function waitTriggerState(parent: Task, w: PipelineBlockWait, now: number)
 }
 
 const lastLeaseResumeAt = new Map<string, number>();
+/** When each closed-out card last looked at its follow-up issue. */
+const lastCloseoutCheck = new Map<string, number>();
 
 /**
  * Resume the parked step of `parentId` in its own session with a note
@@ -853,7 +866,9 @@ export async function resumeBlockedStep(parentId: string, trigger: string, clear
         outgoing: outgoingSteps(graph, w.stepId).map((o) => ({ name: o.step.name, label: o.edge.label })),
         transition: step.transition,
         canFinish: step.canFinish === true,
+        endless: w.endless === true,
       }),
+      endless: w.endless === true && w.attempt + 1 > w.max,
     };
   }).catch(() => null);
   if (!go) return false;
@@ -864,7 +879,7 @@ export async function resumeBlockedStep(parentId: string, trigger: string, clear
   } catch (err) {
     sent = { delivered: false, reason: err instanceof Error ? err.message : String(err) };
   }
-  const count = `automatic retry ${go.attempt} of ${go.max}`;
+  const count = go.endless ? `automatic re-check ${go.attempt}` : `automatic retry ${go.attempt} of ${go.max}`;
   if (sent.delivered) {
     recordActivity(parentId, {
       kind: "step",
@@ -946,6 +961,38 @@ export async function releaseBlockWaits(now = Date.now()): Promise<number> {
   for (const t of waiting) {
     const w = tasks.get(t.id)?.pipelineRun?.wait;
     if (!w || w.state !== "waiting") continue;
+    if (w.closeout) {
+      // Closed out on a follow-up issue: resumed only when it is closed,
+      // never on the timer (which only re-checks).
+      const due = w.at != null && now >= w.at;
+      if (!w.ref) {
+        // Its issue could not be filed: the ladder files it again.
+        if (due) {
+          await runExclusive(t.id, async () => {
+            const run = tasks.get(t.id)?.pipelineRun;
+            if (run?.wait?.closeout && !run.wait.ref) {
+              delete run.wait;
+              persist(t.id, run);
+            }
+          }).catch(() => undefined);
+        }
+        continue;
+      }
+      const trigger = due || (now - (lastCloseoutCheck.get(t.id) ?? 0) >= TRIGGER_MIN_GAP_MS) ? await waitTriggerState(t, w, now) : null;
+      if (trigger) lastCloseoutCheck.set(t.id, now);
+      if (trigger?.state === "cleared" && !quotaHold) {
+        if (await resumeClosedOut(t.id, trigger.text, now)) resumed++;
+      } else if (due) {
+        await runExclusive(t.id, async () => {
+          const run = tasks.get(t.id)?.pipelineRun;
+          if (run?.wait?.closeout && run.wait.state === "waiting") {
+            run.wait = { ...run.wait, at: now + config.longBackoffMin * 60_000 };
+            persist(t.id, run);
+          }
+        }).catch(() => undefined);
+      }
+      continue;
+    }
     if (now >= w.deadline) {
       await escalateWait(t.id, `still waiting on ${w.what} after ${fmtSpan(now - w.since)}`, now);
       continue;
@@ -959,7 +1006,7 @@ export async function releaseBlockWaits(now = Date.now()): Promise<number> {
       // The timer came due, but what it waits on is known not to have
       // changed: look again later, without spending a resume.
       const backoff = config.backoffMin[w.category];
-      const again = now + (backoff[Math.min(w.attempt, backoff.length - 1)] ?? 15) * 60_000;
+      const again = now + (w.endless && w.attempt >= w.max ? config.longBackoffMin : (backoff[Math.min(w.attempt, backoff.length - 1)] ?? 15)) * 60_000;
       await runExclusive(t.id, async () => {
         const run = tasks.get(t.id)?.pipelineRun;
         if (!run?.wait || run.wait.state !== "waiting") return;
@@ -1026,10 +1073,666 @@ export function listBlockWaits(now = Date.now()): WaitingRow[] {
 export function resetBlockWaitsForTests(): void {
   refStates.clear();
   lastLeaseResumeAt.clear();
+  lastCloseoutCheck.clear();
   blockWaitDeps.leases = () => listLeases();
   blockWaitDeps.pr = (taskId) => prStatusForTask(taskId);
   blockWaitDeps.refState = githubRefState;
   blockWaitDeps.rng = Math.random;
+}
+
+// ---------------------------------------------------------------------------
+// No owner holds (src/shared/owner-holds.ts, docs/plans/no-owner-holds.md)
+// ---------------------------------------------------------------------------
+
+/**
+ * Every stop of an unattended run that used to wait for the owner — a
+ * blocked handoff the owner had to answer, a queue wait that escalated, a
+ * step with no handoff after its reminder and retries, a failure whose
+ * retries are spent, a failed check gate after its fresh session, the step
+ * cap after its wrap-up, a used-up corrective route, a profile or join that
+ * cannot launch, an Agetor-run Finish that stopped, a question a step asked —
+ * is found by one pass (`resolveOwnerHolds`), decided by the pure ladder
+ * (`resolveOwnerHold`) and carried out here. The sites that record those
+ * stops are unchanged: they still record the block (and the block log still
+ * logs it); the ladder then resolves it, and says which rung did in the log.
+ *
+ * Only for unattended runs (`snapshot.decisionPolicy`), only while
+ * `owner_holds` is "resolve" (read at every decision), and never for a run
+ * the user stopped (`ladder.userStop`, set by Stop, cleared when a person
+ * starts a step again). Persisted on the run (`run.ladder`): the counters
+ * are written before each action, so a restart resumes at the same rung and
+ * no rung repeats for the same step execution.
+ */
+const ownerHoldsMode = () => parseOwnerHoldsMode(preferences.get(OWNER_HOLDS_PREF));
+
+/** The ladder applies to this run now. */
+function ladderApplies(run: PipelineRunState): boolean {
+  return !!run.snapshot?.decisionPolicy && run.ladder?.userStop == null && ownerHoldsMode() === "resolve";
+}
+
+/** What the ladder reads from and does to the rest of the core — replaceable
+ *  in tests (no GitHub, no tmux). */
+export const ownerHoldDeps: {
+  fileIssue: (input: { dir: string; key: string; title: string; body: string }) => Promise<{ number: number; url: string; reused: boolean } | { error: string }>;
+  answerInteraction: (req: ReturnType<typeof listPendingForTask>[number], note: string) => Promise<boolean>;
+  hasCommits: (parent: Task) => Promise<boolean>;
+  pending: (taskId: string) => ReturnType<typeof listPendingForTask>;
+} = {
+  fileIssue: async (input) => (await import("./owner-hold-io.ts")).fileOwnerHoldIssue(input),
+  answerInteraction: async (req, note) => (await import("./owner-hold-io.ts")).answerPendingInteraction(req, note),
+  hasCommits: async (parent) => (await import("./owner-hold-io.ts")).hasCommittedWork(parent),
+  pending: (taskId) => listPendingForTask(taskId),
+};
+
+/** The questions the ladder answers by itself: AskUserQuestion (dismissed,
+ *  the answer sent as a message) and an fx permission request (declined).
+ *  A scraped REPL prompt (a login, a trust or model dialog) is left alone:
+ *  what pressing Escape on it does is not known. */
+const answerable = (xs: ReturnType<typeof listPendingForTask>) => xs.filter((r) => r.kind !== "tmux_prompt");
+
+/** Questions one step execution may have answered for it automatically. */
+const MAX_AUTO_ANSWERED_QUESTIONS = 3;
+
+interface OwnerHold {
+  block: PipelineBlock;
+  kind: OwnerHoldKind;
+  /** The step execution the rung counters are kept for. */
+  key: string;
+  stepId: string;
+  stepName: string;
+  taskId: string | null;
+  seq: number | null;
+  handoff: Handoff | null;
+}
+
+const isAutoBlock = (b: PipelineBlock) => b.kind === "slot-wait" || b.kind === "await" || b.inputRetry != null;
+/** Blocks that record a Stop someone pressed, or a card someone archived. */
+const STOPPED_RE = /was stopped — retry it or advance past it|the pipeline run was stopped|is archived/;
+
+function holdKindOf(b: PipelineBlock, record: PipelineStepRecord | undefined): OwnerHoldKind | null {
+  switch (b.kind) {
+    case "step-blocked":
+      if (!b.taskId) return /\(run by Agetor\) needs you/.test(b.message) ? "publish" : /would take ".*" again/.test(b.message) ? "edge-limit" : "failed";
+      if (/already taken that route|no permitted corrective route/.test(b.message)) return "edge-limit";
+      if (/is waiting for you$/.test(b.message) || record?.responseKind === "user-ask") return "question";
+      return "blocked";
+    case "handoff-missing":
+    case "handoff-invalid":
+      return "no-handoff";
+    case "step-failed":
+      return "failed";
+    case "check-failed":
+      return "checks";
+    case "step-cap":
+      return "step-cap";
+    case "profile-missing":
+      return "profile-missing";
+    case "join-incomplete":
+      return "join-incomplete";
+    default:
+      return null;
+  }
+}
+
+/**
+ * The stop of `run` that would wait for the owner, if there is one and
+ * nothing automatic has it: no retry or launch retry pending, no execution
+ * live, mid-reminder or mid-checks, and not the wait queue's (a queue entry
+ * that escalated is the ladder's). A Stop the user pressed is never one.
+ * Exported for tests.
+ */
+export function ownerHoldOf(run: PipelineRunState): OwnerHold | null {
+  if (run.status !== "blocked" || !run.snapshot) return null;
+  if (run.autoRetry?.at != null) return null;
+  if (Object.values(run.launchRetries ?? {}).some((r) => r.at != null)) return null;
+  if (run.active.some((a) => isTaskRunLive(a.taskId) || remindersInFlight.has(a.taskId) || checksInFlight.has(a.taskId))) return null;
+  const queued = run.wait && run.wait.state !== "escalated" ? run.wait : null;
+  const graph = run.snapshot.graph;
+  for (const b of run.blocked) {
+    if (isAutoBlock(b) || !b.stepId) continue;
+    if (STOPPED_RE.test(b.message)) return null;
+    // The queue's: its own execution, or the run-level stop it closed out on.
+    if (queued && (b.taskId ? b.taskId === queued.taskId : queued.closeout && queued.taskId === "" && queued.stepId === b.stepId)) continue;
+    const active = b.taskId ? run.active.find((a) => a.taskId === b.taskId) : undefined;
+    if (b.taskId && !active) continue;
+    const record = active ? run.history.find((h) => h.taskId === active.taskId && h.seq === active.seq) : undefined;
+    if (record?.outcome === "cancelled") return null;
+    const kind = holdKindOf(b, record);
+    if (!kind) continue;
+    return {
+      block: b,
+      kind,
+      key: active ? `${active.taskId}#${active.seq}` : `${b.kind}@${b.stepId}`,
+      stepId: b.stepId,
+      stepName: stepNameById(graph, b.stepId),
+      taskId: b.taskId,
+      seq: active?.seq ?? null,
+      handoff: record?.handoff ?? null,
+    };
+  }
+  return null;
+}
+
+const sameHold = (run: PipelineRunState | null | undefined, hold: OwnerHold): boolean => {
+  const now = run ? ownerHoldOf(run) : null;
+  return !!now && now.key === hold.key && now.block.kind === hold.block.kind && now.block.message === hold.block.message;
+};
+
+function ladderOf(run: PipelineRunState): NonNullable<PipelineRunState["ladder"]> {
+  return (run.ladder ??= { steps: {}, reroutes: 0 });
+}
+
+function bump(run: PipelineRunState, key: string, rung: "answers" | "fresh" | "reroutes" | "interactions"): void {
+  const l = ladderOf(run);
+  const c = (l.steps[key] ??= { answers: 0, fresh: 0, reroutes: 0 });
+  c[rung] = (c[rung] ?? 0) + 1;
+  if (rung === "reroutes") l.reroutes += 1;
+  delete l.resolving;
+}
+
+function say(parentId: string, text: string, tone: "info" | "warning" | "muted" = "info"): void {
+  recordActivity(parentId, { kind: "step", text: `${RESOLVING_PREFIX}: ${text}`, tone });
+}
+
+function logResolution(parentId: string, hold: OwnerHold, action: Exclude<OwnerHoldAction, "park">): void {
+  const parent = tasks.get(parentId);
+  if (!parent) return;
+  logBlockResolution({
+    taskId: parentId,
+    title: parent.title,
+    pipeline: parent.pipelineRun?.pipelineName ?? "",
+    step: hold.stepName,
+    kind: hold.block.kind,
+    message: hold.block.message.slice(0, 500),
+    resolution: RESOLUTION[action],
+  });
+}
+
+const sha256 = (s: string) => createHash("sha256").update(s).digest("hex");
+
+/** The outgoing contract of `stepId`, for a note into its session. */
+function noteShape(graph: PipelineGraph, stepId: string) {
+  const step = graph.steps.find((s) => s.id === stepId);
+  return {
+    outgoing: outgoingSteps(graph, stepId).map((o) => ({ name: o.step.name, label: o.edge.label })),
+    transition: step?.transition ?? ("choose" as const),
+    canFinish: step?.canFinish === true,
+  };
+}
+
+/** Send `note` into a stopped step's own session; on failure start the step
+ *  again (the same step task). Outside the lock. */
+async function sendOrRestart(parentId: string, hold: OwnerHold, note: string): Promise<"sent" | "restarted" | "failed"> {
+  const runId = hold.taskId ? tasks.get(hold.taskId)?.runId : null;
+  if (hold.taskId && runId) {
+    const pending = answerable(ownerHoldDeps.pending(hold.taskId));
+    if (pending.length > 0) {
+      let all = true;
+      for (const req of pending) all = (await ownerHoldDeps.answerInteraction(req, note).catch(() => false)) && all;
+      if (all) return "sent";
+    } else {
+      let sent: Awaited<ReturnType<typeof sendInput>>;
+      try {
+        sent = await sendInput(runId, note);
+      } catch (err) {
+        sent = { delivered: false, reason: err instanceof Error ? err.message : String(err) };
+      }
+      if (sent.delivered) return "sent";
+      if (sent.withheld && sent.savedToBacklog) {
+        try {
+          const item = tasks.get(hold.taskId)?.backlog.find((b) => b.text === note);
+          if (item) backlog.remove(hold.taskId, item.id);
+        } catch {
+          // best-effort
+        }
+      }
+    }
+  }
+  const r = await retryPipelineStep(parentId, hold.taskId ? { taskId: hold.taskId } : undefined).catch((e: unknown) => ({ error: String(e) }));
+  return "error" in r ? "failed" : "restarted";
+}
+
+/** Rung 1: the same step, in its own session, with the answer. */
+async function ladderAnswer(parentId: string, hold: OwnerHold, why: string): Promise<boolean> {
+  const note = await runExclusive(parentId, async () => {
+    const run = tasks.get(parentId)?.pipelineRun;
+    if (!run?.snapshot || !sameHold(run, hold)) return null;
+    bump(run, hold.key, "answers");
+    if (run.wait && (run.wait.taskId === hold.taskId || run.wait.state === "escalated")) delete run.wait;
+    persist(parentId, run);
+    return composeOwnerHoldAnswer({
+      stepName: hold.stepName,
+      reason: hold.handoff?.reason?.trim() || hold.block.message,
+      questions: hold.handoff?.openQuestions ?? [],
+      asked: hold.kind === "question",
+      hardStop: hold.handoff?.hardStop ?? null,
+      ...noteShape(run.snapshot.graph, hold.stepId),
+    });
+  }).catch(() => null);
+  if (!note) return false;
+  logResolution(parentId, hold, "answer");
+  const how = await sendOrRestart(parentId, hold, note);
+  if (how === "restarted") {
+    await runExclusive(parentId, async () => {
+      const run = tasks.get(parentId)?.pipelineRun;
+      if (run) {
+        bump(run, hold.key, "fresh");
+        persist(parentId, run, { preserveStatus: true });
+      }
+    }).catch(() => undefined);
+  }
+  say(
+    parentId,
+    how === "sent"
+      ? `told ${hold.stepName} in its own session that nobody will answer — it takes the recommended option as provisional, files a follow-up and continues (${why})`
+      : how === "restarted"
+        ? `${hold.stepName}'s session could not take the answer, so the step was started again (${why})`
+        : `${hold.stepName} could not be resumed (${why}); the next rung follows`,
+    how === "failed" ? "warning" : "info",
+  );
+  return true;
+}
+
+/** Rung 2: one fresh session of the same step. */
+async function ladderFresh(parentId: string, hold: OwnerHold, why: string): Promise<boolean> {
+  const go = await runExclusive(parentId, async () => {
+    const run = tasks.get(parentId)?.pipelineRun;
+    if (!run || !sameHold(run, hold)) return false;
+    bump(run, hold.key, "fresh");
+    if (run.wait && (run.wait.taskId === hold.taskId || run.wait.state === "escalated")) delete run.wait;
+    persist(parentId, run);
+    return true;
+  }).catch(() => false);
+  if (!go) return false;
+  logResolution(parentId, hold, "fresh");
+  const r = await retryPipelineStep(parentId, hold.taskId ? { taskId: hold.taskId, checksFirst: hold.kind === "checks" } : undefined).catch((e: unknown) => ({ error: String(e) }));
+  say(
+    parentId,
+    "error" in r
+      ? `${hold.stepName} could not be started again (${r.error.slice(0, 160)}); the next rung follows`
+      : `started ${hold.stepName} again in a fresh session (${why})`,
+    "error" in r ? "warning" : "info",
+  );
+  return true;
+}
+
+/** Take the stopped execution (or run-level stop) out of the run, so the
+ *  run can move on from another step. Under the lock. */
+async function setAsideHold(parentId: string, run: PipelineRunState, hold: OwnerHold, why: string): Promise<void> {
+  if (hold.taskId) {
+    const a = run.active.find((x) => x.taskId === hold.taskId);
+    run.active = run.active.filter((x) => x.taskId !== hold.taskId);
+    removeBlockedFor(run, hold.taskId);
+    const record = a ? run.history.find((h) => h.taskId === a.taskId && h.seq === a.seq) : undefined;
+    if (record && record.outcome === null) {
+      record.endedAt = Date.now();
+      freezeStepReport(record);
+      record.outcome = "failed";
+    }
+    cancelPendingForTask(hold.taskId, why);
+    const archived = await archiveTask(hold.taskId, { force: true, stopRun: true, fromPipeline: true });
+    if ("error" in archived) console.warn(`[agetor] pipeline ${parentId}: failed to retire step task ${hold.taskId}:`, archived.error);
+  } else {
+    run.blocked = run.blocked.filter((b) => b !== hold.block && !(b.taskId === null && b.kind === hold.block.kind && b.stepId === hold.stepId));
+    if (hold.kind === "publish") delete run.publish;
+  }
+  if (run.wait && (run.wait.taskId === (hold.taskId ?? "") || run.wait.state === "escalated")) delete run.wait;
+}
+
+/** The handoff a stopped step is taken to have given when the ladder moves
+ *  the run on without it. */
+function ladderHandoff(run: PipelineRunState, hold: OwnerHold, summary: string, reason: string, next: string | null): Handoff {
+  const purpose = hold.handoff?.purpose || [...run.history].reverse().find((h) => h.handoff?.purpose)?.handoff?.purpose || "";
+  return normalizeHandoff({
+    schemaVersion: 1,
+    purpose,
+    summary,
+    reason,
+    next,
+    artifacts: hold.handoff?.artifacts ?? [],
+    openQuestions: [],
+    status: "done",
+  });
+}
+
+/** Rung 2: a Review or Finish that cannot proceed sends its reason to Build. */
+async function ladderReroute(parentId: string, hold: OwnerHold, toStepId: string, why: string): Promise<boolean> {
+  const done = await runExclusive(parentId, async () => {
+    const parent = tasks.get(parentId);
+    const run = parent?.pipelineRun;
+    if (!parent || !run?.snapshot || parent.archivedAt != null || !sameHold(run, hold)) return null;
+    const to = run.snapshot.graph.steps.find((s) => s.id === toStepId);
+    if (!to) return null;
+    bump(run, hold.key, "reroutes");
+    const stated = (hold.handoff?.reason?.trim() || hold.block.message).slice(0, 2000);
+    const questions = (hold.handoff?.openQuestions ?? []).filter((q) => q.trim());
+    const handoff = ladderHandoff(
+      run,
+      hold,
+      `${hold.stepName} could not proceed, and nobody will answer (the card runs unattended), so Agetor sent the work back to ${to.name}.\n` +
+        `${hold.stepName} said: ${stated}` +
+        (questions.length ? `\nIts open questions: ${questions.join("; ")}` : ""),
+      `Do what ${to.name} can do about this: fix what can be fixed in the worktree (merge a diverged remote branch into this one, never force-push; ` +
+        `use your edit tool where a command was refused); for each open question take the recommended option as provisional, record it as provisional and file or reuse one follow-up issue; ` +
+        `then hand off as usual so the run continues.`,
+      to.name,
+    );
+    await setAsideHold(parentId, run, hold, `${hold.stepName} sent back to ${to.name} (no owner holds)`);
+    await launchTarget(parent, run, to, [{ stepId: hold.stepId, seq: hold.seq ?? 0, handoff }]);
+    checkJoinIncomplete(run);
+    persist(parentId, run);
+    return to.name;
+  }).catch(() => null);
+  if (!done) return false;
+  logResolution(parentId, hold, "reroute");
+  say(parentId, `${hold.stepName} could not proceed — sent its reason back to ${done}, the step that can act on it (${why})`, "warning");
+  return true;
+}
+
+/** Rung 2 for what clears by itself: back in the queue, never escalated. */
+async function ladderWait(parentId: string, hold: OwnerHold, category: BlockWaitCategory, now: number): Promise<boolean> {
+  const config = blockWaitConfig();
+  const w = await runExclusive(parentId, async () => {
+    const run = tasks.get(parentId)?.pipelineRun;
+    if (!run?.wait || run.wait.state !== "escalated" || !sameHold(run, hold)) return null;
+    const { escalatedAt: _a, escalation: _b, ...rest } = run.wait;
+    run.wait = { ...rest, category, state: "waiting", endless: true, deadline: NO_DEADLINE, at: now + config.longBackoffMin * 60_000 };
+    delete ladderOf(run).resolving;
+    persist(parentId, run);
+    return run.wait;
+  }).catch(() => null);
+  if (!w) return false;
+  logResolution(parentId, hold, "wait");
+  say(parentId, `${hold.stepName} keeps waiting on ${w.what} — it clears by itself, so it is re-checked every ${fmtSpan(config.longBackoffMin * 60_000)} and never left for you`);
+  return true;
+}
+
+/** Rung 3: one follow-up issue per unresolved item, then the wrap-up
+ *  through Finish (committed work) or a dependency wait on the issue. */
+async function ladderClose(parentId: string, hold: OwnerHold, mode: "publish" | "depend", why: string, now: number): Promise<boolean> {
+  const parent = tasks.get(parentId);
+  const run0 = parent?.pipelineRun;
+  if (!parent || !run0?.snapshot) return false;
+  const counters = run0.ladder?.steps[hold.key] ?? NO_COUNTERS;
+  const tried = [
+    ...(counters.answers ? [`answered ${hold.stepName} in its own session`] : []),
+    ...(counters.reroutes ? ["sent the work back to Build"] : []),
+    ...(counters.fresh ? [`started ${hold.stepName} again in a fresh session`] : []),
+    ...(run0.wait?.tried.length ? [`resumed it ${run0.wait.tried.length} time(s) from the wait queue`] : []),
+  ];
+  const reason = hold.handoff?.reason?.trim() || hold.block.message;
+  const items = unresolvedItems({ openQuestions: hold.handoff?.openQuestions ?? [], reason, fallback: hold.block.message });
+  const hardStop = hold.handoff?.hardStop ?? null;
+  const issues: number[] = [];
+  let failure: string | null = null;
+  for (const item of items) {
+    const key = followUpKey({ source: parent.issueUrl ?? parentId, step: hold.stepName, question: item.question }, sha256);
+    const { title, body } = followUpIssue({
+      key, cardTitle: parent.title, cardId: parentId, step: hold.stepName, item, reason, hardStop, tried,
+      issueUrl: parent.issueUrl ?? null, prUrl: parent.prUrl ?? null, close: mode,
+    });
+    const filed = await ownerHoldDeps.fileIssue({ dir: parent.workdir, key, title, body }).catch((e: unknown) => ({ error: String(e) }));
+    if ("error" in filed) failure = filed.error;
+    else if (!issues.includes(filed.number)) issues.push(filed.number);
+  }
+  const config = blockWaitConfig();
+  const done = await runExclusive(parentId, async () => {
+    const p = tasks.get(parentId);
+    const run = p?.pipelineRun;
+    if (!p || !run?.snapshot || p.archivedAt != null || !sameHold(run, hold)) return null;
+    const l = ladderOf(run);
+    delete l.resolving;
+    if (issues.length === 0) {
+      // GitHub did not take the issue: try again later — still nobody's hold.
+      run.wait = {
+        stepId: hold.stepId, taskId: hold.taskId ?? "", category: "environment", source: "signal", what: "GitHub", ref: null,
+        reason: `could not file the follow-up issue: ${(failure ?? "unknown error").slice(0, 160)}`, state: "waiting", since: now, attempt: 0, max: 0,
+        at: now + 15 * 60_000, deadline: NO_DEADLINE, tried: [], endless: true, closeout: true,
+      };
+      persist(parentId, run);
+      return "retry" as const;
+    }
+    l.closed = { at: now, mode, issues };
+    const terminal = mode === "publish" ? capWrapUpStep(run.snapshot.graph) : null;
+    if (terminal) {
+      run.capWrapUp = { at: now, fromStepId: hold.stepId, closeout: { issues, why } };
+      const handoff = ladderHandoff(
+        run,
+        hold,
+        `${hold.stepName} stopped on something nobody will answer (${why}). Agetor filed ${issues.map((n) => `#${n}`).join(", ")} for the owner and closes the run out here.\n${hold.stepName} said: ${reason.slice(0, 1500)}`,
+        `Publish what is committed and finish the run (see the wrap-up section): the pull request says the head is not approved when it is not, and references ${issues.map((n) => `#${n}`).join(", ")}.`,
+        terminal.name,
+      );
+      await setAsideHold(parentId, run, hold, "closed out without the owner");
+      // Nothing else of the run carries on: the wrap-up is its last step.
+      await retireActiveExecutions(parentId, run, "closed out without the owner");
+      run.blocked = [];
+      run.joins = {};
+      delete run.wait;
+      delete run.autoRetry;
+      delete run.launchRetries;
+      delete run.publish;
+      await launchTarget(p, run, terminal, [{ stepId: hold.stepId, seq: hold.seq ?? 0, handoff }]);
+      checkJoinIncomplete(run);
+      persist(parentId, run);
+      return terminal.name;
+    }
+    l.closed = { at: now, mode: "depend", issues };
+    run.wait = {
+      stepId: hold.stepId, taskId: hold.taskId ?? "", category: "dependency", source: "signal", what: `#${issues[0]}`, ref: `#${issues[0]}`,
+      reason: (hold.handoff?.reason?.trim() || hold.block.message).split("\n")[0]!.slice(0, 240) || "no reason given",
+      state: "waiting", since: now, attempt: 0, max: 0, at: now + config.longBackoffMin * 60_000, deadline: NO_DEADLINE, tried: [], endless: true, closeout: true,
+    };
+    persist(parentId, run);
+    return "depend" as const;
+  }).catch(() => null);
+  if (!done) return false;
+  if (done === "retry") {
+    say(parentId, `${hold.stepName} is closed out without you, but its follow-up issue could not be filed (${(failure ?? "").slice(0, 120)}) — trying again in 15 minutes`, "warning");
+    return true;
+  }
+  const list = issues.map((n) => `#${n}`).join(", ");
+  logResolution(parentId, hold, done === "depend" ? "close-depend" : "close-publish");
+  say(
+    parentId,
+    done === "depend"
+      ? `${hold.stepName} stopped (${why}). Filed ${list} for the owner; the card waits on ${`#${issues[0]}`} and resumes by itself when it is closed`
+      : `${hold.stepName} stopped (${why}). Filed ${list} for the owner and closing the run out through ${done}: it publishes what is committed (not approved unless reviewed) and merges nothing`,
+    "warning",
+  );
+  return true;
+}
+
+/** A closed-out card's follow-up issue was closed: a new allowance, and the
+ *  stopped step resumes (or the run-level stop is retried). */
+async function resumeClosedOut(parentId: string, cleared: string, now: number): Promise<boolean> {
+  const go = await runExclusive(parentId, async () => {
+    const run = tasks.get(parentId)?.pipelineRun;
+    const w = run?.wait;
+    if (!run || !w?.closeout || w.state !== "waiting") return null;
+    const userStop = run.ladder?.userStop;
+    run.ladder = { steps: {}, reroutes: 0, ...(userStop != null ? { userStop } : {}) };
+    if (w.taskId) {
+      // The queue's ordinary resume, with what changed.
+      const { closeout: _closeout, ...rest } = w;
+      run.wait = { ...rest, attempt: 0, max: 1, endless: true };
+      persist(parentId, run);
+      return "step" as const;
+    }
+    delete run.wait;
+    persist(parentId, run);
+    return "run" as const;
+  }).catch(() => null);
+  if (!go) return false;
+  recordActivity(parentId, { kind: "step", text: `${cleared} — resuming the card`, tone: "info" });
+  if (go === "step") return resumeBlockedStep(parentId, cleared, `${cleared} (read its resolution with \`gh issue view\` and its comments, and act on it)`, now);
+  const r = await retryPipelineStep(parentId).catch((e: unknown) => ({ error: String(e) }));
+  return !("error" in r);
+}
+
+/** Questions a step of an unattended run asked while working: answered
+ *  automatically (dismissed, never approved) with the rung-1 message. */
+async function answerAskedQuestions(parentId: string): Promise<boolean> {
+  const go = await runExclusive(parentId, async () => {
+    const run = tasks.get(parentId)?.pipelineRun;
+    if (!run?.snapshot || (run.status !== "running" && run.status !== "blocked") || !ladderApplies(run)) return null;
+    for (const a of run.active) {
+      const pending = answerable(ownerHoldDeps.pending(a.taskId));
+      if (pending.length === 0) continue;
+      const key = `${a.taskId}#${a.seq}`;
+      const n = run.ladder?.steps[key]?.interactions ?? 0;
+      const stepName = stepNameById(run.snapshot.graph, a.stepId);
+      if (n >= MAX_AUTO_ANSWERED_QUESTIONS) {
+        // It keeps asking: no more answers. Its turn ends on the question,
+        // and the ladder takes it from there.
+        cancelPendingForTask(a.taskId, "unattended run: nobody will answer (owner_holds)");
+        return { stepName, pending: [], note: "", cancelled: true };
+      }
+      bump(run, key, "interactions");
+      persist(parentId, run, { preserveStatus: true });
+      const record = run.history.find((h) => h.taskId === a.taskId && h.seq === a.seq);
+      const questions = pending.flatMap((p) => (p.kind === "ask_questions" ? p.questions.map((q) => q.question) : []));
+      return {
+        stepName,
+        pending,
+        cancelled: false,
+        note: composeOwnerHoldAnswer({
+          stepName, reason: record?.handoff?.reason || "you asked a question", questions, asked: true, ...noteShape(run.snapshot.graph, a.stepId),
+        }),
+      };
+    }
+    return null;
+  }).catch(() => null);
+  if (!go) return false;
+  if (go.cancelled) {
+    say(parentId, `${go.stepName} keeps asking questions nobody will answer — no more answers; the ladder takes it from here`, "warning");
+    return true;
+  }
+  let all = true;
+  for (const req of go.pending) all = (await ownerHoldDeps.answerInteraction(req, go.note).catch(() => false)) && all;
+  say(parentId, all ? `${go.stepName} asked a question nobody will answer — answered it: take the recommended option as provisional and continue` : `${go.stepName} asked a question; the automatic answer could not be delivered`, all ? "info" : "warning");
+  return true;
+}
+
+const ladderInFlight = new Set<string>();
+
+/** One card: questions first, then its stop, if any. `busy`: the machine
+ *  has no room for another step now (slots, a usage limit) — a rung that
+ *  would start one waits for the next pass. */
+async function resolveOwnerHoldOf(parentId: string, now: number, busy: (stepName: string) => boolean): Promise<boolean> {
+  if (await answerAskedQuestions(parentId)) return true;
+  const seen = await runExclusive(parentId, async () => {
+    const parent = tasks.get(parentId);
+    const run = parent?.pipelineRun;
+    if (!parent || !run?.snapshot || parent.archivedAt != null || !ladderApplies(run)) return null;
+    const hold = ownerHoldOf(run);
+    if (!hold) {
+      if (run.ladder?.resolving) {
+        delete run.ladder.resolving;
+        persist(parentId, run, { preserveStatus: true });
+      }
+      return null;
+    }
+    const graph = run.snapshot.graph;
+    const role = stepRole(hold.stepName, hold.stepId);
+    const build = graph.steps.find((s) => s.id !== hold.stepId && stepRole(s.name, s.id) === "build" && !isFollowUpStepId(s.id));
+    const config = blockWaitConfig();
+    const w = run.wait;
+    const external = w?.state === "escalated" && (w.taskId === (hold.taskId ?? "")) && config.enabled && SELF_CLEARING.includes(w.category) ? w.category : null;
+    return {
+      parent,
+      hold,
+      input: {
+        mode: "resolve" as const,
+        unattended: true,
+        userStopped: false,
+        kind: hold.kind,
+        role,
+        hasSession: !!hold.taskId && !!tasks.get(hold.taskId)?.runId,
+        hardStop: hold.handoff?.hardStop ?? null,
+        external,
+        counters: run.ladder?.steps[hold.key] ?? NO_COUNTERS,
+        runReroutes: run.ladder?.reroutes ?? 0,
+        rerouteTo: build && !exhaustedEdge(graph, run.history, hold.stepId, [build.id]) ? build.id : null,
+        closed: run.ladder?.closed != null,
+        wrapUpAvailable: capWrapUpStep(graph) != null && run.capWrapUp == null,
+      },
+    };
+  }).catch(() => null);
+  if (!seen) return false;
+  const hasCommits = await ownerHoldDeps.hasCommits(seen.parent).catch(() => false);
+  const decision = resolveOwnerHold({ ...seen.input, hasCommits });
+  // Resuming or restarting a step takes a slot like any other start.
+  if ((decision.action === "answer" || decision.action === "fresh") && !isPriority(parentId) && busy(seen.hold.stepName)) return false;
+  switch (decision.action) {
+    case "park":
+      return false;
+    case "answer":
+      return ladderAnswer(parentId, seen.hold, decision.why);
+    case "fresh":
+      return ladderFresh(parentId, seen.hold, decision.why);
+    case "reroute":
+      return ladderReroute(parentId, seen.hold, decision.to, decision.why);
+    case "wait":
+      return ladderWait(parentId, seen.hold, decision.category, now);
+    case "close-publish":
+      return ladderClose(parentId, seen.hold, "publish", decision.why, now);
+    case "close-depend":
+      return ladderClose(parentId, seen.hold, "depend", decision.why, now);
+  }
+}
+
+/**
+ * One pass of the ladder over every unattended card: a question a step asked
+ * is answered; a stop that would wait for the owner gets its next rung. One
+ * action per card a pass; a card being acted on is skipped. Exported for
+ * tests; the slot scheduler runs it every {@link BLOCK_WAIT_TICK_MS}, and a
+ * new stop sets it off sooner (`kickOwnerHolds`).
+ */
+export async function resolveOwnerHolds(now = Date.now()): Promise<number> {
+  if (ownerHoldsMode() === "park") return 0;
+  const config = blockWaitConfig();
+  const live = tasks.listLive().filter((t) => t.archivedAt == null);
+  const quotaHold = live.some((t) => waitingOnQuota(t.pipelineRun) || (t.pipelineRun?.active ?? []).some((a) => isQuotaPaused(a.taskId)));
+  const busy = (stepName: string) => {
+    if (quotaHold) return true;
+    const slots = currentSlots();
+    return !slotDecision(stepName, slotUse(isTaskRunLive, slots), slots).ok;
+  };
+  let acted = 0;
+  // Oldest stop first, priority cards ahead; at most `maxPerPass` actions a
+  // pass, as the wait queue resumes (a board full of stops after an
+  // upgrade is worked through a few at a time).
+  const cards = priorityFirst(
+    live.filter((t) => !t.pipelineParentId && t.pipelineRun?.snapshot?.decisionPolicy)
+      .sort((a, b) => (a.pipelineRun?.ladder?.resolving?.since ?? 0) - (b.pipelineRun?.ladder?.resolving?.since ?? 0)),
+    (t) => t.id,
+  );
+  for (const t of cards) {
+    if (acted >= config.maxPerPass) break;
+    if (ladderInFlight.has(t.id) || recoveriesInFlight.has(t.id)) continue;
+    ladderInFlight.add(t.id);
+    try {
+      if (await resolveOwnerHoldOf(t.id, now, busy)) acted++;
+    } catch (err) {
+      console.warn(`[agetor] owner-hold ladder failed for ${t.id}:`, err);
+    } finally {
+      ladderInFlight.delete(t.id);
+    }
+  }
+  return acted;
+}
+
+let ownerHoldKick: ReturnType<typeof setTimeout> | null = null;
+/** A new stop on an unattended card: decide within seconds rather than at
+ *  the next tick. Only once the scheduler runs (never in tests). */
+function kickOwnerHolds(): void {
+  if (!slotLoop || ownerHoldKick) return;
+  ownerHoldKick = setTimeout(() => {
+    ownerHoldKick = null;
+    void resolveOwnerHolds().catch(() => 0);
+  }, 2_000);
+  ownerHoldKick.unref?.();
 }
 
 /** When each queued step started waiting (`<parentId>:<stepId>`) — slots go
@@ -1251,6 +1954,9 @@ export function startSlotScheduler(): void {
   // The blocked-step wait queue: persisted on the runs, so the first pass
   // after a restart picks up where the last one left off.
   setInterval(() => void releaseBlockWaits().catch(() => 0), BLOCK_WAIT_TICK_MS).unref?.();
+  // No owner holds: every stop that would wait for the owner gets its next
+  // rung. Persisted on the runs, like the queue.
+  setInterval(() => void resolveOwnerHolds().catch(() => 0), BLOCK_WAIT_TICK_MS).unref?.();
 }
 
 function noteSuperseded(parentId: string, steps: string[], by: string): void {
@@ -1335,7 +2041,11 @@ function persist(parentId: string, run: PipelineRunState, opts?: { preserveStatu
   // entry goes with it; and when its block is gone while the queue wasn't
   // the one resuming it, a person took the step up — Retry, a message to
   // the step, an answer — which always wins over the queue.
-  if (run.wait) {
+  if (run.wait?.closeout && run.wait.taskId === "") {
+    // A run-level close-out has no execution: it lasts while its stop does.
+    const w = run.wait;
+    if (!run.blocked.some((b) => b.taskId === null && b.stepId === w.stepId && !isAutoBlock(b))) delete run.wait;
+  } else if (run.wait) {
     const w = run.wait;
     const stillActive = run.active.some((a) => a.taskId === w.taskId);
     const stillBlocked = run.blocked.some((b) => b.taskId === w.taskId);
@@ -1355,6 +2065,16 @@ function persist(parentId: string, run: PipelineRunState, opts?: { preserveStatu
           tone: "muted",
         });
       }
+    }
+  }
+  // No owner holds: a stop the ladder will take reads as being resolved,
+  // not as needing the owner, from the moment it is recorded.
+  if (run.ladder?.resolving && run.status !== "blocked") delete run.ladder.resolving;
+  if (run.status === "blocked" && run.snapshot?.decisionPolicy && run.ladder?.userStop == null && !run.ladder?.resolving) {
+    const hold = ownerHoldOf(run);
+    if (hold && ladderApplies(run)) {
+      ladderOf(run).resolving = { since: Date.now(), note: `${hold.stepName}: ${hold.handoff?.reason?.trim() || hold.block.message}`.split("\n")[0]!.slice(0, 240) };
+      kickOwnerHolds();
     }
   }
   tasks.setPipelineRun(parentId, run);
@@ -2195,7 +2915,7 @@ async function launchStep(
   // the insert comes back through here and is let past the cap again.
   let wrapUp = false;
   if (
-    run.stepCount >= effectiveStepCap(run) &&
+    (run.stepCount >= effectiveStepCap(run) || run.capWrapUp?.closeout != null) &&
     snapshot.decisionPolicy &&
     run.capWrapUp?.seq === undefined
   ) {
@@ -2429,7 +3149,7 @@ async function launchStep(
     machineCapacity: managedRoot ? `## Machine test capacity\n${HEAVY_INSTRUCTIONS}` : null,
     approvalNote: managedRoot ? approvalNote : null,
     // Last, so nothing after it reads as taking the wrap-up back.
-    wrapUp: wrapUp ? capWrapUpSection({ stepCap: effectiveStepCap(run), issueUrl: parent.issueUrl, prUrl: parent.prUrl }) : null,
+    wrapUp: wrapUp ? capWrapUpSection({ stepCap: effectiveStepCap(run), issueUrl: parent.issueUrl, prUrl: parent.prUrl, closeout: run.capWrapUp?.closeout ?? null }) : null,
     inputNote: inputReconciliation.note ?? null,
   };
   const order = parseStepPromptOrder(preferences.get(STEP_PROMPT_ORDER_PREF));
@@ -3721,6 +4441,8 @@ function reopenRunState(run: PipelineRunState, snapshot: PipelineRunSnapshot, pa
   delete run.launchRetries;
   delete run.capWrapUp;
   delete run.publish;
+  // A person reopened the run: the no-owner-holds ladder starts over.
+  delete run.ladder;
   run.snapshot = snapshot;
   run.status = "running";
   run.endedAt = null;
@@ -3908,11 +4630,19 @@ export async function cancelPipelineRun(parentId: string): Promise<{ task: Task 
     const run = parent.pipelineRun;
 
     const runningTargets = run.active.filter((a) => isTaskRunLive(a.taskId));
+    // A Stop the user pressed: the no-owner-holds ladder leaves the run
+    // alone until a person starts a step of it again.
+    const markStopped = () => {
+      const l = ladderOf(run);
+      l.userStop = Date.now();
+      delete l.resolving;
+    };
     const hadLaunchRetry = Object.values(run.launchRetries ?? {}).some(r => r.at != null);
     for (const retry of Object.values(run.launchRetries ?? {})) retry.at = null;
     if (runningTargets.length === 0 && run.blocked.some(b => b.kind === 'slot-wait')) {
       if (run.autoRetry?.at != null) run.autoRetry = { ...run.autoRetry, at: null };
       run.status = 'cancelled';
+      markStopped();
       persist(parentId, run, { preserveStatus: true });
       recordActivity(parentId, { kind: 'step', text: 'Queued execution cancelled — left for you', tone: 'muted' });
       return { task: tasks.get(parentId)! };
@@ -3923,13 +4653,23 @@ export async function cancelPipelineRun(parentId: string): Promise<{ task: Task 
       if (run.autoRetry?.at != null) run.autoRetry = { ...run.autoRetry, at: null };
       // Out of the wait queue too: the block stays, for the user.
       if (run.wait?.state === "waiting") delete run.wait;
+      markStopped();
       persist(parentId, run);
       recordActivity(parentId, { kind: "step", text: "Automatic retry cancelled — left for you", tone: "muted" });
+      return { task: tasks.get(parentId)! };
+    }
+    // Stop on a card the no-owner-holds ladder is resolving: it is left
+    // alone from now on, for the user.
+    if (runningTargets.length === 0 && run.status === "blocked" && run.ladder?.resolving) {
+      markStopped();
+      persist(parentId, run);
+      recordActivity(parentId, { kind: "step", text: "Stopped — Agetor will not resolve this stop by itself; left for you", tone: "muted" });
       return { task: tasks.get(parentId)! };
     }
     if (runningTargets.length === 0) return { error: "pipeline is not running", status: 409 as const };
     // A Stop also cancels any automatic retry that was pending.
     if (run.autoRetry?.at != null) run.autoRetry = { ...run.autoRetry, at: null };
+    markStopped();
 
     for (const t of runningTargets) {
       const runId = tasks.get(t.taskId)?.runId;
@@ -5349,6 +6089,12 @@ async function handleColumnChange(
         const beforeLen = run.blocked.length;
         run.blocked = run.blocked.filter((b) => b.taskId !== taskId);
         let changed = run.blocked.length !== beforeLen;
+        // A step running again after a Stop: a person started it (nothing
+        // automatic resumes a stopped run), so the ladder may act again.
+        if (run.ladder?.userStop != null) {
+          delete run.ladder.userStop;
+          changed = true;
+        }
         // A real new worker supersedes this execution's earlier timer. If
         // that turn reaches an owner hold, the old timer must not answer it
         // by restarting the execution. Retain the bounded attempt count.

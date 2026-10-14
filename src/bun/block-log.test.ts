@@ -18,3 +18,16 @@ test("summarizeBlocks: grouped by pipeline/step/kind, most frequent first, newes
   expect(rows[0]!.lastAt).toBe(3);
   expect(rows[0]!.examples[0]).toEqual({ title: "C", message: "m3" });
 });
+
+test("readBlockLog: a resolution line names the rung that handled the newest matching block, and the block count is unchanged", async () => {
+  // Under `bun test` db.ts allocates a throwaway data dir (never ~/.agetor).
+  const { logBlocks, logBlockResolution, readBlockLog } = await import("./block-log.ts");
+  const e = { taskId: `t-${Math.random()}`, title: "T", pipeline: "Change", step: "Finish", kind: "step-blocked", message: "needs you" };
+  logBlocks([e], 1);
+  logBlockResolution({ ...e, resolution: "answered" }, 2);
+  logBlocks([e], 3);
+  logBlocks([{ ...e, message: "other" }], 4);
+  logBlockResolution({ ...e, resolution: "rerouted" }, 5);
+  const mine = readBlockLog().filter((x) => x.taskId === e.taskId);
+  expect(mine.map((x) => [x.ts, x.message, x.resolution ?? null])).toEqual([[1, "needs you", "answered"], [3, "needs you", "rerouted"], [4, "other", null]]);
+});

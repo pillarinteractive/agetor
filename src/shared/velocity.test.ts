@@ -134,6 +134,20 @@ describe("a card's time, split into phases", () => {
     expect(retried.phases.owner).toBeUndefined();
   });
 
+  test("no owner holds: a stop the ladder resolves is not the owner's time, and its wording is what the ledger reads", async () => {
+    const { RESOLVING_PREFIX } = await import("./owner-holds.ts");
+    const base = (activity: VelocityCard["activity"]): VelocityCard => ({ cardId: "c", runStartedAt: at(0), records: [rec("build", 0, 20, [], { blocked: true }), rec("build", 50, 60, [])], activity });
+    expect(mins(cardWindow(base([]), at(60))!.phases.owner)).toBe(30);
+    for (const line of [
+      `${RESOLVING_PREFIX}: told Build in its own session that nobody will answer — it takes the recommended option as provisional, files a follow-up and continues (x)`,
+      `${RESOLVING_PREFIX}: Build stopped (the ladder is spent). Filed #12 for the owner; the card waits on #12 and resumes by itself when it is closed`,
+    ]) {
+      const w = cardWindow(base([say(21, line)]), at(60))!;
+      expect(w.phases.owner).toBeUndefined();
+      expect(mins(w.phases.other)).toBe(30);
+    }
+  });
+
   test("a 'blocked' handoff that still names the next step is not a wait on the owner", () => {
     const card: VelocityCard = { cardId: "c", runStartedAt: at(0), records: [rec("build", 0, 20, ["review"], { blocked: true }), rec("review", 22, 30, [])], activity: [] };
     expect(cardWindow(card, at(30))!.phases).toEqual({ build: 20 * MIN, slot: 2 * MIN, review: 8 * MIN });

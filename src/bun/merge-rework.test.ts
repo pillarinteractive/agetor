@@ -489,6 +489,39 @@ test("a round that left the head unchanged is not repeated: held", async () => {
   expect(activity(id).some((l) => l.startsWith("Held for you:") && l.includes("left the pull request's head unchanged"))).toBe(true);
 });
 
+test("no owner holds: an unattended card's hold files one follow-up issue, and closing it lifts the hold with a fresh allowance", async () => {
+  const { tasks } = await import("./db.ts");
+  const { id } = await finishedCard();
+  stubCi("AssertionError: nope");
+  const filed: number[] = [];
+  let closed = false;
+  rework.reworkDeps.resolveHolds = () => true;
+  rework.reworkDeps.fileFollowUp = async () => {
+    filed.push(1600);
+    return { number: 1600 };
+  };
+  rework.reworkDeps.issueClosed = async () => closed;
+  let clock = 1_000_000;
+  rework.reworkDeps.now = () => clock;
+  expect(await rework.reworkCiFailure(tasks.get(id)!, failing())).toEqual({ kind: "round", round: 1 });
+  await waitFor(() => tasks.get(id)!.pipelineRun?.status === "done");
+  expect(await rework.reworkCiFailure(tasks.get(id)!, failing())).toEqual({ kind: "held" });
+  expect(filed).toEqual([1600]);
+  expect(rework.reworkEntry(id)).toMatchObject({ held: true, followUp: 1600 });
+  const said = activity(id).find((l) => l.includes("Filed #1600 for the owner"))!;
+  expect(said.startsWith("Resolving without you:")).toBe(true);
+  expect(activity(id).some((l) => l.startsWith("Held for you:"))).toBe(false);
+  // Still open: held, and no second issue.
+  clock += 10 * 60_000;
+  expect(await rework.reworkCiFailure(tasks.get(id)!, failing())).toEqual({ kind: "held" });
+  expect(filed).toEqual([1600]);
+  // Closed: the hold is lifted as a sign-off by hand lifts it.
+  closed = true;
+  clock += 10 * 60_000;
+  expect(await rework.reworkCiFailure(tasks.get(id)!, failing({ headSha: "b".repeat(40) }))).toEqual({ kind: "round", round: 1 });
+  expect(activity(id).some((l) => l === "#1600 is closed — the hold is lifted: a fresh set of fix rounds")).toBe(true);
+});
+
 test("a pipeline without a Review step keeps its follow-ups", async () => {
   const { tasks } = await import("./db.ts");
   const { isMergeQueued } = await import("./merge-intent.ts");

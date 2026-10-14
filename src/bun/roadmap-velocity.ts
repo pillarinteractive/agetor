@@ -54,6 +54,7 @@ import {
 } from "../shared/velocity.ts";
 import { readLogged } from "./activity.ts";
 import { waitingInQueue } from "../shared/block-wait.ts";
+import { resolvingHold } from "../shared/owner-holds.ts";
 import { dataDir, db, tasks } from "./db.ts";
 
 /** The issue number of the step that is the main-release gate, when the
@@ -334,7 +335,8 @@ export function recordVelocityPass(input: VelocityPassInput, io: VelocityIo = VE
     const lastEnd = Math.max(0, ...card.records.map((r) => r.endedAt ?? 0)) || null;
     const run = t.pipelineRun;
     // Parked in the blocked-step wait queue: waiting, but not on the owner.
-    const retrying = waitingInQueue(run) ? "waiting" : run?.status === "blocked" && run.autoRetry?.at != null ? (run.autoRetry.kind === "quota" ? "quota" : "retry") : null;
+    // …or being resolved by the no-owner-holds ladder: not the owner's either.
+    const retrying = waitingInQueue(run) || resolvingHold(run) ? "waiting" : run?.status === "blocked" && run.autoRetry?.at != null ? (run.autoRetry.kind === "quota" ? "quota" : "retry") : null;
     const state: VelocityOpenStep["state"] = input.held.has(issue)
       ? "held"
       : input.quota?.has(issue)
