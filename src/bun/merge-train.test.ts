@@ -92,7 +92,7 @@ async function sh(cwd: string, ...args: string[]) {
   return out.trim();
 }
 
-test("assembling: one squashed commit per PR on the latest base; a PR that conflicts drops out", async () => {
+test("assembling: one merge commit per PR on the latest base, keeping the PR's own commits; a PR that conflicts drops out", async () => {
   const root = mkdtempSync(path.join(tmpdir(), "train-"));
   const origin = path.join(root, "origin.git");
   const repo = path.join(root, "repo");
@@ -125,9 +125,16 @@ test("assembling: one squashed commit per PR on the latest base; a PR that confl
   const { members, dropped } = await assembleTrain(repo, "develop", "agetor/merge-train-x", path.join(root, "wt"), [m("a", 1, "feat-a"), m("b", 2, "feat-b"), m("c", 3, "feat-c")]);
   expect(members.map((x) => x.pr)).toEqual([1, 2]);
   expect(dropped.map((d) => [d.member.pr, d.why])).toEqual([[3, "conflicts with the other PRs"]]);
-  const log = await sh(repo, "git", "log", "--format=%s", "origin/develop..origin/agetor/merge-train-x");
-  expect(log.split("\n")).toEqual(["fix: feat-b (#2)", "fix: feat-a (#1)"]); // three wip commits squashed into one
-  // Each member records the head it was squashed from (not a cached, possibly stale one).
+  const log = await sh(repo, "git", "log", "--first-parent", "--format=%s", "origin/develop..origin/agetor/merge-train-x");
+  expect(log.split("\n")).toEqual(["fix: feat-b (#2)", "fix: feat-a (#1)"]); // one line per PR on the first-parent line
+  // Each is a merge whose second parent is the PR's head: its three wip
+  // commits stay reachable (records pinned to one keep resolving).
+  for (const [subject, b] of [["fix: feat-a (#1)", "feat-a"], ["fix: feat-b (#2)", "feat-b"]] as const) {
+    const sha = await sh(repo, "git", "log", "--first-parent", "--format=%H", `--grep=^${subject.replace(/[()#]/g, ".")}$`, "origin/agetor/merge-train-x");
+    expect((await sh(repo, "git", "rev-list", "--parents", "-n", "1", sha)).split(" ")[2]).toBe(await sh(repo, "git", "rev-parse", `origin/${b}`));
+  }
+  for (const wip of ["wip feat-a 0", "wip feat-a 1", "wip feat-a 2"]) expect(await sh(repo, "git", "log", "--format=%s", `--grep=^${wip}$`, "origin/agetor/merge-train-x")).toBe(wip);
+  // Each member records the head it was merged from (not a cached, possibly stale one).
   expect(members[0]!.headSha).toBe(await sh(repo, "git", "rev-parse", "origin/feat-a"));
 
   // A train of one: pushed only when asked for (the fresh rule), built on the latest base.
@@ -136,7 +143,7 @@ test("assembling: one squashed commit per PR on the latest base; a PR that confl
   expect(await sh(repo, "git", "ls-remote", "origin", "refs/heads/agetor/merge-train-y")).toBe("");
   const alone = await assembleTrain(repo, "develop", "agetor/merge-train-z", path.join(root, "wt-z"), [m("b", 2, "feat-b")], 1);
   expect(alone.members.map((x) => x.pr)).toEqual([2]);
-  expect((await sh(repo, "git", "log", "--format=%s", "origin/develop..origin/agetor/merge-train-z")).split("\n")).toEqual(["fix: feat-b (#2)"]);
+  expect((await sh(repo, "git", "log", "--first-parent", "--format=%s", "origin/develop..origin/agetor/merge-train-z")).split("\n")).toEqual(["fix: feat-b (#2)"]);
   expect(await sh(repo, "git", "rev-parse", "origin/agetor/merge-train-z~1")).toBe(await sh(repo, "git", "rev-parse", "origin/develop"));
 }, 30_000);
 
@@ -265,7 +272,7 @@ test("assembling with regenerable conflicts: resolves conflict via scratch workt
 
     expect(members.map((x) => x.pr)).toEqual([1, 2]);
     expect(dropped).toEqual([]);
-    const log = await sh(repo, "git", "log", "--format=%s", "origin/develop..origin/agetor/merge-train-regen");
+    const log = await sh(repo, "git", "log", "--first-parent", "--format=%s", "origin/develop..origin/agetor/merge-train-regen");
     expect(log.split("\n")).toEqual(["fix: feat-2 (#2)", "fix: feat-1 (#1)"]);
   } finally {
     preferences.set(MERGE_REGENERATE_PREF, "");

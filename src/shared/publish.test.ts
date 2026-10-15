@@ -149,17 +149,16 @@ describe("decidePublish: one action from the state and what Agetor observed", ()
     { name: "verify-head: no reviewApproval at all → the agent runs Finish as before", p: state("verify-head"),
       obs: { state: "verify-head", dirty: [], head: HEAD, tree: "t", approval: { kind: "none" }, unreviewed: [] }, want: "agent" },
     // check-merge
-    { name: "check-merge: the head already contains the base tip", p: state("check-merge"), obs: { state: "check-merge", baseTip: TIP, contains: true, merge: null }, want: "advance:hold-base" },
+    { name: "check-merge: the head already contains the base tip → push", p: state("check-merge"), obs: { state: "check-merge", baseTip: TIP, contains: true, merge: null }, want: "advance:push" },
     { name: "check-merge: the base moved, clean merge, same diff → Agetor merges it in", p: state("check-merge"), obs: { state: "check-merge", baseTip: TIP2, contains: false, merge: clean }, want: "merge-base" },
     { name: "check-merge: conflicts → Build", p: state("check-merge"), obs: { state: "check-merge", baseTip: TIP2, contains: false, merge: { conflicts: ["a.ts"], samePatch: false, commit: null } }, want: "to-build:conflict" },
     { name: "check-merge: clean but the change's diff would differ → publish the approved head as it is", p: state("check-merge"),
-      obs: { state: "check-merge", baseTip: TIP2, contains: false, merge: { conflicts: null, samePatch: false, commit: MERGED } }, want: "advance:hold-base" },
+      obs: { state: "check-merge", baseTip: TIP2, contains: false, merge: { conflicts: null, samePatch: false, commit: MERGED } }, want: "advance:push" },
     { name: "check-merge: git could not try the merge → wait", p: state("check-merge"), obs: { state: "check-merge", baseTip: TIP2, contains: false, merge: null }, want: "wait" },
-    // hold-base
-    { name: "hold-base: base green → push", p: state("hold-base"), obs: { state: "hold-base", baseTip: TIP, checks: green }, want: "advance:push" },
-    { name: "hold-base: base has no CI → push", p: state("hold-base"), obs: { state: "hold-base", baseTip: TIP, checks: [] }, want: "advance:push" },
-    { name: "hold-base: base red → stay; a push would spend a run that must fail", p: state("hold-base"), obs: { state: "hold-base", baseTip: TIP, checks: redOwn }, want: "wait" },
-    { name: "hold-base: the base moved while it waited → merge the new tip first", p: state("hold-base"), obs: { state: "hold-base", baseTip: TIP2, checks: green }, want: "advance:check-merge" },
+    // hold-base: no longer entered; a visit saved in it pushes, whatever the base does
+    { name: "hold-base (saved by an older build): base green → push", p: state("hold-base"), obs: { state: "hold-base", baseTip: TIP, checks: green }, want: "advance:push" },
+    { name: "hold-base (saved by an older build): base red → push anyway; classify parks it only if it fails the same checks", p: state("hold-base"), obs: { state: "hold-base", baseTip: TIP, checks: redOwn }, want: "advance:push" },
+    { name: "hold-base (saved by an older build): the base moved → push; it doesn't chase the base", p: state("hold-base"), obs: { state: "hold-base", baseTip: TIP2, checks: green }, want: "advance:push" },
     // push
     { name: "push: nothing on the remote yet", p: state("push"), obs: { state: "push", branch: "claude/x", localHead: HEAD, remoteHead: null, remoteIsAncestor: false }, want: "push" },
     { name: "push: the remote already has this head → skip", p: state("push"), obs: { state: "push", branch: "claude/x", localHead: HEAD, remoteHead: HEAD, remoteIsAncestor: true }, want: "advance:pr" },
@@ -397,4 +396,15 @@ describe("pipeline_gates entries that match nothing", () => {
     expect(line).toContain('no pipeline has the id or the exact name "Change"');
     expect(line).toContain('no card has the id "card-9"');
   });
+});
+
+test("parked cards re-test against a recovered base a few at a time", async () => {
+  const { refreshAllowed, REFRESH_BURST, REFRESH_WINDOW_MS } = await import("./publish.ts");
+  expect(REFRESH_BURST).toBe(3);
+  const now = 1_000_000_000;
+  expect(refreshAllowed([], now)).toBe(true);
+  expect(refreshAllowed([now - 1, now - 2], now)).toBe(true);
+  expect(refreshAllowed([now - 1, now - 2, now - 3], now)).toBe(false);
+  // Grants older than the window no longer count.
+  expect(refreshAllowed([now - REFRESH_WINDOW_MS, now - REFRESH_WINDOW_MS - 1, now - 3], now)).toBe(true);
 });

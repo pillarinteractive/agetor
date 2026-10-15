@@ -7,11 +7,17 @@
  * and the oldest has waited `windowMin` (or `max` are ready), Agetor:
  *
  *   1. builds `agetor/merge-train-<id>` from `origin/<base>`, adding each PR as
- *      ONE squashed commit "<PR title> (#n)" — a PR that conflicts drops out
- *      and merges on its own;
+ *      ONE merge commit "<PR title> (#n)" whose second parent is the PR's head
+ *      — a PR that conflicts drops out and merges on its own;
  *   2. pushes it and opens one PR, "Merge train: #a, #b, #c";
- *   3. when that PR is green, merges it with the REBASE method — develop gets
- *      one commit per original PR (the squash convention) in one push;
+ *   3. when that PR is green, merges it with the MERGE method — develop's
+ *      first-parent history gets the train's merge, and under it one merge
+ *      per original PR, in one push.
+ *
+ *   Merge commits, not squashes (owner decision 2026-10-15): a PR's own
+ *   commits stay reachable from the base. Records pin the commit they were
+ *   made at (Pillar's docs/engineering/record-pins.md), and a squash left
+ *   that commit off develop, which turned develop red after the merge;
  *   4. closes each original PR ("Merged in merge train #T"), moves its card to
  *      Done and closes its issue.
  *
@@ -332,15 +338,21 @@ export async function assembleTrain(
         dropped.push({ member: c, why: "no changes against the base" });
         continue;
       }
+      if (!candidateSha) {
+        dropped.push({ member: c, why: `couldn't resolve origin/${c.branch}` });
+        continue;
+      }
       const committed = await git([
         "commit-tree",
         newTree,
         "-p",
         currentCommit,
+        "-p",
+        candidateSha,
         "-m",
         `${c.title} (#${c.pr})`,
         "-m",
-        `Squashed from #${c.pr} in a merge train.`,
+        `Merged from #${c.pr} in a merge train.`,
       ], project);
       if (!committed.ok || !committed.stdout) {
         dropped.push({ member: c, why: `commit failed: ${committed.stderr}` });
@@ -362,7 +374,7 @@ export async function assembleTrain(
         try {
           const added = await git(["worktree", "add", "--detach", "--quiet", scratch, currentCommit], project);
           if (added.ok) {
-            const sq = await git(["merge", "--squash", `origin/${c.branch}`], scratch);
+            const sq = await git(["merge", "--no-ff", "--no-commit", `origin/${c.branch}`], scratch);
             if (!sq.ok) {
               for (const f of files) {
                 await git(["checkout", currentCommit, "--", f], scratch).catch(() => undefined);
@@ -385,7 +397,7 @@ export async function assembleTrain(
                     "-m",
                     `${c.title} (#${c.pr})`,
                     "-m",
-                    `Squashed from #${c.pr} in a merge train (regenerated ${files.join(", ")}).`,
+                    `Merged from #${c.pr} in a merge train (regenerated ${files.join(", ")}).`,
                   ], scratch);
                   if (comm.ok) {
                     const newHead = (await git(["rev-parse", "HEAD"], scratch)).stdout.trim();
@@ -575,9 +587,10 @@ async function trainPrState(t: Train): Promise<string | null> {
 async function land(t: Train): Promise<void> {
   const via = mergedViaTrain();
   for (const m of t.members) {
-    await closeGitHubPull({ dir: t.project, number: m.pr, comment: `Merged in merge train #${t.pr} (${t.url}) as one commit on \`${t.base}\`.` });
-    // GitHub deletes a merged PR's branch, but these PRs are closed, not
-    // merged — their work is on the base now, so delete the branch here.
+    // Its head is on the base now, so GitHub usually marks the PR merged by
+    // itself; closing it is for when it doesn't (a refused close is fine).
+    await closeGitHubPull({ dir: t.project, number: m.pr, comment: `Merged in merge train #${t.pr} (${t.url}) as one merge commit on \`${t.base}\`.` });
+    // Its work is on the base: delete the branch here, as GitHub would.
     await git(["push", "--quiet", "--no-verify", "origin", "--delete", m.branch], t.project);
     via[m.taskId] = { pr: t.pr, url: t.url };
     preferences.set(VIA_PREF, JSON.stringify(via));
@@ -696,7 +709,7 @@ export async function advanceTrain(t: Train, prs: Map<string, TaskPrStatus | nul
     return "disbanded";
   }
   if (m.mergeableState !== "clean" && m.mergeableState !== "has_hooks") return "waiting";
-  const merged = await mergeGitHubPull({ dir: t.project, number: t.pr, method: "rebase" });
+  const merged = await mergeGitHubPull({ dir: t.project, number: t.pr, method: "merge" });
   if (!merged.ok) {
     await disband(t, `GitHub refused the merge: ${merged.error}`, prs);
     return "disbanded";

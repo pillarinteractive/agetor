@@ -11,8 +11,9 @@
  *   checks pending          → wait
  *   green, behind the base  → ride a merge train, alone if need be (the
  *                             fresh rule; src/bun/merge-train.ts)
- *   green and mergeable     → squash-merge (the repo's convention; pref
- *                             `merge_method` overrides)
+ *   green and mergeable     → merge with a merge commit (pref
+ *                             `merge_method` overrides), so the PR's own
+ *                             commits stay on the base
  *
  * (*) A card whose pipeline has Build, Review and Finish steps gets no such
  * follow-up — it would push a fix nobody reviewed. Its sign-off is withdrawn
@@ -251,7 +252,9 @@ async function take(task: Task, pr: TaskPrStatus | null, step: MergeStep): Promi
       return;
     }
     case "merge": {
-      const method = (preferences.get(MERGE_METHOD_PREF) as "squash" | "merge" | "rebase" | null) ?? "squash";
+      // Merge commits by default (2026-10-15): a squash leaves the PR's
+      // commits off the base, and records pinned to them then fail there.
+      const method = (preferences.get(MERGE_METHOD_PREF) as "squash" | "merge" | "rebase" | null) ?? "merge";
       const r = await mergeGitHubPull({ dir: task.workdir, number: pr!.number, method });
       note(task, r.ok ? `Merged PR #${pr!.number} into ${base}` : `Couldn't merge PR #${pr!.number}: ${r.error}`, r.ok ? "success" : "warning");
       return;

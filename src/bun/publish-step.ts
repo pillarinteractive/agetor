@@ -27,7 +27,7 @@ import { reviewApprovalMatches, reviewedPipelineShape } from "../shared/pipeline
 import { newestPerName, failedConclusion, ROLLUP_CHECKS, type CheckRunLike } from "../shared/check-runs.ts";
 import {
   PROTECTED_BRANCHES, applyPublish, baseVerdicts, decidePublish, failingCauses, publishBuildHandoff, publishEvidenceComment,
-  publishWriterBrief, verdictsSettled,
+  publishWriterBrief, verdictsSettled, refreshAllowed, REFRESH_BURST, REFRESH_WINDOW_MS,
   MERGE_REGENERATE_PREF, parseRegenerateRules, regenerateCovering, type RegenerateRule,
   type BuildCause, type MergeProbe, type PublishAction, type PublishApproval, type PublishFacts, type PublishObservation,
   type PublishResult, type PullSeen,
@@ -558,6 +558,9 @@ function heldVisit(task: Task | null | undefined): { run: PipelineRunState; p: P
 }
 
 const inFlight = new Set<string>();
+/** When parked cards were let go to re-test against a recovered base, by
+ *  project (`refreshAllowed`). */
+const refreshGrants = new Map<string, number[]>();
 /** When each card waiting on the base last looked at it. */
 const lastBaseLook = new Map<string, number>();
 
@@ -589,7 +592,16 @@ export async function publishCard(parentId: string, now = Date.now()): Promise<v
         if (i === 0 && last !== undefined && now - last < BASE_LOOK_MS && now >= last) return;
         lastBaseLook.set(parentId, now);
       }
-      const action = decidePublish(p, await observe(task, run, p), now);
+      let action: PublishAction = decidePublish(p, await observe(task, run, p), now);
+      if (p.state === "base-red" && action.kind === "advance" && action.to === "refresh") {
+        const key = task.workdir.replace(/\/+$/, "");
+        const granted = (refreshGrants.get(key) ?? []).filter((t) => now - t < REFRESH_WINDOW_MS);
+        if (refreshAllowed(granted, now)) refreshGrants.set(key, [...granted, now]);
+        else {
+          refreshGrants.set(key, granted);
+          action = { kind: "wait", note: `${p.base} is green again — parked cards re-test against it ${REFRESH_BURST} at a time so they don't fill every CI runner at once; this one goes next` };
+        }
+      }
       if ((await perform(task, run, p, action, now)) === "stop") return;
     }
   } finally {
@@ -630,6 +642,7 @@ export function resetPublishForTests(): void {
   publishHooks.held = () => {};
   inFlight.clear();
   lastBaseLook.clear();
+  refreshGrants.clear();
   said.clear();
   settledBaseChecks.clear();
 }

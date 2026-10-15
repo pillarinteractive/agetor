@@ -308,22 +308,15 @@ describe("the approved head goes out once, and CI is waited for without an agent
 });
 
 describe("a red base", () => {
-  test("before the push: nothing is pushed while the base fails; it publishes by itself when the base is green", async () => {
+  test("before the push: a red base doesn't hold it — the change is published and its own CI decides", async () => {
     const repos = await makeRepos();
     fakeGitHub(repos);
     gh.checks.set(repos.baseTip, RED);
     const card = makeCard(repos.repo, approvalHandoff(repos.head));
-    for (let i = 0; i < 40; i++) await publishCard(card.id, T0 + i * BASE_LOOK_MS);
-    expect(stateOf(card)).toBe("hold-base");
-    expect(runOf(card).blocked[0]!.message).toContain("develop is failing web");
-    expect(await repos.remote("claude/x")).toBeNull();
-    expect(gh.opened).toEqual([]);
-    expectNothingSpent(card);
-
-    gh.checks.set(repos.baseTip, [...RED, check("web", "success", 9, 3), check("required", "success", 9, 4)]);
-    await publishCard(card.id, T0 + 41 * BASE_LOOK_MS);
+    await publishCard(card.id, T0);
     expect(stateOf(card)).toBe("wait-ci");
     expect(await repos.remote("claude/x")).toBe(repos.head);
+    expectNothingSpent(card);
   }, 60_000);
 
   test("CI fails on a check the base fails too: parked with no agent, no slot, no attempt — and it resumes by itself (2026-10-13 #1351)", async () => {

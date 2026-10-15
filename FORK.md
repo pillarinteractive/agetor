@@ -1965,3 +1965,22 @@ Three places let a card run ahead of code that was not on the base branch yet.
   open roadmap steps an issue mentions, that are neither its predecessor nor its successor, are listed for the owner
   (for ready steps, at most 150). Each enforced, unmet row is a roadmap problem (`undeclared-predecessor`).
   `agetor roadmap audit [--all]` prints them and exits 1 while a step waits on a predecessor the table doesn't list.
+
+## Cards don't chase the base; merges keep the PR's commits (`feat/stop-chasing-develop`)
+
+Measured on Pillar 2026-10-11..15: develop was red 39% of the time, and one develop push released 11 parked cards
+in a minute — each merged develop and pushed, about 9 runner-hours of PR CI on 10 runners. Develop moved again
+before most of those runs ended, so the cards started over.
+
+- **No hold on a red base** (`src/shared/publish.ts`): Finish no longer waits in `hold-base` for the base's CI to be
+  green before pushing, and no longer goes back to merge each new base tip while it waits. A PR's CI runs only the
+  suites its change selects, so the base's failure is often one it would not hit; when it is, `classify` parks the
+  card in `base-red` as before. A visit saved in `hold-base` pushes at once. Finish still merges the base in once
+  before the push (`check-merge`), and once more when it re-tests after `base-red` (`refresh`).
+- **Staggered release** (`refreshAllowed`, `REFRESH_BURST` = 3 per `REFRESH_WINDOW_MS` = 10 min, per project): when
+  the base turns green, parked cards re-test against it a few at a time; the others say so and go on a later look.
+- **Merge commits** (owner decision 2026-10-15): the merge train adds each PR as one merge commit
+  `"<title> (#n)"` whose second parent is the PR's head, and lands the train with the merge method; the merge
+  queue's default `merge_method` is `merge`. A PR's own commits stay on the base, so a record pinned to one of them
+  (Pillar's `docs/engineering/record-pins.md`) still resolves there — squashing left them off develop and turned it
+  red after the merge. `git log --first-parent` still reads one line per PR.

@@ -10,7 +10,7 @@
  * the state. src/bun/publish-step.ts makes the observations and carries the
  * actions out; nothing here touches git, GitHub or a clock.
  *
- *   verify-head → check-merge → hold-base → push → pr → wait-ci → finalize → write
+ *   verify-head → check-merge → push → pr → wait-ci → finalize → write
  *                                                        │
  *                                   classify ◄───────────┘ (CI failed)
  *                                      │ all inherited
@@ -246,6 +246,19 @@ export function verdictsSettled(verdicts: Record<string, BaseVerdict>): boolean 
  *  that must fail. Judged by the roll-up check (`required`) when the base
  *  has one — a failing optional check must not hold every card — otherwise
  *  by any failed check. */
+/** When the base turns green, the cards parked in `base-red` re-test against
+ *  it at most `REFRESH_BURST` per `REFRESH_WINDOW_MS` per project: each
+ *  re-test is a push and a whole CI run, and releasing every parked card at
+ *  once filled all PR runners for an hour (2026-10-15: 11 cards in a minute). */
+export const REFRESH_BURST = 3;
+export const REFRESH_WINDOW_MS = 10 * 60_000;
+
+/** Whether one more parked card may re-test now, given when the others in
+ *  its project were let go. Pure. */
+export function refreshAllowed(granted: readonly number[], now: number, burst = REFRESH_BURST, windowMs = REFRESH_WINDOW_MS): boolean {
+  return granted.filter((t) => t <= now && now - t < windowMs).length < burst;
+}
+
 export function baseHealth(checks: readonly CheckRunLike[]): { state: "green" | "red" | "pending" | "none"; failing: string[] } {
   const newest = newestPerName(checks);
   if (newest.length === 0) return { state: "none", failing: [] };
@@ -421,29 +434,28 @@ export function decidePublish(p: PipelinePublishState, obs: PublishObservation, 
     }
 
     case "check-merge": {
-      if (obs.contains) return { kind: "advance", to: "hold-base", set: { baseTip: obs.baseTip } };
+      if (obs.contains) return { kind: "advance", to: "push", set: { baseTip: obs.baseTip } };
       if (!obs.merge) return { kind: "wait", note: `couldn't try the merge with ${base} — trying again` };
       if (obs.merge.conflicts) return { kind: "to-build", cause: { kind: "conflict", files: obs.merge.conflicts } };
       if (!obs.merge.samePatch || !obs.merge.commit) {
         // Clean, but the base took part of this change: the approved head is
         // published as it is, and GitHub's CI still tests it merged with the base.
         return {
-          kind: "advance", to: "hold-base", set: { baseTip: obs.baseTip },
+          kind: "advance", to: "push", set: { baseTip: obs.baseTip },
           say: `${base} moved, and merging it in would change this change's own diff — publishing the approved head as it is`,
         };
       }
-      return { kind: "merge-base", commit: obs.merge.commit, baseTip: obs.baseTip, then: "hold-base" };
+      return { kind: "merge-base", commit: obs.merge.commit, baseTip: obs.baseTip, then: "push" };
     }
 
-    case "hold-base": {
-      // The base moved while this waited: bring the new tip in first.
-      if (p.baseTip && obs.baseTip !== p.baseTip) return { kind: "advance", to: "check-merge", set: { baseTip: obs.baseTip } };
-      const health = baseHealth(obs.checks);
-      if (health.state === "red") {
-        return { kind: "wait", note: `${base} is failing ${list(health.failing)} — not pushing a CI run that must fail; Agetor publishes when ${base} is green` };
-      }
+    case "hold-base":
+      // No longer entered (2026-10-15): waiting here for a green base held
+      // every card while the base was red — 39% of the time — and sent it
+      // back to merge each new tip the base got meanwhile, re-running its CI
+      // each time. A PR's CI runs only the suites its change selects, so the
+      // base's failure is often not one it would hit; when it is, `classify`
+      // parks it in `base-red`. A visit saved in this state pushes now.
       return { kind: "advance", to: "push" };
-    }
 
     case "push": {
       if (!p.head || obs.localHead !== p.head) {
