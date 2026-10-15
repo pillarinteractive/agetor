@@ -42,7 +42,7 @@ import { buildEli5Prompt, eli5TaskTitle } from "../shared/clone-eli5.ts";
 import { CLONE_PROVIDERS, isGitProvider } from "../shared/clone-input.ts";
 import { stalledSince } from "./stall-registry.ts";
 import { lastActivityAt } from "./activity-clock.ts";
-import { archivedRowsFor, isTruncatedPromptWrite, parseTaskListOptions, shapeTaskForList } from "./task-list.ts";
+import { archivedRowsFor, isTruncatedPromptWrite, LIST_PROMPT_PREVIEW_CHARS, parseTaskListOptions, shapeTaskForList } from "./task-list.ts";
 import { blockedByFor, blockingFor, dependencyTick, readDependencies, setDependencies } from "./dependencies.ts";
 import { activeTrain, mergedViaTrain, trainFor } from "./merge-train.ts";
 import { isPriority, readPriority, setPriority } from "./priority.ts";
@@ -4537,7 +4537,10 @@ export function startApiServer(deps: { native?: ApiNative } = {}) {
           // legacy full list (older CLI binaries). See src/bun/task-list.ts.
           const opts = parseTaskListOptions(new URL(req.url));
           const counts = subagents.runningCountsByTask();
-          const allTasks = tasks.list({ archived: archivedRowsFor(opts), includeIds: opts.includeIds });
+          // A lean list reads one character past the preview, so the preview
+          // still knows the prompt was cut (src/bun/task-list.ts).
+          const allTasks = tasks.list({ archived: archivedRowsFor(opts), includeIds: opts.includeIds,
+            ...(opts.lean ? { promptChars: LIST_PROMPT_PREVIEW_CHARS + 1 } : {}) });
           const byId = new Map(allTasks.map((t) => [t.id, t]));
           const deps = readDependencies();
           const train = activeTrain();

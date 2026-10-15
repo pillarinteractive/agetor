@@ -5840,7 +5840,7 @@ export async function createTask(
 ): Promise<{ task: Task } | { error: string }> {
   const identity=canonicalIssue(input.issueUrl);
   if(identity&&!internal.reservedTaskId) {
-    const existing=tasks.list().find(t=>!t.pipelineParentId&&t.archivedAt==null&&canonicalIssue(t.issueUrl)===identity);
+    const existing=tasks.listLive().find(t=>!t.pipelineParentId&&t.archivedAt==null&&canonicalIssue(t.issueUrl)===identity);
     if(existing)return {error:`issue is already owned by card ${existing.id}`};
     const claimed=claimIssue(input.issueUrl!,isTaskRunLive);if('error'in claimed)return claimed;
     try{return await createTaskInner(input,{...internal,reservedTaskId:claimed.claim.taskId});}

@@ -3028,10 +3028,7 @@ export function pipelineGatesUnmatched(): GateUnmatched | null {
   const known = pipelines.list().map((p) => ({ id: p.id, name: p.name }));
   // A card whose template was deleted still runs under the name its run
   // froze (`gatePref`): that name is not "nothing".
-  const ids = new Set(known.map((p) => p.id));
-  for (const t of tasks.list()) {
-    if (t.pipelineId && !t.pipelineParentId && !ids.has(t.pipelineId) && t.pipelineRun) known.push({ id: t.pipelineId, name: t.pipelineRun.pipelineName });
-  }
+  known.push(...tasks.pipelinesOutside(new Set(known.map((p) => p.id))));
   const found = unmatchedGateRefs(raw, { pipelines: known, hasCard: (id) => !!tasks.get(id) });
   return found.pipelines.length > 0 || found.cards.length > 0 ? found : null;
 }

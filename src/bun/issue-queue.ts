@@ -100,7 +100,7 @@ export async function createTaskFromIssue(input: {
   if (!thread.ok) return { error: thread.error, status: 502 };
   const existing = taskForIssue(
     thread.item.htmlUrl,
-    tasks.list().filter((t) => !input.allowAfterDone || t.column !== "done"),
+    tasks.listLive().filter((t) => !input.allowAfterDone || t.column !== "done"),
   );
   if (existing) return { error: `"${existing.title}" is already working on this issue`, status: 409 };
 
@@ -109,7 +109,7 @@ export async function createTaskFromIssue(input: {
   try {
   // Reread while owning the durable canonical claim: a concurrent manual
   // create may have completed while the issue thread was being fetched.
-  const freshExisting=taskForIssue(thread.item.htmlUrl,tasks.list().filter(t=>!input.allowAfterDone||t.column!=='done'));
+  const freshExisting=taskForIssue(thread.item.htmlUrl,tasks.listLive().filter(t=>!input.allowAfterDone||t.column!=='done'));
   if(freshExisting) return {error:`"${freshExisting.title}" is already working on this issue`,status:409};
   if(input.validate) {const error=await input.validate();if(error)return {error,status:409};}
 

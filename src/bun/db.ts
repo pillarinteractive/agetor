@@ -1074,6 +1074,32 @@ const TASKS_SELECT = `
     LEFT JOIN runs ON runs.task_id = tasks.id
 `;
 
+/** Prompt characters `listLive` reads per row (a "Fixes #N" line, the
+ *  card's goal and its step section are all near the top). */
+export const LIVE_PROMPT_CHARS = 8_000;
+
+/** `TASKS_SELECT` with each prompt cut to its first `chars` characters in
+ *  SQL: the board's lean poll shows a preview only, and reading every step's
+ *  composed prompt (91 MB on the Pillar board, 2026-10-14) into memory on a
+ *  2 s poll kept the core busy and its heap at gigabytes. The columns are read
+ *  from the schema so a migration that adds one is picked up. */
+const tasksSelectPreview = (() => {
+  let cached: { chars: number; sql: string } | null = null;
+  return (chars: number): string => {
+    if (cached?.chars === chars) return cached.sql;
+    const cols = (db.query("PRAGMA table_info(tasks)").all() as { name: string }[]).map((c) => c.name);
+    const list = cols.map((c) => (c === "prompt" ? `substr(tasks.prompt, 1, ${chars}) AS prompt` : `tasks."${c}"`)).join(", ");
+    const sql = `
+  SELECT ${list},
+         COALESCE(MAX(runs.status IN ${OPENABLE_STATUSES_SQL}), 0) AS has_openable_run
+    FROM tasks
+    LEFT JOIN runs ON runs.task_id = tasks.id
+`;
+    cached = { chars, sql };
+    return sql;
+  };
+})();
+
 export const tasks = {
   // Computes the pending-interaction and open-terminal grouped counts ONCE
   // for the whole result set (two single-pass scans over their respective
@@ -1087,7 +1113,7 @@ export const tasks = {
   // `"none"`, or `"live"` (every non-archived row plus every step row of a
   // non-archived pipeline parent, archived or not — see `listLive`).
   // `opts.includeIds` keeps the named rows whatever they are.
-  list(opts?: { archived?: "all" | "cards" | "none" | "live"; includeIds?: readonly string[] }): Task[] {
+  list(opts?: { archived?: "all" | "cards" | "none" | "live"; includeIds?: readonly string[]; promptChars?: number }): Task[] {
     // The id list rides one JSON parameter (`json_each`) so the SQL text —
     // and with it bun:sqlite's cached statement — stays fixed per mode.
     const archived = opts?.archived ?? "all";
@@ -1101,8 +1127,9 @@ export const tasks = {
       : `WHERE tasks.archived_at IS NULL${extra}
             OR tasks.id IN (SELECT value FROM json_each(?))`;
     const params = archived === "all" ? [] : [JSON.stringify(opts?.includeIds ?? [])];
+    const select = opts?.promptChars != null && opts.promptChars > 0 ? tasksSelectPreview(Math.floor(opts.promptChars)) : TASKS_SELECT;
     const rows = db.query<TaskRow, string[]>(
-      `${TASKS_SELECT}
+      `${select}
          ${where}
          GROUP BY tasks.id
          ORDER BY tasks.created_at DESC`,
@@ -1135,8 +1162,26 @@ export const tasks = {
    *  count into its parent, and every step of a returned parent is
    *  returned). On a board with ~1,200 archived rows this reads ~10% of the
    *  table and parses none of the archived prompts or run blobs. */
+  /** Pipeline ids that cards run under, with the name each run froze, for
+   *  pipelines not in `known` (a deleted template): read in SQL, without
+   *  loading any task. */
+  pipelinesOutside(known: ReadonlySet<string>): { id: string; name: string }[] {
+    const rows = db.query<{ id: string; name: string | null }, []>(
+      `SELECT DISTINCT pipeline_id AS id, json_extract(pipeline_run, '$.pipelineName') AS name
+         FROM tasks
+        WHERE pipeline_id IS NOT NULL AND pipeline_parent_id IS NULL AND pipeline_run IS NOT NULL`,
+    ).all();
+    return rows.filter((r) => !known.has(r.id) && typeof r.name === "string").map((r) => ({ id: r.id, name: r.name! }));
+  },
   listLive(): Task[] {
-    return this.list({ archived: "live" });
+    // The background loops that call this (slots, claims, awaits, leases,
+    // publishing, the merge queue, Autopilot) never use a prompt past its
+    // first lines, and reading every live step's full composed prompt — 91 MB
+    // on the Pillar board, 2026-10-14 — on each of their ticks kept the core
+    // busy for seconds at a time. A caller that needs a prompt reads the row
+    // with `get`, and no caller writes a listed row back whole (`update`
+    // merges a patch onto `get`).
+    return this.list({ archived: "live", promptChars: LIVE_PROMPT_CHARS });
   },
   /** Exactly the rows with these ids (any archived state), `list()`-shaped.
    *  A parent's pending count folds in only the steps that are also in
