@@ -6839,7 +6839,13 @@ export async function reconcilePipelineRuns(): Promise<number> {
           await runExclusive(parent.id, async () => markStepNeverStarted(parent.id, a.taskId));
           count++;
         } else if (latest.status !== "running") {
-          await handleRunStatus(a.taskId, latest.id, latest.status);
+          // Not awaited: settling a step that finished while the core was
+          // down runs its gate checks (ai-check, tests) — 30 s or more each.
+          // Awaited one by one they held the API, and the window, for
+          // minutes (seen 2026-10-14). The per-card lock keeps this card's
+          // later work behind it.
+          void handleRunStatus(a.taskId, latest.id, latest.status).catch((err) =>
+            runExclusive(parent.id, async () => persistReconcileFailure(parent.id, a.taskId, err)).catch(() => {}));
           count++;
         }
       } catch (err) {
