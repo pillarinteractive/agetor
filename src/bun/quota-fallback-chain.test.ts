@@ -104,8 +104,10 @@ test("after a hop hits its own limit the step moves on, or back to its own harne
   preferences.set(QUOTA_FALLBACK_UNTIL_PREF, JSON.stringify({ "via-deepseek": 100_000 }));
   noteQuotaLimit("via-deepinfra", 100_000, 0);
   expect(fallbackAfterLimit("via-deepinfra", snap, { now: NOW })).toMatchObject({ harness: "claude-code", model: "sonnet-5.5", profile: { effort: "medium" } });
-  // No profile rule: the harness rule's backup, as before.
-  expect(fallbackAfterLimit("codex", null, { now: NOW })).toMatchObject({ harness: "via-deepseek", model: "opus-5.5" });
+  // No profile rule: the harness rule's backup — but never one that is at
+  // its own limit (2026-10-15): via-deepseek is limited until 100_000.
+  expect(fallbackAfterLimit("codex", null, { now: NOW })).toBeNull();
+  expect(fallbackAfterLimit("codex", null, { now: 100_000 })).toMatchObject({ harness: "via-deepseek", model: "opus-5.5" });
 });
 
 test("familyOf reads an org prefix, then a pinned harness, then the model name, then the kind", () => {

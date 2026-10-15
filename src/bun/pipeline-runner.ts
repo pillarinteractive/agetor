@@ -39,7 +39,7 @@ import { isPriority, priorityFirst } from "./priority.ts";
 import { awaitsFor, listAwaits, resourceBlockedAwaits } from "./awaits.ts";
 import {HEAVY_INSTRUCTIONS,managedPillarRoot} from './heavy-jobs.ts';
 import { classifyFailure, formatRetryTime, harnessQuotaNotice, isQuotaPaused, nextRetryAt, TRANSIENT_RETRY_MAX, type FailureClass } from "./usage-limit.ts";
-import { fallbackAfterLimit, fallbackForStep, familyOf, noteQuotaLimit, type QuotaFallback } from "./quota-fallback.ts";
+import { capWait, fallbackAfterLimit, fallbackForStep, familyOf, noteQuotaLimit, type QuotaFallback } from "./quota-fallback.ts";
 import { getDiscoveredEfforts } from "./agent-discovery.ts";
 import { listLeases } from "./lease-watch.ts";
 import { invalidatePrStatus, issueNumberForTask, ownFailures, prBase, prStatusForTask } from "./pr-watch.ts";
@@ -3570,6 +3570,23 @@ async function launchStep(
       persist(parent.id, run);
       return { ok: false };
     }
+  }
+  // The usage cap (quota-fallback.ts `capWait`): its harness and every
+  // backup are at their weekly cap. Queued like a slot wait — retried by the
+  // slot scheduler and started when a meter resets — priority or not.
+  const capped = capWait(profile.harness, profile, { excludeFamily: familyToExclude(run, step.id) });
+  if (capped) {
+    const when = capped.until != null ? ` (${new Date(capped.until).toLocaleString("en-US", { weekday: "short", hour: "numeric", minute: "2-digit" })})` : "";
+    upsertBlocked(run, {
+      taskId: null,
+      stepId: step.id,
+      kind: "slot-wait",
+      message: `${step.name} is waiting for usage: ${capped.why}${when}`,
+      pending: { stepId: step.id, arrivals: pendingArrivals },
+    });
+    slotWaitSince.set(`${parent.id}:${step.id}`, slotWaitSince.get(`${parent.id}:${step.id}`) ?? Date.now());
+    persist(parent.id, run);
+    return { ok: false };
   }
   slotWaitSince.delete(`${parent.id}:${step.id}`);
 

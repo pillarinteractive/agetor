@@ -606,6 +606,33 @@ test("a wait on a list of bugs the card filed itself (2026-10-15 #846) leaves th
   expect(activity(card.parentId).some((l) => l.startsWith("Build was waiting on #51, a bug filed from this card — waiting can't clear that"))).toBe(true);
 });
 
+test("past the weekly usage cap with no backup under its own, a step queues for usage and starts when it resets", async () => {
+  const { tasks, preferences, harnessUsage } = await import("./db.ts");
+  const { releaseSlotWaits } = await import("./pipeline-runner.ts");
+  const meter = (used: number) => harnessUsage.upsert({ harnessId: "claude-code", kind: "claude-code", planType: "max", status: "ok" as never, source: "api" as never,
+    fetchedAtMs: Date.now(), meters: [{ id: "weekly_all", label: "Weekly", usedPercent: used, resetsAtMs: Date.now() + 86_400_000 }], reason: null });
+  // The only backup is Codex, disabled in this database: nothing to move to.
+  preferences.set("quota_fallback", JSON.stringify([{ enabled: true, from: ["claude-code"], harness: "codex", model: "gpt-6.1-sol", atPercent: 95, meters: ["weekly_all"], cap: true }]));
+  meter(96);
+  process.env.AGETOR_FAKE_CLAUDE_BLOCKED_REASON = "";
+  try {
+    const { parentId } = await startBuildReview("Review");
+    const run = await waitFor(() => tasks.get(parentId)?.pipelineRun?.blocked.find((b) => b.kind === "slot-wait") ? tasks.get(parentId)!.pipelineRun! : null);
+    expect(run.active).toEqual([]);
+    expect(run.blocked[0]!.message).toMatch(/^Build is waiting for usage: .+ is at the 95% weekly cap — it starts when usage resets \(/);
+    // Still capped: the scheduler leaves it queued.
+    await releaseSlotWaits();
+    expect(tasks.get(parentId)!.pipelineRun!.active).toEqual([]);
+    // The window resets (usage drops): it starts.
+    meter(3);
+    await releaseSlotWaits();
+    await waitFor(() => (tasks.get(parentId)?.pipelineRun?.active.length ?? 0) > 0 || tasks.get(parentId)?.pipelineRun?.status === "done");
+  } finally {
+    preferences.set("quota_fallback", "[]");
+    meter(0);
+  }
+});
+
 test("a card still parked a day later goes to the owner, saying what it waited on", async () => {
   const { tasks } = await import("./db.ts");
   const { releaseBlockWaits, blockWaitDeps } = await import("./pipeline-runner.ts");

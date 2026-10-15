@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,7 +8,7 @@ const dir = mkdtempSync(join(tmpdir(), "agetor-quota-fallback-"));
 process.env.AGETOR_DATA_DIR = dir;
 const { harnesses, harnessUsage, preferences } = await import("./db.ts");
 const { QUOTA_FALLBACK_PREF, QUOTA_FALLBACK_UNTIL_PREF, UNKNOWN_RESET_WINDOW_MS, fallbackDuringLimit, fallbackHarnessFor, harnessDuringLimit, noteQuotaLimit,
-  parseQuotaFallback, parseQuotaFallbackRules, quotaFallbackFor, quotaLimited, usageAtThreshold } = await import("./quota-fallback.ts");
+  parseQuotaFallback, parseQuotaFallbackRules, quotaFallbackFor, quotaLimited, usageAtThreshold, capReachedUntil, capWait } = await import("./quota-fallback.ts");
 harnesses.insert({ id: "claude-backup", kind: "claude-code", label: "Claude via backup" });
 harnesses.insert({ id: "codex-backup", kind: "codex", label: "Codex via backup" });
 const configure = (v: unknown) => preferences.set(QUOTA_FALLBACK_PREF, JSON.stringify(v));
@@ -17,7 +17,10 @@ beforeEach(() => {
   preferences.set(QUOTA_FALLBACK_UNTIL_PREF, "{}");
   harnesses.setEnabled("claude-backup", true);
 });
-afterAll(() => rmTestDataDir(dir));
+afterAll(() => {
+  preferences.set(QUOTA_FALLBACK_PREF, "");
+  rmTestDataDir(dir);
+});
 
 test("parseQuotaFallback needs enabled and a harness; from defaults to claude-code", () => {
   expect(parseQuotaFallback(null)).toBeNull();
@@ -163,4 +166,60 @@ test("each rule's own atPercent decides its early switch", () => {
   expect(harnessDuringLimit("claude-code", 2_000)).toBe("claude-code"); // its rule has no atPercent
   expect(fallbackDuringLimit("codex", 2_000)).toMatchObject({ harness: "claude-backup", model: "opus-5.5" });
   expect(fallbackDuringLimit("codex", 10_000)).toBeNull(); // the weekly window reset
+});
+
+// The owner's 2026-10-15 setting: each subscription falls back to the other
+// at 95% of its weekly meter, and 95% is a ceiling for both.
+const codexUsage = (weekly: number, resetsAtMs: number | null = 50_000) =>
+  harnessUsage.upsert({ harnessId: "codex", kind: "codex", planType: "pro", status: "ok" as never, source: "api" as never, fetchedAtMs: 1_000,
+    meters: [{ id: "weekly", label: "Weekly", usedPercent: weekly, resetsAtMs }], reason: null });
+// Codex is off in this database; these tests switch it on and put it back,
+// with the preference, so later suites see what they expect.
+const codexWasEnabled = harnesses.get("codex")?.enabled ?? false;
+afterEach(() => {
+  harnesses.setEnabled("codex", codexWasEnabled);
+  configure({ enabled: true, from: ["claude-code"], harness: "claude-backup" });
+  preferences.set(QUOTA_FALLBACK_UNTIL_PREF, "{}");
+});
+const capped = (cap = true) => (harnesses.setEnabled("codex", true), configure([
+  { enabled: true, from: ["claude-code"], harness: "codex", model: "gpt-6.1-sol", atPercent: 95, meters: ["weekly_all"], cap },
+  { enabled: true, from: ["codex"], harness: "claude-code", model: "opus-5.5", atPercent: 95, meters: ["weekly"], cap },
+]));
+
+test("cap is kept only beside atPercent", () => {
+  expect(parseQuotaFallback(JSON.stringify({ enabled: true, harness: "x", atPercent: 95, cap: true }))).toMatchObject({ atPercent: 95, cap: true });
+  expect(parseQuotaFallback(JSON.stringify({ enabled: true, harness: "x", cap: true }))).not.toHaveProperty("cap");
+  expect(parseQuotaFallback(JSON.stringify({ enabled: true, harness: "x", atPercent: 95 }))).not.toHaveProperty("cap");
+});
+
+test("two subscriptions that back each other up: past the cap a step moves to the other, never back and forth", () => {
+  capped();
+  usage([{ id: "weekly_all", usedPercent: 96, resetsAtMs: 40_000 }, { id: "session", usedPercent: 99, resetsAtMs: 3_000 }]);
+  codexUsage(16);
+  // Claude is past its weekly cap (the session meter doesn't count): Codex takes the step.
+  expect(fallbackDuringLimit("claude-code", 2_000)).toMatchObject({ harness: "codex", model: "gpt-6.1-sol" });
+  expect(capReachedUntil("claude-code", 2_000)).toBe(40_000);
+  expect(capWait("claude-code", null, { now: 2_000 })).toBeNull();
+  // Codex below its cap stays on Codex; Claude, its backup, is capped anyway.
+  expect(fallbackDuringLimit("codex", 2_000)).toBeNull();
+  // Both past the cap: no backup is chosen, and the step waits for the soonest reset.
+  codexUsage(97, 30_000);
+  expect(quotaFallbackFor("claude-code", 2_000)).toBeNull();
+  expect(quotaFallbackFor("codex", 2_000)).toBeNull();
+  expect(capWait("claude-code", null, { now: 2_000 })).toEqual({ until: 30_000, why: expect.stringContaining("at the 95% weekly cap") });
+  expect(capWait("codex", null, { now: 2_000 })).toMatchObject({ until: 30_000 });
+  // After Codex's window resets, Claude's steps go there again.
+  expect(capWait("claude-code", null, { now: 30_000 })).toBeNull();
+  expect(fallbackDuringLimit("claude-code", 30_000)).toMatchObject({ harness: "codex" });
+});
+
+test("without cap the threshold only switches; a capped harness below its cap takes steps as usual", () => {
+  capped(false);
+  usage([{ id: "weekly_all", usedPercent: 96, resetsAtMs: 40_000 }]);
+  codexUsage(97, 30_000);
+  expect(capWait("claude-code", null, { now: 2_000 })).toBeNull(); // no cap: it runs on until the real limit
+  capped();
+  usage([{ id: "weekly_all", usedPercent: 94, resetsAtMs: 40_000 }]);
+  expect(capWait("claude-code", null, { now: 2_000 })).toBeNull();
+  expect(fallbackDuringLimit("claude-code", 2_000)).toBeNull();
 });

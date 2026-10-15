@@ -2018,3 +2018,20 @@ still returns to Ready to Merge.
   `#1770, #1771 …` (or `#1770–#1775`) is a watched wait like a single issue: no timer, resumed when all are closed,
   and handed to the ladder when any of them is a follow-up the card filed itself (#846 waited on the six bugs its
   own Review had closed out, each of which waited on #846).
+
+## A hard weekly usage cap, and backups that are never themselves at a limit (`feat/usage-cap`)
+
+Owner decision 2026-10-15: Claude Code and Codex back each other up, and each stops taking agent work at 95% of its
+weekly meter (no paid-API backups). `quota_fallback` rules take `"cap": true` beside `atPercent`
+(`src/bun/quota-fallback.ts`):
+
+- **A backup at its own limit or cap is never chosen** (`quotaFallbackFor`), so two rules pointing at each other don't
+  pass steps back and forth.
+- **`capWait`**: a new step whose harness is at its cap and has no backup under its own cap is not started. It queues
+  as a `slot-wait` ("Build is waiting for usage: Claude Code and Codex are at the 95% weekly cap — it starts when usage
+  resets (Tue 2:59 AM)"), priority cards included, and the slot scheduler starts it once a meter resets. Steps already
+  running carry on.
+
+Live setting (2026-10-15): Claude Code → Codex (`gpt-6.1-sol`) at 95% of `weekly_all`; Codex → Claude Code
+(`opus-5.5`) at 95% of `weekly`; both `cap: true`. Chains: Architect, Builder and Sonnet Builder → Codex Builder;
+GPT Reviewer → Claude Reviewer; Finisher → Sonnet Builder.

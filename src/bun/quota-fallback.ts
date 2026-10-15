@@ -23,6 +23,14 @@
  * time has passed is ignored, so steps return to the primary harness once
  * the window resets. Steps already running are not moved.
  *
+ * A hard cap: `"cap": true` with `atPercent` makes the threshold a ceiling,
+ * not only a switch point (owner decision 2026-10-15: both subscriptions stop
+ * at 95% of their weekly allowance). A new step whose harness is at its cap,
+ * and has no backup under its own cap, is not started: it queues like a step
+ * waiting for a slot and starts when a meter resets (pipeline-runner.ts).
+ * A backup at its own limit or cap is never chosen, so two rules that point
+ * at each other don't pass steps back and forth.
+ *
  * Several harnesses: the preference may be a list of such rules, for example
  *   [{"enabled": true, "from": ["claude-code"], "harness": "claude-deepseek", "atPercent": 92},
  *    {"enabled": true, "from": ["codex"], "harness": "claude-deepseek", "model": "opus-5.5", "atPercent": 92}]
@@ -64,6 +72,8 @@ export interface QuotaFallbackConfig {
   meters?: string[];
   /** The model to run on a backup of another kind; required for one. */
   model?: string;
+  /** `atPercent` is a ceiling: past it the harness takes no new step. */
+  cap?: boolean;
 }
 
 export function parseQuotaFallback(raw: string | null | undefined): QuotaFallbackConfig | null {
@@ -76,7 +86,8 @@ export function parseQuotaFallback(raw: string | null | undefined): QuotaFallbac
     const atPercent = typeof v.atPercent === "number" && v.atPercent >= 1 && v.atPercent <= 100 ? v.atPercent : undefined;
     const meters = Array.isArray(v.meters) ? v.meters.filter((s: unknown): s is string => typeof s === "string" && !!s.trim()) : [];
     const model = typeof v.model === "string" ? v.model.trim() : "";
-    return { enabled: true, from, harness, ...(atPercent !== undefined ? { atPercent } : {}), ...(atPercent !== undefined && meters.length ? { meters } : {}), ...(model ? { model } : {}) };
+    const cap = atPercent !== undefined && v.cap === true;
+    return { enabled: true, from, harness, ...(atPercent !== undefined ? { atPercent } : {}), ...(atPercent !== undefined && meters.length ? { meters } : {}), ...(model ? { model } : {}), ...(cap ? { cap } : {}) };
   } catch {
     return null;
   }
@@ -108,13 +119,13 @@ export interface QuotaFallback {
 /** The first rule covering `agent` whose backup is usable, or null: none
  *  covers it, the backup is missing, disabled or `agent` itself, or it is of
  *  another kind and the rule names no model for it. */
-export function quotaFallbackFor(agent: string): QuotaFallback | null {
+export function quotaFallbackFor(agent: string, now: number = Date.now()): QuotaFallback | null {
   const primary = harnesses.getByIdOrKind(agent);
   if (!primary) return null;
   for (const rule of parseQuotaFallbackRules(preferences.get(QUOTA_FALLBACK_PREF))) {
     if (agent === rule.harness || !(rule.from.includes(agent) || rule.from.includes(primary.kind))) continue;
     const backup = harnesses.get(rule.harness);
-    if (!backup || !backup.enabled) continue;
+    if (!backup || !backup.enabled || atLimit(backup.id, now)) continue;
     if (backup.kind === primary.kind) return { harness: backup.id, model: null, rule };
     if (rule.model) return { harness: backup.id, model: rule.model, rule };
   }
@@ -181,7 +192,7 @@ export function harnessDuringLimit(agent: string, now: number = Date.now()): str
 /** The fallback a new step for `agent` should start on right now, or null
  *  when it starts on `agent` itself. */
 export function fallbackDuringLimit(agent: string, now: number = Date.now()): QuotaFallback | null {
-  return quotaLimited(agent, now) || usageAtThreshold(agent, now) ? quotaFallbackFor(agent) : null;
+  return quotaLimited(agent, now) || usageAtThreshold(agent, now) ? quotaFallbackFor(agent, now) : null;
 }
 
 /** A profile's own chain of backups (see the module comment). */
@@ -307,11 +318,58 @@ export function fallbackAfterLimit(
 ): QuotaFallback | null {
   const now = opts.now ?? Date.now();
   const rule = profile ? profileRuleFor(profile) : null;
-  if (!rule || !profile) return quotaFallbackFor(agent);
+  if (!rule || !profile) return quotaFallbackFor(agent, now);
   if (profile.harness !== agent && !atLimit(profile.harness, now)) {
     return { harness: profile.harness, model: profile.model, rule, profile: { id: profile.id, name: profile.name, effort: profile.effort, mode: profile.mode } };
   }
   return nextHop(rule, agent, opts.excludeFamily ?? null, now);
+}
+
+/** When `agent`'s capped meters next reset, if a rule with `"cap": true`
+ *  covers it and its usage is at that cap; otherwise null. A capped meter
+ *  with no reset time counts, with `Infinity`. */
+export function capReachedUntil(agent: string, now: number = Date.now()): number | null {
+  const config = quotaRuleCovering(agent);
+  if (!config?.cap || config.atPercent === undefined) return null;
+  const snapshot = harnessUsage.get(agent);
+  if (!snapshot || snapshot.status !== "ok" || !Array.isArray(snapshot.meters)) return null;
+  let until: number | null = null;
+  for (const m of snapshot.meters) {
+    if (!m || typeof m.usedPercent !== "number") continue;
+    if (config.meters ? !config.meters.includes(m.id) : !!m.scope) continue;
+    if (m.resetsAtMs != null && m.resetsAtMs <= now) continue;
+    if (m.usedPercent < config.atPercent) continue;
+    const at = m.resetsAtMs ?? Infinity;
+    until = until == null ? at : Math.max(until, at);
+  }
+  return until;
+}
+
+/**
+ * Whether a new step run by `profile` on `agent` must wait for usage: its
+ * harness is at its cap and no backup is under its own. Null when it may
+ * start (on its own harness or a backup); otherwise when the soonest capped
+ * harness among the options resets and a sentence saying so. Pure over the
+ * preference and the usage snapshots.
+ */
+export function capWait(
+  agent: string,
+  profile: { id: string; name: string } | null,
+  opts: { excludeFamily?: string | null; now?: number } = {},
+): { until: number | null; why: string } | null {
+  const now = opts.now ?? Date.now();
+  const own = capReachedUntil(agent, now);
+  if (own == null || fallbackForStep(agent, profile, opts)) return null;
+  const label = (id: string) => harnesses.getByIdOrKind(id)?.label ?? id;
+  const config = quotaRuleCovering(agent)!;
+  const others = parseQuotaFallbackRules(preferences.get(QUOTA_FALLBACK_PREF)).map((r) => r.harness).filter((h) => h !== agent);
+  const capped = [...new Set(others)].map((h) => ({ h, at: capReachedUntil(h, now) })).filter((x) => x.at != null) as { h: string; at: number }[];
+  const soonest = [own, ...capped.map((x) => x.at)].filter((t) => Number.isFinite(t)).sort((a, b) => a - b)[0] ?? null;
+  const names = [label(agent), ...capped.map((x) => label(x.h))];
+  return {
+    until: soonest,
+    why: `${names.join(" and ")} ${names.length > 1 ? "are" : "is"} at the ${config.atPercent}% weekly cap — it starts when usage resets`,
+  };
 }
 
 function nextHop(rule: ProfileFallbackConfig, agent: string, excludeFamily: string | null, now: number): QuotaFallback | null {
