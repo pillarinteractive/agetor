@@ -33,8 +33,21 @@
  * profile's own model belongs to the other provider. The step keeps its
  * effort where the backup's kind accepts it, and runs in that kind's default
  * mode (pipeline-runner.ts `launchOnFallback`).
+ *
+ * Chains for one profile: a rule naming `"profile"` (a profile name or id)
+ * and a `"chain"` of profile names or ids gives the steps that profile runs
+ * their own order of backups, for example
+ *   {"enabled": true, "profile": "GPT Reviewer", "chain": ["DeepInfra GLM", "DeepInfra Kimi", "Claude Reviewer"]}
+ * A step starts on the first of the profile itself and then its chain whose
+ * harness is enabled and not at a usage limit. A chain profile lends only its
+ * harness, model, effort and mode: the step keeps its own profile's
+ * instructions and skills. A profile with such a rule never uses the harness
+ * rules above, so `"chain": []` keeps its steps on their own harness. A step
+ * may also exclude one model family from the chain (a Review never runs on
+ * the family that built the head it reviews; see {@link familyOf}).
  */
-import { harnesses, harnessUsage, preferences } from "./db.ts";
+import { agentProfiles, harnesses, harnessUsage, preferences } from "./db.ts";
+import type { AgentProfile } from "../shared/types.ts";
 
 export const QUOTA_FALLBACK_PREF = "quota_fallback";
 export const QUOTA_FALLBACK_UNTIL_PREF = "quota_fallback_until";
@@ -82,11 +95,14 @@ export function parseQuotaFallbackRules(raw: string | null | undefined): QuotaFa
 }
 
 /** What a step on a covered harness starts on instead. `model` is set only
- *  for a backup of another kind, and replaces the profile's model there. */
+ *  for a backup of another kind, and replaces the profile's model there.
+ *  `profile` is set for a hop of a profile's chain, whose model, effort and
+ *  mode the step runs with. */
 export interface QuotaFallback {
   harness: string;
   model: string | null;
-  rule: QuotaFallbackConfig;
+  rule: QuotaFallbackConfig | ProfileFallbackConfig;
+  profile?: { id: string; name: string; effort: string | null; mode: string | null };
 }
 
 /** The first rule covering `agent` whose backup is usable, or null: none
@@ -166,4 +182,145 @@ export function harnessDuringLimit(agent: string, now: number = Date.now()): str
  *  when it starts on `agent` itself. */
 export function fallbackDuringLimit(agent: string, now: number = Date.now()): QuotaFallback | null {
   return quotaLimited(agent, now) || usageAtThreshold(agent, now) ? quotaFallbackFor(agent) : null;
+}
+
+/** A profile's own chain of backups (see the module comment). */
+export interface ProfileFallbackConfig {
+  enabled: true;
+  profile: string;
+  chain: string[];
+}
+
+/** Every enabled profile rule in the preference, in order. */
+export function parseProfileFallbackRules(raw: string | null | undefined): ProfileFallbackConfig[] {
+  let v: unknown;
+  try {
+    v = raw ? JSON.parse(raw) : null;
+  } catch {
+    return [];
+  }
+  const items = Array.isArray(v) ? v : v ? [v] : [];
+  const rules: ProfileFallbackConfig[] = [];
+  for (const item of items) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const r = item as Record<string, unknown>;
+    const profile = typeof r.profile === "string" ? r.profile.trim() : "";
+    if (r.enabled !== true || !profile || !Array.isArray(r.chain)) continue;
+    const chain = r.chain.filter((s: unknown): s is string => typeof s === "string" && !!s.trim()).map((s) => s.trim());
+    rules.push({ enabled: true, profile, chain });
+  }
+  return rules;
+}
+
+function sameProfile(ref: string, p: { id: string; name: string }): boolean {
+  return ref === p.id || ref.toLowerCase() === p.name.toLowerCase();
+}
+
+function liveProfile(ref: string): AgentProfile | null {
+  return agentProfiles.get(ref) ?? agentProfiles.findByName(ref);
+}
+
+/** The first enabled rule for `profile`, or null when none names it. */
+export function profileRuleFor(profile: { id: string; name: string }): ProfileFallbackConfig | null {
+  return parseProfileFallbackRules(preferences.get(QUOTA_FALLBACK_PREF)).find((r) => sameProfile(r.profile, profile)) ?? null;
+}
+
+/** Whether `agent` has a remembered limit or its usage is at its rule's threshold. */
+function atLimit(agent: string, now: number): boolean {
+  return quotaLimited(agent, now) || usageAtThreshold(agent, now);
+}
+
+/** Whether a chain could send a step to `agent` now: it exists, is enabled
+ *  and is not at a limit. (A step's own harness is judged by its limit alone,
+ *  as without a chain.) */
+export function harnessAvailable(agent: string, now: number = Date.now()): boolean {
+  const h = harnesses.getByIdOrKind(agent);
+  return !!h && h.enabled && !atLimit(h.id, now);
+}
+
+/** `harness_families`: harness id → model family, for a harness that sends
+ *  a model name of one family to another provider (Claude Code via DeepSeek
+ *  runs `opus-5.5` as DeepSeek V4 Pro). */
+export const HARNESS_FAMILIES_PREF = "harness_families";
+
+const ORG_FAMILIES: Record<string, string> = {
+  "zai-org": "zai", zai: "zai", moonshotai: "moonshot", moonshot: "moonshot", "deepseek-ai": "deepseek", deepseek: "deepseek",
+  anthropic: "anthropic", openai: "openai", google: "google", "meta-llama": "meta", qwen: "qwen", xai: "xai",
+};
+const NAME_FAMILIES: Array<[RegExp, string]> = [
+  [/^(claude|opus|sonnet|haiku|fable)/, "anthropic"], [/^(gpt|o\d|codex)/, "openai"], [/^deepseek/, "deepseek"],
+  [/^glm/, "zai"], [/^kimi/, "moonshot"], [/^gemini/, "google"], [/^grok/, "xai"], [/^qwen/, "qwen"],
+];
+const KIND_FAMILIES: Record<string, string> = { "claude-code": "anthropic", codex: "openai", gemini: "google" };
+
+/** The model family a step on `agent` with `model` runs on, or null when
+ *  nothing tells. In order: the organisation of an `org/model` id, the
+ *  harness's `harness_families` entry, the model name, the harness's kind. */
+export function familyOf(agent: string, model: string | null | undefined): string | null {
+  const m = (model ?? "").trim().toLowerCase();
+  const slash = m.indexOf("/");
+  if (slash > 0) {
+    const org = m.slice(0, slash);
+    return ORG_FAMILIES[org] ?? org;
+  }
+  try {
+    const pinned = JSON.parse(preferences.get(HARNESS_FAMILIES_PREF) ?? "{}")?.[agent];
+    if (typeof pinned === "string" && pinned.trim()) return pinned.trim().toLowerCase();
+  } catch {
+    // an unreadable preference pins nothing
+  }
+  for (const [re, family] of NAME_FAMILIES) if (re.test(m)) return family;
+  const kind = harnesses.getByIdOrKind(agent)?.kind;
+  return (kind && KIND_FAMILIES[kind]) ?? null;
+}
+
+/**
+ * The fallback a new step run by `profile` (whose harness is `agent`) should
+ * start on now, or null when it starts on its own harness. With a profile
+ * rule: null while `agent` is available, otherwise the first available hop
+ * of the chain outside `excludeFamily`, and null when there is none (the step
+ * then waits on its own limit). Without one: the harness rules
+ * ({@link fallbackDuringLimit}).
+ */
+export function fallbackForStep(
+  agent: string,
+  profile: { id: string; name: string } | null,
+  opts: { excludeFamily?: string | null; now?: number } = {},
+): QuotaFallback | null {
+  const now = opts.now ?? Date.now();
+  const rule = profile ? profileRuleFor(profile) : null;
+  if (!rule) return fallbackDuringLimit(agent, now);
+  if (!atLimit(agent, now)) return null;
+  return nextHop(rule, agent, opts.excludeFamily ?? null, now);
+}
+
+/**
+ * Where a step run by `profile` goes after `agent` hit its usage limit (the
+ * limit already noted): its own profile's harness when that is available
+ * again, else the next available hop of the chain outside `excludeFamily`.
+ * Without a profile rule: the harness rule's backup ({@link quotaFallbackFor}).
+ */
+export function fallbackAfterLimit(
+  agent: string,
+  profile: { id: string; name: string; harness: string; model: string; effort: string | null; mode: string | null } | null,
+  opts: { excludeFamily?: string | null; now?: number } = {},
+): QuotaFallback | null {
+  const now = opts.now ?? Date.now();
+  const rule = profile ? profileRuleFor(profile) : null;
+  if (!rule || !profile) return quotaFallbackFor(agent);
+  if (profile.harness !== agent && !atLimit(profile.harness, now)) {
+    return { harness: profile.harness, model: profile.model, rule, profile: { id: profile.id, name: profile.name, effort: profile.effort, mode: profile.mode } };
+  }
+  return nextHop(rule, agent, opts.excludeFamily ?? null, now);
+}
+
+function nextHop(rule: ProfileFallbackConfig, agent: string, excludeFamily: string | null, now: number): QuotaFallback | null {
+  for (const ref of rule.chain) {
+    const hop = liveProfile(ref);
+    if (!hop || hop.harness === agent || !harnessAvailable(hop.harness, now)) continue;
+    if (excludeFamily && familyOf(hop.harness, hop.model) === excludeFamily) continue;
+    const harness = harnesses.getByIdOrKind(hop.harness)!;
+    return { harness: harness.id, model: hop.model, rule, profile: { id: hop.id, name: hop.name, effort: hop.effort, mode: hop.mode } };
+  }
+  return null;
 }

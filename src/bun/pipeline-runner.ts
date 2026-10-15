@@ -39,7 +39,7 @@ import { isPriority, priorityFirst } from "./priority.ts";
 import { awaitsFor, listAwaits, resourceBlockedAwaits } from "./awaits.ts";
 import {HEAVY_INSTRUCTIONS,managedPillarRoot} from './heavy-jobs.ts';
 import { classifyFailure, formatRetryTime, harnessQuotaNotice, isQuotaPaused, nextRetryAt, TRANSIENT_RETRY_MAX, type FailureClass } from "./usage-limit.ts";
-import { fallbackDuringLimit, noteQuotaLimit, quotaFallbackFor, type QuotaFallback } from "./quota-fallback.ts";
+import { fallbackAfterLimit, fallbackForStep, familyOf, noteQuotaLimit, type QuotaFallback } from "./quota-fallback.ts";
 import { getDiscoveredEfforts } from "./agent-discovery.ts";
 import { listLeases } from "./lease-watch.ts";
 import { invalidatePrStatus, issueNumberForTask, ownFailures, prBase, prStatusForTask } from "./pr-watch.ts";
@@ -426,8 +426,23 @@ export function launchOnFallback(
   const kind = harnesses.get(fallback.harness)!.kind;
   const model = fallback.model;
   const efforts = supportedEfforts(kind, model, getDiscoveredEfforts(kind, model, fallback.harness));
-  const effort = step.effort && efforts.some((o) => o.id === step.effort) ? step.effort : defaultEffortFor(kind, model, fallback.harness);
-  return { agent: fallback.harness, model, effort, mode: defaultModeFor(kind) };
+  const accepted = (e: string | null | undefined): e is string => !!e && efforts.some((o) => o.id === e);
+  // A hop of a profile's chain runs with that profile's own effort and mode
+  // where the step's do not apply.
+  const effort = accepted(step.effort) ? step.effort : accepted(fallback.profile?.effort) ? fallback.profile!.effort! : defaultEffortFor(kind, model, fallback.harness);
+  return { agent: fallback.harness, model, effort, mode: fallback.profile?.mode ?? defaultModeFor(kind) };
+}
+
+/** For a Review step, the model family that built the head it reviews (the
+ *  last Build execution as it actually ran, on a backup included): a Review
+ *  never falls back onto that family. Null for any other step. */
+export function familyToExclude(run: PipelineRunState, stepId: string): string | null {
+  if (!run.snapshot) return null;
+  const graph = run.snapshot.graph;
+  if (stepRole(stepNameById(graph, stepId), stepId) !== "review") return null;
+  const build = run.history.findLast((h) => stepRole(stepNameById(graph, h.stepId), h.stepId) === "build");
+  const task = build ? tasks.get(build.taskId) : null;
+  return task ? familyOf(task.agent, task.model) : null;
 }
 
 function scheduleAutoRetry(
@@ -460,7 +475,7 @@ function scheduleAutoRetry(
     const limited = tasks.get(run.active.find((a) => a.stepId === stepId)?.taskId ?? "");
     if (limited) {
       noteQuotaLimit(limited.agent, failure?.resetAt ?? null, now);
-      const fallback = quotaFallbackFor(limited.agent);
+      const fallback = fallbackAfterLimit(limited.agent, limited.agentProfile ?? null, { excludeFamily: familyToExclude(run, stepId), now });
       if (fallback) {
         const backup = fallback.harness;
         tasks.update(limited.id, launchOnFallback(fallback, limited));
@@ -3677,7 +3692,7 @@ async function launchStep(
   const effort = (reReview ? rounds.reviewEffort : null) ?? profile.effort ?? defaultEffortFor(profile.harnessKind, profile.model, profile.harness);
   // While the profile's harness is at a known usage limit, start on its
   // configured backup (quota-fallback.ts); otherwise this is the profile's.
-  const fallback = fallbackDuringLimit(profile.harness);
+  const fallback = fallbackForStep(profile.harness, profile, { excludeFamily: familyToExclude(run, step.id), now });
   const launch = fallback
     ? launchOnFallback(fallback, { model: profile.model, effort, mode: profile.mode })
     : { agent: profile.harness, model: profile.model, effort, mode: profile.mode };
