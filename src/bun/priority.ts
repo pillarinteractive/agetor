@@ -22,10 +22,14 @@ export function readPriority(raw: string | null | undefined = preferences.get(PR
   }
 }
 
-/** Whether `taskId` (a card, or one of its pipeline steps) goes first. */
+/** Whether `taskId` (a card, or one of its pipeline steps) goes first.
+ *  Reads only the card's id, parent, archived state and column: the board
+ *  poll asks this for every row, and two full reads a row took 5 s a poll
+ *  on the Pillar board (2026-10-14). */
 export function isPriority(taskId: string, set: ReadonlySet<string> = readPriority()): boolean {
-  const t = tasks.get(taskId);
-  const card = t?.pipelineParentId ? tasks.get(t.pipelineParentId) : t;
+  if (set.size === 0) return false;
+  const t = tasks.brief(taskId);
+  const card = t?.pipelineParentId ? tasks.brief(t.pipelineParentId) : t;
   if (!card || !set.has(card.id)) return false;
   return card.archivedAt == null && card.column !== "done";
 }

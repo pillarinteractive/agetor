@@ -1162,6 +1162,14 @@ export const tasks = {
    *  count into its parent, and every step of a returned parent is
    *  returned). On a board with ~1,200 archived rows this reads ~10% of the
    *  table and parses none of the archived prompts or run blobs. */
+  /** The few fields a hot check needs, without reading the row's prompt,
+   *  run or profile (a full `get` reads all of them). */
+  brief(id: string): { id: string; pipelineParentId: string | null; archivedAt: number | null; column: Task["column"] } | null {
+    const r = db.query<{ id: string; pipeline_parent_id: string | null; archived_at: number | null; column: Task["column"] }, [string]>(
+      `SELECT id, pipeline_parent_id, archived_at, "column" FROM tasks WHERE id = ?`,
+    ).get(id);
+    return r ? { id: r.id, pipelineParentId: r.pipeline_parent_id, archivedAt: r.archived_at, column: r.column } : null;
+  },
   /** Pipeline ids that cards run under, with the name each run froze, for
    *  pipelines not in `known` (a deleted template): read in SQL, without
    *  loading any task. */
