@@ -77,6 +77,7 @@ import {
   triedLine,
   waitHasTrigger,
   waitsOnIssue,
+  selfFiledFollowup,
   waitLine,
   type BlockSignals,
   type BlockVerdict,
@@ -702,18 +703,72 @@ async function githubRefState(project: string, n: number): Promise<RefState> {
   return state === "open" ? "open" : state === "closed" ? "closed" : "unknown";
 }
 
+/** Issue `n`'s title, body and when it was opened; null when unreadable. */
+async function githubRefInfo(project: string, n: number): Promise<{ title: string; body: string; createdAt: number | null } | null> {
+  const r = await runCommand(["gh", "api", `repos/{owner}/{repo}/issues/${n}`, "--jq", "{title, body, created_at}"], project, 30_000, process.env).catch(() => null);
+  if (!r?.ok) return null;
+  try {
+    const v = JSON.parse(r.stdout) as { title?: unknown; body?: unknown; created_at?: unknown };
+    const at = typeof v.created_at === "string" ? Date.parse(v.created_at) : NaN;
+    return { title: typeof v.title === "string" ? v.title : "", body: typeof v.body === "string" ? v.body : "", createdAt: Number.isFinite(at) ? at : null };
+  } catch {
+    return null;
+  }
+}
+
 /** What the queue reads from the rest of the core — replaceable in tests. */
 export const blockWaitDeps: {
   leases: () => LeaseStatus[];
   pr: (taskId: string) => TaskPrStatus | null;
   refState: (project: string, n: number) => Promise<RefState>;
+  refInfo: (project: string, n: number) => Promise<{ title: string; body: string; createdAt: number | null } | null>;
   rng: () => number;
 } = {
   leases: () => listLeases(),
   pr: (taskId) => prStatusForTask(taskId),
   refState: githubRefState,
+  refInfo: githubRefInfo,
   rng: Math.random,
 };
+
+/** Waits found not to be on a self-filed follow-up (`<parent>:<step task>:<ref>`). */
+const selfWaitChecked = new Set<string>();
+
+/**
+ * A parked run that waits on an issue the card filed itself: waiting never
+ * clears that, so the stop leaves the queue and becomes an ordinary stop —
+ * the ladder's (`resolveOwnerHolds`) when owner holds are resolved, the
+ * owner's otherwise. Checked once per wait. True when it handed it over.
+ */
+async function handOverSelfWait(t: Task, w: PipelineBlockWait, now: number): Promise<boolean> {
+  const n = issueRef(w.ref);
+  const cardIssue = issueNumberForTask(t);
+  const startedAt = t.pipelineRun?.startedAt ?? null;
+  const key = `${t.id}:${w.taskId}:${w.ref}`;
+  if (n == null || cardIssue == null || startedAt == null || selfWaitChecked.has(key)) return false;
+  const info = await blockWaitDeps.refInfo(t.workdir, n).catch(() => null);
+  if (!info) return false; // unreadable: try again next pass
+  const why = selfFiledFollowup(cardIssue, startedAt, info);
+  // Only a "no" is remembered: a step the ladder resumed that parks on the
+  // same issue again is handed over again, and the ladder's rungs bound that.
+  if (!why) {
+    selfWaitChecked.add(key);
+    return false;
+  }
+  return runExclusive(t.id, async () => {
+    const run = tasks.get(t.id)?.pipelineRun;
+    if (!run?.wait || run.wait.state !== "waiting" || run.wait.taskId !== w.taskId || run.wait.ref !== w.ref) return false;
+    delete run.wait;
+    persist(t.id, run);
+    const stepName = run.snapshot ? stepNameById(run.snapshot.graph, w.stepId) : w.stepId;
+    recordActivity(t.id, {
+      kind: "step",
+      text: `${stepName} was waiting on #${n}, ${why} — waiting can't clear that, so it is handled as a stop${ladderApplies(run) ? " Agetor resolves" : " for you"}`,
+      tone: "warning",
+    });
+    return true;
+  }).catch(() => false);
+}
 
 const sameProject = (a: string, b: string) => a.replace(/\/+$/, "") === b.replace(/\/+$/, "");
 const blockWaitConfig = () => parseBlockWaitConfig(preferences.get(BLOCK_WAIT_PREF));
@@ -1039,6 +1094,10 @@ export async function releaseBlockWaits(now = Date.now()): Promise<number> {
       continue;
     }
     const trigger = await waitTriggerState(t, w, now);
+    if (trigger.state === "holding" && waitsOnIssue(w) && (await handOverSelfWait(t, w, now))) {
+      kickOwnerHolds();
+      continue;
+    }
     // A wait on a numbered issue or PR has no timer (`planWait`); an entry
     // parked by an older build may still carry one, which is ignored.
     const due = w.at != null && now >= w.at && !waitsOnIssue(w);
@@ -1120,7 +1179,9 @@ export function resetBlockWaitsForTests(): void {
   blockWaitDeps.leases = () => listLeases();
   blockWaitDeps.pr = (taskId) => prStatusForTask(taskId);
   blockWaitDeps.refState = githubRefState;
+  blockWaitDeps.refInfo = githubRefInfo;
   blockWaitDeps.rng = Math.random;
+  selfWaitChecked.clear();
 }
 
 // ---------------------------------------------------------------------------

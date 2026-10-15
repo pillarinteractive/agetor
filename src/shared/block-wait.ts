@@ -458,6 +458,32 @@ export function waitsOnIssue(w: Pick<PipelineBlockWait, "category" | "ref">): bo
   return w.category === "dependency" && issueRef(w.ref) != null;
 }
 
+/**
+ * Whether issue `ref` is a follow-up this card filed itself — its own work, a
+ * finding it closed out, or a decision it recorded — so waiting for it to
+ * close can never clear the block (2026-10-15: #830 waited on #1726, the
+ * conflicts its own Build had to resolve; #953 on its closed-out bug #1703,
+ * which in turn waited on #953). Recognised by Agetor's markers (`(from #n)`,
+ * `agetor-decision:…/issues/n:`, `agetor-followup:n:`, a decision follow-up
+ * titled `(#n)`, an owner decision on `"Issue #n:`), or by being opened after
+ * this run started and naming the card's issue. Returns why, or null. Pure.
+ */
+export function selfFiledFollowup(
+  cardIssue: number,
+  runStartedAt: number,
+  ref: { title: string; body: string; createdAt: number | null },
+): string | null {
+  const n = String(cardIssue);
+  const title = ref.title ?? "";
+  const body = ref.body ?? "";
+  if (new RegExp(`\\(from #${n}\\)`, "i").test(title)) return "a bug filed from this card";
+  if (new RegExp(`agetor-decision:[^\\s]*/issues/${n}:|agetor-followup:${n}:`, "i").test(body)) return "a follow-up this card filed";
+  if (new RegExp(`^(?:Decision follow-up|Owner decision)\\b[^\\n]*(?:\\(#${n}\\)|"Issue #${n}:)`, "i").test(title)) return "a decision this card recorded";
+  const names = new RegExp(`(?:#|/issues/)${n}\\b`).test(`${title}\n${body}`);
+  if (names && ref.createdAt != null && ref.createdAt >= runStartedAt) return "an issue opened during this run about this card's own issue";
+  return null;
+}
+
 /** Whether the queue can tell, without resuming the step, that what it
  *  waits on has changed: a watched lease, an issue or PR number, the base
  *  branch's CI. Otherwise the timer is all there is. */

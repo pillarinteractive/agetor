@@ -1984,3 +1984,17 @@ before most of those runs ended, so the cards started over.
   queue's default `merge_method` is `merge`. A PR's own commits stay on the base, so a record pinned to one of them
   (Pillar's `docs/engineering/record-pins.md`) still resolves there — squashing left them off develop and turned it
   red after the merge. `git log --first-parent` still reads one line per PR.
+
+## A card never waits on a follow-up it filed itself (`feat/no-self-waits`)
+
+On 2026-10-15 four cards sat in the wait queue on issues they had filed: #830 on "resolve #830's conflicts" (its own
+Build's work), #1641 on its own CI fixture update, #953 on the bug it closed a finding out into (#1703, which the bug
+lane holds until #953 lands — a cycle), and #1280 on its own provisional decision. Waiting can't clear any of those.
+
+`releaseBlockWaits` now reads the issue a parked run waits on (`blockWaitDeps.refInfo`, once per wait while the answer
+is "no") and asks `selfFiledFollowup` (`src/shared/block-wait.ts`): Agetor's markers — `Bug (from #n)`,
+`agetor-decision:…/issues/n:`, `agetor-followup:n:`, `Decision follow-up (#n)`, `Owner decision: … "Issue #n:` — or an
+issue opened after the run started that names the card's issue. If so, the wait is dropped and the block becomes an
+ordinary stop: the no-owner-holds ladder resolves it (answer with the recommended option, reroute, then publish with
+`Refs`); with `owner_holds` = `park`, it is the owner's. A real dependency — an older issue, or one about another
+issue — stays parked as before.

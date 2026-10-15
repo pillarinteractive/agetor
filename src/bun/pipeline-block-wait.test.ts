@@ -555,6 +555,41 @@ test("a resume waits for a free step slot like any other step", async () => {
   }
 });
 
+test("a wait on an issue the card filed itself leaves the queue as a stop; a real dependency stays parked", async () => {
+  const { tasks } = await import("./db.ts");
+  const { releaseBlockWaits, blockWaitDeps } = await import("./pipeline-runner.ts");
+  await noJitter();
+  blockWaitDeps.refState = async () => "open";
+  const asked: number[] = [];
+  blockWaitDeps.refInfo = async (_project, n) => {
+    asked.push(n);
+    // #41: an older roadmap task. #42: opened by this card's own Finish during the run.
+    return n === 41
+      ? { title: "Package the baseline", body: "Needed by #9 and #77.", createdAt: 0 }
+      : { title: "Resolve #77 branch conflicts with develop before CI", body: "References: #77.", createdAt: Date.now() };
+  };
+  process.env.AGETOR_FAKE_CLAUDE_BLOCKED_REASON = "waiting for the follow-up to close";
+  process.env.AGETOR_FAKE_CLAUDE_BLOCKED_WAITING = JSON.stringify({ waitingOn: "dependency", waitingRef: "#41" });
+  const real = await startBuildReview("blocked");
+  tasks.update(real.parentId, { issueUrl: "https://github.com/o/r/issues/77" });
+  const w = (await blockedRun(real.parentId, parked(0))).wait!;
+  expect(await releaseBlockWaits(w.since + MIN)).toBe(0);
+  expect(tasks.get(real.parentId)!.pipelineRun!.wait).toMatchObject({ state: "waiting", ref: "#41" });
+
+  process.env.AGETOR_FAKE_CLAUDE_BLOCKED_WAITING = JSON.stringify({ waitingOn: "dependency", waitingRef: "#42" });
+  const self = await startBuildReview("blocked");
+  tasks.update(self.parentId, { issueUrl: "https://github.com/o/r/issues/77" });
+  const w2 = (await blockedRun(self.parentId, parked(0))).wait!;
+  await releaseBlockWaits(w2.since + MIN);
+  const run = tasks.get(self.parentId)!.pipelineRun!;
+  expect(run.status).toBe("blocked");
+  expect(run.wait == null || run.wait.ref !== "#42" || run.wait.state !== "waiting").toBe(true);
+  expect(activity(self.parentId).some((l) => l.startsWith("Build was waiting on #42, an issue opened during this run about this card's own issue — waiting can't clear that"))).toBe(true);
+  // The real dependency was looked at once and is not looked at again.
+  await releaseBlockWaits(w.since + 10 * MIN);
+  expect(asked.filter((n) => n === 41)).toHaveLength(1);
+});
+
 test("a card still parked a day later goes to the owner, saying what it waited on", async () => {
   const { tasks } = await import("./db.ts");
   const { releaseBlockWaits, blockWaitDeps } = await import("./pipeline-runner.ts");

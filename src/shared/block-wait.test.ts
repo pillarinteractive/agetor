@@ -18,6 +18,7 @@ import {
   waitingInQueue,
   waitLine,
   waitsOnIssue,
+  selfFiledFollowup,
   type BlockVerdict,
 } from "./block-wait.ts";
 import { normalizeHandoff, parseHandoff } from "./pipeline.ts";
@@ -375,4 +376,21 @@ describe("reading the queue", () => {
     expect(waitHasTrigger({ category: "dependency", ref: "ci" })).toBe(false);
     expect(waitHasTrigger({ category: "unknown", ref: "#41" })).toBe(false);
   });
+});
+
+test("a follow-up the card filed itself is recognised; an older, real dependency is not", () => {
+  const at = 1_000;
+  const f = (title: string, body = "", createdAt: number | null = at + 1, issue = 953) => selfFiledFollowup(issue, at, { title, body, createdAt });
+  // The shapes Agetor's own follow-ups take (2026-10-15).
+  expect(f("Bug (from #953): 953-R5 — retained gap")).toBe("a bug filed from this card");
+  expect(f("Decision follow-up (#953): placement", "", 0)).toBe("a decision this card recorded");
+  expect(f('Owner decision: Finish on "Issue #953: Build private observation" — Finish needs you', "", 0)).toBe("a decision this card recorded");
+  expect(f("x", "<!-- agetor-decision:https://github.com/o/r/issues/953:abc -->", 0)).toBe("a follow-up this card filed");
+  expect(f("[ARC04] Independent receipt", "<!-- agetor-followup:953:ARC08-R15 -->", 0)).toBe("a follow-up this card filed");
+  expect(f("Resolve #953 branch conflicts with develop before CI", "References: #953.")).toBe("an issue opened during this run about this card's own issue");
+  // Opened before this run, or about another issue: a real dependency.
+  expect(f("Resolve #953 branch conflicts", "References: #953.", at - 1)).toBeNull();
+  expect(f("Package the first offline native baseline", "see #9530 and #95")).toBeNull();
+  expect(f("Bug (from #95): other", "")).toBeNull();
+  expect(f("Resolve #953 conflicts", "", null)).toBeNull();
 });
