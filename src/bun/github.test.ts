@@ -1593,3 +1593,45 @@ test("a GitHub server error on push is retried; a real rejection isn't", async (
   expect(isTransientPushError(" ! [rejected] HEAD -> b (non-fast-forward)")).toBe(false);
   expect(isTransientPushError("ERROR: Permission to o/r.git denied")).toBe(false);
 });
+
+test("fetchGitHub caches GET requests by ETag and returns cached body on 304 without burning rate limit", async () => {
+  const { clearETagCacheForTests, getGitHubPullDetail } = await import("./github.ts");
+  clearETagCacheForTests();
+  const dir = await makeGitHubRepo("acme", "etag-repo");
+
+  let callCount = 0;
+  let lastHeaders: Record<string, string> = {};
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    callCount++;
+    const h = (init?.headers ?? {}) as Record<string, string>;
+    lastHeaders = { ...h };
+    if (h["if-none-match"] === '"v1"') {
+      return new Response("", { status: 304, headers: { etag: '"v1"' } });
+    }
+    return new Response(JSON.stringify(githubIssue({ number: 42, title: "Initial Title" })), {
+      status: 200,
+      headers: { etag: '"v1"', "content-type": "application/json" },
+    });
+  }) as typeof fetch;
+
+  try {
+    // 1st request returns 200 with ETag "v1"
+    const r1 = await getGitHubPullDetail({ dir, number: 42 });
+    expect(r1.ok).toBe(true);
+    if (!r1.ok) return;
+    expect(r1.item.title).toBe("Initial Title");
+    expect(callCount).toBe(1);
+
+    // 2nd request sends If-None-Match: "v1", server returns 304, fetchGitHub synthesizes 200 response with cached body
+    const r2 = await getGitHubPullDetail({ dir, number: 42 });
+    expect(r2.ok).toBe(true);
+    if (!r2.ok) return;
+    expect(r2.item.title).toBe("Initial Title");
+    expect(callCount).toBe(2);
+    expect(lastHeaders["if-none-match"]).toBe('"v1"');
+  } finally {
+    globalThis.fetch = original;
+    clearETagCacheForTests();
+  }
+});

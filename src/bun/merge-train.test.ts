@@ -49,11 +49,11 @@ describe("the fresh rule", () => {
     expect(freshRuleOn("false")).toBe(false);
     expect(freshRuleOn(" FALSE ")).toBe(false);
   });
-  test("a lone stale PR leaves as a train of one once it has waited the window", () => {
+  test("a lone stale PR leaves as a train of one immediately", () => {
     const now = 100 * 60_000;
-    expect(shouldDepart([now - 11 * 60_000], cfg, now, 1)).toBe(true);
-    expect(shouldDepart([now - 5 * 60_000], cfg, now, 1)).toBe(false);
-    expect(shouldDepart([now - 11 * 60_000], cfg, now)).toBe(false); // without the rule: never alone
+    expect(shouldDepart([now], cfg, now, 1)).toBe(true);
+    expect(shouldDepart([now - 5 * 60_000], cfg, now, 1)).toBe(true);
+    expect(shouldDepart([now - 11 * 60_000], cfg, now)).toBe(false); // without min=1: never alone
     expect(shouldDepart([], cfg, now, 1)).toBe(false);
     expect(shouldDepart([0], { ...cfg, enabled: false }, now, 1)).toBe(false);
   });
@@ -149,3 +149,126 @@ test("sent by hand: a PR whose own checks are still running can ride; failing, c
   expect(manualTrainEligible(pr({ draft: true }), clean)).toBe(false);
   expect(manualTrainEligible(pr({ unresolvedThreads: 2 }), clean)).toBe(false);
 });
+
+test("bisection: disbanding a failed train of >= 3 members queues two halves instead of skipping all", async () => {
+  const { disband, getBisectQueue, clearBisectQueueForTests, resetTrainMarksForTests, skipsTrain } = await import("./merge-train.ts");
+  clearBisectQueueForTests();
+  resetTrainMarksForTests();
+  const train = {
+    id: "tr1",
+    project: "/tmp/nonexistent-project",
+    branch: "agetor/merge-train-1",
+    base: "develop",
+    pr: 99,
+    url: "https://github.com/foo/bar/pull/99",
+    members: [
+      { taskId: "t1", pr: 101, branch: "b1", title: "t1", headSha: "h1" },
+      { taskId: "t2", pr: 102, branch: "b2", title: "t2", headSha: "h2" },
+      { taskId: "t3", pr: 103, branch: "b3", title: "t3", headSha: "h3" },
+      { taskId: "t4", pr: 104, branch: "b4", title: "t4", headSha: "h4" },
+    ],
+    createdAt: Date.now(),
+    rerunAttempted: false,
+  };
+  const prs = new Map();
+  await disband(train, "its CI failed", prs, true);
+  const queue = getBisectQueue();
+  expect(queue.length).toBe(2);
+  expect(queue[0]).toEqual({ project: "/tmp/nonexistent-project", base: "develop", taskIds: ["t1", "t2"] });
+  expect(queue[1]).toEqual({ project: "/tmp/nonexistent-project", base: "develop", taskIds: ["t3", "t4"] });
+  expect(skipsTrain({ number: 101, headSha: "h1" } as any)).toBe(false);
+});
+
+test("disbanding a failed train of 2 members marks both to skip trains rather than bisecting", async () => {
+  const { disband, getBisectQueue, clearBisectQueueForTests, resetTrainMarksForTests, skipsTrain } = await import("./merge-train.ts");
+  clearBisectQueueForTests();
+  resetTrainMarksForTests();
+  const train = {
+    id: "tr2",
+    project: "/tmp/nonexistent-project",
+    branch: "agetor/merge-train-2",
+    base: "develop",
+    pr: 100,
+    url: "https://github.com/foo/bar/pull/100",
+    members: [
+      { taskId: "t1", pr: 101, branch: "b1", title: "t1", headSha: "h1" },
+      { taskId: "t2", pr: 102, branch: "b2", title: "t2", headSha: "h2" },
+    ],
+    createdAt: Date.now(),
+  };
+  const prs = new Map([
+    ["t1", { number: 101, headSha: "h1" } as any],
+    ["t2", { number: 102, headSha: "h2" } as any],
+  ]);
+  await disband(train, "its CI failed", prs, true);
+  expect(getBisectQueue().length).toBe(0);
+  expect(skipsTrain({ number: 101, headSha: "h1" } as any)).toBe(true);
+  expect(skipsTrain({ number: 102, headSha: "h2" } as any)).toBe(true);
+});
+
+test("disbanding a failed train of 1 member marks it as failedAlone", async () => {
+  const { disband, resetTrainMarksForTests, trainFailedAlone } = await import("./merge-train.ts");
+  resetTrainMarksForTests();
+  const train = {
+    id: "tr3",
+    project: "/tmp/nonexistent-project",
+    branch: "agetor/merge-train-3",
+    base: "develop",
+    pr: 101,
+    url: "https://github.com/foo/bar/pull/101",
+    members: [
+      { taskId: "t1", pr: 101, branch: "b1", title: "t1", headSha: "h1" },
+    ],
+    createdAt: Date.now(),
+  };
+  const prs = new Map([["t1", { number: 101, headSha: "h1" } as any]]);
+  await disband(train, "its CI failed", prs, true);
+  expect(trainFailedAlone({ number: 101, headSha: "h1" })).toBe(true);
+});
+
+test("assembling with regenerable conflicts: resolves conflict via scratch worktree when covered by regenerate rules", async () => {
+  const { preferences } = await import("./db.ts");
+  const { MERGE_REGENERATE_PREF } = await import("../shared/publish.ts");
+  const root = mkdtempSync(path.join(tmpdir(), "train-regen-"));
+  const origin = path.join(root, "origin.git");
+  const repo = path.join(root, "repo");
+  preferences.set(MERGE_REGENERATE_PREF, JSON.stringify([{ project: repo, path: "regen.txt", command: "echo regenerated > regen.txt" }]));
+  try {
+    await sh(root, "git", "init", "-q", "--bare", "-b", "develop", origin);
+    await sh(root, "git", "clone", "-q", origin, repo);
+    await sh(repo, "git", "config", "user.email", "t@t");
+    await sh(repo, "git", "config", "user.name", "t");
+    writeFileSync(path.join(repo, "regen.txt"), "base\n");
+    await sh(repo, "git", "add", ".");
+    await sh(repo, "git", "commit", "-qm", "base");
+    await sh(repo, "git", "push", "-q", "origin", "HEAD:develop");
+
+    // feat-1 modifies regen.txt
+    await sh(repo, "git", "checkout", "-q", "-b", "feat-1", "origin/develop");
+    writeFileSync(path.join(repo, "regen.txt"), "from feat-1\n");
+    await sh(repo, "git", "commit", "-qam", "feat-1");
+    await sh(repo, "git", "push", "-q", "origin", "feat-1");
+
+    // feat-2 modifies regen.txt
+    await sh(repo, "git", "checkout", "-q", "-b", "feat-2", "origin/develop");
+    writeFileSync(path.join(repo, "regen.txt"), "from feat-2\n");
+    await sh(repo, "git", "commit", "-qam", "feat-2");
+    await sh(repo, "git", "push", "-q", "origin", "feat-2");
+
+    await sh(repo, "git", "checkout", "-q", "develop");
+
+    const m = (taskId: string, n: number, b: string) => ({ taskId, pr: n, branch: b, title: `fix: ${b}`, headSha: null });
+    const { members, dropped } = await assembleTrain(repo, "develop", "agetor/merge-train-regen", path.join(root, "wt"), [
+      m("1", 1, "feat-1"),
+      m("2", 2, "feat-2"),
+    ]);
+
+    expect(members.map((x) => x.pr)).toEqual([1, 2]);
+    expect(dropped).toEqual([]);
+    const log = await sh(repo, "git", "log", "--format=%s", "origin/develop..origin/agetor/merge-train-regen");
+    expect(log.split("\n")).toEqual(["fix: feat-2 (#2)", "fix: feat-1 (#1)"]);
+  } finally {
+    preferences.set(MERGE_REGENERATE_PREF, "");
+  }
+}, 30_000);
+

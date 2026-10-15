@@ -1071,17 +1071,40 @@ function countGitHubCall(method: string, url: string): void {
   }
 }
 
+interface ETagCacheEntry {
+  etag: string;
+  status: number;
+  statusText: string;
+  headers: [string, string][];
+  body: string;
+}
+
+const etagCache = new Map<string, ETagCacheEntry>();
+const MAX_ETAG_CACHE_ENTRIES = 1000;
+
+export function clearETagCacheForTests(): void {
+  etagCache.clear();
+}
+
 async function fetchGitHub(
   url: string,
   token: string | null,
   accept: string,
   init?: { method?: string; body?: string },
 ): Promise<Response | GitHubListError> {
-  countGitHubCall(init?.method ?? "GET", url);
+  const method = (init?.method ?? "GET").toUpperCase();
+  countGitHubCall(method, url);
+  const cacheKey = `${accept}\0${token ?? ""}\0${url}`;
+  if (method !== "GET") {
+    for (const k of etagCache.keys()) {
+      if (k.endsWith(`\0${url}`)) etagCache.delete(k);
+    }
+  }
+  const cached = method === "GET" ? etagCache.get(cacheKey) : undefined;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), GITHUB_FETCH_TIMEOUT_MS);
   try {
-    return await fetch(url, {
+    const res = await fetch(url, {
       method: init?.method,
       signal: controller.signal,
       headers: {
@@ -1089,9 +1112,40 @@ async function fetchGitHub(
         ...(init?.body ? { "content-type": "application/json" } : {}),
         "user-agent": "agetor",
         ...(token ? { authorization: `Bearer ${token}` } : {}),
+        ...(cached?.etag ? { "if-none-match": cached.etag } : {}),
       },
       body: init?.body,
     });
+    if (res.status === 304 && cached) {
+      const headers = new Headers(cached.headers);
+      for (const [k, v] of res.headers.entries()) headers.set(k, v);
+      return new Response(cached.body, {
+        status: cached.status,
+        statusText: cached.statusText,
+        headers,
+      });
+    }
+    const etag = res.headers.get("etag");
+    if (res.ok && etag && method === "GET") {
+      const text = await res.text();
+      if (etagCache.size >= MAX_ETAG_CACHE_ENTRIES) {
+        const first = etagCache.keys().next().value;
+        if (first) etagCache.delete(first);
+      }
+      etagCache.set(cacheKey, {
+        etag,
+        status: res.status,
+        statusText: res.statusText,
+        headers: [...res.headers.entries()],
+        body: text,
+      });
+      return new Response(text, {
+        status: res.status,
+        statusText: res.statusText,
+        headers: res.headers,
+      });
+    }
+    return res;
   } catch (e) {
     return { ok: false, error: fetchErrorMessage(e) };
   } finally {
@@ -5091,6 +5145,59 @@ export async function cancelGitHubWorkflowRun(input: CancelGitHubWorkflowRunInpu
     return { ok: false, error: apiError(json, res.status, res.statusText) };
   }
   return { ok: true, message: "Cancellation requested." };
+}
+
+/** `POST /repos/:o/:r/actions/runs/:run_id/force-cancel` */
+export async function forceCancelGitHubWorkflowRun(input: CancelGitHubWorkflowRunInput): Promise<GitHubWorkflowActionResponse> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  if (!Number.isInteger(input.runId) || input.runId <= 0) return { ok: false, error: "valid run id required" };
+
+  const token = await githubToken(repo.remoteHost ?? null);
+  if (!token) return { ok: false, error: "GitHub authentication required to force cancel a workflow run" };
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/actions/runs/${input.runId}/force-cancel`;
+  const res = await fetchGitHub(url, token, "application/vnd.github+json", { method: "POST" });
+  if (!("status" in res)) return res;
+  if (!res.ok) {
+    const json = await res.json().catch(() => null);
+    return { ok: false, error: apiError(json, res.status, res.statusText) };
+  }
+  return { ok: true, message: "Force cancellation requested." };
+}
+
+/** `GET /repos/:o/:r/actions/runs/:run_id` status check */
+export async function getGitHubWorkflowRunStatus(input: { dir: string; runId: number }): Promise<{ ok: true; status: string } | GitHubListError> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  const token = await githubToken(repo.remoteHost ?? null);
+  const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/actions/runs/${input.runId}`;
+  const res = await fetchGitHub(url, token, "application/vnd.github+json");
+  if (!("status" in res)) return res;
+  const json = (await res.json().catch(() => null)) as { status?: unknown } | null;
+  if (!res.ok || !json || typeof json.status !== "string") return { ok: false, error: apiError(json, res.status, res.statusText) };
+  return { ok: true, status: json.status };
+}
+
+/** List active (queued or in_progress) workflow runs in the repository */
+export async function listActiveWorkflowRuns(input: { dir: string }): Promise<{ ok: true; runs: Array<{ id: number; headBranch: string; status: string }> } | GitHubListError> {
+  const repo = await repoForDir(input.dir);
+  if (!repo) return { ok: false, error: "project does not have a GitHub remote" };
+  const token = await githubToken(repo.remoteHost ?? null);
+  const out: Array<{ id: number; headBranch: string; status: string }> = [];
+  for (const status of ["queued", "in_progress"]) {
+    const url = `${GITHUB_API_BASE}/repos/${repo.owner}/${repo.name}/actions/runs?status=${status}&per_page=50`;
+    const res = await fetchGitHub(url, token, "application/vnd.github+json");
+    if (!("status" in res) || !res.ok) continue;
+    const json = (await res.json().catch(() => null)) as { workflow_runs?: Array<{ id?: unknown; head_branch?: unknown; status?: unknown }> } | null;
+    if (json && Array.isArray(json.workflow_runs)) {
+      for (const r of json.workflow_runs) {
+        if (typeof r.id === "number" && typeof r.head_branch === "string") {
+          out.push({ id: r.id, headBranch: r.head_branch, status: String(r.status ?? status) });
+        }
+      }
+    }
+  }
+  return { ok: true, runs: out };
 }
 
 /** `POST /repos/:o/:r/actions/workflows/:workflow_id/dispatches` (F20) —

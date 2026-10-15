@@ -36,7 +36,11 @@
  * Dragging the card back to In Review (or Backlog) withdraws the sign-off.
  */
 import type { Task, TaskPrStatus } from "../shared/types.ts";
-import { MERGE_TRAIN_PREF, activeTrain, advanceTrain, buildTrain, freshAgainstBase, freshRuleOn, manualTrainEligible, markRidesAlone, parseTrainConfig, replaceTrain, shouldDepart, skipsTrain, trainCiStarted, trainEligible, trainFailedAlone } from "./merge-train.ts";
+import {
+  MERGE_TRAIN_PREF, activeTrain, advanceTrain, buildTrain, freshAgainstBase, freshRuleOn,
+  getBisectQueue, manualTrainEligible, markRidesAlone, parseTrainConfig, replaceTrain, saveBisectQueue,
+  shouldDepart, skipsTrain, trainCiStarted, trainEligible, trainFailedAlone,
+} from "./merge-train.ts";
 import { preferences, tasks } from "./db.ts";
 import { recordActivity } from "./activity.ts";
 import { mergeQueue, setMergeQueued } from "./merge-intent.ts";
@@ -425,6 +429,30 @@ async function tick(now: number): Promise<void> {
   for (const id of [...readySince.keys()]) if (!eligibleIds.has(id)) readySince.delete(id);
   for (const e of eligible) if (!readySince.has(e.t.id)) readySince.set(e.t.id, now);
   saveReadySince();
+  // 2a. Bisected batches from a failed train take priority over new trains
+  if (cfg.enabled && !activeTrain()) {
+    const bisectQueue = getBisectQueue();
+    while (bisectQueue.length > 0 && !activeTrain()) {
+      const batch = bisectQueue.shift()!;
+      const batchEvals = batch.taskIds
+        .map((id) => evals.find((e) => e.t.id === id))
+        .filter((e): e is Eval => !!e && !riding.has(e.t.id) && e.t.column === "merge" && !!e.t.branch && trainEligible(e.pr, e.mergeability));
+      if (batchEvals.length > 0) {
+        saveBisectQueue(bisectQueue);
+        const train = await buildTrain(batchEvals.map((e) => ({ task: e.t, pr: e.pr! })), 1).catch(() => null);
+        if (train) {
+          for (const m of train.members) riding.add(m.taskId);
+        } else {
+          for (const e of batchEvals) {
+            leftOut.add(e.t.id);
+            if (freshOn) markRidesAlone(e.pr!);
+          }
+        }
+        break;
+      }
+    }
+    saveBisectQueue(bisectQueue);
+  }
   if (cfg.enabled && !activeTrain()) {
     const groups = new Map<string, Eval[]>();
     for (const e of eligible) {
