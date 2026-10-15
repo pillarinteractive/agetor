@@ -981,6 +981,21 @@ So an unattended board keeps going:
 new steps whose harness is in `from` launch on `harness` once a usage meter reaches `atPercent` (`usageAtThreshold`),
 instead of only after the limit is hit. Running steps are not moved.
 
+### A chain of backups per profile, and no Review on the family that built (`feat/profile-fallback-chains`)
+
+A `quota_fallback` rule may name a profile instead of a harness:
+`{"enabled":true,"profile":"GPT Reviewer","chain":["DeepInfra GLM","DeepInfra Kimi","Claude Reviewer"]}`. A step run
+by that profile starts on the first of its own harness and then the chain whose harness is enabled and not at a limit
+(`fallbackForStep`); a step cut off mid-turn moves to the next one, or back to its own harness once that is free
+(`fallbackAfterLimit`). A chain profile lends its harness, model, effort and mode, never its instructions, and the step
+keeps its own effort where the backup accepts it. A profile with a rule never uses the harness rules, so
+`{"profile":"Finisher","chain":["Sonnet Builder"]}` keeps Finish off DeepSeek, and `"chain": []` keeps a profile on its
+own harness. Harness rules still give the `atPercent` threshold that marks a harness at its limit.
+
+A Review step skips any hop whose model family is the one the last Build actually ran on (`familyToExclude`, after any
+fallback). `familyOf` reads an `org/model` id's organisation, then the `harness_families` preference
+(`{"claude-deepseek":"deepseek"}`: DeepSeek serves Claude model names), then the model name, then the harness's kind.
+
 Claude Code shows a notice when its requests go through a gateway that has not adopted the auto-mode classifier
 billing change. It offers no choices and only waits for Enter. `gatewayBillingNoticeKey`
 (`src/bun/optional-claude-prompt.ts`) matches its exact sentences and sends Enter, with a timeline entry; anything
