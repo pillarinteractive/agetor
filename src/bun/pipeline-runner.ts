@@ -71,6 +71,7 @@ import {
   escalationLine,
   fmtSpan,
   issueRef,
+  issueRefs,
   NO_DEADLINE,
   parseBlockWaitConfig,
   planWait,
@@ -741,14 +742,21 @@ const selfWaitChecked = new Set<string>();
  * owner's otherwise. Checked once per wait. True when it handed it over.
  */
 async function handOverSelfWait(t: Task, w: PipelineBlockWait, now: number): Promise<boolean> {
-  const n = issueRef(w.ref);
+  const ns = issueRefs(w.ref);
   const cardIssue = issueNumberForTask(t);
   const startedAt = t.pipelineRun?.startedAt ?? null;
   const key = `${t.id}:${w.taskId}:${w.ref}`;
-  if (n == null || cardIssue == null || startedAt == null || selfWaitChecked.has(key)) return false;
-  const info = await blockWaitDeps.refInfo(t.workdir, n).catch(() => null);
-  if (!info) return false; // unreadable: try again next pass
-  const why = selfFiledFollowup(cardIssue, startedAt, info);
+  if (ns.length === 0 || cardIssue == null || startedAt == null || selfWaitChecked.has(key)) return false;
+  // Any one of them filed by the card itself is enough: waiting for all of
+  // them to close then can't clear the block either.
+  let why: string | null = null;
+  let n = ns[0]!;
+  for (const m of ns) {
+    const info = await blockWaitDeps.refInfo(t.workdir, m).catch(() => null);
+    if (!info) return false; // unreadable: try again next pass
+    why = selfFiledFollowup(cardIssue, startedAt, info);
+    if (why) { n = m; break; }
+  }
   // Only a "no" is remembered: a step the ladder resumed that parks on the
   // same issue again is handed over again, and the ladder's rungs bound that.
   if (!why) {
@@ -914,11 +922,13 @@ async function waitTriggerState(parent: Task, w: PipelineBlockWait, now: number)
     if (!pr) return { state: "unknown", text: "" };
     return baseCiRed(pr) ? { state: "holding", text: `the same checks still fail on ${pr.baseRef ?? "the base branch"}` } : { state: "cleared", text: `the checks that failed on ${pr.baseRef ?? "the base branch"} no longer fail there` };
   }
-  const n = w.category === "dependency" ? issueRef(w.ref) : null;
-  if (n != null) {
-    const state = await refStateCached(parent.workdir, n, now);
-    if (state === "closed") return { state: "cleared", text: `#${n} is closed` };
-    return state === "open" ? { state: "holding", text: `#${n} is still open` } : { state: "unknown", text: "" };
+  const ns = w.category === "dependency" ? issueRefs(w.ref) : [];
+  if (ns.length > 0) {
+    const states = await Promise.all(ns.map((n) => refStateCached(parent.workdir, n, now)));
+    const open = ns.filter((_, i) => states[i] === "open");
+    if (open.length > 0) return { state: "holding", text: `${open.map((n) => `#${n}`).join(", ")} ${open.length > 1 ? "are" : "is"} still open` };
+    if (states.every((s) => s === "closed")) return { state: "cleared", text: `${ns.map((n) => `#${n}`).join(", ")} ${ns.length > 1 ? "are" : "is"} closed` };
+    return { state: "unknown", text: "" };
   }
   return { state: "unknown", text: "" };
 }

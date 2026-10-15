@@ -2007,3 +2007,14 @@ to Ready to Merge, and the merge queue marked the draft PR (#1664) ready and mer
 the step-cap wrap-up (`run.capWrapUp`) goes to In Review and its sign-off is withdrawn, and a restart from the base
 (`ladderRestartFromBase`) clears the old attempt's sign-off. A signed-off card whose fix-up run finishes approved
 still returns to Ready to Merge.
+
+## Refs lines that can be judged, and waits on several issues (`fix/refs-lists-and-verdicts`)
+
+- **Refs verdicts** (`publishWriterBrief`, `src/shared/publish.ts`): Finish's write-up now writes a `Refs` closing line
+  as `Refs #n — <item> (#m), <item> (#k)`, naming what remains and the issue that tracks each item. On 2026-10-15
+  four merged steps (#867, #1258, #1276, #1280) ended in a bare `Refs #n`, so `refs_close` could never judge them
+  and each waited for the owner; #867 alone held 218 roadmap steps.
+- **Waits on several issues** (`issueRefs`, `src/shared/block-wait.ts`): a step that declares it waits on
+  `#1770, #1771 …` (or `#1770–#1775`) is a watched wait like a single issue: no timer, resumed when all are closed,
+  and handed to the ladder when any of them is a follow-up the card filed itself (#846 waited on the six bugs its
+  own Review had closed out, each of which waited on #846).

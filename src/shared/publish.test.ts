@@ -339,6 +339,16 @@ describe("what Build, the writer and the pull request are told", () => {
     expect(brief).toContain("https://github.com/o/r/pull/7");
     expect(brief).toContain("with origin/develop merged in by Agetor");
   });
+  test("a Refs line names what remains, in the form the release-gate rule reads", async () => {
+    const { classifyRefsVerdict } = await import("./refs-close.ts");
+    const brief = publishWriterBrief({ ...facts, issueUrl: "https://github.com/o/r/issues/3", factsPosted: true, markedReady: true });
+    expect(brief).toContain("`Refs #n — <item> (#m), <item> (#k)`");
+    expect(brief).toContain("a bare `Refs #n` keeps it open for the owner");
+    // The example the brief gives is one the rule can judge, and closes.
+    const example = /for example `(Refs #867 — [^`]+)`/.exec(brief)![1]!;
+    expect(classifyRefsVerdict(`## Summary\nx\n\n${example}`, 867)).toMatchObject({ decision: "close" });
+    expect(classifyRefsVerdict("## Summary\nx\n\nRefs #867", 867).decision).toBe("keep");
+  });
 });
 
 // The trial's preference named the pipeline "Change"; the pipeline is called

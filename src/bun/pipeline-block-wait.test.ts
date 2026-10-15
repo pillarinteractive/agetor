@@ -590,6 +590,22 @@ test("a wait on an issue the card filed itself leaves the queue as a stop; a rea
   expect(asked.filter((n) => n === 41)).toHaveLength(1);
 });
 
+test("a wait on a list of bugs the card filed itself (2026-10-15 #846) leaves the queue as a stop", async () => {
+  const { tasks } = await import("./db.ts");
+  const { releaseBlockWaits, blockWaitDeps } = await import("./pipeline-runner.ts");
+  await noJitter();
+  blockWaitDeps.refState = async () => "open";
+  blockWaitDeps.refInfo = async (_project, n) => ({ title: `Bug (from #77): R77-0${n - 50}: a finding`, body: "", createdAt: Date.now() });
+  process.env.AGETOR_FAKE_CLAUDE_BLOCKED_REASON = "waiting for the closed-out findings";
+  process.env.AGETOR_FAKE_CLAUDE_BLOCKED_WAITING = JSON.stringify({ waitingOn: "dependency", waitingRef: "#51, #52 and #53" });
+  const card = await startBuildReview("blocked");
+  tasks.update(card.parentId, { issueUrl: "https://github.com/o/r/issues/77" });
+  const w = (await blockedRun(card.parentId, parked(0))).wait!;
+  expect(w).toMatchObject({ ref: "#51, #52, #53", at: null });
+  await releaseBlockWaits(w.since + MIN);
+  expect(activity(card.parentId).some((l) => l.startsWith("Build was waiting on #51, a bug filed from this card — waiting can't clear that"))).toBe(true);
+});
+
 test("a card still parked a day later goes to the owner, saying what it waited on", async () => {
   const { tasks } = await import("./db.ts");
   const { releaseBlockWaits, blockWaitDeps } = await import("./pipeline-runner.ts");

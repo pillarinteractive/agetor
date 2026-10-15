@@ -211,6 +211,29 @@ export function issueRef(ref: string | null | undefined): number | null {
   return m ? Number(m[1]) : null;
 }
 
+/** Every issue a reference names: "#12", "#12, #14 and #15", "#12–#15"
+ *  (a range of at most 20); empty unless every part is an issue number. */
+export function issueRefs(ref: string | null | undefined): number[] {
+  const one = issueRef(ref);
+  if (one != null) return [one];
+  const text = (ref ?? "").trim();
+  if (!text) return [];
+  const out: number[] = [];
+  for (const part of text.split(/\s*(?:,|;|\band\b)\s*/i).filter(Boolean)) {
+    const range = /^#?(\d{1,7})\s*[–—-]\s*#?(\d{1,7})$/.exec(part.trim());
+    if (range) {
+      const [a, b] = [Number(range[1]), Number(range[2])];
+      if (b < a || b - a > 20) return [];
+      for (let n = a; n <= b; n++) out.push(n);
+      continue;
+    }
+    const n = issueRef(part);
+    if (n == null) return [];
+    out.push(n);
+  }
+  return [...new Set(out)];
+}
+
 /**
  * Why a step that handed off `blocked` is blocked. See the file comment for
  * the order. `handoff` is the step's own; `signals` what the watchers know.
@@ -253,6 +276,11 @@ export function classifyBlock(
         return { category: "resource", source: "declared", what: label ? `the ${label.replace(/^the\s+/i, "")}` : "a shared resource", ref: label ?? null, why: "the step says a shared resource is busy" };
       }
       case "dependency": {
+        const many = issueRefs(ref);
+        if (many.length > 1) {
+          const list = many.map((m) => `#${m}`).join(", ");
+          return { category: "dependency", source: "declared", what: list, ref: list, why: `the step says it waits on ${list}` };
+        }
         const n = issueRef(ref) ?? dependencyRefIn(prose);
         if (n != null) return { category: "dependency", source: "declared", what: `#${n}`, ref: `#${n}`, why: `the step says it waits on #${n}` };
         return { category: "dependency", source: "declared", what: ref ?? "another change", ref, why: "the step says it waits on another change" };
@@ -455,7 +483,7 @@ export function planWait(input: {
 /** It waits on a numbered issue or PR, which the queue watches on GitHub:
  *  such a wait has no timer and resumes only when that closes. */
 export function waitsOnIssue(w: Pick<PipelineBlockWait, "category" | "ref">): boolean {
-  return w.category === "dependency" && issueRef(w.ref) != null;
+  return w.category === "dependency" && issueRefs(w.ref).length > 0;
 }
 
 /**
@@ -549,7 +577,7 @@ export function waitLine(stepName: string, w: PipelineBlockWait, now: number, tr
   const n = w.endless && w.attempt >= w.max
       ? "re-checking until it clears"
       : `attempt ${Math.min(w.attempt + 1, max)} of ${max}`;
-  if (waitsOnIssue(w)) return `${stepName} ${WAIT_PHRASE[w.category](w)} — resumes when it is closed · ${n}`;
+  if (waitsOnIssue(w)) return `${stepName} ${WAIT_PHRASE[w.category](w)} — resumes when ${issueRefs(w.ref).length > 1 ? "they are" : "it is"} closed · ${n}`;
   const when = w.at != null ? `at ${clock(w.at, now)}` : "soon";
   return `${stepName} ${WAIT_PHRASE[w.category](w)} — retrying ${triggered ? `${TRIGGER_PHRASE(w)} or ` : ""}${when} · ${n}`;
 }

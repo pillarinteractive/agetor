@@ -726,7 +726,10 @@ export function publishWriterBrief(f: PublishFacts & { issueUrl: string | null; 
     "Do this, and only this:",
     `1. Rewrite the pull request's description so a reviewer can act on it without opening the card: Summary, Why, Impact, How it was verified, Review focus. ` +
       `Take it from the handoffs and reports above. Write it to a file and apply it with \`gh pr edit ${f.pr.number} --body-file <file>\`. ` +
-      `Keep the closing line the earlier steps chose${f.issueUrl ? ` for ${f.issueUrl}` : ""} (\`Fixes #n\` when the change completes the issue, \`Refs #n\` when it does not).`,
+      `Keep the closing line the earlier steps chose${f.issueUrl ? ` for ${f.issueUrl}` : ""} (\`Fixes #n\` when the change completes the issue, \`Refs #n\` when it does not). ` +
+      `A \`Refs\` line names what remains on the same line, after a dash, as a comma-separated list, each item with the issue that tracks it: ` +
+      `\`Refs #n — <item> (#m), <item> (#k)\`, for example \`Refs #867 — audit-retention qualification (#1794), owner approval of the role mapping (#1746)\`. ` +
+      `Say plainly whether each item is engineering work or evidence and approval only. Agetor reads that line to decide whether the issue can close (a bare \`Refs #n\` keeps it open for the owner).`,
     "2. If the acceptance criteria need mapping to evidence that the description does not carry, add ONE comment with it. Otherwise add none.",
     "",
     "Do not push, commit, merge, rebase or amend. Do not re-run or wait for CI: it has passed. Do not change code, and do not mark or merge the pull request. " +

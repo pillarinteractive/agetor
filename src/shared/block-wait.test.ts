@@ -19,6 +19,7 @@ import {
   waitLine,
   waitsOnIssue,
   selfFiledFollowup,
+  issueRefs,
   type BlockVerdict,
 } from "./block-wait.ts";
 import { normalizeHandoff, parseHandoff } from "./pipeline.ts";
@@ -393,4 +394,20 @@ test("a follow-up the card filed itself is recognised; an older, real dependency
   expect(f("Package the first offline native baseline", "see #9530 and #95")).toBeNull();
   expect(f("Bug (from #95): other", "")).toBeNull();
   expect(f("Resolve #953 conflicts", "", null)).toBeNull();
+});
+
+test("a wait on several issues: each is read, it has no timer, and it clears only when all are closed", () => {
+  expect(issueRefs("#1770, #1771, #1772")).toEqual([1770, 1771, 1772]);
+  expect(issueRefs("#1770–#1775")).toEqual([1770, 1771, 1772, 1773, 1774, 1775]);
+  expect(issueRefs("#12 and #14")).toEqual([12, 14]);
+  expect(issueRefs("#12")).toEqual([12]);
+  expect(issueRefs("#12, the lab")).toEqual([]);
+  expect(issueRefs("#1–#900")).toEqual([]);
+  expect(issueRefs(null)).toEqual([]);
+  const v = classifyBlock(handoff({ waitingOn: { on: "dependency", ref: "#1770, #1771 and #1772" } }));
+  expect(v).toMatchObject({ category: "dependency", source: "declared", what: "#1770, #1771, #1772", ref: "#1770, #1771, #1772" });
+  expect(waitsOnIssue(v as never)).toBe(true);
+  const w = planWait({ stepId: "review", taskId: "t1", verdict: v as never, reason: "waits on its bugs", config: DEFAULT_BLOCK_WAIT, now: NOW, rng: () => 0 });
+  expect(w.at).toBeNull();
+  expect(waitLine("Review", w, NOW)).toBe("Review waiting on #1770, #1771, #1772 — resumes when they are closed · attempt 1 of 4");
 });
