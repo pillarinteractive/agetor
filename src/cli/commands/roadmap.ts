@@ -18,6 +18,7 @@ import {
   type RoadmapStatus,
 } from "../../shared/roadmap.ts";
 import type { GitHubRepoMilestone } from "../../shared/types.ts";
+import type { RoadmapAuditRow } from "../../shared/canonical-roadmap.ts";
 import type { VelocityAnswer } from "../../shared/velocity.ts";
 import { parseVelocityArgs, velocityLines, velocityPath } from "./roadmap-velocity.ts";
 
@@ -31,6 +32,15 @@ import { parseVelocityArgs, velocityLines, velocityPath } from "./roadmap-veloci
  *   agetor roadmap why <issue|step>
  *   agetor roadmap continue [--always | --off | --not-now]
  *   agetor roadmap velocity [--scope current|roadmap] [--owner-delay <hours>]
+ *   agetor roadmap audit [--all]
+ *
+ * `audit` compares each open step's table predecessors with what its issue
+ * says it needs (src/shared/canonical-roadmap.ts `roadmapAudit`): issues it
+ * declares in its controlling list or says land first, which the step waits
+ * on even though the table leaves them out, and other open roadmap steps the
+ * issue only mentions (with `--all`; reported, never enforced). It exits 1
+ * when a step waits on a predecessor the table doesn't list, so the table
+ * can be fixed.
  *
  * `velocity` reports how fast the run is going (roadmap-velocity.ts):
  * throughput, cycle time, where the time goes, rework, slot utilisation,
@@ -57,7 +67,7 @@ import { parseVelocityArgs, velocityLines, velocityPath } from "./roadmap-veloci
  * whole roadmap. Everything goes through GET/PUT /autopilot.
  */
 const USAGE =
-  "usage: agetor roadmap status | start --project <dir> [--issue <n>] [--milestone <number|title-prefix|all>] [--max <n>] [--pipeline <id|name>] [--auto-continue] | pause | resolve <issue> --close|--redo | why <issue|step> | continue [--always|--off|--not-now] | velocity [--scope current|roadmap] [--owner-delay <hours>]";
+  "usage: agetor roadmap status | start --project <dir> [--issue <n>] [--milestone <number|title-prefix|all>] [--max <n>] [--pipeline <id|name>] [--auto-continue] | pause | resolve <issue> --close|--redo | why <issue|step> | continue [--always|--off|--not-now] | velocity [--scope current|roadmap] [--owner-delay <hours>] | audit [--all]";
 
 interface AutopilotDto {
   config: {
@@ -292,9 +302,35 @@ export function roadmapStatusLines(a: AutopilotDto): string[] {
     lines.push("", c.bold("Next waiting steps:"));
     for (const w of s.nextWaiting) lines.push(`  ${w.step}  #${w.issue} ${w.title}${c.dim(`  — ${w.reason ?? `waits on ${w.waitingOn.join(", ")}`}`)}`);
   }
+  const heldBugs = s.bugsHeld ?? [];
+  if (heldBugs.length) {
+    lines.push("", c.bold("Bugs waiting for their parent to land:"));
+    for (const b of heldBugs) lines.push(`  bug  #${b.issue} ${plain(b.title)}`, c.dim(`      ${plain(b.reason)}`));
+  }
   if (s.problems.length) {
     lines.push("", c.bold(`Roadmap problems (${s.problems.length}):`));
     for (const p of s.problems) lines.push(c.yellow(`  ${p.message}`));
+  }
+  return lines;
+}
+
+/** `agetor roadmap audit`: the status' audit rows, enforced first. Pure. */
+export function roadmapAuditLines(rows: RoadmapAuditRow[], all: boolean): string[] {
+  const enforced = rows.filter((r) => r.enforced);
+  const mentions = rows.filter((r) => !r.enforced);
+  const lines: string[] = [];
+  const ref = (r: RoadmapAuditRow) => `#${r.ref}${r.refStep ? ` (step ${r.refStep})` : ""} ${r.refState}`;
+  lines.push(c.bold(`Predecessors the table leaves out (${enforced.length}) — the step waits on them anyway:`));
+  if (!enforced.length) lines.push(c.dim("  none"));
+  for (const r of enforced) {
+    lines.push(`  ${r.step}  #${r.issue} ← ${ref(r)}`, c.dim(`      ${r.source === "declared" ? "declared in its controlling predecessor list" : `"${plain(r.quote)}"`}`));
+  }
+  if (all) {
+    lines.push("", c.bold(`Open roadmap steps the issue mentions but doesn't declare (${mentions.length}) — not enforced, check them:`));
+    if (!mentions.length) lines.push(c.dim("  none"));
+    for (const r of mentions) lines.push(`  ${r.step}  #${r.issue} mentions ${ref(r)}`, c.dim(`      "${plain(r.quote)}"`));
+  } else if (mentions.length) {
+    lines.push("", c.dim(`${mentions.length} mention${mentions.length === 1 ? "" : "s"} of open roadmap steps not declared as predecessors — agetor roadmap audit --all`));
   }
   return lines;
 }
@@ -336,6 +372,16 @@ export async function runRoadmap(client: Client, args: string[]): Promise<{ data
     const a = await client.call<AutopilotDto>("GET", "/autopilot");
     const s = a.config.roadmap ? currentRoadmapStatus(a.config, a.state.roadmap) : null;
     return { data: { ref: rest[0], step: s?.links ? findRoadmapLinks(s.links, rest[0]!).entry : null }, lines: roadmapWhyLines(a, rest[0]!) };
+  }
+  if (sub === "audit") {
+    if (rest.some((a) => a !== "--all")) throw new Error(USAGE);
+    const a = await client.call<AutopilotDto>("GET", "/autopilot");
+    const s = a.config.roadmap ? currentRoadmapStatus(a.config, a.state.roadmap) : null;
+    if (!s) throw new Error("no roadmap status yet — start the roadmap (agetor roadmap start) and wait for a pass");
+    const rows = s.audit ?? [];
+    const unmet = rows.filter((r) => r.enforced && r.refState !== "complete").length;
+    if (unmet > 0) process.exitCode = 1;
+    return { data: { rows, unmet }, lines: roadmapAuditLines(rows, rest.includes("--all")) };
   }
   if (sub === "velocity") {
     const a = await client.call<VelocityAnswer>("GET", velocityPath(parseVelocityArgs(rest, USAGE)));

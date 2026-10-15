@@ -6,6 +6,7 @@
  */
 import { run } from "./github.ts";
 import type { RoadmapIssueState } from "../shared/roadmap.ts";
+import type { ParentLanding } from "../shared/bug-lane.ts";
 import { createHash } from 'node:crypto';
 import { preferences } from './db.ts';
 import { assembleQueue, coverageIssues, type CanonicalQueue, type QueueSource, type SupplementalTask, type QueueSelection } from '../shared/canonical-roadmap.ts';
@@ -163,6 +164,49 @@ export async function loadRoadmapStates(project: string, numbers: number[]): Pro
     // carries the rest: use what it has.
     const part = parseStatesResponse(r.stdout);
     if (!part) return { error: `couldn't read the roadmap's issue states: ${(r.stderr || r.stdout).slice(-300)}` };
+    for (const [n, s] of part) out.set(n, s);
+  }
+  return out;
+}
+
+/** One query for whether each of up to `BATCH` issues or PRs has landed.
+ *  Pure; exported for tests. */
+export function landingQuery(numbers: number[]): string {
+  const fields = numbers.map((n) => `r${n}: issueOrPullRequest(number: ${n}) { __typename ... on Issue { number state stateReason } ... on PullRequest { number state merged } }`).join(" ");
+  return `query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) { ${fields} } }`;
+}
+
+/** landed: an issue closed as completed, or a merged PR; open: still open;
+ *  unlanded: closed any other way. A number GitHub couldn't resolve is left
+ *  out (the caller reads it as unknown). Null when the response is unusable.
+ *  Pure; exported for tests. */
+export function parseLandingResponse(stdout: string): Map<number, ParentLanding> | null {
+  let repo: unknown;
+  try {
+    repo = (JSON.parse(stdout) as { data?: { repository?: unknown } }).data?.repository;
+  } catch {
+    return null;
+  }
+  if (!repo || typeof repo !== "object") return null;
+  const out = new Map<number, ParentLanding>();
+  for (const v of Object.values(repo as Record<string, unknown>)) {
+    const i = v as { __typename?: unknown; number?: unknown; state?: unknown; stateReason?: unknown; merged?: unknown } | null;
+    if (!i || typeof i.number !== "number") continue;
+    if (i.state === "OPEN") out.set(i.number, "open");
+    else if (i.__typename === "PullRequest") out.set(i.number, i.merged === true ? "landed" : "unlanded");
+    else if (i.state === "CLOSED") out.set(i.number, i.stateReason === "COMPLETED" ? "landed" : "unlanded");
+  }
+  return out;
+}
+
+/** Whether each issue or PR has landed (src/shared/bug-lane.ts `bugParent`). */
+export async function loadLandings(project: string, numbers: number[]): Promise<Map<number, ParentLanding> | { error: string }> {
+  const unique = [...new Set(numbers)];
+  const out = new Map<number, ParentLanding>();
+  for (let i = 0; i < unique.length; i += BATCH) {
+    const r = await run(["gh", "api", "graphql", "-F", "owner={owner}", "-F", "name={repo}", "-f", `query=${landingQuery(unique.slice(i, i + BATCH))}`], project, 60_000, process.env);
+    const part = parseLandingResponse(r.stdout);
+    if (!part) return { error: `couldn't read whether the bugs' parents landed: ${(r.stderr || r.stdout).slice(-300)}` };
     for (const [n, s] of part) out.set(n, s);
   }
   return out;

@@ -49,7 +49,10 @@ export type RoadmapProblemKind =
   | "cycle"
   /** Not from the table alone: a step's milestone column and its issue's
    *  GitHub milestone disagree (reported when a milestone limits the run). */
-  | "milestone-mismatch";
+  | "milestone-mismatch"
+  /** Not from the table: the step's issue names a predecessor the table
+   *  leaves out (src/shared/canonical-roadmap.ts `roadmapAudit`). */
+  | "undeclared-predecessor";
 
 export interface RoadmapProblem {
   kind: RoadmapProblemKind;
@@ -263,7 +266,22 @@ export interface RoadmapStepView extends RoadmapStep {
   url: string | null;
 }
 
-export function roadmapStatus(parsed: ParsedRoadmap, states: ReadonlyMap<number, RoadmapIssueState>): RoadmapStepView[] {
+/**
+ * Each step's status. `extra`: issues a step's own issue says must land
+ * first and the table leaves out (src/shared/canonical-roadmap.ts
+ * `roadmapAudit`), by step issue — the step waits on each until it is closed
+ * as completed (a roadmap step by its step id, any other issue as `#n`;
+ * one whose state wasn't read counts as not landed). Pure.
+ */
+export function roadmapStatus(parsed: ParsedRoadmap, states: ReadonlyMap<number, RoadmapIssueState>, extra?: ReadonlyMap<number, readonly number[]>): RoadmapStepView[] {
+  const stepOf = new Map(parsed.steps.map((s) => [s.issue, s.step]));
+  const extraWaits = (s: RoadmapStep): string[] =>
+    (extra?.get(s.issue) ?? []).filter((n) => n !== s.issue).flatMap((n) => {
+      const step = stepOf.get(n);
+      if (step) return [step];
+      const st = states.get(n);
+      return st?.state === "CLOSED" && st.stateReason === "COMPLETED" ? [] : [`#${n}`];
+    });
   const closedAs = (s: RoadmapStep): "complete" | "declined" | null => {
     const st = states.get(s.issue);
     if (!st || st.state !== "CLOSED") return null;
@@ -275,7 +293,7 @@ export function roadmapStatus(parsed: ParsedRoadmap, states: ReadonlyMap<number,
     const base = { ...s, url: st?.url ?? null, human: s.human || (st?.labels ?? []).some((l) => l.toLowerCase() === MANUAL_LABEL) };
     const closed = closedAs(s);
     if (closed) return { ...base, status: closed, waitingOn: [], reason: null };
-    const waitingOn = s.predecessors.filter((p) => !done.has(p));
+    const waitingOn = [...new Set([...s.predecessors, ...extraWaits(s)])].filter((p) => !done.has(p));
     const reason = parsed.held[s.step] ?? (st ? null : `the state of #${s.issue} couldn't be read`);
     if (reason) return { ...base, status: "held" as const, waitingOn, reason };
     return { ...base, status: waitingOn.length === 0 ? ("ready" as const) : ("waiting" as const), waitingOn, reason: null };
@@ -923,6 +941,12 @@ export interface RoadmapStatus {
   nextMilestone?: RoadmapNextMilestone | null;
   /** The milestones this run continued into, latest last. */
   continued?: RoadmapContinued[];
+  /** What the issues of open steps say they need that the table leaves out
+   *  (src/shared/canonical-roadmap.ts `roadmapAudit`). Absent when none. */
+  audit?: import("./canonical-roadmap.ts").RoadmapAuditRow[];
+  /** Open bugs the bug lane holds back because the work they were filed
+   *  from hasn't landed (src/shared/bug-lane.ts). Absent when none. */
+  bugsHeld?: { issue: number; title: string; parent: number; reason: string }[];
 }
 
 const ref = (v: RoadmapStepView): RoadmapStepRef => ({ step: v.step, issue: v.issue, title: v.title, url: v.url });

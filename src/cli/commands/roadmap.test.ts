@@ -423,3 +423,30 @@ test("start --auto-continue starts with always continue on; without it the flag 
   expect(b.calls.at(-1)!.body).not.toHaveProperty("autoContinue");
   expect(plain.lines.join("\n")).toContain("the next milestone is offered when this one can no longer fill its slots");
 });
+
+test("audit prints what the table leaves out, sets exit code 1 when a step waits on it, and lists mentions with --all", async () => {
+  const audit = [
+    { step: "0.5", issue: 1454, ref: 1268, refStep: "0.4", source: "prose" as const, quote: "SRC03 #1268 merges before this task starts.", refState: "open" as const, enforced: true },
+    { step: "451", issue: 1266, ref: 1454, refStep: "0.5", source: "mention" as const, quote: "With ARC08 #1454 putting the Agent's sources on the host", refState: "open" as const, enforced: false },
+  ];
+  const bugsHeld = [{ issue: 1683, title: "Bug (from #1124): finding", parent: 1124, reason: "it was filed from #1124, which is still open — its code is not on the base branch yet" }];
+  const { client } = fakeClient({ ...dto(), state: { phase: "running", lastError: null, roadmap: { ...status, audit, bugsHeld } } } as ReturnType<typeof dto>);
+  const before = process.exitCode;
+  try {
+    const r = await runRoadmap(client, ["audit"]);
+    expect(process.exitCode).toBe(1);
+    const text = r.lines.join("\n");
+    expect(text).toContain("Predecessors the table leaves out (1)");
+    expect(text).toContain("0.5  #1454 ← #1268 (step 0.4) open");
+    expect(text).toContain('"SRC03 #1268 merges before this task starts."');
+    expect(text).toContain("1 mention of open roadmap steps not declared as predecessors — agetor roadmap audit --all");
+    expect(text).not.toContain("ARC08");
+    const all = (await runRoadmap(client, ["audit", "--all"])).lines.join("\n");
+    expect(all).toContain("451  #1266 mentions #1454 (step 0.5) open");
+    await expect(runRoadmap(client, ["audit", "--bogus"])).rejects.toThrow("usage");
+    // status shows the held bugs.
+    expect((await runRoadmap(client, ["status"])).lines.join("\n")).toContain("Bugs waiting for their parent to land:");
+  } finally {
+    process.exitCode = before;
+  }
+});

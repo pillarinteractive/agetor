@@ -437,6 +437,70 @@ test("bug lane: open bugs outside the roadmap start first, at most two, then the
   expect(g.log.done).toEqual(['bug-705']);
 });
 
+test("bug lane: a bug filed from another card's unlanded work waits for it, and the status says why", async () => {
+  const { assembleQueue } = await import('../shared/canonical-roadmap.ts');
+  const { roadmapPass } = await import('./autopilot.ts');
+  const { BUG_LANE_DEFAULT } = await import('../shared/bug-lane.ts');
+  const { createHash } = await import('node:crypto');
+  const table = '## Numbered completion order\n|Step|Task|Milestone|Predecessor steps|\n|---|---|---|---|\n|1|#1 Work|M09|none|';
+  const contract = '## Dependencies and required inputs\nThis is the sole controlling whole-task predecessor list.\nNone.'
+    + '\n### Conditional and action-specific input predicates\nNo additional conditional predicate is recorded.';
+  const states = new Map([[1, { ...OPEN, body: contract, updatedAt: 'current', url: 'https://github.com/o/r/issues/1', milestone: { number: 9, title: 'M09' } }]]);
+  const queue = assembleQueue({ body: table, states, membership: [1], supplements: [], sources: [], version: 'live-v1', hash: s => createHash('sha256').update(s).digest('hex') });
+  const landing = new Map<number, 'open' | 'landed'>([[1124, 'open']]);
+  const asked: number[][] = [];
+  const f = roadmapDeps({}, {
+    loadQueue: async () => ({ ...queue, states, body: table, url: 'https://github.com/o/r/issues/639' }),
+    runnerFree: () => 3,
+    bugs: async () => ({ config: BUG_LANE_DEFAULT, open: [
+      { number: 1683, title: 'Bug (from #1124): R1124-CI-LIVE-INPUTS — retained unresolved finding', labels: ['bug', 'follow-up'], body: '' },
+      { number: 1690, title: 'Crash on empty list', labels: ['bug'], body: 'Seen in CI.' },
+    ] }),
+    landings: async (_project, numbers) => { asked.push(numbers); return new Map(landing); },
+  });
+  const state = await roadmapState();
+  await roadmapPass({ ...roadmapCfg, maxInFlight: 8, roadmap: { issue: 639 } }, state, [], [], f.deps);
+  expect(asked).toEqual([[1124]]);
+  expect(f.log.started.map(s => s.number)).toEqual([1690, 1]);
+  expect(state.roadmap!.bugsHeld).toEqual([{ issue: 1683, title: 'Bug (from #1124): R1124-CI-LIVE-INPUTS — retained unresolved finding', parent: 1124,
+    reason: 'it was filed from #1124, which is still open — its code is not on the base branch yet' }]);
+
+  // #1124 closes as completed (its PR merged): the bug starts.
+  landing.set(1124, 'landed');
+  f.log.started.length = 0;
+  const running = [roadmapCard('new-1690', 1690, 'running', { pipelineRun: RUNNING_RUN }), roadmapCard('new-1', 1, 'running', { pipelineRun: RUNNING_RUN })];
+  await roadmapPass({ ...roadmapCfg, maxInFlight: 8, roadmap: { issue: 639 } }, state, running, [], f.deps);
+  expect(f.log.started.map(s => s.number)).toEqual([1683]);
+  expect(state.roadmap!.bugsHeld).toBeUndefined();
+});
+
+test("roadmap: a step waits on a predecessor its issue declares or says lands first, even when the table leaves it out", async () => {
+  const { roadmapPass } = await import("./autopilot.ts");
+  const table = '## Numbered completion order\n|Step|Task|Milestone|Predecessor steps|\n|---|---|---|---|\n|1|#21 Producer|M01|none|\n|2|#22 Consumer|M01|none|\n|3|#23 Other|M01|none|';
+  const body = (s: string) => ({ ...OPEN, body: s });
+  const states: Record<number, typeof OPEN & { body?: string }> = {
+    21: body(''),
+    22: body('SRC03 #21 (the producer, PR #90) merges before this task starts.'),
+    23: body('Needs #77 merged? #77 lands before this task.'),
+  };
+  const extra: number[][] = [];
+  const { deps, log } = roadmapDeps(states, { loadTracker: async () => ({ body: table, url: 'https://github.com/o/r/issues/600' }) });
+  const load = deps.loadStates;
+  deps.loadStates = async (project, numbers) => {
+    if (numbers.includes(77)) { extra.push(numbers); return new Map([[77, { ...OPEN }]]); }
+    return load(project, numbers);
+  };
+  const state = await roadmapState();
+  await roadmapPass({ ...roadmapCfg, maxInFlight: 8 }, state, [], [], deps);
+  expect(extra).toEqual([[77]]);
+  expect(log.started.map((s) => s.number)).toEqual([21]);
+  expect(state.roadmap!.problems.filter((p) => p.kind === 'undeclared-predecessor').map((p) => p.message)).toEqual([
+    'step 2 (#22) waits on #21 (step 1): its issue says "SRC03 #21 (the producer, PR #90) merges before this task starts.", but the table doesn\'t list it',
+    'step 3 (#23) waits on #77: its issue says "#77 lands before this task.", but the table doesn\'t list it',
+  ]);
+  expect(state.roadmap!.audit!.map((r) => [r.step, r.ref, r.enforced])).toEqual([['2', 21, true], ['3', 77, true]]);
+});
+
 test("roadmap: starts the ready agent steps in step order; the human step is announced once, never started", async () => {
   const { roadmapPass } = await import("./autopilot.ts");
   const state = await roadmapState();

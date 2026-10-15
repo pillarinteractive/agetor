@@ -44,14 +44,14 @@ import { currentSlots } from './step-slots.ts';
 import {reviewApprovalMatches} from '../shared/pipeline.ts';
 import {approvedHeadFor} from '../shared/publish.ts';
 import { freezeCardInputs, queueValidator } from './queue-validation.ts';
-import type { CanonicalQueue } from '../shared/canonical-roadmap.ts';
+import { auditPrerequisites, roadmapAudit, type CanonicalQueue } from '../shared/canonical-roadmap.ts';
 import { holdsAutopilotSlot, neverStarted, PROGRESSING_COLUMNS, signOffMarkLapsed, waitingOnQuota, type SignOffMark } from "../shared/autopilot.ts";
 import { formatRetryTime, isQuotaPaused } from "./usage-limit.ts";
 import { listLeases } from "./lease-watch.ts";
 import { blockedCardLine } from "../shared/block-reason.ts";
-import { loadCanonicalQueue, loadRoadmapStates, loadRoadmapTracker } from "./roadmap-fetch.ts";
+import { loadCanonicalQueue, loadLandings, loadRoadmapStates, loadRoadmapTracker } from "./roadmap-fetch.ts";
 import { recordVelocityPass, type VelocityPassInput } from "./roadmap-velocity.ts";
-import { BUG_LANE_PREF, bugCardPrompt, parseBugLane, pickBugs, type BugIssue, type BugLaneConfig } from "../shared/bug-lane.ts";
+import { BUG_LANE_PREF, bugCardPrompt, bugParent, parseBugLane, pickBugs, type BugIssue, type BugLaneConfig, type ParentLanding } from "../shared/bug-lane.ts";
 import {
   currentRoadmapStatus,
   displayText,
@@ -111,6 +111,8 @@ const FALLBACK_MS = 15 * 60_000;
  *  Review / Ready to Merge / Done don't. */
 export const BUILDING = new Set<Task["column"]>(["backlog", "ready", "running", "blocked"]);
 const QUIET_MS = 20 * 60_000;
+/** Mention rows of the roadmap audit kept in the saved status. */
+const MAX_AUDIT_MENTIONS = 150;
 /** Retry sooner when the thread is just open in Codex Desktop. */
 const BUSY_MS = 5 * 60_000;
 
@@ -985,6 +987,8 @@ export interface RoadmapDeps {
   /** The bug lane (src/shared/bug-lane.ts): its settings and the open
    *  issues with its label, or null when the lane is off. */
   bugs?(project: string): Promise<{ config: BugLaneConfig; open: BugIssue[] } | { error: string } | null>;
+  /** Whether each bug's parent issue or PR has landed. Absent: not checked. */
+  landings?(project: string, numbers: number[]): Promise<Map<number, ParentLanding> | { error: string }>;
   /** Create a card for the issue and start it. */
   startCard(input: { dir: string; number: number; pipelineId: string; extraPrompt: string;validate?:()=>Promise<string|null>;onCreated?:(task:Task)=>void }): Promise<{ task: Task } | { error: string }>;
   /** Create a card for the issue in the Backlog, not started. */
@@ -1115,9 +1119,22 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
     state.roadmap = summarizeRoadmap({ issue: tracker, url: doc.url, parsed, views: [], busy: new Set(), needsUser: new Map(), now: deps.now() });
     return fail(`roadmap #${tracker}: ${parsed.error}`);
   }
-  const states = queue?.states ?? await deps.loadStates(cfg.project, parsed.steps.map((s) => s.issue));
-  if ("error" in states) return fail(states.error);
-  const views = roadmapStatus(parsed, states);
+  const read = queue?.states ?? await deps.loadStates(cfg.project, parsed.steps.map((s) => s.issue));
+  if ("error" in read) return fail(read.error);
+  // What each step's issue says it needs and the table leaves out: those it
+  // declares or says land first are enforced; the issues that aren't steps
+  // are read too (unread, they count as not landed).
+  let states: ReadonlyMap<number, RoadmapIssueState> = read;
+  let audit = roadmapAudit(parsed.steps, states);
+  const unread = [...new Set(audit.filter((r) => r.enforced && !states.has(r.ref)).map((r) => r.ref))];
+  if (unread.length > 0) {
+    const more = await deps.loadStates(cfg.project, unread).catch(() => null);
+    if (more && !("error" in more)) {
+      states = new Map([...read, ...more]);
+      audit = roadmapAudit(parsed.steps, states);
+    }
+  }
+  const views = roadmapStatus(parsed, states, auditPrerequisites(audit));
   const viewByIssue = new Map(views.map((v) => [v.issue, v]));
   const openSteps = views.filter(isOpenStep);
   const openByIssue = new Map(openSteps.map((v) => [v.issue, v]));
@@ -1358,6 +1375,7 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
   const startedIds = new Map<number, string>();
 
   const bugsNeedYou: RoadmapStatus["needsUser"] = [];
+  const bugsHeld: NonNullable<RoadmapStatus["bugsHeld"]> = [];
   // The bug lane: open `bug` issues outside the roadmap start first, a few
   // at a time (src/shared/bug-lane.ts). They take slots the roadmap would.
   if (fullQueue && deps.bugs && pipelineId && !quotaWait && free > 0 && !deps.outdated()) {
@@ -1369,7 +1387,18 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
       const finished = (t: Task) => !live(t) || t.pipelineRun?.status === "done";
       const cards = projectCards.flatMap((t) => { const n = issueOf(t); return n == null ? [] : [{ issue: n, live: !finished(t) }]; });
       const roadmapIssues = new Set(views.map((v) => v.issue));
-      const pick = pickBugs({ open: found.open, config: found.config, roadmap: roadmapIssues, cards, free });
+      // A bug filed from another card's work waits for that work to land.
+      const withCard = new Set(cards.map((c) => c.issue));
+      const parentsOf = found.open.filter((b) => !withCard.has(b.number) && !roadmapIssues.has(b.number)).map(bugParent).filter((n): n is number => n != null);
+      let parents: Map<number, ParentLanding> | undefined;
+      if (deps.landings) {
+        const got = parentsOf.length > 0 ? await deps.landings(cfg.project, parentsOf).catch((e: unknown) => ({ error: String(e) })) : new Map<number, ParentLanding>();
+        // Unreadable: every bug with a parent waits (read as unknown).
+        if ("error" in got) error ??= `bug lane: ${got.error}`;
+        parents = "error" in got ? new Map() : got;
+      }
+      const pick = pickBugs({ open: found.open, config: found.config, roadmap: roadmapIssues, cards, free, parents });
+      bugsHeld.push(...pick.held);
       // Autopilot's cards outside the roadmap (the bug lane's) that finished
       // without a PR and whose issue has since closed are done.
       const settled = projectCards.filter((t) => {
@@ -1546,6 +1575,23 @@ export async function roadmapPass(cfg: AutopilotConfig, state: AutopilotState, a
     }
   }
   if (bugsNeedYou.length > 0) status.needsUser = [...status.needsUser, ...bugsNeedYou];
+  if (bugsHeld.length > 0) status.bugsHeld = bugsHeld;
+  if (audit.length > 0) {
+    // Mentions are only for the owner to check, and a big roadmap has
+    // thousands: keep those of steps that can start or are running.
+    const live = new Set(views.filter((v) => v.status === "ready").map((v) => v.step));
+    const mentions = audit.filter((r) => !r.enforced && live.has(r.step)).slice(0, MAX_AUDIT_MENTIONS);
+    status.audit = [...audit.filter((r) => r.enforced), ...mentions];
+    const unmet = audit.filter((r) => r.enforced && r.refState !== "complete");
+    status.problems = [
+      ...status.problems,
+      ...unmet.map((r) => ({
+        kind: "undeclared-predecessor" as const,
+        step: r.step,
+        message: `step ${r.step} (#${r.issue}) waits on #${r.ref}${r.refStep ? ` (step ${r.refStep})` : ""}: ${r.source === "declared" ? "its issue declares it" : `its issue says "${r.quote}"`}, but the table doesn't list it`,
+      })),
+    ];
+  }
   state.roadmap = status;
   state.lastError = error ?? (queue?.errors.length ? queue.errors.join('; ') : null);
 
@@ -1856,16 +1902,17 @@ export const ROADMAP_DEPS: RoadmapDeps = {
   async bugs(project) {
     const config = parseBugLane(preferences.get(BUG_LANE_PREF));
     if (!config) return null;
-    const r = await run(["gh", "issue", "list", "--state", "open", "--label", config.label, "--json", "number,title,labels", "--limit", "100"], project, 30_000, process.env);
+    const r = await run(["gh", "issue", "list", "--state", "open", "--label", config.label, "--json", "number,title,labels,body", "--limit", "100"], project, 30_000, process.env);
     if (!r.ok) return { error: (r.stderr || r.stdout || "gh issue list failed").trim().slice(-200) };
     try {
-      const open = (JSON.parse(r.stdout) as { number: number; title: string; labels: { name: string }[] }[])
-        .map((i) => ({ number: i.number, title: i.title, labels: i.labels.map((l) => l.name) }));
+      const open = (JSON.parse(r.stdout) as { number: number; title: string; labels: { name: string }[]; body?: string }[])
+        .map((i) => ({ number: i.number, title: i.title, labels: i.labels.map((l) => l.name), body: i.body ?? "" }));
       return { config, open };
     } catch {
       return { error: "gh issue list returned unreadable JSON" };
     }
   },
+  landings: loadLandings,
   aheadCount: (t) => NO_WORK_DEPS.aheadCount(t),
   hasNoPr: (t) => NO_WORK_DEPS.hasNoPr(t),
   mergedPr: (t) => {

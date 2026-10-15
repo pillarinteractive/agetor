@@ -424,7 +424,12 @@ export function planWait(input: {
     ...(endless ? { endless: true as const } : {}),
   };
   const stretch = 1 + config.jitter * Math.min(0.999, Math.max(0, (input.rng ?? Math.random)()));
+  // Waiting on a named issue or PR: only GitHub reporting it closed (or the
+  // owner's retry) resumes the step — a timer would only re-run the step to
+  // find it still open. Its attempts are not spent while it waits.
+  const watched = waitsOnIssue(verdict);
   if (endless) {
+    if (watched) return base;
     const spentOut = attempt >= max || attempt >= config.maxResumes || backoff.length === 0;
     const minutes = spentOut ? config.longBackoffMin : backoff[Math.min(attempt, backoff.length - 1)]!;
     return { ...base, at: now + Math.round(minutes * 60_000 * stretch) };
@@ -442,8 +447,15 @@ export function planWait(input: {
         : `still waiting after ${fmtSpan(now - since)}`,
     };
   }
+  if (watched) return base;
   const delay = backoff[Math.min(attempt, backoff.length - 1)]! * 60_000;
   return { ...base, at: Math.min(now + Math.round(delay * stretch), deadline) };
+}
+
+/** It waits on a numbered issue or PR, which the queue watches on GitHub:
+ *  such a wait has no timer and resumes only when that closes. */
+export function waitsOnIssue(w: Pick<PipelineBlockWait, "category" | "ref">): boolean {
+  return w.category === "dependency" && issueRef(w.ref) != null;
 }
 
 /** Whether the queue can tell, without resuming the step, that what it
@@ -511,6 +523,7 @@ export function waitLine(stepName: string, w: PipelineBlockWait, now: number, tr
   const n = w.endless && w.attempt >= w.max
       ? "re-checking until it clears"
       : `attempt ${Math.min(w.attempt + 1, max)} of ${max}`;
+  if (waitsOnIssue(w)) return `${stepName} ${WAIT_PHRASE[w.category](w)} — resumes when it is closed · ${n}`;
   const when = w.at != null ? `at ${clock(w.at, now)}` : "soon";
   return `${stepName} ${WAIT_PHRASE[w.category](w)} — retrying ${triggered ? `${TRIGGER_PHRASE(w)} or ` : ""}${when} · ${n}`;
 }

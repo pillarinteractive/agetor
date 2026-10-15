@@ -132,6 +132,9 @@ describe("a card's time, split into phases", () => {
     const retried = cardWindow(base([say(20, "Build crashed (exit 1) — retrying automatically at 9:50 AM (1 of 3)")]), at(60))!;
     expect(mins(retried.phases.other)).toBe(30);
     expect(retried.phases.owner).toBeUndefined();
+    // A wait on a numbered issue has no retry time: it resumes when the issue closes.
+    const watched = cardWindow(base([say(20, "Build waiting on #41 — resumes automatically when it is closed · attempt 1 of 4 (the step says it waits on #41)")]), at(60))!;
+    expect(watched.phases.owner).toBeUndefined();
   });
 
   test("no owner holds: a stop the ladder resolves is not the owner's time, and its wording is what the ledger reads", async () => {

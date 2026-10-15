@@ -228,15 +228,20 @@ test("stepRole reads Build, Review and Finish from the name or id", () => {
 
 const verdict = (category: "dependency" | "unknown") => ({ category, source: "declared" as const, what: "#77", ref: "#77", why: "w" });
 
-test("a dependency wait no longer escalates at 24 hours when holds are resolved; it is re-checked at the long interval", () => {
+test("a dependency wait no longer escalates at 24 hours when holds are resolved; it waits for its issue to close, or is re-checked at the long interval", () => {
   const now = 1_000_000;
   const spent = { stepId: "s", taskId: "t", category: "dependency" as const, source: "declared" as const, what: "#77", ref: "#77", reason: "r", state: "resuming" as const, since: now - 30 * 3_600_000, attempt: 4, max: 4, at: null, deadline: now - 6 * 3_600_000, tried: [] };
   const endless = planWait({ stepId: "s", taskId: "t", verdict: verdict("dependency"), reason: "waits on #77", prev: spent, config: DEFAULT_BLOCK_WAIT, now, rng: () => 0, endless: true });
   expect(endless.state).toBe("waiting");
   expect(endless.deadline).toBe(NO_DEADLINE);
   expect(endless.endless).toBe(true);
-  expect(endless.at).toBe(now + DEFAULT_BLOCK_WAIT.longBackoffMin * 60_000);
-  expect(waitLine("Build", endless, now, true)).toContain("re-checking until it clears");
+  // #77 is watched on GitHub: no timer at all.
+  expect(endless.at).toBeNull();
+  expect(waitLine("Build", endless, now, true)).toBe("Build waiting on #77 — resumes when it is closed · re-checking until it clears");
+  // Base-branch CI has no issue to watch closing: the long interval.
+  const ci = planWait({ stepId: "s", taskId: "t", verdict: { ...verdict("dependency"), what: "develop's CI", ref: "base-ci" }, reason: "r", prev: { ...spent, ref: "base-ci" }, config: DEFAULT_BLOCK_WAIT, now, rng: () => 0, endless: true });
+  expect(ci.at).toBe(now + DEFAULT_BLOCK_WAIT.longBackoffMin * 60_000);
+  expect(waitLine("Build", ci, now, true)).toContain("re-checking until it clears");
   // Today's behaviour without it (and for what does not clear by itself).
   expect(planWait({ stepId: "s", taskId: "t", verdict: verdict("dependency"), reason: "r", prev: spent, config: DEFAULT_BLOCK_WAIT, now }).state).toBe("escalated");
   expect(planWait({ stepId: "s", taskId: "t", verdict: verdict("unknown"), reason: "r", prev: { ...spent, category: "unknown", attempt: 3, max: 3 }, config: DEFAULT_BLOCK_WAIT, now, endless: true }).state).toBe("escalated");

@@ -17,6 +17,7 @@ import {
   waitHasTrigger,
   waitingInQueue,
   waitLine,
+  waitsOnIssue,
   type BlockVerdict,
 } from "./block-wait.ts";
 import { normalizeHandoff, parseHandoff } from "./pipeline.ts";
@@ -311,6 +312,22 @@ describe("planWait", () => {
     });
   });
 
+  test("a wait on a numbered issue or PR has no timer and spends no attempt while it waits", () => {
+    const dep = (ref: string | null) => ({ ...verdict("dependency"), what: ref ?? "another change", ref });
+    const at = (ref: string | null, endless = false, prev: PipelineBlockWait | null = null, now = NOW) =>
+      planWait({ stepId: "build", taskId: "t1", verdict: dep(ref), reason: "waits on #1662 to merge", prev, config: DEFAULT_BLOCK_WAIT, now, rng: () => 0, endless });
+    expect(at("#1662")).toMatchObject({ state: "waiting", at: null, attempt: 0, max: 4 });
+    expect(at("#1662", true)).toMatchObject({ state: "waiting", at: null, deadline: Number.MAX_SAFE_INTEGER });
+    // Even after its retries are spent, endless re-checks are GitHub's, not a timer's.
+    expect(at("#1662", true, { ...at("#1662", true), state: "resuming", attempt: 4 })).toMatchObject({ state: "waiting", at: null, attempt: 4 });
+    // Not endless: the owner still gets it at the deadline.
+    expect(at("#1662", false, { ...at("#1662"), state: "resuming", attempt: 1 }, NOW + 25 * 60 * MIN)).toMatchObject({ state: "escalated" });
+    // CI on the base branch and an unnamed change keep their timers.
+    expect(at("base-ci").at).toBe(NOW + 30 * MIN);
+    expect(at(null).at).toBe(NOW + 30 * MIN);
+    expect([waitsOnIssue({ category: "dependency", ref: "#7" }), waitsOnIssue({ category: "dependency", ref: "PR 7" }), waitsOnIssue({ category: "dependency", ref: "base-ci" }), waitsOnIssue({ category: "resource", ref: "#7" })]).toEqual([true, true, false, false]);
+  });
+
   test("the reason is one capped line", () => {
     const w = planWait({ stepId: "s", taskId: "t", verdict: verdict("unknown"), reason: `- first point ${"x".repeat(400)}\n- second point`, config: DEFAULT_BLOCK_WAIT, now: NOW, rng: () => 0 });
     expect(w.reason.startsWith("first point x")).toBe(true);
@@ -326,7 +343,8 @@ describe("reading the queue", () => {
   test("the status line says what it waits on, when it is retried, and which attempt", () => {
     expect(waitLine("Build", w({ category: "resource", what: "the lab", ref: "lab", max: 3, attempt: 1, at: NOW + 40 * MIN }), NOW, true)).toBe("Build waiting for the lab — retrying when it frees or at 3:40 PM · attempt 2 of 3");
     expect(waitLine("Build", w({ category: "resource", what: "a slot", max: 6, at: NOW + 10 * MIN }), NOW)).toBe("Build waiting for a slot — retrying at 3:10 PM · attempt 1 of 6");
-    expect(waitLine("Finish", w({ category: "dependency", what: "#41", ref: "#41", max: 4, at: NOW + 30 * MIN }), NOW, true)).toBe("Finish waiting on #41 — retrying when it lands or at 3:30 PM · attempt 1 of 4");
+    // A numbered issue or PR has no timer, even on an entry an older build parked with one.
+    expect(waitLine("Finish", w({ category: "dependency", what: "#41", ref: "#41", max: 4, at: NOW + 30 * MIN }), NOW, true)).toBe("Finish waiting on #41 — resumes when it is closed · attempt 1 of 4");
     expect(waitLine("Finish", w({ category: "dependency", what: "develop's CI", ref: "base-ci", max: 4, at: NOW + 30 * MIN }), NOW, true)).toBe("Finish waiting on develop's CI — retrying when it passes or at 3:30 PM · attempt 1 of 4");
     expect(waitLine("Build", w({ category: "environment", max: 4, at: NOW + MIN }), NOW)).toBe("Build hit a transient failure — retrying at 3:01 PM · attempt 1 of 4");
     expect(waitLine("Build", w({ category: "limit", at: NOW + 15 * MIN }), NOW)).toBe("Build waiting on a usage limit — retrying at 3:15 PM · attempt 1 of 3");

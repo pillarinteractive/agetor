@@ -76,6 +76,7 @@ import {
   planWait,
   triedLine,
   waitHasTrigger,
+  waitsOnIssue,
   waitLine,
   type BlockSignals,
   type BlockVerdict,
@@ -802,7 +803,7 @@ function scheduleBlockWait(
     kind: "step",
     // "retrying automatically": what the velocity ledger reads as a wait
     // that isn't the owner's (src/shared/velocity.ts).
-    text: `${line.replace(" — retrying ", " — retrying automatically ")} (${verdict.why})`,
+    text: `${line.replace(" — retrying ", " — retrying automatically ").replace(" — resumes when ", " — resumes automatically when ")} (${verdict.why})`,
     tone: "info",
   });
   return category;
@@ -1038,7 +1039,9 @@ export async function releaseBlockWaits(now = Date.now()): Promise<number> {
       continue;
     }
     const trigger = await waitTriggerState(t, w, now);
-    const due = w.at != null && now >= w.at;
+    // A wait on a numbered issue or PR has no timer (`planWait`); an entry
+    // parked by an older build may still carry one, which is ignored.
+    const due = w.at != null && now >= w.at && !waitsOnIssue(w);
     const lastTried = w.tried[w.tried.length - 1]?.at ?? 0;
     const triggered = trigger.state === "cleared" && now - lastTried >= TRIGGER_MIN_GAP_MS;
     if (!due && !triggered) continue;

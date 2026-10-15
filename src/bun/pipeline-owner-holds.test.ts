@@ -316,7 +316,7 @@ test("a Stop the user pressed is never resumed by the ladder, until a person sta
   await settled(parentId, (r) => r.ladder?.userStop == null && r.wait?.state === "waiting");
 });
 
-test("an unattended dependency wait is never escalated at 24 hours: it is re-checked at the long interval", async () => {
+test("an unattended dependency wait is never escalated at 24 hours: it waits for its issue to close, with no timer", async () => {
   const { releaseBlockWaits, blockWaitDeps } = await import("./pipeline-runner.ts");
   await stubs();
   process.env.AGETOR_FAKE_CLAUDE_BLOCKED_REASON = "waiting for #77 to merge";
@@ -328,7 +328,8 @@ test("an unattended dependency wait is never escalated at 24 hours: it is re-che
   expect(await releaseBlockWaits(Date.now() + 25 * HOUR)).toBe(0);
   const later = await runOf(parentId);
   expect(later.wait?.state).toBe("waiting");
-  expect(later.wait?.at).toBeGreaterThan(Date.now() + 25 * HOUR);
+  expect(later.wait?.at).toBeNull();
+  expect(later.wait?.attempt).toBe(0);
   expect(activity(parentId).some((l) => l.includes("left for you"))).toBe(false);
 });
 

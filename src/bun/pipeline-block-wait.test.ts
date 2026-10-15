@@ -326,11 +326,11 @@ test("waiting for a watched lease: no resume is spent while it is held; the step
   expect(activity(parentId)).toContain("Resumed Build in its own session to check its block — the rig is free (automatic retry 1 of 6)");
 });
 
-test("waiting for another change: resumed when the issue it names is closed, not before", async () => {
+test("waiting for another change: resumed when the issue it names is closed, never on a timer", async () => {
   const { tasks } = await import("./db.ts");
   const { releaseBlockWaits, blockWaitDeps } = await import("./pipeline-runner.ts");
   await noJitter();
-  let state: "open" | "closed" = "open";
+  let state: "open" | "closed" | "unknown" = "open";
   const asked: number[] = [];
   blockWaitDeps.refState = async (_project, n) => {
     asked.push(n);
@@ -340,16 +340,22 @@ test("waiting for another change: resumed when the issue it names is closed, not
   process.env.AGETOR_FAKE_CLAUDE_BLOCKED_WAITING = JSON.stringify({ waitingOn: "dependency", waitingRef: "#41" });
   const { parentId } = await startBuildReview("blocked-then-Review");
   const w = (await blockedRun(parentId, parked(0))).wait!;
-  expect(w).toMatchObject({ category: "dependency", source: "declared", what: "#41", ref: "#41", max: 4 });
-  expect(Math.round((w.at! - w.since) / MIN)).toBe(30);
+  expect(w).toMatchObject({ category: "dependency", source: "declared", what: "#41", ref: "#41", max: 4, at: null });
+  expect(activity(parentId).some((l) => l.startsWith("Build waiting on #41 — resumes automatically when it is closed · attempt 1 of 4"))).toBe(true);
 
   expect(await releaseBlockWaits(w.since + 1 * MIN)).toBe(0);
-  expect(await releaseBlockWaits(w.at! + 1)).toBe(0); // due, but #41 is still open
+  expect(await releaseBlockWaits(w.since + 31 * MIN)).toBe(0); // the old 30-minute timer is gone; #41 is still open
+  // An entry an older build parked with a timer: the timer is ignored, and so
+  // is GitHub not answering.
+  const run = tasks.get(parentId)!.pipelineRun!;
+  tasks.update(parentId, { pipelineRun: { ...run, wait: { ...run.wait!, at: w.since + 30 * MIN } } });
+  state = "unknown";
+  expect(await releaseBlockWaits(w.since + 40 * MIN)).toBe(0);
   expect(tasks.get(parentId)!.pipelineRun!.wait).toMatchObject({ state: "waiting", attempt: 0 });
   expect(asked.every((n) => n === 41)).toBe(true);
 
   state = "closed";
-  expect(await releaseBlockWaits(w.at! + 5 * MIN)).toBe(1); // (the lookup is cached for two minutes)
+  expect(await releaseBlockWaits(w.since + 45 * MIN)).toBe(1); // (the lookup is cached for two minutes)
   await waitFor(() => tasks.get(parentId)?.pipelineRun?.status === "done");
   expect(activity(parentId)).toContain("Resumed Build in its own session to check its block — #41 is closed (automatic retry 1 of 4)");
 });

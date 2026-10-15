@@ -1,7 +1,7 @@
 import {test,expect} from 'bun:test';
 import {readFileSync} from 'node:fs';
 import {createHash} from 'node:crypto';
-import {assembleQueue,canonicalIssue,controllingInputs,coverageIssues,type QueueSelection} from './canonical-roadmap.ts';
+import {assembleQueue,auditPrerequisites,canonicalIssue,controllingInputs,coverageIssues,issuePrerequisites,roadmapAudit,type QueueSelection} from './canonical-roadmap.ts';
 import {parseRoadmap,pickRoadmap,roadmapStatus,type RoadmapIssueState} from './roadmap.ts';
 
 const fixture=(n:string)=>readFileSync(new URL('./fixtures/queue-639/'+n,import.meta.url),'utf8');
@@ -88,4 +88,45 @@ test('inconsistent membership cannot publish ready identities; duplicate baselin
  expect(duplicated.records.filter(r=>r.issue===1)).toHaveLength(1);
  expect(duplicated.records.find(r=>r.issue===1)!.hold).toContain('duplicate');
  expect(roadmapStatus(duplicated.parsed,st).find(s=>s.issue===1)!.status).toBe('held');
+});
+
+const DEPS=(...ns:number[])=>`## Dependencies and required inputs\n\nThis is the sole controlling whole-task predecessor list.\n${ns.map(n=>`- #${n} (input)`).join('\n')||'None.'}\n\n## Acceptance\n`;
+
+test('an issue\'s prerequisites: its controlling list and sentences that say another issue lands first',()=>{
+  // The sentences are #1454's own.
+  const body=DEPS(1351,1349)+'SRC03 #1268 (network counter validity, PR #1389) merges before this task starts. #844 is upstream of this task. Option 2 waits on #977 and needs #1168.';
+  expect(issuePrerequisites(body,1454).map(p=>[p.issue,p.source])).toEqual([[1351,'declared'],[1349,'declared'],[1268,'prose'],[844,'prose']]);
+  expect(issuePrerequisites(body,1454)[2]!.quote).toBe('SRC03 #1268 (network counter validity, PR #1389) merges before this task starts.');
+  expect(issuePrerequisites('No controlling list. #5 merges before this task.',5)).toEqual([]);
+});
+
+test('the roadmap audit: what an issue needs that the table leaves out is enforced; other open steps it mentions are only reported',()=>{
+  const parsed=parseRoadmap(['## Numbered completion order','','| Step | Task | Milestone | Predecessor steps |','| --- | --- | --- | --- |',
+    '| 1 | #10 Producer | M | none |','| 2 | #11 Prereq | M | none |','| 3 | #12 Consumer | M | 1 |','| 4 | #13 Successor | M | 3 |'].join('\n'));
+  expect(parsed.error).toBeNull();
+  const open=(body='')=>({state:'OPEN' as const,stateReason:null,body});
+  const states=new Map<number,RoadmapIssueState>([
+    [10,open()],[11,open()],[13,open()],
+    [12,open(DEPS(10)+'#11 merges before this task starts. #99 lands before this task. With #13 downstream, see also #11.')],
+    [99,{state:'CLOSED',stateReason:'COMPLETED'}],
+  ]);
+  const rows=roadmapAudit(parsed.steps,states);
+  expect(rows.map(r=>[r.step,r.ref,r.source,r.refState,r.enforced])).toEqual([[ '3',11,'prose','open',true],['3',99,'prose','complete',true]]);
+  // #13 is its successor and #10 its table predecessor: neither is a mention.
+  const views=roadmapStatus(parsed,states,auditPrerequisites(rows));
+  expect(views.find(v=>v.step==='3')).toMatchObject({status:'waiting',waitingOn:['1','2']});
+  states.set(10,{state:'CLOSED',stateReason:'COMPLETED'});
+  states.set(11,{state:'CLOSED',stateReason:'COMPLETED'});
+  expect(roadmapStatus(parsed,states,auditPrerequisites(roadmapAudit(parsed.steps,states))).find(v=>v.step==='3')).toMatchObject({status:'ready',waitingOn:[]});
+  // A prerequisite that isn't a step and wasn't read counts as not landed.
+  states.delete(99);
+  expect(roadmapStatus(parsed,states,auditPrerequisites(roadmapAudit(parsed.steps,states))).find(v=>v.step==='3')).toMatchObject({status:'waiting',waitingOn:['#99']});
+  // A mention of an open step that is neither predecessor nor successor.
+  // (#10 mentioning #12 is not one: #12 is its successor.)
+  states.set(10,open('Feeds #12.'));
+  states.set(11,open('With #12 putting the sources on the host, the composition is the obvious candidate.'));
+  const audit=roadmapAudit(parsed.steps,states);
+  expect(audit.filter(r=>r.issue!==12).map(r=>[r.step,r.ref,r.refStep,r.source,r.enforced])).toEqual([['2',12,'3','mention',false]]);
+  expect(audit.find(r=>r.issue===11)!.quote).toBe('With #12 putting the sources on the host, the composition is the obvious candidate.');
+  expect(roadmapStatus(parsed,states,auditPrerequisites(audit)).find(v=>v.step==='2')!.status).toBe('ready');
 });

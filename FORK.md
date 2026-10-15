@@ -1939,3 +1939,29 @@ run can produce; each Review sent it back again, and the loop burned the step ca
 - **State**: `run.noChangeLoop` (`reviewed`, `key`, `rounds`, `instructedAt`, `wrappedAt`), kept by the run sanitizer
   in `db.ts`, so a restart keeps the count; cleared when a person reopens the run. Only unattended runs with
   `owner_holds` = `resolve`; a card a person runs and `park` are unchanged. No preference of its own.
+
+## Dependency gates: nothing starts or wakes before what it needs has landed (`feat/dependency-gates`)
+
+Three places let a card run ahead of code that was not on the base branch yet.
+
+- **Bug lane** (`src/shared/bug-lane.ts` `bugParent`, `pickBugs`): a bug filed from another card's work — Review's
+  finding close-out titles it `Bug (from #N): …`; its body says "on #N came back", or names a dependency ("blocked by
+  #N until it merges") — waits until #N has landed: an issue closed as completed, or a merged PR
+  (`roadmap-fetch.ts` `loadLandings`, one `issueOrPullRequest` GraphQL batch a pass). Open, closed any other way or
+  unreadable: held, taking no lane slot. `agetor roadmap status` lists them under "Bugs waiting for their parent to
+  land" (`RoadmapStatus.bugsHeld`).
+- **Wait queue** (`src/shared/block-wait.ts` `waitsOnIssue`, `planWait`; `pipeline-runner.ts` `releaseBlockWaits`): a
+  block on a numbered issue or PR (`category: "dependency"`, ref `#N`) has no timer. It is resumed only when GitHub
+  reports #N closed (polled every pass, cached two minutes) or when a person retries it; its attempts are not spent
+  while it waits. The card reads "Build waiting on #N — resumes when it is closed". A timer an older build set on
+  such an entry is ignored. Base-branch CI and an unnamed dependency keep their backoff. Without `owner_holds` =
+  `resolve`, the 24-hour deadline still hands the card to the owner.
+- **Roadmap** (`src/shared/canonical-roadmap.ts` `issuePrerequisites`, `roadmapAudit`; `roadmap.ts` `roadmapStatus`'s
+  `extra`): each open step also waits on what its issue says it needs and the tracker table leaves out — its
+  controlling `## Dependencies and required inputs` list (table mode; the canonical queue already uses it), and any
+  sentence that says another issue lands first ("#N merges before this task starts", "#N is upstream of this task").
+  A prerequisite that isn't a step is read too, and counts as not landed until it is closed as completed. Looser
+  wording ("needs #N", "waits on #N") is mostly options and questions in the issues, so it is only reported: other
+  open roadmap steps an issue mentions, that are neither its predecessor nor its successor, are listed for the owner
+  (for ready steps, at most 150). Each enforced, unmet row is a roadmap problem (`undeclared-predecessor`).
+  `agetor roadmap audit [--all]` prints them and exits 1 while a step waits on a predecessor the table doesn't list.

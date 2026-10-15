@@ -149,7 +149,7 @@ const RE = {
   /** pipeline-runner.ts `scheduleAutoRetry` */
   quota: /is waiting on a usage limit/,
   /** …and the no-owner-holds ladder (src/shared/owner-holds.ts `RESOLVING_PREFIX`) */
-  retry: /retrying automatically|^Resolving without you: /,
+  retry: /retrying automatically|resumes automatically when|^Resolving without you: /,
   /** pr-watch.ts `maybeAutoFix` */
   fixCi: /^Started Fix CI automatically/,
   /** autopilot.ts `roadmapPass` restart guard */

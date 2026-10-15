@@ -2,7 +2,7 @@ import { useEffect, useRef } from "react";
 import { ArrowRight, ExternalLink, FolderOpen, RotateCcw, Square, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import type { Task } from "../../../shared/types.ts";
-import { triedLine } from "../../../shared/block-wait.ts";
+import { triedLine, waitsOnIssue } from "../../../shared/block-wait.ts";
 import { shortPipelineName } from "@/components/pipelines/PipelineBadge";
 import { clockTime, formatElapsed, type CardAction, type CardState } from "@/lib/card-state";
 import { useCardState } from "@/lib/use-card-state";
@@ -51,7 +51,7 @@ export function retrySchedule(task: Task, now: number): [string, string][] {
   if (w) {
     rows.push(["Waits on", w.what]);
     rows.push(["Waiting since", `${clockTime(w.since)} (${formatElapsed(now - w.since)})`]);
-    if (w.state === "waiting") rows.push(["Next retry", w.at != null ? clockTime(w.at) : "soon"]);
+    if (w.state === "waiting") rows.push(["Next retry", waitsOnIssue(w) ? `when ${w.what} is closed` : w.at != null ? clockTime(w.at) : "soon"]);
     rows.push(["Attempts", `${w.attempt} of ${Math.max(1, w.max)} used — ${triedLine(w, now)}`]);
     rows.push(w.state === "escalated" ? ["Given up", w.escalation ?? "automatic retries ran out"] : ["Gives up at", clockTime(w.deadline)]);
   }

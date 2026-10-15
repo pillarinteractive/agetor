@@ -52,7 +52,7 @@ describe("cardStatus — pipelines", () => {
     const now = at - 20 * 60_000;
     const st = (t: Task, lease = noLease) => cardStatus(t, { pr: null, lease, now });
     expect(st(card(wait()))).toEqual({ line: "Build blocked — retrying at 3:40 PM · attempt 2 of 3", tone: "muted", needsYou: null });
-    expect(st(card(wait({ category: "dependency", what: "#41", ref: "#41", max: 4 }))).line).toBe("Build waiting on #41 — retrying when it lands or at 3:40 PM · attempt 2 of 4");
+    expect(st(card(wait({ category: "dependency", what: "#41", ref: "#41", max: 4 }))).line).toBe("Build waiting on #41 — resumes when it is closed · attempt 2 of 4");
     // A watched lease: who holds it, and the place in line.
     const lab = wait({ category: "resource", source: "signal", what: "the lab", ref: "lab", max: 6 });
     expect(st(card(lab), { holds: [], waiting: [{ label: "lab", heldBy: "E2E", free: false, position: 2, queueLength: 3 }] })).toMatchObject({

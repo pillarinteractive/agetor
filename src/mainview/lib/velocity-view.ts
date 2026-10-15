@@ -9,6 +9,7 @@
  */
 import type { LeaseStatus, Task, TaskPrStatus, TaskProgress } from "../../shared/types.ts";
 import type { RoadmapCardInfo } from "../../shared/roadmap.ts";
+import { waitsOnIssue } from "../../shared/block-wait.ts";
 import { fmtDuration, fmtPct, targetRange, type ForecastTarget, type VelocityBottleneck, type VelocityPhase, type VelocityReport } from "../../shared/velocity.ts";
 import { CARD_STATE_ICON, cardState, clockTime, formatElapsed, type CardAction, type CardState, type CardStateIcon, type CardStateTone } from "./card-state.ts";
 import { leaseInfoForTask } from "./leases.ts";
@@ -174,7 +175,7 @@ function retryTiming(task: Task): string | null {
   const run = task.pipelineRun;
   if (!run || run.status !== "blocked") return null;
   const w = run.wait;
-  if (w && w.state === "waiting") return `Next retry ${w.at != null ? clockTime(w.at) : "soon"} · attempt ${Math.min(w.attempt + 1, Math.max(1, w.max))} of ${Math.max(1, w.max)}`;
+  if (w && w.state === "waiting") return `Next retry ${waitsOnIssue(w) ? `when ${w.what} is closed` : w.at != null ? clockTime(w.at) : "soon"} · attempt ${Math.min(w.attempt + 1, Math.max(1, w.max))} of ${Math.max(1, w.max)}`;
   if (run.autoRetry?.at != null) return `Next retry ${clockTime(run.autoRetry.at)} · attempt ${run.autoRetry.attempt} · no maximum recorded`;
   const held = run.blocked.find((b) => b.inputRetry != null)?.inputRetry;
   if (held) return `Next check ${clockTime(held.at)} · attempt ${held.attempt} · no maximum recorded`;
