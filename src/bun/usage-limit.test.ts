@@ -5,6 +5,7 @@ import {
   matchClaudeResetNotice,
   nextRetryAt,
   parseResetTime,
+  BILLING_WINDOW_MS,
   CLAUDE_QUOTA_PAUSED_RE,
   QUOTA_RESET_MARGIN_MS,
   TRANSIENT_RETRY_MAX,
@@ -64,6 +65,17 @@ test("a harness's limit message standing alone on a row is its notice; a log lin
   ]) {
     expect(harnessQuotaNotice(row)).toBe(false);
   }
+});
+
+test("an empty prepaid wallet (HTTP 402) is a quota that lasts the billing window; prose about a 402 is not", () => {
+  const now = Date.UTC(2026, 9, 14, 20, 0);
+  const deepinfra = classifyFailure("API Error: 402 You need positive balance to do inference. Please add balance manually or setup top-up", now);
+  expect(deepinfra).toMatchObject({ kind: "quota", resetAt: now + BILLING_WINDOW_MS });
+  expect(classifyFailure("api error: HTTP 402 — turn aborted; blocked for manual retry", now)?.kind).toBe("quota");
+  // A 429 with no reset time keeps the short default (null: the caller's window).
+  expect(classifyFailure("You've hit your usage limit.", now)?.resetAt).toBeNull();
+  expect(classifyFailure("The checkout route now returns HTTP 402 Payment Required when the card is declined", now)).toBeNull();
+  expect(classifyFailure("Insufficient balance errors are mapped to 402 in billing/charge.ts", now)).toBeNull();
 });
 
 test("overload, capacity and launch failures are transient; other text is unclassified", () => {

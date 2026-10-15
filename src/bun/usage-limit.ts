@@ -24,6 +24,12 @@
  *   `Quota exceeded. Check your plan and billing details.` Codex's capacity
  *   error `Selected model is at capacity. Please try a different model.`
  *   (real, run_events stderr) is transient, not a quota.
+ * - A prepaid provider behind a Claude Code alias (DeepInfra), wallet empty:
+ *   `API Error: 402 You need positive balance to do inference. Please add
+ *   balance manually or setup top-up` (claude -p result, 2026-10-14), and
+ *   Agetor's own `api error: HTTP 402 — turn aborted` line. A wallet
+ *   does not refill by itself, so with no reset time a billing limit lasts
+ *   {@link BILLING_WINDOW_MS} instead of the usual short window.
  */
 
 export type FailureKind = "quota" | "transient";
@@ -36,6 +42,15 @@ export interface FailureClass {
   detail: string;
 }
 
+/** An out-of-balance prepaid account (HTTP 402): a quota only a top-up ends.
+ *  Provider error forms only — a turn that merely discusses a 402 (Pillar has
+ *  billing code) must not read as one. */
+const BILLING_RES: RegExp[] = [
+  /\bAPI Error: 402\b/i, // claude's own API error line
+  /\bapi error: HTTP 402\b/i, // agetor's turn-aborted line
+  /\bYou need positive balance to do inference\b/i, // DeepInfra
+];
+
 /** A usage/quota limit: retrying before it resets can't succeed. */
 const QUOTA_RES: RegExp[] = [
   /You['’]ve hit your\b[^.\n·]*\blimit/i, // claude + codex
@@ -43,7 +58,13 @@ const QUOTA_RES: RegExp[] = [
   /\bUsage limit reached\b/i, // claude notices + grace window
   /\bQuota exceeded\b/i, // codex (API key out of quota)
   /You['’]re out of (?:usage )?credits/i,
+  ...BILLING_RES,
 ];
+
+/** How long an out-of-balance account counts as limited when the message
+ *  gives no reset time: long enough that each new step does not first fail
+ *  on the empty wallet, short enough that a top-up is noticed the same day. */
+export const BILLING_WINDOW_MS = 6 * 60 * 60_000;
 
 /** Failures that are worth retrying a few times: overload/5xx/capacity,
  *  launch flakes. A failed run that matches nothing is treated as transient
@@ -67,7 +88,10 @@ export function classifyFailure(text: string, now: number = Date.now()): Failure
   // The last matching line is the freshest notice (claude's "continuing
   // automatically at 11:30pm" follows its grace-window note).
   const quota = lines.findLast((l) => QUOTA_RES.some((re) => re.test(l)));
-  if (quota) return { kind: "quota", resetAt: parseResetTime(text, now), detail: quota.slice(0, 200) };
+  if (quota) {
+    const billing = BILLING_RES.some((re) => re.test(quota));
+    return { kind: "quota", resetAt: parseResetTime(text, now) ?? (billing ? now + BILLING_WINDOW_MS : null), detail: quota.slice(0, 200) };
+  }
   for (const re of TRANSIENT_RES) {
     const line = lines.find((l) => re.test(l));
     if (line) return { kind: "transient", resetAt: null, detail: line.slice(0, 200) };

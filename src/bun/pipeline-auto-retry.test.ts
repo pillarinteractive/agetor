@@ -526,3 +526,43 @@ test("a usage limit that cuts a turn off mid-work resumes that session; one hit 
   expect(atStart.autoRetry!.resume).toBeUndefined();
   expect(activity(fresh.parentId).some((l) => l.includes("Build is waiting on a usage limit") && l.includes("retrying automatically at"))).toBe(true);
 });
+
+test("an empty prepaid wallet (HTTP 402) moves the step to the next profile of its chain and marks the harness for the billing window", async () => {
+  const { createTask, startTask } = await import("./orchestrator.ts");
+  const { agentProfiles, harnesses, pipelines, preferences, tasks } = await import("./db.ts");
+  const { newStep } = await import("../shared/pipeline.ts");
+  const { FAKE_CLAUDE_HANDOFF_PROMPT_MARKER } = await import("./agents.ts");
+  const { QUOTA_FALLBACK_PREF, QUOTA_FALLBACK_UNTIL_PREF } = await import("./quota-fallback.ts");
+  const { BILLING_WINDOW_MS } = await import("./usage-limit.ts");
+  const prepaid = `prepaid-${randomUUID().slice(0, 8)}`;
+  const backup = `backup-${randomUUID().slice(0, 8)}`;
+  harnesses.insert({ id: prepaid, kind: "claude-code", label: "Claude via a prepaid provider" });
+  harnesses.insert({ id: backup, kind: "claude-code", label: "Claude via the next backup" });
+  const own = agentProfiles.insert({ name: `wallet-${randomUUID()}`, harness: prepaid, model: "vendor/model-a", effort: null, mode: null, fast: false, maxMode: false, instructions: "", skills: [] });
+  const next = agentProfiles.insert({ name: `wallet-next-${randomUUID()}`, harness: backup, model: "vendor/model-b", effort: null, mode: null, fast: false, maxMode: false, instructions: "", skills: [] });
+  const before = { rules: preferences.get(QUOTA_FALLBACK_PREF), until: preferences.get(QUOTA_FALLBACK_UNTIL_PREF) };
+  preferences.set(QUOTA_FALLBACK_PREF, JSON.stringify([{ enabled: true, profile: own.name, chain: [next.name] }]));
+  try {
+    process.env.AGETOR_FAKE_CLAUDE_API_ERROR = "1";
+    process.env.AGETOR_FAKE_CLAUDE_API_ERROR_TEXT = "API Error: 402 You need positive balance to do inference. Please add balance manually or setup top-up";
+    process.env.AGETOR_FAKE_CLAUDE_API_ERROR_STATUS = "402";
+    const A = newStep({ name: "Build", agentProfileId: own.id, instructions: `Do it. ${FAKE_CLAUDE_HANDOFF_PROMPT_MARKER}:done` });
+    const pipeline = pipelines.insert({ name: `wallet-${randomUUID()}`, graph: { steps: [A], edges: [], startStepId: A.id }, maxSteps: 25 });
+    const created = await createTask({ title: "empty wallet", prompt: "goal", workdir: mkdtempSync(path.join(tmpdir(), "agetor-auto-retry-wd-")), isolation: "none", pipelineId: pipeline.id });
+    if ("error" in created) throw new Error(created.error);
+    parents.push(created.task.id);
+    const startedAt = Date.now();
+    const started = await startTask(created.task.id);
+    if ("error" in started) throw new Error(started.error);
+    const line = await waitFor(() => activity(created.task.id).find((l) => l.startsWith("Build hit a usage limit")));
+    expect(line).toContain("Claude via the next backup");
+    const run = tasks.get(created.task.id)!.pipelineRun!;
+    expect(run.autoRetry).toMatchObject({ stepId: A.id, kind: "quota" });
+    expect(tasks.get(run.active[0]!.taskId)).toMatchObject({ agent: backup, model: "vendor/model-b" });
+    const until = JSON.parse(preferences.get(QUOTA_FALLBACK_UNTIL_PREF) ?? "{}")[prepaid] as number;
+    expect(until).toBeGreaterThanOrEqual(startedAt + BILLING_WINDOW_MS);
+  } finally {
+    preferences.set(QUOTA_FALLBACK_PREF, before.rules ?? "");
+    preferences.set(QUOTA_FALLBACK_UNTIL_PREF, before.until ?? "{}");
+  }
+});
