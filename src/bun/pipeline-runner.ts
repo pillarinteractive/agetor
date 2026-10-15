@@ -31,7 +31,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { recordActivity } from "./activity.ts";
 import { syncBaseNote } from "./sync-base.ts";
 import { logBlockResolution, logBlocks, newBlocks } from "./block-log.ts";
-import { isMergeQueued } from "./merge-intent.ts";
+import { isMergeQueued, setMergeQueued } from "./merge-intent.ts";
 import { currentSlots, slotDecision, slotUse } from "./step-slots.ts";
 import { reserveRunner, releaseUnspawnedRunner } from './dispatch-claims.ts';
 import { reconcileCardInputs } from './queue-validation.ts';
@@ -2060,6 +2060,10 @@ async function ladderRestartFromBase(parentId: string, hold: OwnerHold, why: str
       // base it starts on, and its PR is a new one.
       tasks.update(parentId, { baseRef: r.baseSha, prUrl: null });
       invalidatePrStatus(parentId);
+      // A sign-off was for the old attempt's PR, now closed: the new attempt
+      // is signed off on its own (2026-10-15: #1040's stale flag let an
+      // unapproved head into the merge queue).
+      setMergeQueued(parentId, false);
       run.capRestart = {
         at: now, state: "reset", base: r.base, archive: r.archive,
         ...(r.closedPr ? { closedPr: r.closedPr } : {}), ...(r.note ? { note: r.note } : {}),
@@ -2667,8 +2671,12 @@ function persist(parentId: string, run: PipelineRunState, opts?: { preserveStatu
     cancelled: "ready",
   };
   // A signed-off card (Ready to Merge) comes back there when a fix-up run
-  // finishes, not to In Review (src/bun/merge-intent.ts).
-  const nextColumn = run.status === "done" && isMergeQueued(parentId) ? "merge" : columnFor[run.status];
+  // finishes, not to In Review (src/bun/merge-intent.ts) — unless the run
+  // ended through the step-cap wrap-up, which publishes a head Review did
+  // not approve: that one goes to In Review, and its sign-off is withdrawn.
+  const unapproved = run.status === "done" && run.capWrapUp != null;
+  if (unapproved && isMergeQueued(parentId)) setMergeQueued(parentId, false);
+  const nextColumn = run.status === "done" && !unapproved && isMergeQueued(parentId) ? "merge" : columnFor[run.status];
   if (nextColumn && parent && parent.column !== nextColumn && previousStatus !== run.status) {
     pipelineUpdateColumn(parentId, null, nextColumn);
   }

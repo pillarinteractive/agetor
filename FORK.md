@@ -1998,3 +1998,12 @@ issue opened after the run started that names the card's issue. If so, the wait 
 ordinary stop: the no-owner-holds ladder resolves it (answer with the recommended option, reroute, then publish with
 `Refs`); with `owner_holds` = `park`, it is the owner's. A real dependency — an older issue, or one about another
 issue — stays parked as before.
+
+## An unapproved head never reaches Ready to Merge (`fix/unapproved-never-queued`)
+
+2026-10-15: #1040's card had been signed off, went back for a CI fix round, hit its step cap, and the wrap-up published
+a head Review never approved. When that run finished, `isMergeQueued` (the old sign-off) sent the card straight back
+to Ready to Merge, and the merge queue marked the draft PR (#1664) ready and merged it. Now a run that ends through
+the step-cap wrap-up (`run.capWrapUp`) goes to In Review and its sign-off is withdrawn, and a restart from the base
+(`ladderRestartFromBase`) clears the old attempt's sign-off. A signed-off card whose fix-up run finishes approved
+still returns to Ready to Merge.

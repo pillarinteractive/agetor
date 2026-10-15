@@ -207,6 +207,29 @@ test("unattended: the cap reached on the launch of the terminal step launches it
   expect(wrapUpLines(parentId)).toEqual(["Reached the 2-step cap — finishing through Finish and filing issues for what is unresolved"]);
 });
 
+test("unattended: a run that ends through the wrap-up goes to In Review even when the card was signed off before — its head is not approved", async () => {
+  const { tasks } = await import("./db.ts");
+  const { isMergeQueued, setMergeQueued } = await import("./merge-intent.ts");
+  // 2026-10-15: #1040 was signed off, sent back for a CI fix, hit the cap,
+  // and its unapproved wrap-up head went straight back to Ready to Merge.
+  const { parentId } = await startTemplate("Finish", "done", 1, true);
+  setMergeQueued(parentId, true);
+  const done = await waitFor(() => (tasks.get(parentId)?.pipelineRun?.status === "done" ? tasks.get(parentId)! : null));
+  expect(done.pipelineRun!.capWrapUp).toBeTruthy();
+  await waitFor(() => tasks.get(parentId)?.column === "review");
+  expect(isMergeQueued(parentId)).toBe(false);
+});
+
+test("a signed-off card whose fix-up run finishes approved still comes back to Ready to Merge", async () => {
+  const { tasks } = await import("./db.ts");
+  const { setMergeQueued } = await import("./merge-intent.ts");
+  const { parentId } = await startTemplate("Finish", "done", 25, true);
+  setMergeQueued(parentId, true);
+  const done = await waitFor(() => (tasks.get(parentId)?.pipelineRun?.status === "done" ? tasks.get(parentId)! : null));
+  expect(done.pipelineRun!.capWrapUp ?? null).toBeNull();
+  await waitFor(() => tasks.get(parentId)?.column === "merge");
+});
+
 test("unattended: the cap reached on the launch of another step launches the terminal step in its place, then blocks", async () => {
   const { tasks } = await import("./db.ts");
   const { retryPipelineStep } = await import("./pipeline-runner.ts");
